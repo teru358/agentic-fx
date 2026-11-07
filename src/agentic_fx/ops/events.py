@@ -21,7 +21,8 @@ IMPROVE_CODE = "improve_run_changed"
 
 FIELDS = {
     "ops_request_terminal": frozenset({"endpoint_code", "result_code", "authenticated_principal"}),
-    "approval_state_changed": frozenset({"state", "decision_code", "decided_by", "plugin_kind"}),
+    "approval_state_changed": frozenset({"state", "decision_code", "decided_by", "plugin_kind",
+                                        "candidate_origin", "deploy_phase"}),
     "job_state_changed": frozenset({"job_kind", "state", "result_code"}),
     "guard_state_changed": frozenset({"guard_kind", "state", "generation"}),
     "service_health_changed": frozenset({"component_code", "health_code"}),
@@ -82,7 +83,8 @@ class EventSchemaError(ValueError):
 
 
 def validate_fields(code: str, fields: dict, ref: str | None = None) -> None:
-    optional = ({"plugin_kind"} if code == "approval_state_changed" else set())
+    optional = ({"plugin_kind", "candidate_origin", "deploy_phase"}
+                if code == "approval_state_changed" else set())
     if code == IMPROVE_CODE:
         optional = {"repeat_run", "repeat_max_runs", "repeat_elapsed_sec", "repeat_duration_sec"}
     if (code not in FIELDS or not isinstance(fields, dict)

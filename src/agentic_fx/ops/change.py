@@ -51,6 +51,12 @@ def _candidate_source(plugins_root: Path, status: str, payload: dict,
             if path != f"plugins/_human/{name}":
                 raise safe_open.SourceError(L.UNSAFE_SOURCE)
             source = safe_open.human_source(name)
+        elif origin == "reevaluation":
+            # 版 dir は配備中の版そのもの。locator の等値検査の後は承認済みと同じ読み方
+            if (type(artifact_hash) is not str
+                    or path != f"plugins/.versions/{name}/{artifact_hash}"):
+                raise safe_open.SourceError(L.UNSAFE_SOURCE)
+            return safe_open.version_source(name, artifact_hash)
         else:
             raise safe_open.SourceError(L.UNSAFE_SOURCE)
         _lexical_locator_check(plugins_root, origin, path, name)

@@ -31,6 +31,7 @@ from agentic_fx.store.approvals import AlreadyDecidedError, ApprovalNotFoundErro
 from agentic_fx.store.state import (
     GenerationMismatch, NotLatched, ResetNotApplied, StateStore, StateUncertain)
 from agentic_fx.loops import econ_signal_report
+from agentic_fx.ops import reevaluation_view
 from agentic_fx.ops.contracts import ErrorCode, OpsError, ShellCaller
 from agentic_fx.policy_projection import (
     POLICY_TEXT_LIMIT, MigrationRecordUnknown, ProjectionReconcileBlocked, insert_policy,
@@ -38,6 +39,8 @@ from agentic_fx.policy_projection import (
 
 POLICY_WRITE_ERRORS = (sqlite3.Error, OSError, ValueError, ProjectionReconcileBlocked,
                        MigrationRecordUnknown)
+
+_APPROVED_OUTCOMES = ("deployed", "deployed_after_rollback", "reevaluation_confirmed")
 
 class PolicyFileNotReflected(RuntimeError):
     """A committed policy record could not be reflected to its file."""
@@ -187,14 +190,15 @@ class Commands:
                         now=self.clock.now(), plugins_root=self.plugins_root,
                         settings=self.settings, activity=self.activity)
                     text = self._approval_outcome_text(outcome)
-                    if outcome.outcome not in ("deployed", "deployed_after_rollback"):
+                    if outcome.outcome not in _APPROVED_OUTCOMES:
                         # 「今回の操作では」= status が既に `approved` の
                         # 二重 approve (`already_decided`) でも文が矛盾しない
                         # ようにするため (§3.6.3 / §3.6.5 の 1)。
                         return (f"approval #{args[0]} は今回の操作では承認されません"
                                f"でした (status={outcome.status}): {text}")
-                    self.activity.write(Category.APPROVAL, "approved",
-                                        f"#{args[0]} via shell", ref_id=args[0])
+                    if outcome.outcome != "reevaluation_confirmed":
+                        self.activity.write(Category.APPROVAL, "approved",
+                                            f"#{args[0]} via shell", ref_id=args[0])
                     return f"approval #{args[0]} approved: {text}"
                 # 決定の対象は kind='plugin' だけ (他の kind は将来枠で、決定経路を持たない)。
                 if row is None:
@@ -212,10 +216,12 @@ class Commands:
                     if self.plugins_root is None:
                         return "plugin approval backend (plugins_root) が未配線です"
                     from agentic_fx.plugin import switch as plugin_switch
-                    plugin_switch.reject_candidate(
+                    decided = plugin_switch.reject_candidate(
                         self.conn, approval_id, decided_by="shell",
                         reason=reason or "", now=self.clock.now(),
                         plugins_root=self.plugins_root, activity=self.activity)
+                    if isinstance(decided, plugin_switch.ApprovalOutcome):
+                        return self._reevaluation_reject_text(args[0], decided)
                 else:
                     if row is None:
                         raise ApprovalNotFoundError(approval_id)
@@ -473,7 +479,8 @@ class Commands:
         except (ValueError, KeyError) as e:
             return f"エラー: {safe_error_text(e)}\n{render_shell_help()}"
         except Exception as e:
-            return f"エラー: {safe_error_text(e)}"
+            return f"エラー: {safe_error_text(e)}" + self._reevaluation_stop_hint(
+                cmd == "reject" and bool(args), args[0] if args else None)
         return render_shell_help()
 
     def _ops_decide(self, kind: str, approval_id: int, reason: str | None,
@@ -491,8 +498,14 @@ class Commands:
             return f"エラー: {e.code.value}"
         outcome = job.detail
         if kind == "reject":
+            from agentic_fx.plugin import switch as plugin_switch
+            if isinstance(outcome, plugin_switch.ApprovalOutcome):
+                if job.error_code is not None and outcome.outcome != "history_epoch_changed":
+                    return self._ops_decision_error(job.error_code, approval_id)
+                return self._reevaluation_reject_text(shown_id, outcome)
             if job.error_code is not None:
-                return self._ops_decision_error(job.error_code, approval_id)
+                return (self._ops_decision_error(job.error_code, approval_id)
+                        + self._reevaluation_stop_hint(True, shown_id))
             self.activity.write(Category.APPROVAL, "rejected",
                                 f"#{shown_id} via shell", ref_id=shown_id)
             return f"approval #{shown_id} rejected"
@@ -503,11 +516,12 @@ class Commands:
             self.activity.write(Category.APPROVAL, "retry",
                                 f"#{approval_id} via shell", ref_id=str(approval_id))
             return f"approval #{approval_id} を再試行しました: {text}"
-        if outcome.outcome not in ("deployed", "deployed_after_rollback"):
+        if outcome.outcome not in _APPROVED_OUTCOMES:
             return (f"approval #{shown_id} は今回の操作では承認されません"
                     f"でした (status={outcome.status}): {text}")
-        self.activity.write(Category.APPROVAL, "approved",
-                            f"#{shown_id} via shell", ref_id=shown_id)
+        if outcome.outcome != "reevaluation_confirmed":
+            self.activity.write(Category.APPROVAL, "approved",
+                                f"#{shown_id} via shell", ref_id=shown_id)
         return f"approval #{shown_id} approved: {text}"
 
     @staticmethod
@@ -836,11 +850,30 @@ class Commands:
         if kind == "legacy_plain_present":
             return (f"plugins/{outcome.name} が旧式のディレクトリのままです "
                     "(先に afx plugin retire が要ります)")
+        if kind == "invalidated" and outcome.reason == "reevaluation_stale":
+            return reevaluation_view.STALE_TEXT
+        if kind == "reevaluation_confirmed":
+            return reevaluation_view.CONFIRMED_TEXT
         if kind in ("already_decided", "invalidated"):
             return f"この承認は既に決着しています (status={outcome.status})"
         if kind == "history_epoch_changed":
             return "履歴修復後の評価でないため承認できません (history_epoch_changed)"
         raise ValueError(f"unknown approval outcome: {kind!r}")
+
+    def _reevaluation_reject_text(self, shown_id: str, outcome) -> str:
+        """再評価の依頼の却下を、結果の形どおりの文言にする。"""
+        if outcome.outcome == "rejected":
+            tail = reevaluation_view.reject_text(outcome.name, outcome.deploy_phase)
+            if tail is None:
+                raise ValueError(f"unknown deploy phase: {outcome.deploy_phase!r}")
+            return f"approval #{shown_id} {tail}"
+        if outcome.outcome == "invalidated" and outcome.reason == "reevaluation_stale":
+            return (f"approval #{shown_id} "
+                    + reevaluation_view.STALE_STOP_TEXT.format(name=outcome.name))
+        if outcome.outcome == "history_epoch_changed":
+            return (f"approval #{shown_id} "
+                    + reevaluation_view.EPOCH_STOP_TEXT.format(name=outcome.name))
+        raise ValueError(f"unexpected reject outcome: {outcome.outcome!r}")
 
     def _approval_list(self, limit_arg: "str | None") -> str:
         """承認待ちの一覧 + 未終端の切替ジャーナル (設計書 §3.5)。"""
@@ -904,6 +937,29 @@ class Commands:
                 return approval_facts.INVALID_FORMAT_TEXT
         return display_text(value, approval_facts.CLAIM_DISPLAY_LIMIT)
 
+    def _reevaluation_stop_hint(self, wanted: bool, approval_id) -> str:
+        """再評価の依頼の却下が止まったとき、配備を止める手段を添える。"""
+        if not wanted:
+            return ""
+        try:
+            row = self.conn.execute(
+                "SELECT payload_json FROM approval_requests WHERE id=?",
+                (int(approval_id),)).fetchone()
+            payload = json.loads(row["payload_json"]) if row is not None else None
+        except Exception:  # noqa: BLE001
+            return ""
+        if (not isinstance(payload, dict)
+                or payload.get("candidate_origin") != reevaluation_view.ORIGIN
+                or not isinstance(payload.get("name"), str)):
+            return ""
+        return "\n" + reevaluation_view.STOP_HINT.format(name=display_text(payload["name"]))
+
+    def _reevaluation_view(self, payload: dict) -> dict | None:
+        try:
+            return reevaluation_view.build_view(self.conn, payload)
+        except Exception:  # noqa: BLE001 — 比較の表示が読めなくても詳細は出す
+            return None
+
     def _approval_detail(self, approval_id: int) -> str:
         row = self.conn.execute(
             "SELECT kind, status, payload_json, reason, decided_by, "
@@ -931,6 +987,8 @@ class Commands:
             f"content_hash={display_text(payload.get('content_hash'))} "
             f"eval_timeframe={display_text(payload.get('eval_timeframe'))}",
         ]
+        lines += reevaluation_view.lines(
+            self._reevaluation_view(payload), self._when)
         lines += self._metrics_lines("in_sample", payload.get("in_sample"))
         lines += self._metrics_lines("holdout", payload.get("holdout"))
         warning = None

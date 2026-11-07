@@ -91,6 +91,20 @@ def test_monitor_counts_an_unavailable_submission_that_left_no_baseline_row(ops_
     assert row["by_candidate_hash"][0]["verdict"] == "unavailable"
 
 
+def test_a_reevaluation_row_does_not_replace_the_window_the_version_was_adopted_with(ops_env):
+    """Dropping the reevaluation exclusion makes the later row win and the overlap change."""
+    conn = ops_env.conn
+    _adopted(conn)
+    later = (datetime(2026, 10, 10, tzinfo=timezone.utc), datetime(2026, 10, 20, tzinfo=timezone.utc))
+    _row(conn, content_hash="b" * 64, variant="candidate", mission_id=None, period=later,
+         outcome="reevaluation")
+    _compare(conn, 1, "1" * 64, pf=1.1, avg_r=0.1)
+
+    (summary,) = monitor_summary(conn)
+
+    assert summary["window_overlap"] == {"mean": 16 / 45, "n": 1}
+
+
 def test_monitor_reads_adoption_windows_in_one_select_regardless_of_the_row_count(ops_env):
     """Going back to one SELECT per baseline row must raise the counted statements."""
     conn = ops_env.conn

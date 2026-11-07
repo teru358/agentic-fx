@@ -292,6 +292,10 @@ _BASE_COMMANDS: tuple[CommandRecord, ...] = (
             "plugin を戻す", "backtest/cli.py", confirm=True, condition="再起動後反映", exposed=True),
     _record(Group.PLUGIN, Lane.LOCAL, "plugin revoke", "afx plugin revoke <name> --version HASH …",
             Label.CHANGE, "plugin の版を失効させる", "backtest/cli.py", confirm=True, exposed=True),
+    _record(Group.PLUGIN, Lane.LOCAL, "plugin reevaluate",
+            "afx plugin reevaluate [--all-deployed | <name>]", Label.CHANGE,
+            "配備中の strategy を再評価する", "backtest/cli.py", confirm=True,
+            exposed=True),
     _record(Group.PLUGIN, Lane.LOCAL, "plugin versions", "afx plugin versions <name>", Label.READ,
             "plugin の版を表示する", "backtest/cli.py", exposed=True),
     _record(Group.PLUGIN, Lane.LOCAL, "plugin list", "afx plugin list [--kind indicator|strategy]",
@@ -529,6 +533,13 @@ class HelpFormatter(argparse.RawDescriptionHelpFormatter):
     def __init__(self, prog: str, **kwargs) -> None:
         kwargs["width"] = 100
         super().__init__(prog, **kwargs)
+
+
+def wrapped_choices_usage(prog: str, choices) -> str:
+    """子コマンドの選択肢が prog の下に揃えると幅を超えるグループの usage。`usage: ` に
+    続く本文を返す。選択肢の列は 1 つの `{a,b}` のまま、次の行へ 4 桁字下げで置く
+    (補完の照合が `{...}` を 1 つの塊として読むため、折り返さない)。"""
+    return f"{prog} [-h]\n    {{{','.join(choices)}}} ..."
 
 
 class SurfaceRenderer:

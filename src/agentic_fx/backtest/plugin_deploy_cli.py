@@ -714,6 +714,77 @@ def plugin_revoke(conn, settings, args, root: Path) -> int:
                   render=lambda outcome: render_revoke(outcome, args.name, content_hash))
 
 
+REEVALUATE_RESULT_TEXT = {
+    "created": "承認の依頼を作りました",
+    "existing": "同じ評価の依頼が既にあります",
+    "unevaluable": "評価できませんでした",
+    "failed": "失敗しました",
+    "changed_during_evaluation": "評価中に配備が変わったため、何も書いていません。もう一度実行してください",
+    "skipped": "対象にしませんでした",
+}
+# 配備中の strategy ではないことによる skipped。--all-deployed の走査では対象外の通常の姿。
+_NOT_A_DEPLOYED_STRATEGY = frozenset({
+    "plain_plugin", "not_approved", "not_deployed", "not_strategy"})
+
+
+def reevaluate_line(result) -> str:
+    """結果表の 1 行 (1 版 1 行)。"""
+    parts = [result.name, result.status]
+    if result.approval_id is not None:
+        parts.append(f"#{result.approval_id}")
+    if result.reason:
+        parts.append(f"({result.reason})")
+    parts.append(REEVALUATE_RESULT_TEXT[result.status])
+    if result.status == "unevaluable":
+        parts.append(f"止めるには: afx plugin disable {result.name}")
+    return "  ".join(parts)
+
+
+def reevaluate_exit_code(results, *, all_deployed: bool) -> int:
+    """`created` と `existing` 以外が 1 本でもあれば非 0。`--all-deployed` の走査で
+    配備中の strategy でないことによる skipped (indicator・旧式の plugin・承認の無い
+    entry) は、対象外の通常の姿なので数えない。名前で指したときは数える。"""
+    for result in results:
+        if result.status in ("created", "existing"):
+            continue
+        if (all_deployed and result.status == "skipped"
+                and result.reason in _NOT_A_DEPLOYED_STRATEGY):
+            continue
+        return RC_FAILED
+    return RC_OK
+
+
+@guarded
+def plugin_reevaluate(conn, settings, args, root: Path) -> int:
+    plugins_dir, activity = _common(root)
+    all_deployed = bool(getattr(args, "all_deployed", False))
+    name = getattr(args, "name", None)
+    if all_deployed == (name is not None):
+        return _emit(_failure("<name> か --all-deployed のどちらか一方を指定してください",
+                              "invalid_request", rc=2))
+    names = plugin_switch.reevaluation_candidate_names(plugins_dir) if all_deployed else [name]
+    if not bool(getattr(args, "yes", False)):
+        print("配備中の strategy を今の履歴で評価し直し、承認の依頼を作ります。"
+              "評価に数分かかります。daemon は動いたままでよく、配備は変わりません。")
+        print("対象: " + (", ".join(names) if names else "(なし)"))
+        if not _isatty():
+            return _emit(_failure(
+                "確認が必要です。端末で実行するか --yes を付けてください。何も変更していません",
+                "confirmation_required"))
+        if not _confirm():
+            return _emit(_failure("中止しました。何も変更していません", "aborted"))
+    # 時刻と設定は全 strategy で共通にするため、ここで 1 回だけ読む。
+    now = datetime.now(timezone.utc)
+    results = [
+        plugin_switch.reevaluate_deployed(
+            conn, name=target, plugins_root=plugins_dir, settings=settings, now=now,
+            activity=activity)
+        for target in names]
+    for result in results:
+        print(reevaluate_line(result))
+    return reevaluate_exit_code(results, all_deployed=all_deployed)
+
+
 @guarded
 def report_config_error(exc: Exception) -> int:
     """Refuse with a coded one-line error when the settings cannot be read."""

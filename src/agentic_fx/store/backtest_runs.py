@@ -183,7 +183,8 @@ def in_sample_view(conn: sqlite3.Connection, *,
                     pair: str | None = None) -> list[dict]:
     """改善ループが読む唯一の成績面。period_start/period_end は含めない。"""
     query = (f"SELECT {_VIEW_COLUMNS} FROM backtest_runs "
-             "WHERE scope='in_sample' AND issued_by='harness'")
+             "WHERE scope='in_sample' AND issued_by='harness' "
+             "AND (mission_outcome IS NULL OR mission_outcome <> 'reevaluation')")
     params: list[Any] = []
     if pair is not None:
         query += " AND pair=?"
@@ -205,9 +206,73 @@ def in_sample_view(conn: sqlite3.Connection, *,
     return result
 
 
+_UNAVAILABLE = object()
+
+
+def _reevaluation_payload(conn: sqlite3.Connection, name: str, content_hash: str,
+                          cache: dict | None) -> dict | None:
+    """(name, content_hash) の最新の承認が再評価の依頼ならその payload を返す。
+    承認の走査が失敗したときは再評価前の値に戻すため None (警告ログ 1 回)。
+    cache があれば同じ (name, content_hash) の結果を使い回す。"""
+    from agentic_fx.store import approvals as approvals_store
+
+    key = (name, content_hash)
+    if cache is not None and key in cache:
+        return cache[key]
+    payload = None
+    try:
+        latest = approvals_store.latest_approved_for_identity(conn, name, content_hash)
+        if latest is not None:
+            loaded = json.loads(latest["payload_json"])
+            if isinstance(loaded, dict) and loaded.get("candidate_origin") == "reevaluation":
+                payload = loaded
+    except Exception:
+        _log.warning("latest_in_sample_metrics: reevaluation lookup failed "
+                     "content_hash=%s — no numbers are attached", content_hash)
+        payload = _UNAVAILABLE
+    if cache is not None:
+        cache[key] = payload
+    return payload
+
+
+def _reevaluated_in_sample_metrics(conn: sqlite3.Connection, name: str, content_hash: str,
+                                   *, pair: str, variant: str, source: str,
+                                   base_interval: str, cache: dict | None = None) -> dict | None:
+    """(name, content_hash) の最新の承認が再評価の依頼なら、その依頼が指す
+    in_sample の行の metrics を返す。再評価でなければ None。
+
+    承認を読めない・再評価の行が欠ける・壊れているときは ``_UNAVAILABLE``
+    を返す。呼び出し元は再評価前の数値に戻さず、成績を添えない (古い
+    数値を今の成績として渡さない)。"""
+    payload = _reevaluation_payload(conn, name, content_hash, cache)
+    if payload is None:
+        return None
+    if payload is _UNAVAILABLE:
+        return _UNAVAILABLE
+    run_ids = payload.get("run_ids")
+    in_sample_ids = run_ids.get("in_sample") if isinstance(run_ids, dict) else None
+    run_id = in_sample_ids.get(pair) if isinstance(in_sample_ids, dict) else None
+    if not isinstance(run_id, int) or isinstance(run_id, bool):
+        return _UNAVAILABLE
+    row = conn.execute(
+        "SELECT metrics_json FROM backtest_runs WHERE id=? AND scope='in_sample' "
+        "AND issued_by='harness' AND mission_outcome='reevaluation' AND content_hash=? "
+        "AND pair=? AND variant=? AND source=? AND base_interval=?",
+        (run_id, content_hash, pair, variant, source, base_interval)).fetchone()
+    if row is None:
+        return _UNAVAILABLE
+    try:
+        return _filter_metrics(json.loads(row["metrics_json"]))
+    except (TypeError, ValueError):
+        _log.warning("latest_in_sample_metrics: reevaluation metrics_json decode failed "
+                     "content_hash=%s pair=%s", content_hash, pair)
+        return _UNAVAILABLE
+
+
 def latest_in_sample_metrics(conn: sqlite3.Connection, content_hash: str, *,
                               pair: str, variant: str, source: str,
-                              base_interval: str) -> dict | None:
+                              base_interval: str, name: str | None = None,
+                              reevaluation_cache: dict | None = None) -> dict | None:
     """指定 content_hash・pair の in_sample 成績のうち最新 1 件の metrics
     を返す。
 
@@ -236,6 +301,14 @@ def latest_in_sample_metrics(conn: sqlite3.Connection, content_hash: str, *,
     (get_signals 側) と同じ fail-open 流儀で、decode 失敗は warning ログ +
     None 返却にする。
     """
+    if name is not None:
+        reevaluated = _reevaluated_in_sample_metrics(
+            conn, name, content_hash, pair=pair, variant=variant, source=source,
+            base_interval=base_interval, cache=reevaluation_cache)
+        if reevaluated is _UNAVAILABLE:
+            return None
+        if reevaluated is not None:
+            return reevaluated
     row = conn.execute(
         "SELECT metrics_json FROM backtest_runs WHERE scope='in_sample' "
         "AND issued_by='harness' AND content_hash=? AND pair=? "
@@ -297,7 +370,7 @@ def find_matching_approved_metrics(conn: sqlite3.Connection, *, pair: str,
         rows = conn.execute(
             "SELECT content_hash, metrics_json FROM backtest_runs WHERE "
             "scope='in_sample' AND issued_by='harness' AND variant=? "
-            "AND mission_outcome='approval' AND pair=? AND source=? "
+            "AND mission_outcome IN ('approval','reevaluation') AND pair=? AND source=? "
             "AND base_interval=? AND content_hash IN ("
             "SELECT json_extract(payload_json, '$.content_hash') "
             "FROM approval_requests) ORDER BY id",
@@ -306,7 +379,7 @@ def find_matching_approved_metrics(conn: sqlite3.Connection, *, pair: str,
         rows = conn.execute(
             "SELECT content_hash, metrics_json FROM backtest_runs WHERE "
             "scope='in_sample' AND issued_by='harness' AND variant=? "
-            "AND mission_outcome='approval' AND pair=? AND source=? "
+            "AND mission_outcome IN ('approval','reevaluation') AND pair=? AND source=? "
             "AND base_interval=? AND content_hash IN ("
             "SELECT json_extract(payload_json, '$.content_hash') "
             "FROM approval_requests "

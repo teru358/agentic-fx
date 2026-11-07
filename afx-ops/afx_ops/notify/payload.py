@@ -16,7 +16,8 @@ _TIMESTAMP = re.compile(r"[A-Za-z0-9_.:+\-]{1,64}\Z")
 
 ALLOWED_FIELDS: Mapping[str, frozenset[str]] = MappingProxyType({
     "ops_request_terminal": frozenset({"endpoint_code", "result_code", "authenticated_principal"}),
-    "approval_state_changed": frozenset({"state", "decision_code", "decided_by", "plugin_kind"}),
+    "approval_state_changed": frozenset({"state", "decision_code", "decided_by", "plugin_kind",
+                                        "candidate_origin", "deploy_phase"}),
     "job_state_changed": frozenset({"job_kind", "state", "result_code"}),
     "guard_state_changed": frozenset({"guard_kind", "state", "generation"}),
     "service_health_changed": frozenset({"component_code", "health_code"}),
@@ -26,7 +27,7 @@ ALLOWED_FIELDS: Mapping[str, frozenset[str]] = MappingProxyType({
     improve_events.CODE: improve_events.FIELDS,
 })
 # 外へ出さない field。event にあっても無くてもよい
-_OPTIONAL_FIELDS = frozenset({"decided_by", "plugin_kind"})
+_OPTIONAL_FIELDS = frozenset({"decided_by", "plugin_kind", "candidate_origin", "deploy_phase"})
 _OMITTED_FIELDS = frozenset({"decided_by"})
 _REF = MappingProxyType({
     "ops_request_terminal": re.compile(r"audit:[0-9]{1,18}\Z"),

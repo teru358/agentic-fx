@@ -141,7 +141,9 @@ _BACKLOG_TRANSITIONS = {
     "note": (("open", "observation"), "note", "human_noted"),
     "reopen": (("done", "rejected"), "open", "reopened"),
 }
-_DEPLOYED = frozenset({"deployed", "deployed_after_rollback", "invalidated"})
+_DEPLOYED = frozenset({"deployed", "deployed_after_rollback", "invalidated",
+                       "reevaluation_confirmed", "rejected"})
+_REEVALUATION_OUTCOMES = frozenset({"reevaluation_confirmed", "rejected"})
 _BACKLOG_TEXT_LIMIT = 4096
 _BACKLOG_TRUNCATION = "…[truncated]"
 
@@ -998,7 +1000,8 @@ class OpsService:
         gate = approval_facts.gate_fields(payload)
         if gate:
             gate["gate_lines"] = approval_facts.gate_lines(payload)
-        return {**gate,
+        reevaluation = self._reevaluation_detail(payload, row["status"], row["decided_at"])
+        return {**gate, **reevaluation,
                 "id": approval_id, "kind": display_text(row["kind"]),
                 "status": row["status"], "change": change,
                 "parent_facts": payload.get("parent_facts"),
@@ -1014,6 +1017,41 @@ class OpsService:
                 "decided_by": row["decided_by"], "decided_at": row["decided_at"],
                 "expires_at": row["expires_at"],
                 "asserted_actor": None}
+
+    def _reevaluation_detail(self, payload: dict, status: str,
+                             decided_at: str | None = None) -> dict:
+        """再評価の依頼だけに足す field。bot と web が通常の承認と見分け、前回との比較を出す。
+        却下済みなら配備停止の段階 (`deploy_phase`) も持つ。"""
+        from . import reevaluation_view
+        if payload.get("candidate_origin") != reevaluation_view.ORIGIN:
+            return {}
+        try:
+            view = reevaluation_view.build_view(self._conn, payload)
+        except Exception:  # noqa: BLE001 — 表示の材料は読めなくても詳細全体は返す
+            _log.error("reevaluation view failed")
+            view = None
+        detail = {"candidate_origin": reevaluation_view.ORIGIN, "reevaluation": view,
+                  "deploy_phase": None}
+        if status == "rejected":
+            try:
+                detail["deploy_phase"] = self._reevaluation_deploy_phase(payload, decided_at)
+            except Exception:  # noqa: BLE001
+                _log.error("reevaluation deploy phase failed")
+        return detail
+
+    def _reevaluation_deploy_phase(self, payload: dict, decided_at: str | None) -> str | None:
+        """却下が作った配備停止の op の今の段階 (done / needs_retry / foreign)。
+        op は却下と同じ tx・同じ時刻で作られるので、決定時刻と作成時刻の一致で結ぶ。"""
+        if decided_at is None:
+            return None
+        row = self._conn.execute(
+            "SELECT phase FROM plugin_deploy_ops WHERE op_kind='disable_symlink' AND name=? "
+            "AND subject_content_hash=? AND subject_artifact_hash=? AND approval_id IS ? "
+            "AND created_at=? ORDER BY op_id DESC LIMIT 1",
+            (payload.get("name"), payload.get("content_hash"), payload.get("artifact_hash"),
+             payload.get("reevaluates_approval_id"), decided_at)).fetchone()
+        return row["phase"] if row is not None and row["phase"] in (
+            "done", "needs_retry", "foreign") else None
 
     def _decided_journals(self, approval_id: int) -> list[dict]:
         return [dict(r) for r in self._conn.execute(
@@ -1935,13 +1973,24 @@ class OpsService:
                         plugins_root=self._plugins_root, activity=self._activity_log,
                         deadline=self._foreign(flock_deadline), stop_event=self.stop_event,
                         require_plugin_kind=True)
-                    if not decided:
-                        raise OpsError(ErrorCode.INVALID_STATE)
-                    outcome = None
-                    result = {"approval_id": approval_id, "outcome": "rejected",
-                              "status": "rejected"}
+                    if isinstance(decided, switch.ApprovalOutcome):
+                        outcome = decided
+                        result = {"approval_id": approval_id, "outcome": outcome.outcome,
+                                  "status": outcome.status}
+                        if outcome.deploy_phase is not None:
+                            result["deploy_phase"] = outcome.deploy_phase
+                        if outcome.reason == "reevaluation_stale":
+                            result["reason"] = outcome.reason
+                    else:
+                        if not decided:
+                            raise OpsError(ErrorCode.INVALID_STATE)
+                        outcome = None
+                        result = {"approval_id": approval_id, "outcome": "rejected",
+                                  "status": "rejected"}
                 else:
-                    outcome = switch.approve_candidate(
+                    decide = (switch.retry_approval if kind == "retry"
+                              else switch.approve_candidate)
+                    outcome = decide(
                         self._decide_conn, approval_id, decided_by=decided_by,
                         now=self._wall_clock(), plugins_root=self._plugins_root,
                         settings=self._settings, activity=self._activity_log,
@@ -1949,6 +1998,8 @@ class OpsService:
                         require_plugin_kind=True, expected_payload_sha256=digest)
                     result = {"approval_id": approval_id, "outcome": outcome.outcome,
                               "status": outcome.status}
+                    if outcome.reason == "reevaluation_stale":
+                        result["reason"] = outcome.reason
             except switch.PluginBusyError:
                 raise OpsError(ErrorCode.UNAVAILABLE if self.stop_event.is_set()
                                else ErrorCode.PLUGIN_BUSY) from None
@@ -1969,10 +2020,15 @@ class OpsService:
                 plugin_kind = _approval_plugin_kind(self._decide_conn, approval_id)
             except Exception:  # noqa: BLE001 — notification metadata is best-effort
                 plugin_kind = None
+            fields = {"state": result["status"], "decision_code": kind,
+                      "decided_by": decided_by, "plugin_kind": plugin_kind}
+            if outcome is not None and (outcome.outcome in _REEVALUATION_OUTCOMES
+                                        or outcome.reason == "reevaluation_stale"):
+                fields["candidate_origin"] = switch.REEVALUATION_ORIGIN
+                if outcome.deploy_phase is not None:
+                    fields["deploy_phase"] = outcome.deploy_phase
             self._decide_events.emit_best_effort(
-                "approval_state_changed", f"approval:{approval_id}",
-                {"state": result["status"], "decision_code": kind, "decided_by": decided_by,
-                 "plugin_kind": plugin_kind})
+                "approval_state_changed", f"approval:{approval_id}", fields)
             return result
         return run
 

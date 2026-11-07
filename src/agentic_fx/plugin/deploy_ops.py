@@ -296,6 +296,42 @@ def require_no_open_deploy_ops(conn: sqlite3.Connection, names: set[str], *,
                 f"blocking {operation}")
 
 
+def write_intent_rows(conn: sqlite3.Connection, *, intent_row: dict,
+                      revoke: RevokeSpec | None,
+                      cascade_identities: list[tuple[str, str]], now: datetime,
+                      actor: str,
+                      after_insert: Callable[[int], None] | None = None) -> int:
+    """Write a restrictive deploy intent and its signal effects inside the caller's tx.
+
+    The caller owns ``BEGIN IMMEDIATE`` and the commit or rollback, so a decision and
+    its intent can share one transaction.
+    """
+    revoke_row_id = None
+    approval_id = intent_row.get("approval_id")
+    if revoke is not None:
+        revoke_row_id = approvals_store.append_revocation(
+            conn, revoke.name, revoke.content_hash, now=now, actor=actor,
+            commit=False)
+        if revoke_row_id is None:
+            raise ValueError(
+                f"cannot revoke {revoke.name!r} {revoke.content_hash!r}: "
+                "latest approval is already rejected")
+        revoke_payload = conn.execute(
+            "SELECT payload_json FROM approval_requests WHERE id=?", (revoke_row_id,)
+        ).fetchone()
+        approval_id = json.loads(revoke_payload["payload_json"])["revokes_approval_id"]
+    values = dict(intent_row)
+    values.update(approval_id=approval_id, revoke=revoke is not None,
+                  revoke_row_id=revoke_row_id, actor=actor, now=now,
+                  commit=False)
+    op_id = deploy_store.insert_intent(conn, **values)
+    if after_insert is not None:
+        after_insert(op_id)
+    signals_store.abandon_pending_for_identities(
+        conn, cascade_identities, op_id=op_id, now=now, commit=False)
+    return op_id
+
+
 def record_intent(conn: sqlite3.Connection, *, intent_row: dict,
                   revoke: RevokeSpec | None,
                   cascade_identities: list[tuple[str, str]], now: datetime,
@@ -303,34 +339,43 @@ def record_intent(conn: sqlite3.Connection, *, intent_row: dict,
     """Atomically persist a restrictive deploy intent and its signal effects."""
     conn.execute("BEGIN IMMEDIATE")
     try:
-        revoke_row_id = None
-        approval_id = intent_row.get("approval_id")
-        if revoke is not None:
-            revoke_row_id = approvals_store.append_revocation(
-                conn, revoke.name, revoke.content_hash, now=now, actor=actor,
-                commit=False)
-            if revoke_row_id is None:
-                raise ValueError(
-                    f"cannot revoke {revoke.name!r} {revoke.content_hash!r}: "
-                    "latest approval is already rejected")
-            revoke_payload = conn.execute(
-                "SELECT payload_json FROM approval_requests WHERE id=?", (revoke_row_id,)
-            ).fetchone()
-            approval_id = json.loads(revoke_payload["payload_json"])["revokes_approval_id"]
-        values = dict(intent_row)
-        values.update(approval_id=approval_id, revoke=revoke is not None,
-                      revoke_row_id=revoke_row_id, actor=actor, now=now,
-                      commit=False)
-        op_id = deploy_store.insert_intent(conn, **values)
-        if after_insert is not None:
-            after_insert(op_id)
-        signals_store.abandon_pending_for_identities(
-            conn, cascade_identities, op_id=op_id, now=now, commit=False)
+        op_id = write_intent_rows(
+            conn, intent_row=intent_row, revoke=revoke,
+            cascade_identities=cascade_identities, now=now, actor=actor,
+            after_insert=after_insert)
         conn.commit()
         return op_id
     except BaseException:
         conn.rollback()
         raise
+
+
+def unlink_live_for_intent(conn: sqlite3.Connection, plugins_root: Path, name: str,
+                           op_id: int, from_target: str | None, activity, *,
+                           now: datetime) -> str:
+    """Take the live entry away for a recorded disable intent; the caller holds the name lock.
+
+    Returns the resulting phase: ``done``, ``foreign`` (live is no longer what the intent
+    recorded) or ``needs_retry`` (the unlink failed). Each phase attempts its notification.
+    """
+    live_path = Path(plugins_root) / name
+    if not live_matches_from(live_path, from_target):
+        deploy_store.set_phase(conn, op_id, "foreign", now=now)
+        try_notify(conn, deploy_store.get_by_id(conn, op_id), activity_or_null(activity),
+                   now=now)
+        return "foreign"
+    try:
+        os.unlink(live_path)
+    except OSError:
+        deploy_store.set_phase(conn, op_id, "needs_retry", now=now,
+                               fail_reason="syscall_failed")
+        try_notify(conn, deploy_store.get_open_by_name(conn, name),
+                   activity_or_null(activity), now=now)
+        return "needs_retry"
+    deploy_store.set_phase(conn, op_id, "done", now=now)
+    try_notify(conn, deploy_store.get_by_id(conn, op_id), activity_or_null(activity),
+               now=now)
+    return "done"
 
 
 def activity_event(op_row: Mapping[str, object]) -> str | None:

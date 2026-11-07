@@ -37,7 +37,7 @@ from agentic_fx.backtest import time_repair
 from agentic_fx.backtest.runner import run_replay
 from agentic_fx.config import ConfigError, load_env_file, load_settings
 from agentic_fx.cli_surface import (HelpFormatter, argument_help, leaf_help, parser_description, parser_help,
-                                    render_epilog)
+                                    render_epilog, wrapped_choices_usage)
 from agentic_fx.core.contracts import Bar, Origin, TradeIntent
 from agentic_fx.datafeed.sources import BridgeTimeRuleMismatch, BridgeTimeUnverified
 from agentic_fx.loops.verify_backend import VerifyBackendGateError
@@ -218,10 +218,18 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
                                help="取り消す版の content hash (`versions` の content=。前方一致可)")
     revoke_parser.add_argument("--dry-run", action="store_true")
     revoke_parser.add_argument("--yes", action="store_true", help="確認を省略する")
+    reevaluate_parser = plugin_sub.add_parser(
+        "reevaluate", **_surface_parser_kw("plugin reevaluate", leaf=True))
+    reevaluate_parser.add_argument("name", nargs="?", default=None)
+    reevaluate_parser.add_argument(
+        "--all-deployed", action="store_true",
+        help="配備中の strategy を名前順に全部評価し直す (<name> とは同時に指定できない)")
+    reevaluate_parser.add_argument("--yes", action="store_true", help="確認を省略する")
     versions_parser = plugin_sub.add_parser("versions", **_surface_parser_kw("plugin versions", leaf=True))
     versions_parser.add_argument("name")
     plugin_sub.add_parser("list", **_surface_parser_kw("plugin list", leaf=True)).add_argument(
         "--kind", choices=("indicator", "strategy"), default=None)
+    plugin.usage = wrapped_choices_usage(plugin.prog, list(plugin_sub.choices))
 
 
 # ---- history import ------------------------------------------------------
@@ -996,6 +1004,8 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
                     return plugin_deploy_cli.plugin_rollback(conn, settings, args, root)
                 if args.plugin_command == "revoke":
                     return plugin_deploy_cli.plugin_revoke(conn, settings, args, root)
+                if args.plugin_command == "reevaluate":
+                    return plugin_deploy_cli.plugin_reevaluate(conn, settings, args, root)
                 raise ValueError(f"unknown plugin subcommand: {args.plugin_command!r}")
             return _analyze_corr(conn, args)
         finally:
