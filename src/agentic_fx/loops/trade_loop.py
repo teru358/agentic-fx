@@ -64,13 +64,14 @@ import logging
 
 _log = logging.getLogger("agentic_fx.trade_loop")
 
-_CRON_TOOLS = ["get_ohlcv", "get_indicators", "search_news",
+_BASE_TOOLS = ["get_ohlcv", "get_indicators", "search_news",
                "get_econ_calendar", "get_positions", "get_account",
                "get_recent_reflections", "search_reflections"]
-_ASK_TOOLS = [*_CRON_TOOLS, "get_signals"]
+_CRON_TOOLS = [*_BASE_TOOLS, "get_econ_reactions"]
+_ASK_TOOLS = [*_BASE_TOOLS, "get_signals"]
 # Full registry-facing set retained for service validation; missions use the
 # explicit cron, ask, or signal list above.
-_TRADE_TOOLS = _ASK_TOOLS
+_TRADE_TOOLS = [*_BASE_TOOLS, "get_signals", "get_econ_reactions"]
 
 
 def signal_source_active(conn, plugins_root: Path, plugin: str, content_hash: str,

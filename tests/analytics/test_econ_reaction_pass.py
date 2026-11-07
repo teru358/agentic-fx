@@ -49,7 +49,8 @@ def _set(conn, event, pair="USDJPY", *, state="complete", rows="observed", ts=TS
     return set_id
 
 
-def _run(conn, pairs=SETTINGS, *, now=TS, stopped=lambda: False, write=None):
+def _run(conn, pairs=SETTINGS, *, now=TS, stopped=lambda: False, write=None, cursor=None,
+         pip_size_fn=lambda pair: .01):
     def begin(c):
         c.execute("BEGIN IMMEDIATE")
         return True
@@ -58,7 +59,7 @@ def _run(conn, pairs=SETTINGS, *, now=TS, stopped=lambda: False, write=None):
         return op(conn, begin, lambda: None)
 
     run_pass(read=lambda fn: fn(conn), write=write or default_write, stopped=stopped,
-             pair_currencies=pairs, pip_size_fn=lambda pair: .01, now=now)
+             pair_currencies=pairs, pip_size_fn=pip_size_fn, now=now, cursor=cursor)
 
 
 def _values(conn, set_id):
@@ -260,3 +261,83 @@ def test_pass_does_not_touch_state_machine_module():
     import agentic_fx.analytics.econ_reaction_pass as mod
     src = open(mod.__file__).read()
     assert "signal_shadow" not in src
+
+
+def _broken_pip(pair):
+    if pair == "EURUSD":
+        raise RuntimeError("pip size unavailable")
+    return .01
+
+
+def test_permanently_failing_sets_beyond_one_batch_do_not_starve_later_sets(tmp_path, monkeypatch):
+    monkeypatch.setattr(reaction_pass, "REACTION_BATCH", 2)
+    conn = _conn(tmp_path)
+    bad = [_set(conn, _event(conn, country="EUR", name=f"Bad{i}"), "EURUSD") for i in range(3)]
+    good = _set(conn, _event(conn, name="Good"))
+    cursor = reaction_pass.ReactionCursor()
+    for _ in range(3):
+        _run(conn, cursor=cursor, pip_size_fn=_broken_pip)
+    assert len(_values(conn, good)) == 3
+    assert all(_values(conn, s) == [] for s in bad)
+
+
+def test_without_a_cursor_the_pass_starts_from_the_first_set_every_time(tmp_path, monkeypatch):
+    monkeypatch.setattr(reaction_pass, "REACTION_BATCH", 2)
+    conn = _conn(tmp_path)
+    for i in range(2):
+        _set(conn, _event(conn, country="EUR", name=f"Bad{i}"), "EURUSD")
+    good = _set(conn, _event(conn, name="Good"))
+    for _ in range(3):
+        _run(conn, pip_size_fn=_broken_pip)
+    assert _values(conn, good) == []
+
+
+def test_the_cursor_wraps_to_the_start_after_the_end_and_retries_earlier_sets(tmp_path, monkeypatch):
+    monkeypatch.setattr(reaction_pass, "REACTION_BATCH", 2)
+    conn = _conn(tmp_path)
+    bad = [_set(conn, _event(conn, country="EUR", name=f"Bad{i}"), "EURUSD") for i in range(2)]
+    good = _set(conn, _event(conn, name="Good"))
+    cursor = reaction_pass.ReactionCursor()
+    _run(conn, cursor=cursor, pip_size_fn=_broken_pip)
+    assert cursor.after == bad[-1]
+    _run(conn, cursor=cursor, pip_size_fn=_broken_pip)
+    assert cursor.after is None and len(_values(conn, good)) == 3
+    _run(conn, cursor=cursor)
+    assert all(len(_values(conn, s)) == 3 for s in bad)
+
+
+def test_a_stop_or_declined_write_does_not_move_the_cursor_past_the_unhandled_set(tmp_path, monkeypatch):
+    monkeypatch.setattr(reaction_pass, "REACTION_BATCH", 2)
+    conn = _conn(tmp_path)
+    sets = [_set(conn, _event(conn, name=f"E{i}")) for i in range(4)]
+    cursor = reaction_pass.ReactionCursor()
+    _run(conn, cursor=cursor, write=lambda op: None)
+    assert cursor.after is None
+    _run(conn, cursor=cursor)
+    assert cursor.after == sets[1]
+    _run(conn, cursor=cursor, write=lambda op: None)
+    assert cursor.after == sets[1]
+
+
+def test_failure_logs_name_the_set_and_event_and_the_exception_type(tmp_path, caplog):
+    conn = _conn(tmp_path)
+    event = _event(conn, country="EUR", name="Bad")
+    set_id = _set(conn, event, "EURUSD")
+    with caplog.at_level("ERROR"):
+        _run(conn, pip_size_fn=_broken_pip)
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert f"set {set_id} event {event}" in text
+    assert "RuntimeError: pip size unavailable" in text
+
+    caplog.clear()
+    event2 = _event(conn, name="Write")
+    set2 = _set(conn, event2)
+
+    def write(op):
+        raise OSError("disk https://secret.example/x?apikey=abc")
+
+    with caplog.at_level("ERROR"):
+        _run(conn, write=write)
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert f"set {set2} event {event2}" in text
+    assert "OSError" in text and "secret.example" not in text and "abc" not in text

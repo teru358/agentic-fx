@@ -134,7 +134,7 @@ def test_trade_local_runner_registry_has_only_read_only_tools(tmp_path):
 _READ_ONLY_TRADE_TOOLS = [
     "get_ohlcv", "get_indicators", "search_news", "get_econ_calendar",
     "get_positions", "get_account", "get_recent_reflections",
-    "search_reflections", "get_signals"]
+    "search_reflections", "get_signals", "get_econ_reactions"]
 
 
 def test_build_app_gives_the_calendar_its_pairs_and_window(tmp_path):

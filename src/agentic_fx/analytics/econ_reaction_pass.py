@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
+from agentic_fx._safe_error import safe_error_text
 from agentic_fx.analytics import econ_reactions
 from agentic_fx.store import econ_reaction_values, ohlcv_slices
 
@@ -11,11 +12,27 @@ log = logging.getLogger(__name__)
 REACTION_BATCH = 20
 
 
-def run_pass(*, read, write, stopped, pair_currencies, pip_size_fn, now: datetime) -> None:
+class ReactionCursor:
+    """Resume point between passes: the last set id handled, None means start over."""
+
+    def __init__(self) -> None:
+        self.after: int | None = None
+
+
+def run_pass(*, read, write, stopped, pair_currencies, pip_size_fn, now: datetime,
+             cursor: ReactionCursor | None = None) -> None:
+    after = None if cursor is None else cursor.after
     rows = read(lambda conn: econ_reaction_values.pending_sets(
-        conn, pair_currencies=pair_currencies, limit=REACTION_BATCH))
+        conn, pair_currencies=pair_currencies, limit=REACTION_BATCH, after=after))
+    if cursor is not None and len(rows) < REACTION_BATCH:
+        cursor.after = None
+    advance = cursor is not None and len(rows) >= REACTION_BATCH
+    prev = None
     for item in rows:
         if stopped(): break
+        if advance and prev is not None:
+            cursor.after = prev
+        prev = item['id']
         try:
             slice_rows = read(lambda conn: ohlcv_slices.complete_rows(conn, item['id']))
             existing = item.get('missing_keys')
@@ -34,8 +51,9 @@ def run_pass(*, read, write, stopped, pair_currencies, pip_size_fn, now: datetim
                         pip_size=(1.0 if item['state'] == ohlcv_slices.STATE_UNRECOVERABLE
                                   else pip_size_fn(item['pair'])), spread_pips=spread,
                         set_state=item['state'])
-                except Exception:
-                    log.exception("econ reaction calculation failed for set %s", item['id'])
+                except Exception as e:
+                    log.exception("econ reaction calculation failed for set %s event %s: %s",
+                                  item['id'], item['event_id'], safe_error_text(e))
                     continue
             keys = [(item['event_id'], c) for c in currencies]
             result = write(lambda conn, begin, checkpoint: econ_reaction_values.write_set_tx(
@@ -43,5 +61,9 @@ def run_pass(*, read, write, stopped, pair_currencies, pip_size_fn, now: datetim
                 begin=begin, checkpoint=checkpoint))
             if result is None:
                 break
-        except Exception:
-            log.exception("econ reaction pass failed for set %s", item['id'])
+        except Exception as e:
+            log.exception("econ reaction pass failed for set %s event %s: %s",
+                          item['id'], item['event_id'], safe_error_text(e))
+    else:
+        if advance:
+            cursor.after = rows[-1]['id']

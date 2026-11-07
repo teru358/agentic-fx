@@ -295,6 +295,7 @@ def test_cron_mission_tools_exclude_signal_reads(tmp_path):
         "completed", {"action": "hold", "reasoning": "w"}, [])])
     loop.run_once()
     assert "get_signals" not in runner.missions[0].tools
+    assert "get_econ_reactions" in runner.missions[0].tools
 
 
 def test_ask_mission_uses_its_signal_aware_tool_list(tmp_path):
@@ -302,6 +303,7 @@ def test_ask_mission_uses_its_signal_aware_tool_list(tmp_path):
         "completed", {"answer": "test"}, [])])
     loop.ask_once("今どう見てる？")
     assert "get_signals" in runner.missions[0].tools
+    assert "get_econ_reactions" not in runner.missions[0].tools
     assert "get_signals は" in runner.missions[0].prompt
 
 
