@@ -6,7 +6,7 @@ priority: 高
 kind: 不具合
 opened: 2026-11-01
 closed: null
-related: [graceful-stop-waits-mission]
+related: [graceful-stop-waits-mission, verify-backend-counts-preexisting-descendants]
 ---
 # [improve-admission-selftest-flake-needs-restart] 改善 admission の自己試験が 1 回落ちると再起動まで改善が止まる
 
@@ -36,3 +36,4 @@ related: [graceful-stop-waits-mission]
 - 2026-11-07: 再発 (3 回目)。07:05Z の再起動で同じ gate=incomplete (call=0) → admitted=no、16:27 / 16:33 JST の improve #3254・#3255 が sandbox_unavailable で 0 秒終了。fingerprint 15bd94e5… (codex 0.166.0) が未登録で毎起動に自己試験が走っていた → 登録を更新 (起動時の自己試験を減らす当面の策、本件の是正ではない)
 - 2026-11-07: 優先: 高 — 利用者が優先タスクに指定 (11-07 の 3 回目の再発を受けて)。設計に着手
 - 2026-11-07: 状態: 実装中、関連: [graceful-stop-waits-mission] — 設計 v0.2 を利用者が承認、実装着手
+- 2026-11-07: 関連: [graceful-stop-waits-mission, verify-backend-counts-preexisting-descendants] — /code-review の指摘 #4 (他の子孫で reaped が偽) は verify-backend-counts-preexisting-descendants と同根として関連付け
