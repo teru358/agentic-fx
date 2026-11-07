@@ -419,6 +419,7 @@ def test_a_producer_style_lock_wait_succeeds_during_the_evaluation(dep):
 def test_the_snapshot_is_taken_and_the_result_saved_under_the_locks(dep, monkeypatch):
     seen = []
     real_snapshot = switch._take_reevaluation_snapshot
+    real_recheck = switch._snapshot_is_current
     real_store = switch._store_reevaluation
 
     def lock_state() -> bool:
@@ -436,13 +437,16 @@ def test_the_snapshot_is_taken_and_the_result_saved_under_the_locks(dep, monkeyp
     monkeypatch.setattr(switch, "_take_reevaluation_snapshot",
                         lambda *a, **k: (seen.append(("snapshot", lock_state())),
                                          real_snapshot(*a, **k))[1])
+    monkeypatch.setattr(switch, "_snapshot_is_current",
+                        lambda *a, **k: (seen.append(("recheck", lock_state())),
+                                         real_recheck(*a, **k))[1])
     monkeypatch.setattr(switch, "_store_reevaluation",
                         lambda *a, **k: (seen.append(("store", lock_state())),
                                          real_store(*a, **k))[1])
 
     dep.reevaluate(FakeGate())
 
-    assert seen == [("snapshot", True), ("snapshot", True), ("store", True)]
+    assert seen == [("snapshot", True), ("recheck", True), ("store", True)]
 
 
 # ------------------------------------------------------------------ unevaluable and failed
@@ -537,6 +541,22 @@ def test_a_failure_while_saving_keeps_the_earlier_pending_request(dep, monkeypat
     assert len(dep.runs()) == 2
 
 
+def test_the_gate_rows_are_written_by_the_shared_writer(dep, monkeypatch):
+    calls = []
+    real = switch._write_gate_rows
+    monkeypatch.setattr(switch, "_write_gate_rows",
+                        lambda conn, rows, **kw: (calls.append((len(rows), kw)),
+                                                  real(conn, rows, **kw))[1])
+
+    result = dep.reevaluate(FakeGate())
+
+    assert result.status == "created"
+    assert calls == [(2, {"mission_outcome": "reevaluation"})]
+    payload = json.loads(dep.requests("pending")[0]["payload_json"])
+    assert payload["run_ids"] == {"in_sample": {"USDJPY": dep.runs()[0]["id"]},
+                                  "holdout": {"USDJPY": dep.runs()[1]["id"]}}
+
+
 def test_the_rows_and_the_request_are_one_transaction(dep, monkeypatch):
     seen = []
     real_create = approvals_store.create
@@ -562,6 +582,30 @@ def test_an_indicator_is_skipped(tmp_path):
     result = dep.reevaluate(FakeGate(), name="ind")
 
     assert (result.status, result.reason) == ("skipped", "not_strategy")
+
+
+def test_an_indicator_is_skipped_without_building_the_inventory(tmp_path, monkeypatch):
+    dep = Deployed(tmp_path, indicator=True)
+    builds = []
+    real = switch.tools_plugin_loader.approved_plugins
+    monkeypatch.setattr(switch.tools_plugin_loader, "approved_plugins",
+                        lambda *a, **k: (builds.append(1), real(*a, **k))[1])
+
+    dep.reevaluate(FakeGate(), name="ind")
+
+    assert builds == []
+
+
+def test_one_evaluation_builds_the_inventory_once(dep, monkeypatch):
+    builds = []
+    real = switch.tools_plugin_loader.approved_plugins
+    monkeypatch.setattr(switch.tools_plugin_loader, "approved_plugins",
+                        lambda *a, **k: (builds.append(1), real(*a, **k))[1])
+
+    result = dep.reevaluate(FakeGate())
+
+    assert result.status == "created"
+    assert builds == [1]
 
 
 def test_a_name_that_is_not_deployed_is_skipped(dep):

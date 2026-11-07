@@ -674,3 +674,15 @@ def test_symbol_option_check_accepts_the_accessor():
     tree = ast.parse('p.add_argument("--a", help=argument_help("analyze corr", "--a"))\n'
                      'p.add_argument("--n", help="別 option")')
     assert _argument_copy_outside_accessor(tree) == []
+
+
+def test_the_plugin_group_usage_lists_every_subcommand_within_the_help_width(capsys):
+    text = _captured_help(["plugin", "--help"], capsys)
+    usage = text.split("\n\n")[0]
+
+    assert usage.startswith("usage: afx plugin [-h]\n")
+    assert all(cli_surface._display_width(line) <= 100 for line in usage.splitlines())
+    flat = "".join(usage.split())
+    expected = ",".join(["submit", "bless", "materialize", "lock", "retire", "disable",
+                         "rollback", "revoke", "reevaluate", "versions", "list"])
+    assert flat.endswith("[-h]{" + expected + "}...")

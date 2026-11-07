@@ -722,7 +722,9 @@ REEVALUATE_RESULT_TEXT = {
     "changed_during_evaluation": "評価中に配備が変わったため、何も書いていません。もう一度実行してください",
     "skipped": "対象にしませんでした",
 }
-_INFORMATIONAL_SKIP = "not_strategy"
+# 配備中の strategy ではないことによる skipped。--all-deployed の走査では対象外の通常の姿。
+_NOT_A_DEPLOYED_STRATEGY = frozenset({
+    "plain_plugin", "not_approved", "not_deployed", "not_strategy"})
 
 
 def reevaluate_line(result) -> str:
@@ -740,12 +742,13 @@ def reevaluate_line(result) -> str:
 
 def reevaluate_exit_code(results, *, all_deployed: bool) -> int:
     """`created` と `existing` 以外が 1 本でもあれば非 0。`--all-deployed` の走査で
-    indicator を飛ばしたものは、対象外の通常の姿なので数えない。"""
+    配備中の strategy でないことによる skipped (indicator・旧式の plugin・承認の無い
+    entry) は、対象外の通常の姿なので数えない。名前で指したときは数える。"""
     for result in results:
         if result.status in ("created", "existing"):
             continue
         if (all_deployed and result.status == "skipped"
-                and result.reason == _INFORMATIONAL_SKIP):
+                and result.reason in _NOT_A_DEPLOYED_STRATEGY):
             continue
         return RC_FAILED
     return RC_OK

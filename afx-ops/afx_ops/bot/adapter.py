@@ -31,7 +31,7 @@ from dataclasses import dataclass
 
 import discord
 
-from afx_ops import improve_events
+from afx_ops import improve_events, reevaluation_text
 from afx_ops.event_outcome import SkipKnown, is_improve
 from afx_ops.events_page import parse_page, unreadable_notice
 from afx_ops.gate import reconcile as gate_reconcile
@@ -528,13 +528,37 @@ class BotAdapter:
         # gate は遷移ごとに persist 口で snapshot へ確定する
         result = self.gate.handle(request, now=int(self._now()))
         if result.decision is None:
-            return result
+            return self._with_reject_warning(request, result)
         try:
             return self.gate.perform(result.decision)
         finally:
             # perform の事前 detail が受けた 429 / 503 も、その承認の次の問合せ時刻へ写す
             if result.decision.approval_id in self.gate.throttled:
                 self._absorb_throttle(result.decision.approval_id)
+
+    def _with_reject_warning(self, request: Interaction, result: GateResult) -> GateResult:
+        """再評価の依頼の Reject の確認文に、配備を停止することを明記する。
+        daemon の詳細が読めない・再評価でないときは、gate の確認文のまま。"""
+        try:
+            action, approval_id = decode_custom_id(request.custom_id)
+        except CustomIdError:
+            return result
+        if action != "reject" or result.confirm_view is None:
+            return result
+        try:
+            reply = self.client.approval(approval_id)
+        except Exception:  # noqa: BLE001 — 確認文の補足なので、読めなくても gate の文を返す
+            return result
+        data = getattr(reply, "data", None)
+        status = getattr(reply, "status", 0)
+        if not (200 <= status < 300 and reevaluation_text.is_reevaluation(data)):
+            return result
+        view = data.get("reevaluation") if type(data.get("reevaluation")) is dict else {}
+        change = data.get("change") if type(data.get("change")) is dict else {}
+        name = (reevaluation_text.safe_name(view.get("name"))
+                or reevaluation_text.safe_name(change.get("name")) or "(名前不明)")
+        return GateResult(reevaluation_text.reject_warning(name), result.effects,
+                          result.confirm_view, result.decision)
 
     async def _respond(self, interaction: discord.Interaction, result: GateResult) -> None:
         view = None

@@ -1,4 +1,4 @@
-# 配備中 strategy の評価を修復後の履歴でやり直す — 設計 C2.2
+# 配備中 strategy の評価を修復後の履歴でやり直す — 設計 C2.3
 
 チケット: `redo-deployed-strategy-evaluation-after-time-repair` (保守 / 中)。関連: DST 設計 `2026-11-02-utc-time-rules-dst-design.md` §8 J2 (c)。
 
@@ -79,7 +79,7 @@ symlink が外れる前に「配備解除済み」とは表示しない (op の 
 
 - **評価不能** (`evaluable=False`: trades 不足・dataset 未設定・参照履歴不足): 依頼を作らない。activity `reevaluation_unevaluable` (名前・理由) は全ケースで残す。gate の行は生成済みの分だけ、§3.2-4 と同じ lock と再検証の後に `mission_outcome="reevaluation"` で短い tx に残す。trades 不足は in_sample を回した後なので行が残り、dataset 未設定・参照履歴不足は再生前に戻る (`plugin/strategy_gate.py:480-503`) ので行は無い。配備は変えない。
 - **失敗** (worker 例外・中断・lock timeout): 行を書かない。activity `reevaluation_failed`。配備は変えない。
-- **`--all-deployed`**: 1 本ずつ独立 (snapshot → 評価 → 保存)。1 本の失敗で止めず、最後に名前ごとの結果 (`created #id` / `existing #id` / `unevaluable` / `failed` / `changed_during_evaluation` / `skipped`) を出す。`unevaluable` の行には理由と、止めたいときのコマンド `afx plugin disable <name>` を並べる。`created` と `existing` 以外が 1 本でもあれば終了コードは非 0。ただし `--all-deployed` が対象外として飛ばした indicator (`not_strategy`) は数えない (規則 3.1 の対象外。名前で indicator を指したときは非 0)。再実行は同じ鍵の pending がある名前を評価せずに飛ばし、他は回し直す。
+- **`--all-deployed`**: 1 本ずつ独立 (snapshot → 評価 → 保存)。1 本の失敗で止めず、最後に名前ごとの結果 (`created #id` / `existing #id` / `unevaluable` / `failed` / `changed_during_evaluation` / `skipped`) を出す。`unevaluable` の行には理由と、止めたいときのコマンド `afx plugin disable <name>` を並べる。`created` と `existing` 以外が 1 本でもあれば終了コードは非 0。ただし `--all-deployed` が配備中の strategy でないとして飛ばした entry (`plain_plugin` / `not_approved` / `not_deployed` / `not_strategy`) は数えない (規則 3.1 の対象外。名前で指したときは非 0)。再実行は同じ鍵の pending がある名前を評価せずに飛ばし、他は回し直す。
 
 ### 3.4 依頼の行 (指摘 3・5・6)
 
@@ -128,6 +128,7 @@ symlink が外れる前に「配備解除済み」とは表示しない (op の 
 | reader | 扱い | 理由 |
 |---|---|---|
 | `in_sample_view` (改善ループの成績面) | 対象外。条件は `(mission_outcome IS NULL OR mission_outcome <> 'reevaluation')` (NULL の行を落とさない) | 再評価は改善の試行ではない。改善ループの入力を変えない |
+| `baseline_monitor._adoption_windows` (採用時の holdout 期間) | 対象外 (NULL は残す) | 採用時の期間を再評価の期間で上書きしない |
 | `latest_in_sample_metrics` (get_signals の成績添付) | 承認済み再評価だけ。name は signal 行の `plugin` 列 (`tools/signal_tools.py:153,166`) を新しい引数で渡し、`(name, content_hash)` の最新承認が再評価ならその `run_ids` の pair の行、そうでなければ今の SQL | 根拠の差し替え (J1) を取引判断に見せる数値にも及ぼす |
 | `find_matching_approved_metrics` (質検査) | 再評価全件を母集団に入れる | 修復後の履歴で回る候補の複製は修復後の数値でしか一致しない。既存も承認の status を問わない |
 | `baseline_monitor.monitor_summary` | 対象外 (`compare_mode="off"` で baseline 行を書かない) | — |
@@ -220,3 +221,4 @@ symlink が外れる前に「配備解除済み」とは表示しない (op の 
 | 2026-11-07 | C2 | 却下の結果の形 (5 形) と ops / shell / event / Discord の配線、digest の扱い、Discord の確認文・終端文言に配備停止、`_is_superseded` の除外条件を逐語に、get_signals の name の出所、`stale` を `invalidated` + reason に、retry の拒否、台帳 settle の分岐、`in_sample_view` の NULL 条件、`previous` の時刻条件 ≤、`live_source`、配備世代の過剰 stale を残余に、task 順序 T1 (専用経路) → T2、受入条件 10〜15、評価不能の要判断を T4 で出たときだけに | Fable 2 周目 (Important 4 + Minor 8) | — |
 | 2026-11-07 | C2.1 | ops の retry を `retry_approval` へ振り分け (T1、§5-16)、通常 reject の `False → INVALID_STATE` を保つ、通知の回復保証を既存 disable の契約に限定、評価不能の行は生成済みの分だけ (2 ケースを別 test)、epoch 変更の受入条件を fixture と実修復に分ける | sol 閉鎖確認 (Important 1 + Minor 3) | — |
 | 2026-11-07 | C2.2 | `--all-deployed` の `not_strategy` は終了コードに数えない。payload の `previous` は `{approval_id, in_sample/holdout: {pair: {metrics, source: payload\|run\|unknown, run_id}}}`、`pairs` を持つ | T2 の実装で確定 | — |
+| 2026-11-07 | C2.3 | §3.7 に `baseline_monitor._adoption_windows` を追加。`--all-deployed` は配備中の strategy でない skipped (plain_plugin / not_approved / not_deployed / not_strategy) を終了コードに数えない | /code-review (T1+T2) | — |

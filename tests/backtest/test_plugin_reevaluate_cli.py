@@ -195,3 +195,21 @@ def test_the_parser_takes_a_name_or_the_all_deployed_flag():
     assert (named.plugin_command, named.name, named.all_deployed, named.yes) == (
         "reevaluate", "sma", False, False)
     assert (every.name, every.all_deployed, every.yes) == (None, True, True)
+
+
+@pytest.mark.parametrize("reason", ["plain_plugin", "not_approved", "not_deployed",
+                                    "not_strategy"])
+def test_the_scan_does_not_count_an_entry_that_is_not_a_deployed_strategy(reason):
+    results = [switch.ReevaluationResult("a", "created", 1),
+               switch.ReevaluationResult("b", "skipped", reason=reason)]
+
+    assert plugin_deploy_cli.reevaluate_exit_code(results, all_deployed=True) == 0
+    assert plugin_deploy_cli.reevaluate_exit_code(results, all_deployed=False) == 1
+
+
+@pytest.mark.parametrize("reason", ["non_canonical_symlink", "not_canonical_version",
+                                    "version_mismatch", "indicator_not_live"])
+def test_the_scan_counts_a_deployed_strategy_that_could_not_be_evaluated(reason):
+    results = [switch.ReevaluationResult("a", "skipped", reason=reason)]
+
+    assert plugin_deploy_cli.reevaluate_exit_code(results, all_deployed=True) == 1

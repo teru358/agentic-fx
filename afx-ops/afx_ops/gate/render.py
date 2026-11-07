@@ -7,7 +7,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 
-from afx_ops import display_time
+from afx_ops import display_time, reevaluation_text
 from afx_ops.display_zone import zone_of
 from afx_ops.notify.payload import encode_event
 
@@ -131,8 +131,8 @@ def _hashable_str(value: object) -> bool:
     return type(value) is str
 
 
-def _heading(approval_id: int, change: object) -> str:
-    head = f"承認 #{approval_id}"
+def _heading(approval_id: int, change: object, reevaluation: bool = False) -> str:
+    head = f"承認 #{approval_id}" + (f" {reevaluation_text.HEADING}" if reevaluation else "")
     if type(change) is not dict:
         return head
     kind = KIND_LABELS.get(change.get("kind"), "plugin") if _hashable_str(change.get("kind")) else "plugin"
@@ -207,6 +207,24 @@ def _claim_paragraph(change: dict) -> str | None:
     if type(summary) is not str or not _clean_inline(summary):
         return None
     return "agent の申告 (未検証):\n> " + cut_escaped(summary, SUMMARY_CHARS)
+
+
+def _second_time(value: str, tz: str) -> str:
+    return display_time.convert_or_raw(value, tz, display_time.PRECISION_SECOND,
+                                       raw=value, utc_fallback=True)
+
+
+def _reevaluation_parts(data: dict, tz: str) -> list[tuple[str, int]]:
+    """再評価の依頼の段落 (前回 → 今回)。再評価でなければ空。"""
+    described = reevaluation_text.describe(data, lambda value: _second_time(value, tz))
+    if described is None:
+        return []
+    parts = [("\n".join([escape_discord(described.heading)]
+                        + [cut_escaped(note, 200) for note in described.notes]), 0)]
+    if described.rows:
+        parts.append(("前回 → 今回:\n" + "\n".join(
+            cut_escaped(f"{label}: {text}", 160) for label, text in described.rows[:12]), 3))
+    return parts
 
 
 def _guide(approval_id: int) -> str:
@@ -294,23 +312,40 @@ def render_approval(record: ApprovalRecord, detail: object | None = None) -> str
            if change.get(key) is not None):
         return _fallback(record.approval_id, "legacy_payload")
     expires = _moment(data.get("expires_at"), zone_of(data))
-    parts = [(_heading(record.approval_id, change), 0)]
+    reeval = reevaluation_text.is_reevaluation(data)
+    parts = [(_heading(record.approval_id, change, reeval), 0)]
     if reason is not None:
         parts.append((REASON_TEXT.get(reason, REASON_TEXT["unsafe_source"]), 0))
-    parts += _summary_parts(change)
+    parts += _reevaluation_parts(data, zone_of(data))
+    parts += _summary_parts(change, performance=not reeval)
     parts.append((f"期限: {expires}" if expires is not None else "期限: なし", 1))
     parts.append((_guide(record.approval_id), 0))
     return _assemble(parts)
 
 
-def _summary_parts(change: dict) -> list[tuple[str, int]]:
-    """変更・成績・申告の段落 (残す優先度は 変更 > 成績 > 申告)。"""
+def _summary_parts(change: dict, *, performance: bool = True) -> list[tuple[str, int]]:
+    """変更・成績・申告の段落 (残す優先度は 変更 > 成績 > 申告)。`performance` を偽にすると
+    成績の段落を出さない (再評価は前回 → 今回の比較が成績を兼ねる)。"""
     parts: list[tuple[str, int]] = []
-    for paragraph, rank in ((_params_paragraph(change), 2), (_performance_paragraph(change), 3),
+    for paragraph, rank in ((_params_paragraph(change), 2),
+                            (_performance_paragraph(change) if performance else None, 3),
                             (_claim_paragraph(change), 4)):
         if paragraph is not None:
             parts.append((paragraph, rank))
     return parts
+
+
+def _reevaluation_outcome(data: dict) -> str | None:
+    """再評価の依頼の終端の結果文 (却下は配備停止の段階ごと)。"""
+    state = data.get("status")
+    if state == "approved":
+        return reevaluation_text.CONFIRMED_TEXT
+    view = data.get("reevaluation")
+    name = reevaluation_text.safe_name(view.get("name") if type(view) is dict else None)
+    if state == "rejected":
+        text = reevaluation_text.reject_text(name or "<name>", data.get("deploy_phase"))
+        return escape_discord(text) if text is not None else None
+    return None
 
 
 def render_terminal(record: ApprovalRecord, detail: object | None) -> str | None:
@@ -331,8 +366,13 @@ def render_terminal(record: ApprovalRecord, detail: object | None) -> str | None
     if code is not None:
         return f"承認 #{record.approval_id}\n\n{status_line}\n\n{REASON_TEXT[code]}"
     change = data["change"]
-    parts = [(_heading(record.approval_id, change), 0), (status_line, 0)]
-    parts += _summary_parts(change)
+    reeval = reevaluation_text.is_reevaluation(data)
+    parts = [(_heading(record.approval_id, change, reeval), 0), (status_line, 0)]
+    outcome = _reevaluation_outcome(data) if reeval else None
+    if outcome is not None:
+        parts.append((outcome, 0))
+    parts += _reevaluation_parts(data, zone_of(data))
+    parts += _summary_parts(change, performance=not reeval)
     parts.append((_guide(record.approval_id), 0))
     return _assemble(parts)
 
@@ -360,6 +400,21 @@ def _generic_event(payload: dict[str, object], *_args, **_kwargs) -> str:
     return f"イベント {escape_discord(payload['code'])} が記録されました。"
 
 
+def _reevaluation_event_text(state: str | None, phase: str | None, name: str | None,
+                             decision: str | None = None) -> str | None:
+    """再評価の依頼の決定の通知文。承認は根拠の差し替えだけ、却下は配備停止の段階ごと。"""
+    if state == "approved":
+        return reevaluation_text.CONFIRMED_TEXT + "。"
+    if state == "invalidated":
+        hint = (escape_discord(reevaluation_text.STOP_HINT.format(name=name or "<name>")) + "。"
+                if decision == "reject" else "")
+        return reevaluation_text.STALE_TEXT + "。" + hint
+    if state == "rejected":
+        text = reevaluation_text.reject_text(name or "<name>", phase)
+        return None if text is None else escape_discord(text) + "。"
+    return None
+
+
 def _event_text_for_code(payload: dict[str, object], plugin_name: str | None,
                          approval_id: int | None, *, integer_limit: int = 18) -> str:
     code = payload["code"]
@@ -369,6 +424,11 @@ def _event_text_for_code(payload: dict[str, object], plugin_name: str | None,
         kind = {"strategy": "戦略", "indicator": "指標"}.get(
             _event_value(payload.get("plugin_kind")), "plugin")
         subject = f"承認 #{approval}" + (f" ({kind} {escape_discord(name)})" if name else "")
+        if _event_value(payload.get("candidate_origin")) == reevaluation_text.ORIGIN:
+            text = _reevaluation_event_text(state, _event_value(payload.get("deploy_phase")), name,
+                                            _event_value(payload.get("decision_code")))
+            if text is not None:
+                return f"{subject}: {text}"
         endings = {"approved": "が承認・配備されました", "rejected": "が却下されました", "expired": "は期限切れになりました"}
         return f"{subject} {endings[state]}。" if state in endings else f"承認 #{approval} の状態が変わりました" + (f" ({escape_discord(state)})" if state else "") + "。"
     if code == "job_state_changed":

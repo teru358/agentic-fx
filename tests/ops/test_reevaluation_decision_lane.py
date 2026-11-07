@@ -158,7 +158,7 @@ def test_a_stale_request_ends_as_invalidated_for_both_decisions(fx, ops_env, kin
     job = _run(ops_env, ops_env.service(), kind, fx.approval_id)
     assert job["state"] == "done"
     assert job["result"] == {"approval_id": fx.approval_id, "outcome": "invalidated",
-                             "status": "invalidated"}
+                             "status": "invalidated", "reason": "reevaluation_stale"}
     row = fx.row()
     assert (row["status"], row["reason"]) == ("invalidated", "reevaluation_stale")
     (_, fields), = fx.events()

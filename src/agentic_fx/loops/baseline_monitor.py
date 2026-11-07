@@ -151,7 +151,8 @@ _ADOPTION_CHUNK = 500
 def _adoption_windows(conn: sqlite3.Connection, hashes: set[str]
                       ) -> dict[tuple[str, str], tuple[datetime, datetime]]:
     """承認済みの版が採用時に通った holdout の期間を (版, pair) ごとに一括で読む。
-    記録が無い、または期間が読めない組は含めない。同じ組が複数あれば最新の行。"""
+    記録が無い、または期間が読めない組は含めない。同じ組が複数あれば最新の行。
+    再評価の行 (採用後に別の期間で評価し直したもの) は採用時の期間ではないので読まない。"""
     ordered = sorted(hashes)
     found: dict[tuple[str, str], tuple[datetime, datetime]] = {}
     for start in range(0, len(ordered), _ADOPTION_CHUNK):
@@ -160,6 +161,7 @@ def _adoption_windows(conn: sqlite3.Connection, hashes: set[str]
         rows = conn.execute(
             "SELECT content_hash,pair,period_start,period_end FROM backtest_runs "
             "WHERE variant='candidate' AND scope='holdout_gate' "
+            "AND (mission_outcome IS NULL OR mission_outcome <> 'reevaluation') "
             f"AND content_hash IN ({marks}) ORDER BY id", chunk).fetchall()
         for row in rows:
             try:

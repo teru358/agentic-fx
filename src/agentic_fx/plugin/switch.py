@@ -1188,8 +1188,22 @@ def _dependency_names(candidate_dir: Path, name: str) -> list[str]:
     return [name, *deps]
 
 
+@contextlib.contextmanager
+def _immediate_tx(conn: sqlite3.Connection):
+    """BEGIN IMMEDIATE で始め、抜けるときに開いたままなら commit、例外なら rollback する。
+    本文の途中で自分で rollback して return した場合は、何も commit しない。"""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+        if conn.in_transaction:
+            conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _write_gate_rows(conn: sqlite3.Connection, rows, *,
-                     mission_outcome: str) -> None:
+                     mission_outcome: str) -> list[int]:
     """[profitability-floor] codex 2 周目レビュー CR5 (2026-09-13):
     `outcome.gate_rows` を `backtest_runs` へ書く生ループを 1 箇所に
     集約する。**tx 管理は呼び出し元の責務** (このループ自体は
@@ -1199,11 +1213,12 @@ def _write_gate_rows(conn: sqlite3.Connection, rows, *,
     両方から共有する。以前はこの `for row in rows: save_harness_run(...)`
     が 3 箇所 (成功パス 1 + bless の 2 分岐) に手書きでコピーされて
     おり、将来の変更 (activity 追加・mission_outcome の意味変更等) を
-    3 箇所そろえて直す必要があった。"""
-    for row in rows:
+    3 箇所そろえて直す必要があった。書いた行の id を行と同じ順で返す。"""
+    return [
         backtest_runs_store.save_harness_run(
             conn, commit=False, mission_id=None,
             mission_outcome=mission_outcome, **row)
+        for row in rows]
 
 
 def _persist_human_gate_rows(conn: sqlite3.Connection, rows: list[dict], *,
@@ -1954,15 +1969,10 @@ def _decide_reevaluation(
         _reject_open_deploy_ops(conn, set(lock_names), operation="approval")
 
         if not _reevaluation_is_fresh(conn, plugins_root, payload):
-            conn.execute("BEGIN IMMEDIATE")
-            try:
+            with _immediate_tx(conn):
                 approvals_store.apply_decision(
                     conn, approval_id, "invalidated", decided_by="system", now=now,
                     reason="reevaluation_stale", commit=False)
-                conn.commit()
-            except BaseException:
-                conn.rollback()
-                raise
             _reevaluation_activity(
                 activity, "reevaluation_invalidated",
                 f"approval_id={approval_id} name={name} reason=reevaluation_stale")
@@ -1981,18 +1991,13 @@ def _decide_reevaluation(
 def _confirm_reevaluation(conn, approval_id, payload, *, decided_by, now, activity,
                           epoch_changed) -> "ApprovalOutcome":
     name = payload["name"]
-    conn.execute("BEGIN IMMEDIATE")
-    try:
+    with _immediate_tx(conn):
         if payload.get("history_epoch", "none") != history_epoch(conn):
             conn.rollback()
             return epoch_changed
         approvals_store.apply_decision(
             conn, approval_id, "approved", decided_by=decided_by, now=now,
             reason="reevaluation_confirmed", commit=False)
-        conn.commit()
-    except BaseException:
-        conn.rollback()
-        raise
     _reevaluation_activity(
         activity, "reevaluation_approved",
         f"approval_id={approval_id} name={name} content_hash={payload['content_hash']} "
@@ -2014,8 +2019,7 @@ def _reject_reevaluation(conn, approval_id, payload, *, decided_by, reason, now,
         "target_artifact_hash": None,
         "approval_id": payload.get("reevaluates_approval_id"), "force": False,
     }
-    conn.execute("BEGIN IMMEDIATE")
-    try:
+    with _immediate_tx(conn):
         if payload.get("history_epoch", "none") != history_epoch(conn):
             conn.rollback()
             return epoch_changed
@@ -2025,10 +2029,6 @@ def _reject_reevaluation(conn, approval_id, payload, *, decided_by, reason, now,
         op_id = deploy_ops_common.write_intent_rows(
             conn, intent_row=intent_row, revoke=None,
             cascade_identities=[(name, content_hash)], now=now, actor=decided_by)
-        conn.commit()
-    except BaseException:
-        conn.rollback()
-        raise
     phase = deploy_ops_common.unlink_live_for_intent(
         conn, plugins_root, name, op_id, raw_target, activity, now=now)
     _reevaluation_activity(
@@ -2827,12 +2827,6 @@ class _Snapshot:
         return (self.meta.name, self.meta.content_hash, self.meta.artifact_hash,
                 self.history_epoch, self.decision_id, tuple(self.deploy_generation))
 
-    def identity(self) -> tuple:
-        """評価中に変わってはならない項目の全部 (保存の前に取り直して比べる)。"""
-        return (self.meta.content_hash, self.meta.artifact_hash, self.target,
-                json.dumps(self.pins, sort_keys=True), self.decision_id, self.previous_id,
-                tuple(self.deploy_generation), self.history_epoch, self.lock_names)
-
 
 def reevaluation_candidate_names(plugins_root: Path) -> list[str]:
     """`--all-deployed` の走査対象: plugins 直下の正規名の entry を名前順に。"""
@@ -2922,6 +2916,31 @@ def _take_reevaluation_snapshot(conn, plugins_root: Path, name: str, settings,
         lock_names=tuple(lock_names))
 
 
+def _snapshot_is_current(conn, plugins_root: Path, snapshot: _Snapshot) -> bool:
+    """評価の間に、配備が snapshot の時点のままか (lock 内で呼ぶ)。inventory は組み直さず、
+    live の target・版 dir の実 hash・依存 pin・最新決定・配備世代をたしかめる。lock の
+    集合は config (content_hash に含まれる)、履歴の epoch は保存 tx の中でたしかめる。"""
+    name = snapshot.meta.name
+    pseudo = {
+        "name": name, "content_hash": snapshot.meta.content_hash,
+        "artifact_hash": snapshot.meta.artifact_hash, "indicator_deps": snapshot.pins,
+        "basis_decision_id": snapshot.decision_id,
+        "deploy_generation": snapshot.deploy_generation,
+    }
+    return _reevaluation_is_fresh(conn, plugins_root, pseudo)
+
+
+def _live_declared_kind(plugins_root: Path, name: str) -> str | None:
+    """live の版の config.yaml が宣言する kind。読めなければ None (判定は snapshot に任せる)。"""
+    try:
+        config = yaml.safe_load(
+            (plugins_root / name / "config.yaml").read_text(encoding="utf-8"))
+    except (OSError, ValueError, yaml.YAMLError):
+        return None
+    kind = config.get("kind") if isinstance(config, dict) else None
+    return kind if isinstance(kind, str) else None
+
+
 def _payload_pair_metrics(value, pair: str, pairs: list[str]) -> dict | None:
     """承認 payload の成績 (pair ごと、または 1 pair だけ平らな dict) から 1 pair 分を取る。"""
     if not isinstance(value, dict) or not value:
@@ -2988,11 +3007,9 @@ def _reevaluation_previous(conn, previous_row: dict, *, pairs: list[str],
 def _write_reevaluation_rows(conn, rows) -> dict:
     """gate の行を書き、scope と pair ごとの id を返す (tx は呼び出し元)。"""
     run_ids: dict = {"in_sample": {}, "holdout": {}}
-    for row in rows:
+    written = _write_gate_rows(conn, rows, mission_outcome=REEVALUATION_MISSION_OUTCOME)
+    for row, run_id in zip(rows, written):
         scope = "holdout" if row["scope"] == "holdout_gate" else "in_sample"
-        run_id = backtest_runs_store.save_harness_run(
-            conn, commit=False, mission_id=None,
-            mission_outcome=REEVALUATION_MISSION_OUTCOME, **row)
         if row.get("variant", "candidate") == "candidate":
             run_ids[scope][row["pair"]] = run_id
     return run_ids
@@ -3038,6 +3055,8 @@ def reevaluate_deployed(
             return ReevaluationResult(name, "skipped", reason=skip.reason)
         except OSError:
             return ReevaluationResult(name, "skipped", reason="not_deployed")
+        if _live_declared_kind(plugins_root, name) not in (None, "strategy"):
+            return ReevaluationResult(name, "skipped", reason="not_strategy")
         with _plugin_locks(plugins_root, lock_names, deadline=deadline(), stop_event=None):
             try:
                 snapshot = _take_reevaluation_snapshot(
@@ -3052,12 +3071,7 @@ def reevaluate_deployed(
         verdict = gate(conn, snapshot, settings=settings, now=now, rows=rows)
 
         with _plugin_locks(plugins_root, lock_names, deadline=deadline(), stop_event=None):
-            try:
-                current = _take_reevaluation_snapshot(
-                    conn, plugins_root, name, settings, lock_names)
-            except (_Skip, ValueError):
-                current = None
-            if current is None or current.identity() != snapshot.identity():
+            if not _snapshot_is_current(conn, plugins_root, snapshot):
                 _reevaluation_activity(
                     activity, "reevaluation_changed_during_evaluation", f"name={name}")
                 return ReevaluationResult(name, "changed_during_evaluation")
@@ -3083,16 +3097,11 @@ def reevaluate_deployed(
 def _store_unevaluable_rows(conn, snapshot: _Snapshot, rows: list) -> bool:
     """評価不能でも生成済みの gate の行は残す。tx の中で履歴の epoch を確かめ、
     変わっていれば何も書かず False を返す。"""
-    conn.execute("BEGIN IMMEDIATE")
-    try:
+    with _immediate_tx(conn):
         if history_epoch(conn) != snapshot.history_epoch:
             conn.rollback()
             return False
         _write_reevaluation_rows(conn, rows)
-        conn.commit()
-    except BaseException:
-        conn.rollback()
-        raise
     return True
 
 
@@ -3106,8 +3115,7 @@ def _store_reevaluation(conn, snapshot: _Snapshot, verdict, rows: list, *, setti
     dataset = settings.backtest.dataset()
     pairs = list(meta.pairs)
     g = settings.improve.gate
-    conn.execute("BEGIN IMMEDIATE")
-    try:
+    with _immediate_tx(conn):
         if history_epoch(conn) != snapshot.history_epoch:
             conn.rollback()
             _reevaluation_activity(
@@ -3157,10 +3165,6 @@ def _store_reevaluation(conn, snapshot: _Snapshot, verdict, rows: list, *, setti
         }
         approval_id = approvals_store.create(
             conn, kind="plugin", payload=payload, now=now, commit=False)
-        conn.commit()
-    except BaseException:
-        conn.rollback()
-        raise
     _reevaluation_activity(
         activity, "reevaluation_created",
         f"approval_id={approval_id} name={name} content_hash={meta.content_hash} "

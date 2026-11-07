@@ -41,6 +41,7 @@ from agentic_fx.core.econ_window import FRESHNESS_UNKNOWN, FRESHNESS_VALUES
 from agentic_fx.datafeed.reference_status import REFERENCE_STATES
 from agentic_fx.loops.econ_signal_report import format_econ_lines
 from agentic_fx.loops import approval_facts
+from agentic_fx.ops import reevaluation_view
 from agentic_fx.loops.approval_facts import display_text
 from agentic_fx.cli_surface import render_ctl_help
 from agentic_fx.setup.pending_text import (STEP_PARAMS, PendingStep, is_ident,
@@ -930,12 +931,25 @@ def format_change_lines(change, tz: str = "UTC") -> list[str]:
     return lines
 
 
+def _reevaluation_name(detail) -> str | None:
+    """承認の詳細が再評価の依頼なら strategy 名。"""
+    if not isinstance(detail, dict) or detail.get("candidate_origin") != reevaluation_view.ORIGIN:
+        return None
+    view = detail.get("reevaluation")
+    name = view.get("name") if isinstance(view, dict) else None
+    change = detail.get("change")
+    if not isinstance(name, str) and isinstance(change, dict):
+        name = change.get("name")
+    return display_text(name) if isinstance(name, str) else "<name>"
+
+
 def format_approval_detail(data: dict) -> str:
     tz = _tz_of(data)
     # in_sample / holdout の行は対話シェルの承認詳細と同じ renderer を使う。
     from agentic_fx.commands import Commands
     lines = [f"approval #{_ident(data.get('id'))} kind={display_text(data.get('kind'))} "
              f"status={display_text(data.get('status'))}"]
+    lines += reevaluation_view.lines(data.get("reevaluation"), lambda value: _when(value, tz))
     lines += Commands._metrics_lines("in_sample", data.get("in_sample"))
     lines += Commands._metrics_lines("holdout", data.get("holdout"))
     lines += Commands._baseline_comparison_lines(data.get("baseline"),
@@ -1592,13 +1606,25 @@ class Runner:
 
     def _op_reject(self, approval_id: int, reason: str | None, *, terminal: Terminal) -> int:
         # 却下は取り戻しにくい。id の打ち間違いに気付けるよう、先に対象を見せる。
-        self.say(format_approval_detail(self._get(f"/v1/approvals/{approval_id}")))
-        if not terminal.yes(f"approval #{approval_id} を却下しますか"):
+        detail = self._get(f"/v1/approvals/{approval_id}")
+        self.say(format_approval_detail(detail))
+        name = _reevaluation_name(detail)
+        question = f"approval #{approval_id} を却下しますか"
+        if name is not None:
+            question = reevaluation_view.reject_warning(name) + "。" + question
+        if not terminal.yes(question):
             raise ClientError(RC_FAILED, MESSAGES["cancelled"])
         body = {} if reason is None else {"reason": reason}
-        return self._decide("reject", approval_id, body)
+        try:
+            return self._decide("reject", approval_id, body, name=name)
+        except ClientError as exc:
+            hint = reevaluation_view.STOP_HINT.format(name=name) if name is not None else ""
+            if not hint or hint in exc.message:
+                raise
+            raise ClientError(exc.rc, f"{exc.message}\n{hint}") from exc
 
-    def _decide(self, kind: str, approval_id: int, body: dict) -> int:
+    def _decide(self, kind: str, approval_id: int, body: dict, *,
+                name: str | None = None) -> int:
         reply = self._post(f"/v1/approvals/{approval_id}/{kind}", body)
         if reply.data is None:
             if reply.code == "not_found":
@@ -1618,11 +1644,29 @@ class Runner:
             if kind == "approve" and result:
                 raise ClientError(RC_FAILED, f"approval #{approval_id} は今回の操作では承認され"
                                   f"ませんでした (status={status} outcome={outcome})")
+            if kind == "reject" and result.get("outcome") == "history_epoch_changed":
+                raise ClientError(RC_FAILED, f"approval #{approval_id} "
+                                  + reevaluation_view.EPOCH_STOP_TEXT.format(
+                                      name=name or "<name>"))
             raise ClientError(RC_FAILED, error_text(code if isinstance(code, str) else None))
-        if kind == "reject":
-            self.say(f"approval #{approval_id} rejected")
+        stale = result.get("outcome") == "invalidated" and result.get(
+            "reason") == "reevaluation_stale"
+        if stale:
+            self.say(f"approval #{approval_id} " + (
+                reevaluation_view.STALE_STOP_TEXT.format(name=name or "<name>")
+                if kind == "reject" else reevaluation_view.STALE_TEXT))
+        elif kind == "reject":
+            phase = result.get("deploy_phase")
+            if phase is None:
+                self.say(f"approval #{approval_id} rejected")
+            else:
+                text = reevaluation_view.reject_text(name or "<name>", phase)
+                self.say(f"approval #{approval_id} " + (
+                    text if text is not None else f"処理が完了しました (outcome={outcome})"))
         elif kind == "retry":
             self.say(f"approval #{approval_id} を再試行しました (status={status} outcome={outcome})")
+        elif result.get("outcome") == "reevaluation_confirmed":
+            self.say(f"approval #{approval_id} approved: " + reevaluation_view.CONFIRMED_TEXT)
         elif result.get("outcome") in _APPROVING_OUTCOMES:
             self.say(f"approval #{approval_id} approved (outcome={outcome})")
         else:

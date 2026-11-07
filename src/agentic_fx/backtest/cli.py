@@ -37,7 +37,7 @@ from agentic_fx.backtest import time_repair
 from agentic_fx.backtest.runner import run_replay
 from agentic_fx.config import ConfigError, load_env_file, load_settings
 from agentic_fx.cli_surface import (HelpFormatter, argument_help, leaf_help, parser_description, parser_help,
-                                    render_epilog)
+                                    render_epilog, wrapped_choices_usage)
 from agentic_fx.core.contracts import Bar, Origin, TradeIntent
 from agentic_fx.datafeed.sources import BridgeTimeRuleMismatch, BridgeTimeUnverified
 from agentic_fx.loops.verify_backend import VerifyBackendGateError
@@ -229,6 +229,7 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     versions_parser.add_argument("name")
     plugin_sub.add_parser("list", **_surface_parser_kw("plugin list", leaf=True)).add_argument(
         "--kind", choices=("indicator", "strategy"), default=None)
+    plugin.usage = wrapped_choices_usage(plugin.prog, list(plugin_sub.choices))
 
 
 # ---- history import ------------------------------------------------------

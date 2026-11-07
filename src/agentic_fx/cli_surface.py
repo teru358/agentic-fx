@@ -534,15 +534,12 @@ class HelpFormatter(argparse.RawDescriptionHelpFormatter):
         kwargs["width"] = 100
         super().__init__(prog, **kwargs)
 
-    def _format_usage(self, usage, actions, groups, prefix):
-        text = super()._format_usage(usage, actions, groups, prefix)
-        lines = text.rstrip("\n").split("\n")
-        if len(lines) < 2 or all(_display_width(line) <= 100 for line in lines):
-            return text
-        # 子コマンドの選択肢が長いと、prog に揃えた折り返しが幅を超える。
-        # 継続行を 4 桁の字下げに寄せて固定幅に収める。
-        rest = ["    " + line.strip() for line in lines[1:] if line.strip()]
-        return "\n".join([lines[0], *rest]) + "\n\n"
+
+def wrapped_choices_usage(prog: str, choices) -> str:
+    """子コマンドの選択肢が prog の下に揃えると幅を超えるグループの usage。`usage: ` に
+    続く本文を返す。選択肢の列は 1 つの `{a,b}` のまま、次の行へ 4 桁字下げで置く
+    (補完の照合が `{...}` を 1 つの塊として読むため、折り返さない)。"""
+    return f"{prog} [-h]\n    {{{','.join(choices)}}} ..."
 
 
 class SurfaceRenderer:
