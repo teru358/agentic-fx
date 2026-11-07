@@ -246,7 +246,8 @@ def apply_decision(
                     else (reason or "")),
             now=now, commit=False)
         # 承認の CAS が成立した同じ tx で、提出した候補の台帳の行も進める。
-        if row is not None and row["kind"] == "plugin":
+        if (row is not None and row["kind"] == "plugin"
+                and payload.get("candidate_origin") != "reevaluation"):
             _settle_archive(conn, payload, expected_from="pending",
                             outcome=_DECISION_OUTCOME[status],
                             approval_id=approval_id)

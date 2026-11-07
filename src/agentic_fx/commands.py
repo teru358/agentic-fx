@@ -34,6 +34,17 @@ from agentic_fx.policy_projection import (
 POLICY_WRITE_ERRORS = (sqlite3.Error, OSError, ValueError, ProjectionReconcileBlocked,
                        MigrationRecordUnknown)
 
+_APPROVED_OUTCOMES = ("deployed", "deployed_after_rollback", "reevaluation_confirmed")
+_REEVALUATION_STALE_TEXT = ("依頼が古いため無効にしました。配備は変えていません。"
+                            "再評価をやり直してください")
+_REEVALUATION_REJECT_TEXT = {
+    "done": "却下し、配備を停止しました",
+    "needs_retry": ("却下しました。取引は止まりましたが symlink を外せていません。"
+                    "`afx plugin disable {name}` で完了してください"),
+    "foreign": ("却下しました。取引は止まりましたが plugins/{name} が想定と違うため"
+                "外していません。確認してください"),
+}
+
 class PolicyFileNotReflected(RuntimeError):
     """A committed policy record could not be reflected to its file."""
 
@@ -172,14 +183,15 @@ class Commands:
                         now=self.clock.now(), plugins_root=self.plugins_root,
                         settings=self.settings, activity=self.activity)
                     text = self._approval_outcome_text(outcome)
-                    if outcome.outcome not in ("deployed", "deployed_after_rollback"):
+                    if outcome.outcome not in _APPROVED_OUTCOMES:
                         # 「今回の操作では」= status が既に `approved` の
                         # 二重 approve (`already_decided`) でも文が矛盾しない
                         # ようにするため (§3.6.3 / §3.6.5 の 1)。
                         return (f"approval #{args[0]} は今回の操作では承認されません"
                                f"でした (status={outcome.status}): {text}")
-                    self.activity.write(Category.APPROVAL, "approved",
-                                        f"#{args[0]} via shell", ref_id=args[0])
+                    if outcome.outcome != "reevaluation_confirmed":
+                        self.activity.write(Category.APPROVAL, "approved",
+                                            f"#{args[0]} via shell", ref_id=args[0])
                     return f"approval #{args[0]} approved: {text}"
                 # 決定の対象は kind='plugin' だけ (他の kind は将来枠で、決定経路を持たない)。
                 if row is None:
@@ -197,10 +209,12 @@ class Commands:
                     if self.plugins_root is None:
                         return "plugin approval backend (plugins_root) が未配線です"
                     from agentic_fx.plugin import switch as plugin_switch
-                    plugin_switch.reject_candidate(
+                    decided = plugin_switch.reject_candidate(
                         self.conn, approval_id, decided_by="shell",
                         reason=reason or "", now=self.clock.now(),
                         plugins_root=self.plugins_root, activity=self.activity)
+                    if isinstance(decided, plugin_switch.ApprovalOutcome):
+                        return self._reevaluation_reject_text(args[0], decided)
                 else:
                     if row is None:
                         raise ApprovalNotFoundError(approval_id)
@@ -478,6 +492,11 @@ class Commands:
             return f"エラー: {e.code.value}"
         outcome = job.detail
         if kind == "reject":
+            from agentic_fx.plugin import switch as plugin_switch
+            if isinstance(outcome, plugin_switch.ApprovalOutcome):
+                if job.error_code is not None and outcome.outcome != "history_epoch_changed":
+                    return self._ops_decision_error(job.error_code, approval_id)
+                return self._reevaluation_reject_text(shown_id, outcome)
             if job.error_code is not None:
                 return self._ops_decision_error(job.error_code, approval_id)
             self.activity.write(Category.APPROVAL, "rejected",
@@ -490,11 +509,12 @@ class Commands:
             self.activity.write(Category.APPROVAL, "retry",
                                 f"#{approval_id} via shell", ref_id=str(approval_id))
             return f"approval #{approval_id} を再試行しました: {text}"
-        if outcome.outcome not in ("deployed", "deployed_after_rollback"):
+        if outcome.outcome not in _APPROVED_OUTCOMES:
             return (f"approval #{shown_id} は今回の操作では承認されません"
                     f"でした (status={outcome.status}): {text}")
-        self.activity.write(Category.APPROVAL, "approved",
-                            f"#{shown_id} via shell", ref_id=shown_id)
+        if outcome.outcome != "reevaluation_confirmed":
+            self.activity.write(Category.APPROVAL, "approved",
+                                f"#{shown_id} via shell", ref_id=shown_id)
         return f"approval #{shown_id} approved: {text}"
 
     @staticmethod
@@ -819,11 +839,28 @@ class Commands:
         if kind == "legacy_plain_present":
             return (f"plugins/{outcome.name} が旧式のディレクトリのままです "
                     "(先に afx plugin retire が要ります)")
+        if kind == "invalidated" and outcome.reason == "reevaluation_stale":
+            return _REEVALUATION_STALE_TEXT
+        if kind == "reevaluation_confirmed":
+            return "再評価の結果で承認の根拠を差し替えました (配備は変わりません)"
         if kind in ("already_decided", "invalidated"):
             return f"この承認は既に決着しています (status={outcome.status})"
         if kind == "history_epoch_changed":
             return "履歴修復後の評価でないため承認できません (history_epoch_changed)"
         raise ValueError(f"unknown approval outcome: {kind!r}")
+
+    def _reevaluation_reject_text(self, shown_id: str, outcome) -> str:
+        """再評価の依頼の却下を、結果の形どおりの文言にする。"""
+        if outcome.outcome == "rejected":
+            tail = _REEVALUATION_REJECT_TEXT.get(outcome.deploy_phase)
+            if tail is None:
+                raise ValueError(f"unknown deploy phase: {outcome.deploy_phase!r}")
+            return f"approval #{shown_id} {tail.format(name=outcome.name)}"
+        if outcome.outcome == "invalidated" and outcome.reason == "reevaluation_stale":
+            return f"approval #{shown_id} {_REEVALUATION_STALE_TEXT}"
+        if outcome.outcome == "history_epoch_changed":
+            return f"approval #{shown_id} は履歴が変わったため決定していません"
+        raise ValueError(f"unexpected reject outcome: {outcome.outcome!r}")
 
     def _approval_list(self, limit_arg: "str | None") -> str:
         """承認待ちの一覧 + 未終端の切替ジャーナル (設計書 §3.5)。"""

@@ -205,21 +205,12 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
                     "force": force,
                 }, revoke=deploy_ops.RevokeSpec(name, live.content_hash) if revoke else None,
                 cascade_identities=identities, now=now, actor=actor)
-        if not deploy_ops.live_matches_from(live_path, raw_target):
-            deploy_store.set_phase(conn, op_id, "foreign", now=now)
-            row = deploy_store.get_by_id(conn, op_id)
-            deploy_ops.try_notify(conn, row, deploy_ops.activity_or_null(activity), now=now)
+        phase = deploy_ops.unlink_live_for_intent(
+            conn, plugins_root, name, op_id, raw_target, activity, now=now)
+        if phase == "foreign":
             return DisableOutcome("foreign", name, op_id=op_id)
-        try:
-            os.unlink(live_path)
-        except OSError:
-            deploy_store.set_phase(conn, op_id, "needs_retry", now=now, fail_reason="syscall_failed")
-            row = deploy_store.get_open_by_name(conn, name)
-            deploy_ops.try_notify(conn, row, deploy_ops.activity_or_null(activity), now=now)
+        if phase == "needs_retry":
             return DisableOutcome("needs_retry", name, op_id=op_id)
-        deploy_store.set_phase(conn, op_id, "done", now=now)
-        row = deploy_store.get_by_id(conn, op_id)
-        deploy_ops.try_notify(conn, row, deploy_ops.activity_or_null(activity), now=now)
         return DisableOutcome("disabled", name, True, "effective_on_next_signal_insert",
                               tuple(sorted(report.dependent_names)), op_id=op_id)
 

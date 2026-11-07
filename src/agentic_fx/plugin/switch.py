@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import json
+import logging
 import os
 import hashlib
 import re
@@ -38,7 +39,10 @@ from agentic_fx.store import backtest_runs as backtest_runs_store  # [profitabil
 from agentic_fx.store import candidate_archives as candidate_archives_store  # T4 §1 L4 の archive GC が使う
 from agentic_fx.plugin import deploy_ops as deploy_ops_common
 from agentic_fx.plugin import indicator_pipeline
+from agentic_fx.store import plugin_deploy_ops as deploy_store
 from agentic_fx.store import plugin_switch_journal as journal_store  # Task 8 produces
+
+_log = logging.getLogger(__name__)
 
 _PHASE_ORDER = ["preparing", "versioned", "recorded", "switched", "decided", "reverted"]
 
@@ -48,7 +52,10 @@ _TERMINAL_PHASES = ("decided", "reverted")
 APPROVAL_OUTCOMES = frozenset({
     "deployed", "deployed_after_rollback", "already_decided", "foreign_waiting",
     "still_pending", "legacy_plain_present", "invalidated", "history_epoch_changed",
+    "reevaluation_confirmed", "rejected",
 })
+
+REEVALUATION_ORIGIN = "reevaluation"
 
 
 @dataclass(frozen=True)
@@ -64,6 +71,7 @@ class ApprovalOutcome:
     rolled_back_op_id: int | None = None
     target: str | None = None
     reason: str | None = None
+    deploy_phase: str | None = None
 
     def __post_init__(self) -> None:
         if self.outcome not in APPROVAL_OUTCOMES:
@@ -1557,7 +1565,8 @@ def _is_superseded(conn: sqlite3.Connection, row: dict, payload: dict) -> bool:
     for r in rows:
         other_payload = json.loads(r["payload_json"])
         if (other_payload.get("name") == name
-                and other_payload.get("content_hash") != content_hash):
+                and other_payload.get("content_hash") != content_hash
+                and other_payload.get("candidate_origin") != "reevaluation"):
             return True
     return False
 
@@ -1805,6 +1814,252 @@ def _reverify_switched_journal(
     return _new_target_hash_ok()
 
 
+# ============================================================
+# 再評価の依頼 (candidate_origin="reevaluation") の決定
+# ============================================================
+
+def deploy_generation(conn: sqlite3.Connection, name: str) -> list[int]:
+    """配備の世代: その名前の switch journal と deploy op の最大 op_id の組。
+    live が A→B→A と戻っても組は進むので、評価した時点の配備と区別できる。"""
+    journal = conn.execute(
+        "SELECT MAX(op_id) FROM plugin_switch_journal WHERE name=?", (name,)).fetchone()[0]
+    ops = conn.execute(
+        "SELECT MAX(op_id) FROM plugin_deploy_ops WHERE name=?", (name,)).fetchone()[0]
+    return [int(journal or 0), int(ops or 0)]
+
+
+def _reevaluation_activity(activity, event: str, summary: str) -> None:
+    """決定の commit 後の記録。書けなくても決定は覆らない。"""
+    if activity is None:
+        return
+    try:
+        activity.write(Category.APPROVAL, event, summary)
+    except Exception as exc:  # noqa: BLE001 - the decision is already committed
+        _log.warning("activity write failed event=%s: %r", event, exc)
+
+
+def _reevaluation_locator_ok(payload: dict) -> bool:
+    name, artifact = payload.get("name"), payload.get("artifact_hash")
+    if not (isinstance(name, str) and isinstance(artifact, str)
+            and loader.is_canonical_plugin_name(name)):
+        return False
+    return (loader.is_canonical_symlink_target(name, f".versions/{name}/{artifact}")
+            and payload.get("candidate_path") == f"plugins/.versions/{name}/{artifact}")
+
+
+def _reevaluation_pins_are_live(conn: sqlite3.Connection, plugins_root: Path,
+                                payload: dict) -> bool:
+    refs = payload.get("indicator_deps")
+    if refs is None:
+        return True
+    if not isinstance(refs, dict):
+        return False
+    for ref in refs.values():
+        if not isinstance(ref, dict):
+            return False
+        plugin, pinned = ref.get("plugin"), ref.get("content_hash")
+        if not (isinstance(plugin, str) and loader.is_canonical_plugin_name(plugin)
+                and isinstance(pinned, str)):
+            return False
+        live = deploy_store.live_identity(plugins_root, plugin)
+        if live is None or live.content_hash != pinned:
+            return False
+        if deploy_ops_common.approved_row(conn, plugin, pinned) is None:
+            return False
+    return True
+
+
+def _reevaluation_is_fresh(conn: sqlite3.Connection, plugins_root: Path,
+                           payload: dict) -> bool:
+    """依頼が評価した配備が今も続いているか (lock 内で呼ぶ)。live の正規 target・
+    版 dir の実 hash・依存 indicator の live と承認・最新決定・配備世代の全部が
+    合うときだけ真。"""
+    name = payload["name"]
+    content_hash, artifact_hash = payload["content_hash"], payload["artifact_hash"]
+    live = plugins_root / name
+    try:
+        if not live.is_symlink() or os.readlink(live) != f".versions/{name}/{artifact_hash}":
+            return False
+        if not _version_dir_hashes_ok(
+                plugins_root / ".versions" / name / artifact_hash,
+                content_hash=content_hash, artifact_hash=artifact_hash):
+            return False
+    except (OSError, ValueError):
+        return False
+    if not _reevaluation_pins_are_live(conn, plugins_root, payload):
+        return False
+    decision = approvals_store.latest_decision_for_identity(conn, name, content_hash)
+    if (decision is None or decision["status"] != "approved"
+            or decision["id"] != payload.get("basis_decision_id")):
+        return False
+    return payload.get("deploy_generation") == deploy_generation(conn, name)
+
+
+def _reevaluation_lock_names(payload: dict) -> list[str]:
+    return sorted({payload["name"]} | _payload_indicator_names(payload))
+
+
+def _decide_reevaluation(
+    conn: sqlite3.Connection, approval_id: int, action: Literal["approve", "reject"], *,
+    decided_by: str, reason: str | None, now: datetime, plugins_root: Path,
+    activity: "ActivityLog | None", deadline: float | None, stop_event,
+    require_plugin_kind: bool, expected_payload_sha256: str | None,
+) -> "ApprovalOutcome":
+    """再評価の依頼の承認 / 却下。locator は解決せず、配備が評価した時点のままで
+    あることを lock の内側で確かめてから決める。承認は決定の記録だけで、配備は
+    何も変えない。却下は `afx plugin disable` と同じ停止を同じ lock の中で行う。
+
+    注意: ここから `disable_plugin` / `approve_candidate` を呼ばない。plugin lock は
+    再入できない。"""
+    row = conn.execute(
+        "SELECT * FROM approval_requests WHERE id=?", (approval_id,)).fetchone()
+    if row is None:
+        raise approvals_store.ApprovalNotFoundError(f"approval {approval_id} not found")
+    payload = json.loads(row["payload_json"])
+    name = payload["name"]
+    lock_names = _reevaluation_lock_names(payload)
+
+    with _plugin_locks(plugins_root, lock_names,
+                       **_bounded_lock_kwargs(deadline, stop_event)):
+        row = conn.execute(
+            "SELECT * FROM approval_requests WHERE id=?", (approval_id,)).fetchone()
+        _check_in_lock(row, require_plugin_kind=require_plugin_kind,
+                       expected_payload_sha256=expected_payload_sha256)
+        payload = json.loads(row["payload_json"])
+        if (payload.get("candidate_origin") != REEVALUATION_ORIGIN
+                or payload.get("name") != name
+                or not set(_reevaluation_lock_names(payload)) <= set(lock_names)):
+            raise ValueError("candidate_changed")
+        if row["status"] != "pending":
+            if action == "approve":
+                return ApprovalOutcome(outcome="already_decided", name=name,
+                                       status=row["status"])
+            raise approvals_store.AlreadyDecidedError(
+                f"approval {approval_id} is not pending")
+        if not _reevaluation_locator_ok(payload):
+            raise ValueError(
+                f"candidate_path {payload.get('candidate_path')!r} does not match the "
+                f"canonical form for candidate_origin={REEVALUATION_ORIGIN!r} "
+                f"and name={name!r}")
+        epoch_changed = ApprovalOutcome(outcome="history_epoch_changed", name=name,
+                                        status="pending")
+        if payload.get("history_epoch", "none") != history_epoch(conn):
+            return epoch_changed
+        journal = journal_store.get_open_by_name(conn, name)
+        if journal is not None:
+            raise UnresolvedJournalError(
+                f"plugin {name!r}: an unresolved switch journal "
+                f"(op_id={journal['op_id']}) blocks approval {approval_id} — resolve it "
+                "first (reconcile or approval retry)")
+        _reject_open_deploy_ops(conn, set(lock_names), operation="approval")
+
+        if not _reevaluation_is_fresh(conn, plugins_root, payload):
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                approvals_store.apply_decision(
+                    conn, approval_id, "invalidated", decided_by="system", now=now,
+                    reason="reevaluation_stale", commit=False)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+            _reevaluation_activity(
+                activity, "reevaluation_invalidated",
+                f"approval_id={approval_id} name={name} reason=reevaluation_stale")
+            return ApprovalOutcome(outcome="invalidated", name=name, status="invalidated",
+                                   reason="reevaluation_stale")
+
+        if action == "approve":
+            return _confirm_reevaluation(
+                conn, approval_id, payload, decided_by=decided_by, now=now,
+                activity=activity, epoch_changed=epoch_changed)
+        return _reject_reevaluation(
+            conn, approval_id, payload, decided_by=decided_by, reason=reason, now=now,
+            plugins_root=plugins_root, activity=activity, epoch_changed=epoch_changed)
+
+
+def _confirm_reevaluation(conn, approval_id, payload, *, decided_by, now, activity,
+                          epoch_changed) -> "ApprovalOutcome":
+    name = payload["name"]
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if payload.get("history_epoch", "none") != history_epoch(conn):
+            conn.rollback()
+            return epoch_changed
+        approvals_store.apply_decision(
+            conn, approval_id, "approved", decided_by=decided_by, now=now,
+            reason="reevaluation_confirmed", commit=False)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    _reevaluation_activity(
+        activity, "reevaluation_approved",
+        f"approval_id={approval_id} name={name} content_hash={payload['content_hash']} "
+        f"artifact_hash={payload['artifact_hash']} "
+        f"reevaluates_approval_id={payload.get('reevaluates_approval_id')}")
+    return ApprovalOutcome(outcome="reevaluation_confirmed", name=name, status="approved")
+
+
+def _reject_reevaluation(conn, approval_id, payload, *, decided_by, reason, now,
+                         plugins_root, activity, epoch_changed) -> "ApprovalOutcome":
+    name, content_hash = payload["name"], payload["content_hash"]
+    artifact_hash = payload["artifact_hash"]
+    raw_target = f".versions/{name}/{artifact_hash}"
+    intent_row = {
+        "op_kind": "disable_symlink", "name": name, "from_kind": "symlink",
+        "to_kind": "absent", "from_target": raw_target, "to_target": None,
+        "retired_path": None, "subject_content_hash": content_hash,
+        "subject_artifact_hash": artifact_hash, "target_content_hash": None,
+        "target_artifact_hash": None,
+        "approval_id": payload.get("reevaluates_approval_id"), "force": False,
+    }
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if payload.get("history_epoch", "none") != history_epoch(conn):
+            conn.rollback()
+            return epoch_changed
+        approvals_store.apply_decision(
+            conn, approval_id, "rejected", decided_by=decided_by, now=now,
+            reason=reason, commit=False)
+        op_id = deploy_ops_common.write_intent_rows(
+            conn, intent_row=intent_row, revoke=None,
+            cascade_identities=[(name, content_hash)], now=now, actor=decided_by)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    phase = deploy_ops_common.unlink_live_for_intent(
+        conn, plugins_root, name, op_id, raw_target, activity, now=now)
+    _reevaluation_activity(
+        activity, "reevaluation_rejected",
+        f"approval_id={approval_id} name={name} op_id={op_id} phase={phase}")
+    return ApprovalOutcome(outcome="rejected", name=name, status="rejected", op_id=op_id,
+                           deploy_phase=phase)
+
+
+def _refuse_reevaluation_retry(conn: sqlite3.Connection, approval_id: int, *,
+                               require_plugin_kind: bool) -> "ApprovalOutcome | None":
+    row = conn.execute(
+        "SELECT kind, status, payload_json FROM approval_requests WHERE id=?",
+        (approval_id,)).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload_json"])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("candidate_origin") != REEVALUATION_ORIGIN:
+        return None
+    if require_plugin_kind and row["kind"] != "plugin":
+        raise ApprovalKindUnsupported(f"kind={row['kind']!r}")
+    name = str(payload.get("name"))
+    if row["status"] != "pending":
+        return ApprovalOutcome(outcome="already_decided", name=name, status=row["status"])
+    return ApprovalOutcome(outcome="still_pending", name=name, status="pending",
+                           reason="reevaluation_retry_unsupported")
+
+
 def approve_candidate(
     conn: sqlite3.Connection, approval_id: int, *,
     decided_by: str, now: datetime, plugins_root: Path, settings,
@@ -1827,6 +2082,13 @@ def approve_candidate(
         raise ValueError(f"approval {approval_id} not found")
     payload = json.loads(row["payload_json"])
     name = payload["name"]
+
+    if payload.get("candidate_origin") == REEVALUATION_ORIGIN:
+        return _decide_reevaluation(
+            conn, approval_id, "approve", decided_by=decided_by, reason=None, now=now,
+            plugins_root=plugins_root, activity=activity, deadline=deadline,
+            stop_event=stop_event, require_plugin_kind=require_plugin_kind,
+            expected_payload_sha256=expected_payload_sha256)
 
     payload_pre = json.loads(row["payload_json"])
     candidate_origin_pre = payload_pre["candidate_origin"]
@@ -2212,7 +2474,13 @@ def retry_approval(conn: sqlite3.Connection, approval_id: int, *,
     B-1 是正で plugins_root/settings を追加した (approve_candidate へそのまま
     透過する)。B3 是正: `activity` も同様に透過する (0d の再検証失敗時の
     ERROR 記録用)。[switch-ops-hardening] T5: `approve_candidate` が lock 内で
-    確定した `ApprovalOutcome` を**そのまま透過する** (§3.5)。"""
+    確定した `ApprovalOutcome` を**そのまま透過する** (§3.5)。
+
+    再評価の依頼には retry する journal が無いので、決定せずに拒否する。"""
+    refused = _refuse_reevaluation_retry(
+        conn, approval_id, require_plugin_kind=require_plugin_kind)
+    if refused is not None:
+        return refused
     return approve_candidate(conn, approval_id, decided_by=decided_by, now=now,
                              plugins_root=plugins_root, settings=settings,
                              activity=activity, deadline=deadline,
@@ -2226,7 +2494,7 @@ def reject_candidate(conn: sqlite3.Connection, approval_id: int, *,
                      plugins_root: Path,
                      activity: "ActivityLog | None" = None,
                      deadline: float | None = None, stop_event=None,
-                     require_plugin_kind: bool = False) -> bool:
+                     require_plugin_kind: bool = False) -> "bool | ApprovalOutcome":
     """§8.1-32: 全 terminal decision (approve/reject/expire/reconcile) が
     同じ plugin flock を通る。本 task (11g) が新規命名 (骨格 Interfaces 節
     に無い — submit/approve/bless の 3 関数しか列挙されていないが、reject
@@ -2256,6 +2524,13 @@ def reject_candidate(conn: sqlite3.Connection, approval_id: int, *,
                 f"approval_id={approval_id}: plugin payload に name が無く "
                 "契約違反のため reject を実行せず pending 留置")
         return False
+
+    if payload.get("candidate_origin") == REEVALUATION_ORIGIN:
+        return _decide_reevaluation(
+            conn, approval_id, "reject", decided_by=decided_by, reason=reason, now=now,
+            plugins_root=plugins_root, activity=activity, deadline=deadline,
+            stop_event=stop_event, require_plugin_kind=require_plugin_kind,
+            expected_payload_sha256=None)
 
     with _plugin_lock(plugins_root, name, **_bounded_lock_kwargs(deadline, stop_event)):
         locked_row = conn.execute(

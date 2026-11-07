@@ -141,7 +141,9 @@ _BACKLOG_TRANSITIONS = {
     "note": (("open", "observation"), "note", "human_noted"),
     "reopen": (("done", "rejected"), "open", "reopened"),
 }
-_DEPLOYED = frozenset({"deployed", "deployed_after_rollback", "invalidated"})
+_DEPLOYED = frozenset({"deployed", "deployed_after_rollback", "invalidated",
+                       "reevaluation_confirmed", "rejected"})
+_REEVALUATION_OUTCOMES = frozenset({"reevaluation_confirmed", "rejected"})
 _BACKLOG_TEXT_LIMIT = 4096
 _BACKLOG_TRUNCATION = "…[truncated]"
 
@@ -1935,13 +1937,22 @@ class OpsService:
                         plugins_root=self._plugins_root, activity=self._activity_log,
                         deadline=self._foreign(flock_deadline), stop_event=self.stop_event,
                         require_plugin_kind=True)
-                    if not decided:
-                        raise OpsError(ErrorCode.INVALID_STATE)
-                    outcome = None
-                    result = {"approval_id": approval_id, "outcome": "rejected",
-                              "status": "rejected"}
+                    if isinstance(decided, switch.ApprovalOutcome):
+                        outcome = decided
+                        result = {"approval_id": approval_id, "outcome": outcome.outcome,
+                                  "status": outcome.status}
+                        if outcome.deploy_phase is not None:
+                            result["deploy_phase"] = outcome.deploy_phase
+                    else:
+                        if not decided:
+                            raise OpsError(ErrorCode.INVALID_STATE)
+                        outcome = None
+                        result = {"approval_id": approval_id, "outcome": "rejected",
+                                  "status": "rejected"}
                 else:
-                    outcome = switch.approve_candidate(
+                    decide = (switch.retry_approval if kind == "retry"
+                              else switch.approve_candidate)
+                    outcome = decide(
                         self._decide_conn, approval_id, decided_by=decided_by,
                         now=self._wall_clock(), plugins_root=self._plugins_root,
                         settings=self._settings, activity=self._activity_log,
@@ -1969,10 +1980,15 @@ class OpsService:
                 plugin_kind = _approval_plugin_kind(self._decide_conn, approval_id)
             except Exception:  # noqa: BLE001 — notification metadata is best-effort
                 plugin_kind = None
+            fields = {"state": result["status"], "decision_code": kind,
+                      "decided_by": decided_by, "plugin_kind": plugin_kind}
+            if outcome is not None and (outcome.outcome in _REEVALUATION_OUTCOMES
+                                        or outcome.reason == "reevaluation_stale"):
+                fields["candidate_origin"] = switch.REEVALUATION_ORIGIN
+                if outcome.deploy_phase is not None:
+                    fields["deploy_phase"] = outcome.deploy_phase
             self._decide_events.emit_best_effort(
-                "approval_state_changed", f"approval:{approval_id}",
-                {"state": result["status"], "decision_code": kind, "decided_by": decided_by,
-                 "plugin_kind": plugin_kind})
+                "approval_state_changed", f"approval:{approval_id}", fields)
             return result
         return run
 
