@@ -143,8 +143,11 @@ def test_scheduler_tick_returns_signal_hook_but_not_improve_hook_when_improve_is
         app.scheduler.on_signal_maintenance = signal_ticks.append
         app.scheduler.on_improve_tick = None
         pending = app.scheduler.tick(NOW)
-        assert len(pending) == 1
-        pending[0]()
+        # signal maintenance の遅延実行は必ずある (日次 report の hook も同じ tick で
+        # 返りうる)。improve の hook は返らない。
+        assert pending
+        for hook in pending:
+            hook()
         assert signal_ticks == [NOW]
     finally:
         app.close()
