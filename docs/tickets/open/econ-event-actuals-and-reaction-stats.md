@@ -27,3 +27,4 @@ econ_events は forecast / previous だけで actual が 1026 件中 0 件 (econ
 - 2026-10-30: 起票。
 - 2026-10-30: 状態: 裁定待ち — ブレスト → sol 前提確認 → 設計 C0 の順 (3 件を一束で)
 - 2026-11-01: 状態: 実装待ち — 設計 C0 v0.9 (docs/superpowers/specs/2026-11-01-econ-window-signal-authority-shadow-design.md) を 8 周のレビューで清書、J1〜J3 をユーザーが推奨どおり承認。3 件は束 1 (回避帯・採否契約・shadow、T1a〜T5) と束 2 (反応統計、T1〜T4) で実装。actual 取得は対象外 (源に無い)
+- 2026-11-07: 状態: 実装待ち — 束 1 (slice の退避と 1m 規則、反応統計の後処理差込口) は 2026-11-07 に配備 (main c0aa9bb0)。反応統計の集計・tool・人間面は束 2 (T1〜T4)
