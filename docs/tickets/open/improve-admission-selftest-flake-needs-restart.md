@@ -2,7 +2,7 @@
 id: improve-admission-selftest-flake-needs-restart
 title: 改善 admission の自己試験が 1 回落ちると再起動まで改善が止まる
 status: 設計待ち
-priority: 中
+priority: 高
 kind: 不具合
 opened: 2026-11-01
 closed: null
@@ -10,7 +10,7 @@ related: []
 ---
 # [improve-admission-selftest-flake-needs-restart] 改善 admission の自己試験が 1 回落ちると再起動まで改善が止まる
 
-**状態**: 設計待ち / **優先**: 中 / **種別**: 不具合
+**状態**: 設計待ち / **優先**: 高 / **種別**: 不具合
 
 ## 現象
 
@@ -26,3 +26,4 @@ related: []
 
 - 2026-11-01: 起票。
 - 2026-11-07: 再発 (3 回目)。07:05Z の再起動で同じ gate=incomplete (call=0) → admitted=no、16:27 / 16:33 JST の improve #3254・#3255 が sandbox_unavailable で 0 秒終了。fingerprint 15bd94e5… (codex 0.166.0) が未登録で毎起動に自己試験が走っていた → 登録を更新 (起動時の自己試験を減らす当面の策、本件の是正ではない)
+- 2026-11-07: 優先: 高 — 利用者が優先タスクに指定 (11-07 の 3 回目の再発を受けて)。設計に着手
