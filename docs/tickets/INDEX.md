@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 159 件。完了分は closed/。
+未完了: 160 件。完了分は closed/。
 
 ## 実装中 (1)
 
@@ -63,7 +63,7 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (140)
+## 設計待ち (141)
 
 ### 不具合 (76)
 
@@ -146,7 +146,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (40)
+### 機能 (41)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -188,6 +188,7 @@
 | [settings-hot-reload-safe-keys](open/settings-hot-reload-safe-keys.md) | 低 | 2026-10-28 | 設定の一部を daemon 再起動なしで反映する (安全なキーに限定) |
 | [datafeed-fetch-evidence-and-bridge-completeness](open/datafeed-fetch-evidence-and-bridge-completeness.md) | 低 | 2026-11-03 | 価格取得の証跡と bridge の過去区間の完全性保証 (tick 無しの証明) |
 | [cli-datetime-input-in-display-timezone](open/cli-datetime-input-in-display-timezone.md) | 低 | 2026-11-06 | CLI の日時入力 (--from / --to) を表示 tz で解釈する |
+| [approval-retry-button-always-shown](open/approval-retry-button-always-shown.md) | 低 | 2026-11-07 | Discord の承認カードに Retry が常に出て、未承認の依頼では承認と同じになる |
 | [legacy-e2e-model](open/legacy-e2e-model.md) | 低 |  | backend を切り替えるたびにモデル名の手編集が要る |
 | [legacy-oc-qwen3-8-toolcall](open/legacy-oc-qwen3-8-toolcall.md) | 低 |  | モデルが壊れた引数でツールを連打し予算を焼く |
 
