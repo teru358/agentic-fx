@@ -34,13 +34,14 @@ def run_pass(*, read, write, stopped, pair_currencies, pip_size_fn, now: datetim
             cursor.after = prev
         prev = item['id']
         try:
-            slice_rows = read(lambda conn: ohlcv_slices.complete_rows(conn, item['id']))
             existing = item.get('missing_keys')
             if existing is not None:
                 currencies = existing
                 values = ()
             else:
-                currency_list = econ_reactions.event_currencies(item['country'], pair_currencies)
+                slice_rows = read(lambda conn: ohlcv_slices.complete_rows(conn, item['id']))
+                currency_list = (() if item.get('superseded_by') is not None else
+                                 econ_reactions.event_currencies(item['country'], pair_currencies))
                 currencies = [c for c in currency_list if econ_reactions.canonical_pair(c, pair_currencies) == item['pair']]
                 try:
                     spread = item['spread_pips']
@@ -56,6 +57,11 @@ def run_pass(*, read, write, stopped, pair_currencies, pip_size_fn, now: datetim
                                   item['id'], item['event_id'], safe_error_text(e))
                     continue
             keys = [(item['event_id'], c) for c in currencies]
+        except Exception as e:
+            log.error("econ reaction pass failed for set %s event %s: %s",
+                          item['id'], item['event_id'], safe_error_text(e))
+            continue
+        try:
             result = write(lambda conn, begin, checkpoint: econ_reaction_values.write_set_tx(
                 conn, set_id=item['id'], values=values, keys=keys, now=now,
                 begin=begin, checkpoint=checkpoint))

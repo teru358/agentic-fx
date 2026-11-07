@@ -1460,6 +1460,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         # 注入された spec_fn ではなく定義表そのものを引く
         pair_currencies = currencies_by_pair(
             settings.pairs, lambda pair: PriceProvider.spec(provider, pair))
+        pip_size_fn = lambda pair: PriceProvider.spec(provider, pair).pip_size
         econ_window_settings = WindowSettings.from_config(settings.econ.window)
         econ = EconCalendar(
             conn_core, activity, clock,
@@ -1951,13 +1952,13 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             read_conn=conn_econ_read, write_conn=conn_econ_write,
             core_lock=core_lock, admission=writer_admission,
             quote_fn=lambda pair: executor.quote_fn(pair),
-            pip_size_fn=lambda pair: executor.spec_fn(pair).pip_size,
+            pip_size_fn=pip_size_fn,
             assumed_spread_pips_fn=lambda pair: _assumed_spread_pips(settings, pair),
             now_fn=clock.now,
             after_cycle=lambda context: run_econ_reaction_pass(
                 read=context.read, write=context.write, stopped=context.stopped,
-                pair_currencies=currencies_by_pair(settings.pairs, executor.spec_fn),
-                pip_size_fn=lambda pair: executor.spec_fn(pair).pip_size,
+                pair_currencies=pair_currencies,
+                pip_size_fn=pip_size_fn,
                 now=context.now, cursor=reaction_cursor))
         econ_measurer = CapacityMeasurer(
             open_conn=lambda: connect_readonly(root / "data" / "agentic.db"),

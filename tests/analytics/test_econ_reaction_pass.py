@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from agentic_fx.analytics import econ_reaction_pass as reaction_pass
+from agentic_fx.analytics import econ_reactions
 from agentic_fx.analytics.econ_reaction_pass import run_pass
 from agentic_fx.store import econ_reaction_values as rv
 from agentic_fx.store.db import connect, init_db
@@ -118,7 +119,7 @@ def test_a_second_pass_changes_nothing_and_pair_order_does_not_move_keys_or_stat
     _run(conn)
     values = conn.execute("SELECT * FROM econ_reaction_values ORDER BY 1,2").fetchall()
     keys = conn.execute("SELECT * FROM econ_reaction_keys ORDER BY 1,2").fetchall()
-    stats = rv.bundle_stats(conn)
+    stats = econ_reactions.aggregate(rv.load_samples(conn))
     assert len(values) == 9 and values and keys and stats
     later = TS + timedelta(days=3)
     _run(conn, now=later)
@@ -127,7 +128,7 @@ def test_a_second_pass_changes_nothing_and_pair_order_does_not_move_keys_or_stat
     _run(conn, {"USDJPY": ("USD", "JPY"), "EURUSD": ("EUR", "USD")}, now=later)
     assert conn.execute("SELECT * FROM econ_reaction_values ORDER BY 1,2").fetchall() == values
     assert conn.execute("SELECT * FROM econ_reaction_keys ORDER BY 1,2").fetchall() == keys
-    assert rv.bundle_stats(conn) == stats
+    assert econ_reactions.aggregate(rv.load_samples(conn)) == stats
 
 
 def test_a_currency_key_waits_for_its_canonical_pair_set(tmp_path):
@@ -179,15 +180,26 @@ def test_a_currency_no_longer_in_settings_gets_values_but_no_key(tmp_path):
         "sets_without_values": 0, "events_without_currency_key": 1}
 
 
-def test_a_superseded_event_makes_neither_values_nor_keys_nor_samples(tmp_path):
+def test_a_superseded_event_set_gets_its_three_windows_but_no_key_or_sample(tmp_path):
     conn = _conn(tmp_path)
     new = _event(conn, "JPY", "Rate", ts=TS + timedelta(hours=1))
     old = _event(conn, "JPY", "Rate", superseded_by=new)
     old_set = _set(conn, old)
     _run(conn)
-    assert _values(conn, old_set) == []
+    assert len(_values(conn, old_set)) == 3
     assert _keys(conn) == []
     assert rv.load_samples(conn) == ()
+    from agentic_fx.store import ohlcv_slices
+    conn.execute("UPDATE ohlcv_slice_sets SET created_at=? WHERE id=?",
+                 ((TS - timedelta(days=ohlcv_slices.RETENTION_DAYS + 1)).isoformat(), old_set))
+    conn.commit()
+    assert ohlcv_slices.purgeable_sets(conn, now=TS, limit=10) == [old_set]
+    for _ in range(10):
+        if ohlcv_slices.purge_step(conn, set_id=old_set, now=TS).done:
+            break
+    else:
+        raise AssertionError("purge did not finish")
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv_slices WHERE set_id=?", (old_set,)).fetchone()[0] == 0
 
 
 def test_a_failing_set_is_logged_and_the_rest_of_the_pass_continues(tmp_path, caplog):

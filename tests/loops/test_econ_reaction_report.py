@@ -107,6 +107,19 @@ def test_reaction_status_reports_the_backlog_counts(tmp_path):
     assert backlog == {"sets_without_values": 1, "events_without_currency_key": 1}
 
 
+def test_daily_reaction_report_projects_untrusted_name_keys_to_one_markdown_line():
+    reaction = {"bundles": [{"currency": "USD", "kind": "name",
+        "key": "Rate\n|*_[bad]`<x>", "window_min": 15, "n": 1,
+        "unique_ts_n": 1, "unresolvable_n": 0,
+        "range_median": None, "range_p75": None, "abs_median": None,
+        "abs_p75": None, "net_median": None, "net_p75": None,
+        "close_change_median": None}], "backlog": {}}
+    lines = esr._reaction_report_lines(reaction)
+    assert len(lines) == 2
+    assert "\n" not in lines[0] and "|" not in lines[0]
+    assert "*" not in lines[0] and "[" not in lines[0] and "]" not in lines[0]
+
+
 def test_status_carries_the_reaction_section_only_when_pairs_are_given(tmp_path):
     conn = _conn(tmp_path)
     seed(conn, currency="USD", resolved=1)

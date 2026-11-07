@@ -209,7 +209,8 @@ def _seed_reaction_canaries(conn):
 
     add("JPY", 3, "ReactCanaryName", 25, (7777.25, -2121.5, 4242.5, 3131.75), 0)
     add("USD", 2, "BelowFloorCanary", 5, (5555.75, -2121.5, 4242.5, 3131.75), 40)
-    stats = rv.bundle_stats(conn)
+    from agentic_fx.analytics.econ_reactions import aggregate
+    stats = aggregate(rv.load_samples(conn))
     assert any(s.n >= 20 and s.range_median == 7777.25 for s in stats)
     assert any(s.n == 5 and s.range_median == 5555.75 for s in stats)
 

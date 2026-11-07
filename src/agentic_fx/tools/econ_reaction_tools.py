@@ -4,9 +4,9 @@ from __future__ import annotations
 import sqlite3
 from typing import Mapping
 
-from agentic_fx.analytics.econ_reactions import AGENT_FLOOR, agent_view
+from agentic_fx.analytics.econ_reactions import AGENT_FLOOR, agent_view, aggregate
 from agentic_fx.config import Settings
-from agentic_fx.store.econ_reaction_values import bundle_stats
+from agentic_fx.store.econ_reaction_values import load_samples
 from agentic_fx.tools.registry import ToolDef
 
 DESCRIPTION = (
@@ -22,7 +22,7 @@ def build(conn: sqlite3.Connection, settings: Settings,
     def get_econ_reactions(pair: str) -> list[dict]:
         if pair not in pairs:
             raise ValueError(f"pair must be one of {pairs}: {pair!r}")
-        return agent_view(bundle_stats(conn), pair=pair,
+        return agent_view(aggregate(load_samples(conn)), pair=pair,
                           pair_currencies=pair_currencies, floor=AGENT_FLOOR)
 
     return [ToolDef(

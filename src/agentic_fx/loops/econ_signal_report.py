@@ -345,7 +345,7 @@ def reaction_status(conn: sqlite3.Connection, *,
 
     importance の束を先、name の束を後に、通貨・key・窓の順に並べる。"""
     bundles = []
-    for stat_row in econ_reaction_values.bundle_stats(conn):
+    for stat_row in econ_reactions.aggregate(econ_reaction_values.load_samples(conn)):
         row = {"currency": stat_row.currency, "kind": stat_row.kind,
                "key": stat_row.key, "window_min": stat_row.window_min}
         for field in _REACTION_COUNTS:
@@ -613,8 +613,14 @@ def _reaction_report_lines(reaction: dict | None) -> list[str]:
         return ["unavailable"]
     lines = []
     for row in reaction.get("bundles") or []:
+        key = row.get("key", "")
+        if not isinstance(key, str):
+            key = ""
+        key = "".join(ch if ch.isprintable() and ch not in "|*_[]`<>" else " "
+                      for ch in key)
+        key = " ".join(key.split())[:80]
         lines.append(
-            f"- {row['currency']} {row['kind']}={row['key']} {row['window_min']}m: "
+            f"- {row['currency']} {row['kind']}={key} {row['window_min']}m: "
             f"n={row['n']} unique_ts_n={row['unique_ts_n']} "
             f"unresolvable_n={row['unresolvable_n']} "
             f"range={_fmt(row['range_median'])}/{_fmt(row['range_p75'])} "

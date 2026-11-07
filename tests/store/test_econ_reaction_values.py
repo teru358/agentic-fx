@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from agentic_fx.analytics.econ_reactions import WindowValue
+from agentic_fx.analytics.econ_reactions import WindowValue, aggregate
 from agentic_fx.store import econ_reaction_values as rv
 from agentic_fx.store.db import connect, init_db
 
@@ -77,15 +77,15 @@ def test_pending_sets_lists_terminal_sets_without_values_or_without_a_canonical_
                        ("2026-11-10T13:00:00+00:00", "JPY", "Rate", 3)).lastrowid
     _, old_set = _more_set(conn, "JPY", "C", "USDJPY", superseded_by=new)
     got = rv.pending_sets(conn, pair_currencies=PAIRS, limit=10)
-    assert [r["id"] for r in got] == [set_id, lost]
+    assert [r["id"] for r in got] == [set_id, lost, old_set]
     assert all("missing_keys" not in r for r in got)
     assert [r["id"] for r in rv.pending_sets(conn, pair_currencies=PAIRS, limit=1)] == [set_id]
     assert [r["id"] for r in rv.pending_sets(conn, pair_currencies=PAIRS, limit=10,
-                                             after=set_id)] == [lost]
+                                             after=set_id)] == [lost, old_set]
     assert rv.pending_sets(conn, pair_currencies=PAIRS, limit=0) == []
     assert rv.write_set_tx(conn, set_id=set_id, values=_vals(), keys=[(event, "JPY")], now=NOW).committed
-    assert [r["id"] for r in rv.pending_sets(conn, pair_currencies=PAIRS, limit=10)] == [lost]
-    del awaiting, old_set
+    assert [r["id"] for r in rv.pending_sets(conn, pair_currencies=PAIRS, limit=10)] == [lost, old_set]
+    del awaiting
 
 
 def test_pending_sets_reports_a_missing_canonical_key_on_a_set_that_already_has_values(tmp_path):
@@ -101,6 +101,21 @@ def test_pending_sets_reports_a_missing_canonical_key_on_a_set_that_already_has_
     assert rv.write_set_tx(conn, set_id=usdjpy, values=(), keys=[(usd, "USD")], now=NOW).committed
     assert [r for r in rv.pending_sets(conn, pair_currencies=only_jpy, limit=10)
             if r["event_id"] == usd] == []
+
+
+def test_pending_sets_uses_one_query_when_many_sets_already_have_values(tmp_path):
+    conn, first_event, first_set = _db(tmp_path)
+    assert rv.write_set_tx(conn, set_id=first_set, values=_vals(),
+                           keys=[(first_event, "JPY")], now=NOW).committed
+    for i in range(40):
+        event, set_id = _more_set(conn, "JPY", f"Rate {i}", "USDJPY")
+        assert rv.write_set_tx(conn, set_id=set_id, values=_vals(),
+                               keys=[(event, "JPY")], now=NOW).committed
+    statements = []
+    conn.set_trace_callback(statements.append)
+    assert rv.pending_sets(conn, pair_currencies=PAIRS, limit=20) == []
+    conn.set_trace_callback(None)
+    assert len(statements) == 1
 
 
 def test_a_set_with_one_or_two_value_rows_is_a_conflict_and_is_left_alone(tmp_path):
@@ -134,17 +149,17 @@ def test_write_stamps_rule_version_and_times_and_never_rewrites_values_or_keys(t
         rv.write_set_tx(conn, set_id=other + 100, values=_vals()[:2], keys=[], now=NOW)
 
 
-def test_bundle_stats_skip_superseded_events_and_unkeyed_sets(tmp_path):
+def test_sample_loading_skips_superseded_events_and_unkeyed_sets(tmp_path):
     conn, event, set_id = _db(tmp_path)
     assert rv.write_set_tx(conn, set_id=set_id, values=_vals(), keys=[(event, "JPY")], now=NOW).committed
     new = conn.execute("INSERT INTO econ_events(ts,country,name,importance) VALUES(?,?,?,?)",
                        ("2026-11-10T13:00:00+00:00", "JPY", "Rate", 3)).lastrowid
     conn.commit()
-    n_before = sum(s.n for s in rv.bundle_stats(conn))
+    n_before = sum(s.n for s in aggregate(rv.load_samples(conn)))
     assert n_before == 6
     conn.execute("UPDATE econ_events SET superseded_by=? WHERE id=?", (new, event))
     conn.commit()
-    assert rv.bundle_stats(conn) == ()
+    assert aggregate(rv.load_samples(conn)) == ()
 
 
 def test_purge_after_values_keeps_values_keys_and_stats(tmp_path):
@@ -162,13 +177,13 @@ def test_purge_after_values_keeps_values_keys_and_stats(tmp_path):
     assert rv.write_set_tx(conn, set_id=set_id, values=_vals(), keys=[(event, "JPY")], now=NOW).committed
     values = conn.execute("SELECT * FROM econ_reaction_values ORDER BY 1,2").fetchall()
     keys = conn.execute("SELECT * FROM econ_reaction_keys").fetchall()
-    stats = rv.bundle_stats(conn)
+    stats = aggregate(rv.load_samples(conn))
     assert os_.purgeable_sets(conn, now=NOW, limit=10) == [set_id]
     assert os_.purge_step(conn, set_id=set_id, now=NOW).done
     assert conn.execute("SELECT COUNT(*) FROM ohlcv_slices").fetchone()[0] == 0
     assert conn.execute("SELECT * FROM econ_reaction_values ORDER BY 1,2").fetchall() == values
     assert conn.execute("SELECT * FROM econ_reaction_keys").fetchall() == keys
-    assert rv.bundle_stats(conn) == stats and sum(s.n for s in stats) == 6
+    assert aggregate(rv.load_samples(conn)) == stats and sum(s.n for s in stats) == 6
 
 
 def test_backlog_counts_count_sets_without_values_and_events_without_a_currency_key(tmp_path):
