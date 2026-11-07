@@ -3,13 +3,14 @@
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 未完了: 163 件。完了分は closed/。
 
-## 実装中 (4)
+## 実装中 (5)
 
-### 不具合 (1)
+### 不具合 (2)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [executor-pair-membership-guard](open/executor-pair-membership-guard.md) | 高 | 2026-10-25 | 発注経路に Order.pair ∈ settings.pairs の決定論的検査が無い |
+| [improve-admission-selftest-flake-needs-restart](open/improve-admission-selftest-flake-needs-restart.md) | 高 | 2026-11-01 | 改善 admission の自己試験が 1 回落ちると再起動まで改善が止まる |
 
 ### 機能 (3)
 
@@ -71,16 +72,15 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (141)
+## 設計待ち (140)
 
-### 不具合 (77)
+### 不具合 (76)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [gate-pytest-dev-writable-and-ldso-exec](open/gate-pytest-dev-writable-and-ldso-exec.md) | 高 | 2026-10-03 | gate の pytest は /dev 全体が書き込み可で ld.so 経由で任意の ELF を起動できる |
 | [ops-bot-exits-not-lock-holder](open/ops-bot-exits-not-lock-holder.md) | 高 | 2026-10-22 | afx-ops bot が稼働中に not_lock_holder で終了し systemd が再起動する |
 | [approval-base-identity-cas](open/approval-base-identity-cas.md) | 高 | 2026-10-27 | 承認時に候補の土台版を照合し、同名候補の上書き (lost update) を防ぐ |
-| [improve-admission-selftest-flake-needs-restart](open/improve-admission-selftest-flake-needs-restart.md) | 高 | 2026-11-01 | 改善 admission の自己試験が 1 回落ちると再起動まで改善が止まる |
 | [human-corridor-gate-rows-null-outcome](open/human-corridor-gate-rows-null-outcome.md) | 中 | 2026-09-12 | 人間回廊 (`submit_candidate` / `bless_candidate` → `_run_full_g… |
 | [backtest-worker-cpu-budget-shrinks-with-timeframe](open/backtest-worker-cpu-budget-shrinks-with-timeframe.md) | 中 | 2026-09-20 | strategy の backtest は plugin worker 1 プロセスを再生全体で使い回すので、`plu… |
 | [backtest-rpc-timeout-does-not-stop-parent-work](open/backtest-rpc-timeout-does-not-stop-parent-work.md) | 中 | 2026-09-21 | backtest の待ち時間超過後も親の処理と worker が走り続ける |

@@ -4,7 +4,7 @@ status: 設計待ち
 priority: 低
 opened: null
 closed: null
-related: [selftest-loop-no-cutoff, mission46-selftest-loop, llama-swap-contention]
+related: [selftest-loop-no-cutoff, mission46-selftest-loop, llama-swap-contention, improve-admission-selftest-flake-needs-restart]
 backfilled: true
 source_section: 未完了
 kind: 不具合
@@ -21,3 +21,4 @@ kind: 不具合
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-25: 種別: 不具合 — 種別を付与
+- 2026-11-07: 関連: [selftest-loop-no-cutoff, mission46-selftest-loop, llama-swap-contention, improve-admission-selftest-flake-needs-restart] — improve-admission-selftest-flake-needs-restart から申し送り: admission の canary / 自己試験 (verify_backend の echo 用の専用 stop Event、verify_backend.py:606-608) に service の停止が伝わらない。是正で自己試験が improve 要求のたびに走りうるので、停止の伝播はこちらで WorkerRunner の stop_event と合わせて設計する
