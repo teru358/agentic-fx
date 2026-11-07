@@ -1,6 +1,6 @@
 # 指標回避帯・シグナル採否契約・shadow 成績・反応統計 — 設計 C0
 
-**版:** v0.10.4 C0（2026-11-05、裁量 OPEN の帯内拒否の配線（executor の所有、reject_category と activity の写像、判定例外）。v0.10.3: DST 是正の反映、欠損の分類（閉場は除外、開場中の欠落はすべて障害欠損）、14 運用日の始点。J1〜J3 利用者承認済、利用者判断待ちなし）
+**版:** v0.10.5 C0（2026-11-07、束 2 着手前の前提確認: 反応値は DB を再走査する cycle 後処理で書く、unrecoverable も 3 窓 unresolvable、値の無い event set は purge しない、marker source は実装の `econ-normalizer`。v0.10.4: 裁量 OPEN の帯内拒否の配線（executor の所有、reject_category と activity の写像、判定例外）。v0.10.3: DST 是正の反映、欠損の分類（閉場は除外、開場中の欠落はすべて障害欠損）、14 運用日の始点。J1〜J3 利用者承認済、利用者判断待ちなし）
 **対象:** `econ-event-hold-window-deterministic` / `llm-vs-strategy-signal-authority` / `econ-event-actuals-and-reaction-stats`。実装は束 1 と束 2 に分けるが、本書を共通契約とする。
 
 ## 0. 目的と非目標
@@ -277,7 +277,7 @@ CHECK は全 nullable 列に `IS NULL` / `IS NOT NULL` を明示し、accept、L
 | `set_id` | `ohlcv_slice_sets` への FK。NOT NULL |
 | `bar_time` | UTC 1 分境界 |
 | `open` / `high` / `low` / `close` / `volume` | observed では NOT NULL。outage marker では NULL |
-| `source` | 代表 source（§3.5）。障害欠損の marker は pair の live 保存 source（`mt5` なら `mt5-live`） |
+| `source` | 代表 source（§3.5）。障害欠損の marker は `econ-normalizer`（実装 `econ_bars.py:11` に合わせた） |
 | `quality` | `observed` / `datafeed_outage_gap` |
 
 UNIQUE は `(set_id,bar_time)`。quality と OHLC の NULL 対応を CHECK する。行は開場 minute にだけ作り、既知閉場の minute には作らない。`datafeed_outage_gap` は §3.5-3 の障害欠損を表す値の名前で、同名の表を参照する意味は無い（T1a の DDL の値をそのまま使う、`db.py:285-306`）。T1a の DDL（`db.py:281-306`）と T1c の store（`ohlcv_slices.py:39-41,91-103`）にある `no_tick_flat` の値と、その 4 値同一・volume=0 の CHECK は、読み手も書き手も無い値になるので T4a が除く（§4）。econ-b1 は未配備で、本機の DB に `ohlcv_slices` は無い（`mode=ro` で確認）ので、既存行の移行は要らない。別版で flat を足すときに値と CHECK を戻す。
@@ -380,8 +380,8 @@ scheduler 専用の write 接続は無い。scheduler は executor・broker・tr
    - `net_abs_close_change_pips` = abs_close_change_pips − set の `spread_pips`（往復 1 回分の全幅）。負値もそのまま残す
    - 基準足か対象足に outage marker か source 不一致があれば、その窓は unresolvable
    - `[ts-1m,ts+H)` に既知閉場の minute が 1 つでもあれば、その窓は unresolvable（閉場をまたぐ窓は H 分の取引にならず、他の event と比べられない）。平日の NY 17:00 は閉場ではないので、日次境界をまたぐ窓は解決できる
-8. 3 窓は set が complete になった直後の worker cycle で `econ_reaction_values` に 1 回書き、以後変えない。集計は窓 × 束ごとに range / abs / net の median / p75 と、符号付き close_change の median を返す。
-9. 集計の一意キーは `(event_id,currency)`。通常 event は country の 1 通貨、`All` は settings pairs に含まれる全通貨へ 1 回ずつ展開する。各通貨の価格系列は、反応値を書く時点の settings pairs の並びでその通貨を含む最初の pair を canonical pair とし、`(event_id,currency)` → set の対応を、その canonical pair の set の反応値と同じ transaction で 1 回だけ保存する（先に完備した別 pair の set には結ばない）。後から pair の並びや集合が変わっても保存済みの対応は変えず、集計は保存済みの対応だけを使う。同じ event の別 pair set は保存しても同じ通貨束へ重複加算しない。束は `(currency,importance)` と `(currency,name)`。superseded row は除外し、同時刻の別名は別 event。人間面は `n` / `unique_ts_n` を併記する。
+8. 3 窓は worker の cycle ごとの後処理差込口で書く。差込口は worker の読取り・停止判定・`locked=True` の短い書込み（admission・core lock・予算・stop）を渡し、反応 pass は shadow 状態機械を import しない独立 module に置く。pass は毎 cycle DB から次を拾う（bounded、id 順）: (a) state が `complete` / `unrecoverable` で `econ_reaction_values` が 3 行揃っていない event set、(b) 3 行揃っているが、その set の pair が今の settings で canonical になる通貨の `(event_id,currency)` key がまだ無いもの。計算は lock の外、書込みは set ごとに 3 窓 + 該当 key を 1 transaction。`on_complete` callback は使わない（commit 後の 1 回きりの通知で、失敗は log だけ、配備済みの complete 52 件の backlog も拾えないため）。`unrecoverable` の set は 3 窓とも `unresolvable`（数値 NULL）を書く（§3.5-4）。complete でも窓ごとに基準足・対象足の marker と閉場を判定する（complete は全窓 resolved を意味しない）。窓内で代表 source の名前が変わることは不一致ではない（不一致は正規化の段で marker になっている）。complete で `spread_pips` が NULL の set（通常の writer では起きない、staging 開始時に assumed を補う `ohlcv_slices.py:509-515`）は 3 窓とも unresolvable にし、error log を出す。書いた値は以後変えない（key の後付けは値を変えない）。集計は窓 × 束ごとに range / abs / net の median / p75 と、符号付き close_change の median を返す。
+9. 集計の一意キーは `(event_id,currency)`。通常 event は country の 1 通貨、`All` は settings pairs に含まれる全通貨へ 1 回ずつ展開する。各通貨の価格系列は、反応値を書く時点の settings pairs の並びでその通貨を含む最初の pair を canonical pair とし、`(event_id,currency)` → set の対応を、その canonical pair の set の反応値と同じ transaction で 1 回だけ保存する（先に完備した別 pair の set には結ばない）。後から pair の並びや集合が変わっても保存済みの対応は変えず、集計は保存済みの対応だけを使う。未保存の key は書く時点の settings で canonical を選び直す（旧 canonical の set が cancelled のままでも、残った pair が値を持てば結ぶ。新 canonical が未終端なら待つ）。対象通貨が settings から消えた event は key を持たず、人間面に未集計の件数として出す。同じ event の別 pair set は保存しても同じ通貨束へ重複加算しない。束は `(currency,importance)` と `(currency,name)`。superseded row は除外し、同時刻の別名は別 event。人間面は `n` / `unique_ts_n` を併記する。
 10. trade agent の開示床は束 × 窓で n>=20。床未満は `status=insufficient` だけ、人間面は n と数値を出す。pair 入力には、その base / quote currency の束を返し、値は 9 の canonical pair から算出する。pair は `settings.pairs` の enum に限定し、watch symbols は受けない。cron trade mission にだけ見せ、ask / improve / 専用採否 mission へ登録しない。
 11. **保持と容量。** LLM 呼出枠（`plugin.signal_min_interval_min` / `plugin.signal_daily_max`。`system_filtered` は不算入）と、全 signal / shadow の保存容量を分離する。最小保持日数 D = 400 日（set の `created_at` 起点）。producer は承認・admit 済みの executable strategy の `(name, content_hash)` ごと、対象 pair ごと、bar ごとに最大 1 signal を既存 UNIQUE 制約で保存する。content hash の更新直後は新 cursor が鮮度窓を再評価するため、更新 1 回につき最大 `k × pair 数` 本だけこの上限を超え得るが、80% 警告の範囲で扱う。日次上限 `S_producer` は `Σa (|a.pairs ∩ settings.pairs| × ceil(1,440 / timeframe_minutes(a)))`。任意設定 `econ.signal_capacity_daily_max` は config 読込時には 1 以上の整数だけを検査し、省略時は `S_producer`、指定時はその値を S とする。起動時に上書き値が `S_producer` 未満なら起動を拒否する。実行中の strategy 承認・pair・timeframe の変更で下回ったら S=`S_producer` に切り上げ、status に `capacity_override_below_producer` を出す。S の比較と再計算は T1c / T2a-2 が持つ。
 
@@ -389,7 +389,7 @@ scheduler 専用の write 接続は無い。scheduler は executor・broker・tr
 
     byte 容量は `B = B0 + C × β`。B0 は production と同じ fresh DDL / index / WAL / synchronous 設定で、DDL commit 後に `wal_checkpoint(TRUNCATE)` し、slice 0 行の DB + WAL bytes を 3 回測った最大値。β は固定例 C の代表行数 `Ci = unique(ceil(C/1000), ceil(C/100), ceil(C/10))` ごとに `ceil((size(Ci) − B0) / Ci)` を求めた上側最大値で、`size(Ci)` は signal / event 比で Ci 行を 240 行以下の transaction に分け、最後の COMMIT 直後・明示 checkpoint 前に測る。各 run は fresh DB を作り、B0 測定後は production と同じ auto-checkpoint に任せる。この手順を各 Ci で 3 回行い、全点で `B0 + Ci × β ≥ size(Ci)` を満たす B0 / β だけをコードに置き、C 自体は `B0 + C × β` で外挿する。capacity job 全体は 4 時間以内、job が同時に占有する test 用 DB / WAL / 成果物は 4 GiB 以下とし、どちらかを超えたら fail とする。
 
-    D 未満の set は削除しない。D を過ぎた complete / unrecoverable の set だけ、set 単位で slice 行を 240 行ずつ消して `purged_at` を付ける。set 行、shadow の終端、reaction 値 snapshot は残す。status と親 report は S の導出値 / 上書き値、`capacity_override_below_producer`、現在行数/C、B0 / β、DB bytes、WAL bytes、同じ filesystem の空き bytes を常時出す。byte 比較の「slice 関連」は新 7 表 `signal_decisions` / `signal_shadow` / `ohlcv_slice_sets` / `ohlcv_slices` / `ohlcv_slice_generations` / `econ_reaction_keys` / `econ_reaction_values` とそれらの index に固定し、bench と実行時の双方が同じ集合を `dbstat(aggregate=1)` で測って B0 に空 DDL からの増分だけを足し、transcript など無関係な表の増分は含めない。行数またはこの slice 関連 bytes のどちらかが 80% / 100% に達したら警告する。取引は止めず、D 未満は消さない。
+    D 未満の set は削除しない。D を過ぎた complete / unrecoverable の set だけ、set 単位で slice 行を 240 行ずつ消して `purged_at` を付ける。event set は `econ_reaction_values` が 3 行揃うまで purge しない（候補の抽出と削除 transaction の両方で確かめる。key 待ちでは止めない）。値の無い event set の滞留件数は status に出す。set 行、shadow の終端、reaction 値 snapshot は残す。status と親 report は S の導出値 / 上書き値、`capacity_override_below_producer`、現在行数/C、B0 / β、DB bytes、WAL bytes、同じ filesystem の空き bytes を常時出す。byte 比較の「slice 関連」は新 7 表 `signal_decisions` / `signal_shadow` / `ohlcv_slice_sets` / `ohlcv_slices` / `ohlcv_slice_generations` / `econ_reaction_keys` / `econ_reaction_values` とそれらの index に固定し、bench と実行時の双方が同じ集合を `dbstat(aggregate=1)` で測って B0 に空 DDL からの増分だけを足し、transcript など無関係な表の増分は含めない。行数またはこの slice 関連 bytes のどちらかが 80% / 100% に達したら警告する。取引は止めず、D 未満は消さない。
 
 ### 3.6 agent 面と既存 reader
 
@@ -616,8 +616,8 @@ DST 是正（`2026-11-02-utc-time-rules-dst-design.md` §3.6）の引渡しの�
 
 | task | 内容 | 見積 | 担当 | 所有 | 引渡し（入力 → 出力） | 依存 |
 |---|---|---:|---|---|---|---|
-| 束2 T1 定義 fixture | 基準 close、3 窓、range、終値、spread、source、重複、欠損、束、床 | 300 | codex terra | reaction fixture | 式 → 固定期待値 | 束1 T4c |
-| 束2 T2 集計器 / snapshot | complete event set の 3 窓値、`(event_id,currency)`、2 束、median / p75、n / unique_ts_n | 500 | codex terra | reaction store / analytics と test | complete set + fixture → 値 snapshot / 集計値 | 束2 T1 |
+| 束2 T1 定義 fixture | 基準 close、3 窓、range、終値、spread、source、重複、欠損、束、床 | 300 | codex luna | reaction fixture | 式 → 固定期待値 | 束1 T4c |
+| 束2 T2 集計器 / snapshot | 終端 event set の 3 窓値を書く cycle 後処理 pass（§3.5-8 の (a)(b)、backlog を含む）、`(event_id,currency)`、2 束、median / p75、n / unique_ts_n、値の無い event set の purge 見送り | 600 | codex luna | reaction store / analytics と test、`econ_slice_worker.py` の後処理差込口、`ohlcv_slices.py` の purge 候補と削除 tx、`service.py` の配線 | complete set + fixture → 値 snapshot / 集計値 | 束2 T1 |
 | 束2 T3 trade tool | settings pair、床 projection、cron trade だけへ登録 | 300 | sonnet | market tool / registry、T2b-2 から受けた `trade_loop.py` の tool 一覧 | 集計値 → cron tool 応答。ask / improve / 専用採否には非登録 | 束2 T2 |
 | 束2 T4 人間面 / 再現 | report / status / web の reaction 節、canary、22/38・9/12 再現 | 400 | sonnet | T5 から受けた report / status / web ファイル | 集計値 → report / DTO | 束2 T3 |
 
@@ -689,3 +689,4 @@ J1〜J3 以外の境界、欠損、CAS、calendar fail-open、limit 非取消、
 | 2026-11-03 | v0.10.2 C0 | 取得の証跡（`datafeed_fetch_evidence`、T4a-0、§5-39）を v1 から除き、別版の要件（bridge の現在の接続確認と過去区間の完全性保証、そのときに証跡を記録し始める）を §6 の 1 項にまとめる。分類を「閉場は除外、開場中の欠落はすべて障害欠損」の 2 つにし、`no_tick_flat` の値・CHECK・store の検査を T4a が除く。T4a の依存を T2b-2、見積を 370 に。AC 40 / 41 を 39 / 40 に振り直す | 指揮者裁定（v1 の分類は証跡を読まず、証跡が意味を持つのは別版から） | — |
 | 2026-11-03 | v0.10.3 C0 | 閉鎖確認の指摘を反映。§6 の残余のうち no-tick の規則と無関係な項目（shadow と実注文の価格差、cron 優先、spread の限界、保持期限後の再計算不可、床と p75、既存 writer の待ちなど）を v0.9.3 の文で戻した。§4 の `test_econ_signal_schema.py` の配線に T4a を追記。§0.1 への参照を実測の新見出し §0.2 に直した | 閉鎖確認（r10）の新指摘 3 件 | — |
 | 2026-11-05 | v0.10.4 C0 | 裁量 OPEN の帯内拒否の配線を §3.1-4 に（判定は cron commit-core で OPEN だけ、executor の任意引数から `GateContext` の任意 field へ、帯で短絡しない、他理由と同時でも `econ_window`、activity は `open_rejected_econ_window` だけ、判定例外は `execution` で記録）。§4 に `core/executor.py` の行（所有 T2b-2）、trade prompt の行に「判断足ごと」と get_signals 文の ask 限定。AC 25 に混在・例外・None 経路・streak。T2b-2 の所有に executor | T2b-2 実装で配線表に executor が無く、category の写像が未定だった | — |
+| 2026-11-07 | v0.10.5 C0 | 束 2 着手前の前提確認を反映。§3.5-8 を DB 再走査の cycle 後処理（終端 event set の値未算出 + canonical key の後付け、on_complete は使わない）に、unrecoverable も 3 窓 unresolvable、complete でも窓ごとに判定、source 名の変化は不一致でない、spread NULL は 3 窓 unresolvable。§3.5-9 に未保存 key の canonical 再選択と未集計件数。§3.5-11 に値の無い event set の purge 見送り。§3.3 の marker source を実装の `econ-normalizer` に。§7 束 2 の T1 / T2 を codex luna、T2 の所有を worker の差込口・purge・service 配線まで広げ見積 600 | 本番 DB（mode=ro）で complete の event set 52 件・反応値 0 件、`on_complete` は service で未配線、purge は created_at 起点で値の有無を見ない（`ohlcv_slices.py:834-846`）。sol の前提確認（tmp/review-econ2） | — |

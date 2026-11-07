@@ -3,7 +3,7 @@
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 未完了: 163 件。完了分は closed/。
 
-## 実装中 (3)
+## 実装中 (4)
 
 ### 不具合 (1)
 
@@ -11,14 +11,15 @@
 |---|---|---|---|
 | [executor-pair-membership-guard](open/executor-pair-membership-guard.md) | 高 | 2026-10-25 | 発注経路に Order.pair ∈ settings.pairs の決定論的検査が無い |
 
-### 機能 (2)
+### 機能 (3)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [improve-mission-indicator-creation-path](open/improve-mission-indicator-creation-path.md) | 中 | 2026-10-25 | 改善 mission に indicator 新設の経路を開く (規律 7 と方針の衝突) |
+| [econ-event-actuals-and-reaction-stats](open/econ-event-actuals-and-reaction-stats.md) | 中 | 2026-10-30 | 指標の発表実績を取得し、種別ごとの価格反応を決定論的に集計する |
 | [multi-timeframe-indicator-deps](open/multi-timeframe-indicator-deps.md) | 低 | 2026-09-15 | 1 つの strategy が複数時間足の指標を同時に使えない |
 
-## 実装待ち (13)
+## 実装待ち (12)
 
 ### 不具合 (7)
 
@@ -32,11 +33,10 @@
 | [flaky-tool-schemas](open/flaky-tool-schemas.md) | 低 |  | 全ツールのスキーマテストがフル suite でだけ ERROR になる |
 | [improve-add-quotes](open/improve-add-quotes.md) | 低 |  | improve add がクォートを剥がさず表示が崩れる |
 
-### 機能 (2)
+### 機能 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
-| [econ-event-actuals-and-reaction-stats](open/econ-event-actuals-and-reaction-stats.md) | 中 | 2026-10-30 | 指標の発表実績を取得し、種別ごとの価格反応を決定論的に集計する |
 | [legacy-oc-tool-not-found](open/legacy-oc-tool-not-found.md) | 低 |  | 存在しない候補名を読むときの誘導が足りない |
 
 ### 保守 (4)
