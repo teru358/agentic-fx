@@ -1,6 +1,6 @@
 # 指標回避帯・シグナル採否契約・shadow 成績・反応統計 — 設計 C0
 
-**版:** v0.10.5 C0（2026-11-07、束 2 着手前の前提確認: 反応値は DB を再走査する cycle 後処理で書く、unrecoverable も 3 窓 unresolvable、値の無い event set は purge しない、marker source は実装の `econ-normalizer`。v0.10.4: 裁量 OPEN の帯内拒否の配線（executor の所有、reject_category と activity の写像、判定例外）。v0.10.3: DST 是正の反映、欠損の分類（閉場は除外、開場中の欠落はすべて障害欠損）、14 運用日の始点。J1〜J3 利用者承認済、利用者判断待ちなし）
+**版:** v0.10.6 C0（2026-11-07、reasoning 経由の反応統計の流入を出所で遮断（§3.6 の reflection 行、利用者承認）、hold の activity を §6 の残余に。v0.10.5: 束 2 着手前の前提確認: 反応値は DB を再走査する cycle 後処理で書く、unrecoverable も 3 窓 unresolvable、値の無い event set は purge しない、marker source は実装の `econ-normalizer`。v0.10.4: 裁量 OPEN の帯内拒否の配線（executor の所有、reject_category と activity の写像、判定例外）。v0.10.3: DST 是正の反映、欠損の分類（閉場は除外、開場中の欠落はすべて障害欠損）、14 運用日の始点。J1〜J3 利用者承認済、利用者判断待ちなし）
 **対象:** `econ-event-hold-window-deterministic` / `llm-vs-strategy-signal-authority` / `econ-event-actuals-and-reaction-stats`。実装は束 1 と束 2 に分けるが、本書を共通契約とする。
 
 ## 0. 目的と非目標
@@ -400,7 +400,7 @@ scheduler 専用の write 接続は無い。scheduler は executor・broker・tr
 | 専用採否 mission tool | ニュース検索と建玉一覧の 2 つだけ | signal 一覧（正本値は prompt に注入）、価格・指標（方向不一致は reject 理由にならない）、calendar（帯判定は決定論）、reaction |
 | ask | 現行と同じ集合（signal 一覧を含む）を ask 専用の一覧として分離する。ask は人間が起動する | reaction tool |
 | signal prompt | signal 正本値、二値採否、2 reject code | shadow 過去成績、変更可能な数値 field |
-| reflection / RAG / improve agent | 従来の実注文・改善入力 | decision / shadow / reaction / 親 report |
+| reflection / RAG / improve agent | 従来の実注文・改善入力。reflection の entry_reasoning は、intent の payload の `reasoning_source` が `strategy`（signal 由来）か `llm`（`get_econ_reactions` を呼んでいない非 signal mission）のときだけ渡す。`llm_with_reactions`・キー無し・呼出し回数が取れない mission は固定文で省き、価格・損益・決済理由など構造化した列は残す（LLM が reasoning に引用した反応統計の数値が reflection / RAG に入るのを出所で遮断する。数値の文字列除去は言い換えで破れるので採らない） | decision / shadow / reaction / 親 report |
 | activity | 固定語と参照 ID | shadow pnl・勝率・分位 |
 | 人間面 | decision 母数、accept / reject shadow、abandoned、reaction 全束、slice 容量 | agent prompt への再注入 |
 
@@ -551,6 +551,7 @@ DB migration は `db.py` の既存流儀に従う。新 7 表 / index は fresh 
 
 ## 6. 残余
 
+- hold の intent の reasoning の先頭 120 文字は、既存の振る舞いとして activity（`executor.py:474`）に入る。§3.6 の「activity は固定語と参照 ID」と食い違うが、reader は人間面だけで agent には届かない。反応統計を引用した文がここに残り得る。是正は別チケット。
 - actual は供給元に無く 1027 件すべて NULL。本束では取得・surprise 計算をしない。
 - backtest 側に回避帯を入れない。数値補完は replay 経路と live producer で同じ規則にする。
 - hold 944 はチケット / メモリの途中値。固定再現値は §1 / §5 の半開区間に対する hold 970 / open 3 / signal-linked 57。
@@ -690,3 +691,4 @@ J1〜J3 以外の境界、欠損、CAS、calendar fail-open、limit 非取消、
 | 2026-11-03 | v0.10.3 C0 | 閉鎖確認の指摘を反映。§6 の残余のうち no-tick の規則と無関係な項目（shadow と実注文の価格差、cron 優先、spread の限界、保持期限後の再計算不可、床と p75、既存 writer の待ちなど）を v0.9.3 の文で戻した。§4 の `test_econ_signal_schema.py` の配線に T4a を追記。§0.1 への参照を実測の新見出し §0.2 に直した | 閉鎖確認（r10）の新指摘 3 件 | — |
 | 2026-11-05 | v0.10.4 C0 | 裁量 OPEN の帯内拒否の配線を §3.1-4 に（判定は cron commit-core で OPEN だけ、executor の任意引数から `GateContext` の任意 field へ、帯で短絡しない、他理由と同時でも `econ_window`、activity は `open_rejected_econ_window` だけ、判定例外は `execution` で記録）。§4 に `core/executor.py` の行（所有 T2b-2）、trade prompt の行に「判断足ごと」と get_signals 文の ask 限定。AC 25 に混在・例外・None 経路・streak。T2b-2 の所有に executor | T2b-2 実装で配線表に executor が無く、category の写像が未定だった | — |
 | 2026-11-07 | v0.10.5 C0 | 束 2 着手前の前提確認を反映。§3.5-8 を DB 再走査の cycle 後処理（終端 event set の値未算出 + canonical key の後付け、on_complete は使わない）に、unrecoverable も 3 窓 unresolvable、complete でも窓ごとに判定、source 名の変化は不一致でない、spread NULL は 3 窓 unresolvable。§3.5-9 に未保存 key の canonical 再選択と未集計件数。§3.5-11 に値の無い event set の purge 見送り。§3.3 の marker source を実装の `econ-normalizer` に。§7 束 2 の T1 / T2 を codex luna、T2 の所有を worker の差込口・purge・service 配線まで広げ見積 600 | 本番 DB（mode=ro）で complete の event set 52 件・反応値 0 件、`on_complete` は service で未配線、purge は created_at 起点で値の有無を見ない（`ohlcv_slices.py:834-846`）。sol の前提確認（tmp/review-econ2） | — |
+| 2026-11-07 | v0.10.6 C0 | §3.6 の reflection 行に、entry_reasoning は `reasoning_source` が strategy / llm のときだけ渡す規則（`get_econ_reactions` を呼んだ非 signal mission・キー無し・回数不明は省く）。§6 に hold の reasoning が activity に入る既存の食い違いを残余として | sol r1 Important（cron trade が reasoning に引用した反応統計が reflection / RAG に残る）、sol と Fable の検討、利用者承認（A 案） | — |

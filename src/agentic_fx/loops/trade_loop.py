@@ -64,13 +64,14 @@ import logging
 
 _log = logging.getLogger("agentic_fx.trade_loop")
 
-_CRON_TOOLS = ["get_ohlcv", "get_indicators", "search_news",
+_BASE_TOOLS = ["get_ohlcv", "get_indicators", "search_news",
                "get_econ_calendar", "get_positions", "get_account",
                "get_recent_reflections", "search_reflections"]
-_ASK_TOOLS = [*_CRON_TOOLS, "get_signals"]
+_CRON_TOOLS = [*_BASE_TOOLS, "get_econ_reactions"]
+_ASK_TOOLS = [*_BASE_TOOLS, "get_signals"]
 # Full registry-facing set retained for service validation; missions use the
 # explicit cron, ask, or signal list above.
-_TRADE_TOOLS = _ASK_TOOLS
+_TRADE_TOOLS = [*_BASE_TOOLS, "get_signals", "get_econ_reactions"]
 
 
 def signal_source_active(conn, plugins_root: Path, plugin: str, content_hash: str,
@@ -322,7 +323,8 @@ class TradeLoop:
                     # intent は執行前に必ず記録し、以降の拒否理由を iid に
                     # 結び付ける。record_and_validate_intent 自体は発注しない。
                     iid, early = self.executor.record_and_validate_intent(
-                        intent, mid)
+                        intent, mid,
+                        reasoning_source=self._reasoning_source(result))
                     if isinstance(snapshot_error,
                                     (NotTradableSymbol, ExposureNotTradableSymbol)):
                         reason = (EXPOSURE_NOT_TRADABLE_REASON
@@ -549,7 +551,8 @@ class TradeLoop:
             else:
                 quote = self._quote_for_spread(intent.pair)
             spread = self._shadow_spread(intent.pair, spec.pip_size, quote)
-            payload_for_commit = intent_payload(intent)
+            payload_for_commit = intent_payload(
+                intent, reasoning_source="strategy")
             with contextlib.ExitStack() as locks:
                 resolved = self._resolved_by_identity.get(
                     (claimed["plugin"], claimed["content_hash"]))
@@ -1015,6 +1018,17 @@ class TradeLoop:
             state["warned"] = True
         except Exception:  # noqa: BLE001 — 観測障害で mission を失敗させない
             _log.exception("market tool call observation failed")
+
+    @staticmethod
+    def _reasoning_source(result: MissionResult) -> str:
+        """signal 以外の mission の reasoning の出所。`get_econ_reactions` を
+        1 回でも呼んだ、または回数が取れないときは llm_with_reactions。"""
+        calls = result.market_tool_calls
+        count = calls.get("get_econ_reactions") if isinstance(calls, dict) else None
+        if (isinstance(count, int) and not isinstance(count, bool)
+                and count == 0):
+            return "llm"
+        return "llm_with_reactions"
 
     @staticmethod
     def _market_tool_calls_suffix(result: MissionResult) -> str:

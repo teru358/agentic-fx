@@ -2058,6 +2058,16 @@ def _completed_world(world):
     return event_set, shadow
 
 
+def _give_values(db, *set_ids):
+    """purge の条件を満たすよう、event set に 3 窓の反応値を置く。"""
+    for set_id in set_ids:
+        db.executemany(
+            "INSERT INTO econ_reaction_values (set_id,window_min,status,"
+            "rule_version,computed_at) VALUES (?,?,'unresolvable',1,?)",
+            [(set_id, w, LATE.isoformat()) for w in (15, 60, 240)])
+    db.commit()
+
+
 def _retention_end(db, set_id):
     created = _at(os_.get_set(db, set_id)["created_at"])
     return created + timedelta(days=os_.RETENTION_DAYS)
@@ -2079,11 +2089,11 @@ def test_a_cycle_deletes_only_the_rows_of_a_set_past_the_retention_days(world):
     event_set, shadow = _completed_world(world)
     sets_before = {s["id"]: s for s in _sets(world.db)}
     shadow_before = ss.get(world.db, shadow)
-    world.db.execute(
+    world.db.executemany(
         "INSERT INTO econ_reaction_values (set_id,window_min,status,range_pips,"
         "close_change_pips,abs_close_change_pips,net_abs_close_change_pips,"
-        "rule_version,computed_at) VALUES (?,15,'resolved',1,1,1,0,1,?)",
-        (event_set, LATE.isoformat()))
+        "rule_version,computed_at) VALUES (?,?,'resolved',1,1,1,0,1,?)",
+        [(event_set, w, LATE.isoformat()) for w in (15, 60, 240)])
     world.db.execute(
         "INSERT INTO econ_reaction_keys (event_id,currency,set_id,decided_at) "
         "SELECT event_id,'USD',id,? FROM ohlcv_slice_sets WHERE id=?",
@@ -2116,6 +2126,7 @@ def test_a_cycle_deletes_only_the_rows_of_a_set_past_the_retention_days(world):
 
 def test_purge_does_not_take_the_core_lock(world):
     event_set, shadow = _completed_world(world)
+    _give_values(world.db, event_set)
     lock = threading.RLock()
     held, release = threading.Event(), threading.Event()
 
@@ -2178,6 +2189,7 @@ def test_the_purge_slot_runs_even_when_the_spread_stage_used_the_whole_budget(wo
     old = _event_set(world.db, EVENT_TS, name="OLD")
     _worker(world, _Clock(LATE)).run_cycle()
     assert os_.get_set(world.db, old)["state"] == "complete"
+    _give_values(world.db, old)
     clock = _Clock(_retention_end(world.db, old) + timedelta(seconds=1))
     w = _worker(world, clock)
     real = w._record_spreads
@@ -2196,6 +2208,7 @@ def test_the_purge_slot_does_not_wait_on_busy(world):
     _seed(world.db)
     old = _event_set(world.db, EVENT_TS, name="OLD")
     _worker(world, _Clock(LATE)).run_cycle()
+    _give_values(world.db, old)
     clock = _Clock(_retention_end(world.db, old) + timedelta(seconds=1))
     sleeps = []
     w = _worker(world, clock, sleep=sleeps.append)
@@ -2220,6 +2233,7 @@ def _two_expired_sets(world):
     second = _event_set(world.db, EVENT_TS + timedelta(minutes=1), name="B")
     _worker(world, _Clock(LATE)).run_cycle()
     assert {os_.get_set(world.db, i)["state"] for i in (first, second)} == {"complete"}
+    _give_values(world.db, first, second)
     return first, second
 
 
@@ -2228,6 +2242,7 @@ def test_purge_advances_every_cycle_even_when_owners_use_the_whole_budget(world)
     old = _event_set(world.db, EVENT_TS, name="OLD")
     _worker(world, _Clock(LATE)).run_cycle()
     assert os_.get_set(world.db, old)["state"] == "complete"
+    _give_values(world.db, old)
     for i in range(4):
         _event_set(world.db, EVENT_TS + timedelta(minutes=i + 1), name=f"E{i}")
     clock = _Clock(_retention_end(world.db, old) + timedelta(seconds=1))
@@ -2264,6 +2279,94 @@ def test_a_set_that_keeps_going_over_budget_does_not_hold_back_later_sets(world,
     calls.clear()
     w.run_cycle()
     assert calls and calls[0] == (first, 240)
+
+
+# --- cycle 後処理の差込口 ------------------------------------------------------------
+
+def test_after_cycle_runs_once_per_cycle_with_the_cycle_time(world):
+    seen = []
+    clock = _Clock(LATE)
+    w = _worker(world, clock, after_cycle=seen.append)
+    w.run_cycle()
+    clock.now = LATE + timedelta(minutes=1)
+    w.run_cycle()
+    assert [c.now for c in seen] == [LATE, LATE + timedelta(minutes=1)]
+    assert all(isinstance(c, worker_mod.CycleContext) for c in seen)
+
+
+def test_a_failing_after_cycle_is_logged_and_the_cycle_still_purges(world, caplog):
+    event_set, shadow = _completed_world(world)
+    _give_values(world.db, event_set)
+
+    def boom(context):
+        raise RuntimeError("after cycle failed")
+
+    clock = _Clock(_retention_end(world.db, event_set) + timedelta(seconds=1))
+    w = _worker(world, clock, after_cycle=boom)
+    with caplog.at_level("ERROR"):
+        report = w.run_cycle()
+    assert report.purged == 255
+    assert any("after cycle failed" in (r.exc_text or "") for r in caplog.records)
+    assert w.run_cycle() is not None
+
+
+def test_after_cycle_writes_take_the_core_lock_and_follow_the_stop_request(world):
+    lock = threading.RLock()
+    stop = threading.Event()
+    got = {}
+
+    def after(context):
+        got["stopped_before"] = context.stopped()
+        got["free"] = context.write(lambda conn, begin, checkpoint: "wrote")
+        held, release = threading.Event(), threading.Event()
+
+        def hold():
+            with lock:
+                held.set()
+                release.wait(timeout=30)
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        try:
+            assert held.wait(timeout=10)
+            got["locked"] = context.write(lambda conn, begin, checkpoint: "wrote")
+        finally:
+            release.set()
+            thread.join()
+        stop.set()
+        got["stopped_after"] = context.stopped()
+
+    w = _worker(world, _Clock(LATE), lock=lock, after_cycle=after)
+    w.run_cycle(stop)
+    assert got == {"stopped_before": False, "free": "wrote", "locked": None,
+                   "stopped_after": True}
+
+
+def test_the_reaction_pass_through_the_worker_writes_values_and_key_once(world):
+    from agentic_fx.analytics.econ_reaction_pass import run_pass
+    _seed(world.db)
+    event_set = _event_set(world.db, EVENT_TS, name="CPI")
+    pairs = {"USDJPY": ("USD", "JPY")}
+    clock = _Clock(LATE)
+
+    def after(context):
+        run_pass(read=context.read, write=context.write, stopped=context.stopped,
+                 pair_currencies=pairs, pip_size_fn=lambda pair: 0.01, now=context.now)
+
+    w = _worker(world, clock, after_cycle=after)
+    w.run_cycle()
+    assert os_.get_set(world.db, event_set)["state"] == "complete"
+    values = world.db.execute(
+        "SELECT window_min,status,computed_at FROM econ_reaction_values "
+        "WHERE set_id=? ORDER BY 1", (event_set,)).fetchall()
+    assert [(r[0], r[1]) for r in values] == [(15, "resolved"), (60, "resolved"), (240, "resolved")]
+    keys = world.db.execute("SELECT currency,set_id FROM econ_reaction_keys").fetchall()
+    assert [tuple(r) for r in keys] == [("USD", event_set)]
+    clock.now = LATE + timedelta(hours=1)
+    w.run_cycle()
+    assert world.db.execute(
+        "SELECT window_min,status,computed_at FROM econ_reaction_values "
+        "WHERE set_id=? ORDER BY 1", (event_set,)).fetchall() == values
 
 
 # --- 実ディスクの bench (writer 優先と容量) ------------------------------------------

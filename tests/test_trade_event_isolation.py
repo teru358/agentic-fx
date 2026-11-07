@@ -24,7 +24,8 @@ SETTINGS = load_settings(ROOT / "config" / "settings.yaml.example")
 
 TRADE_TOOLS = frozenset({
     "get_ohlcv", "get_indicators", "search_news", "get_econ_calendar", "get_positions",
-    "get_account", "get_recent_reflections", "search_reflections", "get_signals"})
+    "get_account", "get_recent_reflections", "search_reflections", "get_signals",
+    "get_econ_reactions"})
 IMPROVE_TOOLS = frozenset({
     "web_search", "fetch_article", "list_staging", "read_staging_file", "write_staging_file",
     "read_plugin_source", "list_examples", "read_example_plugin", "run_plugin_tests",

@@ -38,6 +38,8 @@ from agentic_fx.core import transitions
 from agentic_fx.core.contracts import Clock, Mode, SystemClock
 from agentic_fx.core.econ_slice_worker import CapacityMeasurer, EconSliceWorker
 from agentic_fx.core.econ_window import WindowSettings, currencies_by_pair
+from agentic_fx.analytics.econ_reaction_pass import ReactionCursor
+from agentic_fx.analytics.econ_reaction_pass import run_pass as run_econ_reaction_pass
 from agentic_fx.core.executor import Executor
 from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.notifier import Notifier
@@ -1458,6 +1460,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         # 注入された spec_fn ではなく定義表そのものを引く
         pair_currencies = currencies_by_pair(
             settings.pairs, lambda pair: PriceProvider.spec(provider, pair))
+        pip_size_fn = lambda pair: PriceProvider.spec(provider, pair).pip_size
         econ_window_settings = WindowSettings.from_config(settings.econ.window)
         econ = EconCalendar(
             conn_core, activity, clock,
@@ -1921,7 +1924,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         capacity_reader = econ_signal_report.CapacityReader(
             capacity_monitor.plan, root / "data" / "agentic.db", clock=clock.now)
         econ_status_cache = econ_signal_report.EconStatusCache(
-            lambda: _compute_econ_signal(root, clock, capacity_reader, econ_health))
+            lambda: _compute_econ_signal(root, clock, capacity_reader, econ_health,
+                                         pair_currencies))
         ops_service = _build_ops_service(
             root, settings, clock, conn_ops=conn_ops, state=state, activity=activity,
             health_latch=health_latch, supervisor=supervisor,
@@ -1936,20 +1940,26 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             anchor=root,
             open_conn=lambda: connect_readonly(root / "data" / "agentic.db"),
             capacity=capacity_reader, worker=econ_health,
-            admission_status=admission.status))
+            admission_status=admission.status, pair_currencies=pair_currencies))
         # 取りこぼした改善通知の event を、listener を開く前・supervisor の開始前に出す。
         ops_service.emit_pending_improve_notices(
             enabled=settings.notify.improve_events)
         commands.use_ops_service(ops_service)
         commands.use_econ_status_source(econ_status_cache.get)
         ops_recovered = _recover_ops(ops_service, conn_ops, activity)
+        reaction_cursor = ReactionCursor()
         econ_worker = EconSliceWorker(
             read_conn=conn_econ_read, write_conn=conn_econ_write,
             core_lock=core_lock, admission=writer_admission,
             quote_fn=lambda pair: executor.quote_fn(pair),
-            pip_size_fn=lambda pair: executor.spec_fn(pair).pip_size,
+            pip_size_fn=pip_size_fn,
             assumed_spread_pips_fn=lambda pair: _assumed_spread_pips(settings, pair),
-            now_fn=clock.now)
+            now_fn=clock.now,
+            after_cycle=lambda context: run_econ_reaction_pass(
+                read=context.read, write=context.write, stopped=context.stopped,
+                pair_currencies=pair_currencies,
+                pip_size_fn=pip_size_fn,
+                now=context.now, cursor=reaction_cursor))
         econ_measurer = CapacityMeasurer(
             open_conn=lambda: connect_readonly(root / "data" / "agentic.db"),
             measure_fn=econ_signal_report.slice_related_bytes, now_fn=clock.now)
@@ -2106,12 +2116,14 @@ def _reference_status_rows(conn, ingest, now: datetime, settings) -> list[dict] 
         return None
 
 
-def _compute_econ_signal(root: Path, clock, capacity_reader, econ_health) -> dict:
+def _compute_econ_signal(root: Path, clock, capacity_reader, econ_health,
+                         pair_currencies=None) -> dict:
     """status 用の econ 集計。専用の短命な読取接続で、他の lock を持たずに計算する。"""
     conn = connect_readonly(root / "data" / "agentic.db")
     try:
         return econ_signal_report.econ_signal_status(
-            conn, now=clock.now(), capacity=capacity_reader, worker=econ_health)
+            conn, now=clock.now(), capacity=capacity_reader, worker=econ_health,
+            pair_currencies=pair_currencies)
     finally:
         conn.close()
 

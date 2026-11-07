@@ -22,7 +22,7 @@ from agentic_fx.datafeed.econ_calendar import EconCalendar
 from agentic_fx.datafeed.price_provider import PriceProvider
 from agentic_fx.store.rag import Rag
 from agentic_fx.tools import (
-    account_tools, market_tools, news_tools, reflection_tools,
+    account_tools, econ_reaction_tools, market_tools, news_tools, reflection_tools,
     signal_tools, improve_rpc_tools, improve_staging_tools, research_tools,
 )
 from agentic_fx.tools.registry import ToolRegistry
@@ -129,13 +129,14 @@ def build_mission_registry(
     if provider is None:
         provider = PriceProvider(conn, settings, clock, readonly=readonly,
                                  activity=activity)
+    # 注入された provider の spec ではなく定義表そのものを引く
+    pair_currencies = currencies_by_pair(
+        settings.pairs, lambda pair: PriceProvider.spec(provider, pair))
     econ = EconCalendar(
         conn, activity, clock,
         timeout_sec=settings.worker.data_hook_timeout_sec,
         window=WindowSettings.from_config(settings.econ.window),
-        # 注入された provider の spec ではなく定義表そのものを引く
-        pair_currencies=currencies_by_pair(
-            settings.pairs, lambda pair: PriceProvider.spec(provider, pair)))
+        pair_currencies=pair_currencies)
     broker = PaperBroker(conn, settings, clock)
 
     registry = ToolRegistry(on_result=on_tool_result)
@@ -146,4 +147,5 @@ def build_mission_registry(
     registry.register_all(account_tools.build(conn, broker))
     registry.register_all(reflection_tools.build(conn, rag, settings.pairs))
     registry.register_all(signal_tools.build(conn, settings, clock))
+    registry.register_all(econ_reaction_tools.build(conn, settings, pair_currencies))
     return registry

@@ -279,7 +279,8 @@ def test_intent_reasoning_in_prompt(tmp_path):
 
     # Create trade_intent with reasoning
     import json
-    intent_payload = {"reasoning": "市場が弱気だから売り"}
+    intent_payload = {"reasoning": "市場が弱気だから売り",
+                      "reasoning_source": "llm"}
     mid = conn.execute(
         "INSERT INTO missions (loop, runner, model, status, started_at) "
         "VALUES ('trade', 'fake', 'fake', 'completed', ?) RETURNING id",

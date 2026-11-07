@@ -156,7 +156,8 @@ def _page(title: str, body: str, tz: str | None = None) -> bytes:
 def render_status(data: Mapping[str, object]) -> bytes:
     tz = zone_of(data)
     body = _pairs(data, STATUS_FIELDS, nested_allowed=NESTED_FIELDS, emphasis=_EMPHASIS, tz=tz)
-    return _page("Status", body + _calendar_section(data) + _econ_section(data, tz), tz)
+    return _page("Status", body + _calendar_section(data) + _econ_section(data, tz)
+                 + _reaction_section(data), tz)
 
 
 # daemon 側 (agentic_fx.loops.econ_signal_report) の定義の写し。test が突き合わせる。
@@ -275,6 +276,72 @@ def _econ_section(data: Mapping[str, object], tz: str = "UTC") -> str:
     else:
         pairs.append(("slice capacity", "unavailable"))
     return "<section><h2>Economic signal</h2>" + _rows(pairs) + "</section>"
+
+
+# 反応統計の表。窓は daemon の定義 (分) の写し、床の既定も同じ。
+_REACTION_WINDOWS = ((15, "15m"), (60, "1h"), (240, "4h"))
+_REACTION_KINDS = (("importance", "importance 別"), ("name", "name 別"))
+_REACTION_FLOOR = 20
+# page 全体の上限 (MAX_RESPONSE_BYTES) に収めるため、表ごとの行数に上限を置く
+_REACTION_TABLE_ROWS = {"importance": 24, "name": 24}
+_REACTION_HEAD = ("通貨", "{kind}", "n", "unique_ts_n", "未算定",
+                  "range 中央値 / p75", "abs 中央値 / p75", "net 中央値 / p75",
+                  "close_change 中央値", "印")
+
+
+def _pair_cell(median: object, p75: object) -> str:
+    return f"{_num(median)} / {_num(p75)}"
+
+
+def _reaction_cells(row: dict, floor: int) -> list[str]:
+    n = row.get("n")
+    mark = f"n<{floor}" if type(n) is not int or n < floor else ""
+    return [_text(row.get("currency")), _text(row.get("key")), _count_text(n),
+            _count_text(row.get("unique_ts_n")), _count_text(row.get("unresolvable_n")),
+            _pair_cell(row.get("range_median"), row.get("range_p75")),
+            _pair_cell(row.get("abs_median"), row.get("abs_p75")),
+            _pair_cell(row.get("net_median"), row.get("net_p75")),
+            _num(row.get("close_change_median")), html.escape(mark, quote=True)]
+
+
+def _reaction_table(rows: list[dict], kind: str, floor: int) -> tuple[str, int]:
+    limit = _REACTION_TABLE_ROWS[kind]
+    head = "".join(f"<th>{item.format(kind=kind)}</th>" for item in _REACTION_HEAD)
+    body = "".join("<tr>" + "".join(f"<td>{cell}</td>" for cell in _reaction_cells(row, floor))
+                   + "</tr>" for row in rows[:limit])
+    return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>", max(0, len(rows) - limit)
+
+
+def _reaction_section(data: Mapping[str, object]) -> str:
+    econ = data.get("econ_signal")
+    if type(econ) is not dict or "reaction" not in econ:
+        return ""
+    reaction = econ["reaction"]
+    title = "<h2>Economic reactions</h2>"
+    if type(reaction) is not dict or type(reaction.get("bundles")) is not list:
+        return "<section>" + title + _rows([("reaction", "unavailable")]) + "</section>"
+    floor = reaction.get("floor") if type(reaction.get("floor")) is int else _REACTION_FLOOR
+    bundles = [row for row in reaction["bundles"] if type(row) is dict]
+    parts = [title, f"<p>数値は pips (窓は指標時刻から)。n&lt;{floor} の行は参考値。"
+                    "中央値 / p75 の順。</p>"]
+    omitted = (reaction.get("bundles_omitted") if type(reaction.get("bundles_omitted")) is int
+               else 0)
+    for kind, label in _REACTION_KINDS:
+        parts.append(f"<h3>{label}</h3>")
+        for window, window_label in _REACTION_WINDOWS:
+            rows = [row for row in bundles
+                    if row.get("kind") == kind and row.get("window_min") == window]
+            table, cut = _reaction_table(rows, kind, floor)
+            omitted += cut
+            parts.append(f"<h4>{window_label}</h4>" + table)
+    pairs: list[tuple[str, str]] = []
+    if omitted > 0:
+        pairs.append(("reaction 省略", f"{omitted} 行"))
+    backlog = _dict(reaction.get("backlog"))
+    pairs.append(("reaction sets_without_values", _count_text(backlog.get("sets_without_values"))))
+    pairs.append(("reaction events_without_currency_key",
+                  _count_text(backlog.get("events_without_currency_key"))))
+    return "<section>" + "".join(parts) + _rows(pairs) + "</section>"
 
 
 def _detail_link(item: dict) -> str:
