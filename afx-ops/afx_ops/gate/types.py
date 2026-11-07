@@ -40,11 +40,14 @@ class Interaction:
     display_generation: int | None
 
 
+Tone = Literal["neutral", "positive", "destructive"]
+
+
 @dataclass(frozen=True, slots=True)
 class ViewComponent:
     custom_id: str
     label: str
-    destructive: bool = False
+    tone: Tone = "neutral"
 
 
 @dataclass(frozen=True, slots=True)
