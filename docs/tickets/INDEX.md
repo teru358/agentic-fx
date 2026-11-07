@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 165 件。完了分は closed/。
+未完了: 163 件。完了分は closed/。
 
 ## 実装中 (4)
 
@@ -19,7 +19,7 @@
 | [display-timestamps-in-local-timezone](open/display-timestamps-in-local-timezone.md) | 中 | 2026-11-02 | 人が読む面の時刻を現地 tz で表示し、bridge.log も UTC に揃える |
 | [multi-timeframe-indicator-deps](open/multi-timeframe-indicator-deps.md) | 低 | 2026-09-15 | 1 つの strategy が複数時間足の指標を同時に使えない |
 
-## 実装待ち (15)
+## 実装待ち (13)
 
 ### 不具合 (7)
 
@@ -33,13 +33,11 @@
 | [flaky-tool-schemas](open/flaky-tool-schemas.md) | 低 |  | 全ツールのスキーマテストがフル suite でだけ ERROR になる |
 | [improve-add-quotes](open/improve-add-quotes.md) | 低 |  | improve add がクォートを剥がさず表示が崩れる |
 
-### 機能 (4)
+### 機能 (2)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [econ-event-actuals-and-reaction-stats](open/econ-event-actuals-and-reaction-stats.md) | 中 | 2026-10-30 | 指標の発表実績を取得し、種別ごとの価格反応を決定論的に集計する |
-| [econ-event-hold-window-deterministic](open/econ-event-hold-window-deterministic.md) | 中 | 2026-10-30 | 指標前の様子見を tool 側で重要イベントと回避帯に絞る |
-| [llm-vs-strategy-signal-authority](open/llm-vs-strategy-signal-authority.md) | 中 | 2026-10-30 | LLM と戦略シグナルの役割分担 (シグナルの最終審査員にするか) |
 | [legacy-oc-tool-not-found](open/legacy-oc-tool-not-found.md) | 低 |  | 存在しない候補名を読むときの誘導が足りない |
 
 ### 保守 (4)
