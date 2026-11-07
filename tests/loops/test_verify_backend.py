@@ -13,6 +13,7 @@ import hashlib
 import logging
 import os
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1348,6 +1349,30 @@ def test_call0_transcript_is_classified_by_watch_structure():
     assert classified(missing) is False
     assert VerifyBackendResult(False, "codex", None, None, "opaque", gate="incomplete",
                                status="completed", watch=valid).tool_not_called is False
+
+
+def test_echo_watch_tool_not_called_waits_for_state_lock():
+    from agentic_fx.loops.verify_backend import _EchoWatch
+
+    stop = threading.Event()
+    watch = _EchoWatch("nonce", stop, "codex")
+    watch.seen = True
+    watch.initialized = True
+    watch.listed = ["list_staging"]
+    result = VerifyBackendResult(False, "codex", None, None, "opaque", gate="incomplete",
+                                 status="completed", watch=watch,
+                                 cli_child_seen=True, reaped=True)
+    checked = threading.Event()
+    watch._lock.acquire()
+    try:
+        thread = threading.Thread(target=lambda: (result.tool_not_called, checked.set()))
+        thread.start()
+        assert not checked.wait(0.05)
+    finally:
+        watch._lock.release()
+    thread.join(timeout=1)
+    assert checked.is_set()
+    assert result.tool_not_called is True
 
 
 @pytest.mark.parametrize(("seen_child", "remaining", "expected"), [

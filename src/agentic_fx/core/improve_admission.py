@@ -217,11 +217,15 @@ class ImproveAdmission:
         kernel = self.kernel()
         reason = preflight_reason(kernel, host)
         if reason is not None:
+            with self._lock:
+                self._last_admitted[backend] = False
             return AdmissionDecision(False, reason, backend)
         try:
             artifact = inspect_artifact(artifact_path)
             package = inspect_codex_package(artifact_path) if backend == "codex" else None
         except ValueError as e:
+            with self._lock:
+                self._last_admitted[backend] = False
             return AdmissionDecision(False, REASON_ARTIFACT, backend, detail=str(e))
         fp = F.compute_fingerprint(backend, artifact, kernel, codex_package=package)
         key = (backend, fp.aggregate)
@@ -229,18 +233,33 @@ class ImproveAdmission:
             # 停止の後は覚えた判定も返さず、canary・自己試験も始めない (停止の判定は覚えない)
             if self._stopping():
                 return self._stopping_decision(backend, fp, artifact)
+            admitted_transition = None
             with self._lock:
                 now = self._clock()
                 cached = self._cache.get(key)
+                cached_decision = None
                 if cached is not None:
                     decision, ts = cached
                     if not decision.retryable or now - ts < self._retry:
+                        previous_admitted = self._last_admitted.get(backend)
+                        if decision.admitted and previous_admitted is False:
+                            admitted_transition = _admission_status_line(
+                                backend, True, fp.aggregate)
                         self._last_admitted[backend] = decision.admitted
-                        return decision
-                done = self._running.get(key)
-                if done is None:
+                        cached_decision = decision
+                done = None if cached_decision is not None else self._running.get(key)
+                if cached_decision is None and done is None:
                     done = self._running[key] = threading.Event()
                     break
+            if cached_decision is not None:
+                if admitted_transition is not None:
+                    with self._lock:
+                        technical_log = self._technical_log
+                    try:
+                        technical_log(admitted_transition)
+                    except Exception:  # noqa: BLE001
+                        _log.exception("improve isolation admission transition logging failed")
+                return cached_decision
             # 同じ fingerprint の canary / 自己試験が進行中。終わったら cache を読み直す
             while not done.wait(WAIT_POLL_SEC):
                 if self._stopping():
@@ -324,6 +343,8 @@ class ImproveAdmission:
 
 def _admission_status_line(backend: str, admitted: bool, fingerprint: str,
                            reason: str | None = None) -> str:
+    if not admitted and (not isinstance(reason, str) or not reason):
+        raise ValueError("reason must be a non-empty string when admission is denied")
     if admitted:
         return (f"improve isolation: enabled; backend={backend} admitted=yes "
                 f"fingerprint={fingerprint}")

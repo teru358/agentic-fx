@@ -920,3 +920,42 @@ def test_permanent_no_then_different_fingerprint_yes_logs_transition(tmp_path):
     expected = (f"improve isolation: enabled; backend=codex admitted=yes "
                 f"fingerprint={second.fingerprint.aggregate}")
     assert emitted == [expected]
+
+
+def test_cached_yes_after_permanent_no_logs_transition(tmp_path):
+    emitted = []
+    canary = Probe(OK, IA.ProbeOutcome(False, transient=False, detail="permanent"))
+    adm = _admission(canary=canary, technical_log=emitted.append)
+    path_a = str(_elf(tmp_path, name="cli-a", extra=b"first"))
+    path_b = str(_elf(tmp_path, name="cli-b", extra=b"second"))
+
+    admitted_a = adm.admit(backend="codex", artifact_path=path_a, host=Host())
+    denied_b = adm.admit(backend="codex", artifact_path=path_b, host=Host())
+    cached_a = adm.admit(backend="codex", artifact_path=path_a, host=Host())
+
+    assert admitted_a.admitted and not denied_b.admitted
+    assert cached_a is admitted_a
+    expected = (f"improve isolation: enabled; backend=codex admitted=yes "
+                f"fingerprint={admitted_a.fingerprint.aggregate}")
+    assert emitted == [expected]
+
+
+def test_preflight_no_then_yes_logs_transition(tmp_path):
+    emitted = []
+    adm = _admission(technical_log=emitted.append)
+    path = str(_elf(tmp_path))
+
+    denied = adm.admit(backend="codex", artifact_path=path,
+                       host=Host(("cgroup_delegation_missing",)))
+    admitted = adm.admit(backend="codex", artifact_path=path, host=Host())
+
+    assert not denied.admitted and admitted.admitted
+    expected = (f"improve isolation: enabled; backend=codex admitted=yes "
+                f"fingerprint={admitted.fingerprint.aggregate}")
+    assert emitted == [expected]
+
+
+def test_denied_admission_status_requires_string_reason():
+    for reason in (None, ""):
+        with pytest.raises(ValueError):
+            IA._admission_status_line("codex", False, "fingerprint", reason)

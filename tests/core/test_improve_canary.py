@@ -9,6 +9,7 @@ import ast
 import inspect
 import json
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -454,8 +455,8 @@ def test_selftest_call0_incomplete_is_retryable_but_other_incomplete_is_not(
     ctx = SimpleNamespace(host=SimpleNamespace(mission_allowed=lambda: True), backend="opencode",
                           artifact=SimpleNamespace(as_dict=lambda: {}),
                           fingerprint=SimpleNamespace(aggregate="a"))
-    watch = SimpleNamespace(seen=True, initialized=True, listed=["list_staging"], calls=0,
-                             grace_expired=False)
+    watch = VB._EchoWatch("nonce", threading.Event(), "opencode")
+    watch.seen, watch.initialized, watch.listed = True, True, ["list_staging"]
     monkeypatch.setattr(VB, "verify_backend", lambda *_args, **_kwargs: VB.VerifyBackendResult(
         False, "opencode", None, None, "gate=incomplete status=completed reason=-",
         gate="incomplete", status="completed", watch=watch,
@@ -474,8 +475,8 @@ def test_selftest_call0_is_permanent_when_cgroup_gate_is_closed(monkeypatch, tmp
 
     settings = load_settings(Path(__file__).resolve().parents[2] / "config"
                              / "settings.yaml.example")
-    watch = SimpleNamespace(seen=True, initialized=True, listed=["list_staging"], calls=0,
-                            grace_expired=False)
+    watch = VB._EchoWatch("nonce", threading.Event(), "opencode")
+    watch.seen, watch.initialized, watch.listed = True, True, ["list_staging"]
     monkeypatch.setattr(VB, "verify_backend", lambda *_args, **_kwargs: VB.VerifyBackendResult(
         False, "opencode", None, None, "gate=incomplete status=completed reason=-",
         gate="incomplete", status="completed", watch=watch,
