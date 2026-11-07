@@ -1016,3 +1016,23 @@ def test_the_offline_status_does_not_load_the_env_file_for_the_zone(tmp_path, ca
     root = full_root(tmp_path)
     monkeypatch.setattr(config, "load_env_file", lambda *a: pytest.fail("env loaded"))
     assert fields(run_status(root, capsys)[1])["表示 tz"] == "Asia/Tokyo (+09:00)"
+
+
+def test_offline_status_counts_econ_signal_abandonment_and_filtered_missions(tmp_path, capsys):
+    root = full_root(tmp_path)
+    import sqlite3 as _sqlite3
+    conn = _sqlite3.connect(root / "data" / "agentic.db")
+    conn.execute("INSERT INTO missions (loop,runner,model,status,started_at) "
+                 "VALUES ('trade','local','m','system_filtered','2026-10-25T00:00:00+00:00')")
+    conn.commit()
+    conn.close()
+    rc, out = run_status(root, capsys)
+    values = fields(out)
+
+    assert rc == 0
+    assert values["recent mission"] == (
+        "#2 system_filtered (filtered, not failed) at 2026-10-25 09:00:00 +09:00")
+    assert "econ signal:" in out.splitlines()
+    assert "  missions (latest day): system_filtered=0 failed=0 running=0" in out
+    assert "  abandoned (latest day/total): none" in out
+    assert "slice capacity" not in out

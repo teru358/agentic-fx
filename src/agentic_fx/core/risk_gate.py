@@ -37,6 +37,10 @@ class GateContext:
     # 固定 (呼び出し側が同一サイクル内で使い回す)。
     quote_to_account: ConversionRate
     base_to_account: ConversionRate
+    # None means that this gate invocation is outside the live econ-window
+    # decision path (for example backtests and signal accept).
+    econ_window_in_window: bool | None = None
+    econ_window_event_ids: tuple[int, ...] = ()
 
 
 def _validate_context(intent: TradeIntent, ctx: GateContext) -> list[str]:
@@ -105,6 +109,7 @@ class GateResult:
     reasons: list[str]
     size: SizeResult | None
     entry_price: float | None
+    econ_window_rejected: bool = False
 
 
 def evaluate(intent: TradeIntent, ctx: GateContext,
@@ -116,6 +121,14 @@ def evaluate(intent: TradeIntent, ctx: GateContext,
         # 入力が信頼できないので以降の評価はしない (fail closed)
         return GateResult(accepted=False, reasons=reasons, size=None,
                           entry_price=None)
+    econ_window_rejected = ctx.econ_window_in_window is True
+    if econ_window_rejected:
+        reason = "economic event avoidance window active"
+        if ctx.econ_window_event_ids:
+            ids = ",".join(str(event_id)
+                            for event_id in ctx.econ_window_event_ids)
+            reason += f" (event ids: {ids})"
+        reasons.append(reason)
     rule = risk.pair_rules.get(intent.pair)
     spread = (rule.assumed_spread_pips * ctx.spec.pip_size) if rule else 0.0
 
@@ -232,5 +245,5 @@ def evaluate(intent: TradeIntent, ctx: GateContext,
 
     accepted = not reasons
     return GateResult(accepted=accepted, reasons=reasons,
-                      size=size if accepted else None,
-                      entry_price=entry)
+                      size=size if accepted else None, entry_price=entry,
+                      econ_window_rejected=econ_window_rejected)

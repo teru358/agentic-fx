@@ -6,6 +6,10 @@ alert_state (key-value) に残し、再起動をまたいで間隔を守る。
 
 値は JSON: attempted_at (tz-aware UTC の ISO) と retry_after_sec
 (先方が Retry-After で待てと言った秒数。無ければ 0)。
+
+経済指標カレンダーは取得の結果 (成功・失敗) も同じ値に残す: last_outcome
+("success" / "failure")、last_outcome_at、last_success_at。試行の記録
+(record_attempt / record_retry_after) はこれらを書き換えない。
 """
 from __future__ import annotations
 
@@ -14,9 +18,19 @@ import math
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
+from agentic_fx.core.econ_window import (
+    FRESHNESS_FRESH, FRESHNESS_STALE, FRESHNESS_UNKNOWN)
+
 ECON_KEY = "fetch_attempt.econ"
 NEWS_KEY = "fetch_attempt.news"
 NEWS_SOURCE_KEY_PREFIX = "fetch_attempt.news."
+
+# 経済指標カレンダーの取得周期。scheduler の取得間隔と同じ値で、鮮度の閾値
+# (周期 × 2) の基になる。
+ECON_REFRESH_INTERVAL = timedelta(hours=6)
+_OUTCOME_FIELDS = ("last_outcome", "last_outcome_at", "last_success_at")
+OUTCOME_SUCCESS = "success"
+OUTCOME_FAILURE = "failure"
 
 # 先方の Retry-After をそのまま信じると、異常な値で取得が事実上止まる。
 MAX_RETRY_AFTER = timedelta(hours=24)
@@ -32,10 +46,28 @@ def _utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _preserved_outcome(conn: sqlite3.Connection, key: str) -> dict:
+    """既存の値に残っている取得結果の項目。読めなければ空。"""
+    row = conn.execute(
+        "SELECT value FROM alert_state WHERE key=?", (key,)).fetchone()
+    if row is None:
+        return {}
+    try:
+        data = json.loads(row[0])
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: data[k] for k in _OUTCOME_FIELDS if k in data}
+
+
 def _write(conn: sqlite3.Connection, key: str, attempted_at: datetime,
-           retry_after: timedelta, *, now: datetime) -> None:
-    value = json.dumps({"attempted_at": _utc(attempted_at).isoformat(),
-                        "retry_after_sec": retry_after.total_seconds()})
+           retry_after: timedelta, *, now: datetime,
+           outcome: dict | None = None) -> None:
+    fields = {"attempted_at": _utc(attempted_at).isoformat(),
+              "retry_after_sec": retry_after.total_seconds()}
+    fields.update(_preserved_outcome(conn, key) if outcome is None else outcome)
+    value = json.dumps(fields)
     # with conn: 例外時は ROLLBACK し、呼び出し側の接続に未確定の
     # transaction を残さない。
     with conn:
@@ -132,3 +164,53 @@ def blocked_until(conn: sqlite3.Connection, key: str,
     except OverflowError:
         return None
     return until if retry > timedelta(0) and until > _utc(now) else None
+
+
+def record_outcome(conn: sqlite3.Connection, key: str, now: datetime, *,
+                   ok: bool) -> None:
+    """取得の結果を残す。試行時刻と Retry-After は変えない。
+
+    成功は last_success_at も更新する。失敗は最後の成功の時刻を保つ。
+    値が壊れていれば、今を試行時刻にした新しい値から始める。
+    """
+    now = _utc(now)
+    try:
+        attempted, retry = load(conn, key) or (now, timedelta(0))
+    except ValueError:
+        attempted, retry = now, timedelta(0)
+    outcome = _preserved_outcome(conn, key)
+    outcome["last_outcome"] = OUTCOME_SUCCESS if ok else OUTCOME_FAILURE
+    outcome["last_outcome_at"] = now.isoformat()
+    if ok:
+        outcome["last_success_at"] = now.isoformat()
+    _write(conn, key, attempted, retry, now=now, outcome=outcome)
+
+
+def freshness(conn: sqlite3.Connection, key: str, now: datetime, *,
+              refresh_interval: timedelta = ECON_REFRESH_INTERVAL) -> str:
+    """取得結果の鮮度: unknown / fresh / stale。
+
+    成功が一度も記録されていなければ unknown。直近の取得が失敗、または最後の
+    成功から `refresh_interval` の 2 倍を超えていれば stale (ちょうどは fresh)。
+    それ以外は fresh。値が読めないとき、結果の種別が success / failure でないとき、
+    最後の成功が `now` より未来のときも unknown (新しいとは言えない)。
+    """
+    now = _utc(now)
+    row = conn.execute(
+        "SELECT value FROM alert_state WHERE key=?", (key,)).fetchone()
+    if row is None:
+        return FRESHNESS_UNKNOWN
+    try:
+        data = json.loads(row[0])
+        raw_success = data.get("last_success_at")
+        if raw_success is None:
+            return FRESHNESS_UNKNOWN
+        success = _utc(datetime.fromisoformat(raw_success))
+        outcome = data.get("last_outcome")
+    except (ValueError, TypeError, AttributeError):
+        return FRESHNESS_UNKNOWN
+    if outcome not in (OUTCOME_SUCCESS, OUTCOME_FAILURE) or success > now:
+        return FRESHNESS_UNKNOWN
+    if outcome == OUTCOME_FAILURE or now - success > refresh_interval * 2:
+        return FRESHNESS_STALE
+    return FRESHNESS_FRESH

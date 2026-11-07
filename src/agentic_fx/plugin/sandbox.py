@@ -2086,6 +2086,11 @@ _STRATEGY_ALLOWED_KEYS = frozenset(
      "stop_loss", "take_profit"})
 
 
+def validate_strategy_result(result: Any) -> dict[str, Any]:
+    """live 経路と保存済み payload の移行が共有する公開検証。"""
+    return _validate_strategy_result(result)
+
+
 def _validate_strategy_result(result: Any) -> dict[str, Any]:
     """`contracts.StrategyDecision` を実際に構築してみて `ValueError`/
     `TypeError` (必須フィールド欠落) を `SandboxError` へ写像する — brief

@@ -249,6 +249,7 @@ TIME_FIELDS = frozenset({
     "computed_at", "observed_at", "effective_at", "deadline_at", "expires_at",
     "first_failed_at", "last_failed_at", "last_attempt_at",
     "expected_last_attempt_at", "restricted_since", "since", "deadline", "until",
+    "slice_bytes_measured_at", "abandoned_at",
 })
 
 

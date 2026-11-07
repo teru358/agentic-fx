@@ -146,7 +146,7 @@ def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, fo
                     raise FileExistsError(f"retired destination already exists: {retired_path}")
                 deploy_store.set_retired_path(conn, op_id, retired_path, commit=False)
                 signals_store.abandon_pending_for_name(
-                    conn, name, op_id=op_id, commit=False)
+                    conn, name, op_id=op_id, now=now, commit=False)
 
             cascade = deploy_ops.cascade_identities(
                 conn, plugins_root, report.dependent_names)

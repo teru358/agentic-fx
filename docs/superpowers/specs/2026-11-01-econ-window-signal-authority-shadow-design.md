@@ -1,6 +1,6 @@
 # 指標回避帯・シグナル採否契約・shadow 成績・反応統計 — 設計 C0
 
-**版:** v0.9 C0（2026-11-01、設計レビュー 8 周を全件反映、J1〜J3 利用者承認済、実装待ち）
+**版:** v0.10.4 C0（2026-11-05、裁量 OPEN の帯内拒否の配線（executor の所有、reject_category と activity の写像、判定例外）。v0.10.3: DST 是正の反映、欠損の分類（閉場は除外、開場中の欠落はすべて障害欠損）、14 運用日の始点。J1〜J3 利用者承認済、利用者判断待ちなし）
 **対象:** `econ-event-hold-window-deterministic` / `llm-vs-strategy-signal-authority` / `econ-event-actuals-and-reaction-stats`。実装は束 1 と束 2 に分けるが、本書を共通契約とする。
 
 ## 0. 目的と非目標
@@ -25,10 +25,22 @@
 | 1m は必要時に元表から読める | cache は 30 日で消え、後日の再現結果が変わる | event / shadow 単位の 1m slice を確定時に退避し、以後は退避値を正本にする |
 | scheduler には専用の write 接続がある | scheduler は executor・broker・trade loop・reflection・calendar・news と core 接続を共有し、signal maintenance は同じ tick 内で別の signal 接続から書く。フラグを持たない長い writer（improve 等）もいる | 既存接続の busy timeout 5000ms は変えない。新設の worker 接続だけを即 rollback の規律にし、scheduler の待ちは実測で判定する |
 | slice は確定 transaction で一緒に書けばよい | 1 owner 最大 1,680 行あり、scheduler と同じ core lock と SQLite の書込み直列を長く占有する | lock の外で staging へ小分けに書き、lock 内は完備 marker と短い CAS だけにする |
-| 足が無い分はすべて欠損である | rollover など tick が無い分と feed 障害が混在する | `datafeed_outage_gap` だけを障害欠損とし、それ以外は前値保持の flat 足にする |
+| 足が無い分はすべて欠損である | 既知の閉場（週末・12/25・1/1。境界は NY 17:00 で夏 21:00Z / 冬 22:00Z）、開場中の tick 不在、取得の失敗が混在する | 閉場 minute は期待格子に入れない。開場中の欠落は、tick 不在を証明する情報が無いのですべて障害欠損にする。tick 無しの flat は v1 では作らず、bridge が区間の完全性を返せるようになった別版で足す（§3.5-3、§6） |
+| `datafeed_outage_gap` を障害欠損の正本にできる | 1 episode × key に 1 行（PK `(pair, interval, epoch)`）で、`gap_start` は episode 突入時の直近 watermark（最初の欠落 minute ではない）、終わりの列は無い（`replay_through` は全行 NULL）。episode は停滞（足が予定どおり来ない）でも取得失敗でも開く。実測 43 episode のうち取得失敗を含むのは 3 本で、40 本は停滞だけ | 表示用として残し、分類では読まない。開場中の欠落はすべて障害欠損にするので、v1 は障害の区間を知る必要が無い（§3.5-3） |
 | calendar が取れなければ帯も安全側に閉じられる | calendar 取得は fail-soft で、未知のイベントは列挙できない | 帯は保存済みイベントに対してのみ決定論的。未取得時は fail-open とし鮮度警告を出す |
 | shadow と反応統計は改善材料にもできる | 評価と選別が循環し、agent 入力が汚染される | 数値は人間面だけ。反応統計 tool も trade mission 限定とする |
 | managed-policy id=1 を置換すれば方針文が変わる | 現行の方針 1 行目は managed block の外の利用者行で、id=1 は DB に存在せず再採番もされない | 既定文の全文を本書に置いて fixture にし（J3 の承認を前提）、配備時に利用者が managed 行として登録し旧行を消す |
+
+### 0.2 ingest の記録の実測
+
+**実測（2026-11-03、本機 `data/agentic.db` を `mode=ro` で、activity と技術ログはファイルを読んだ）。**
+
+- 価格取得の 1 回ごとの記録は DB のどこにも無い。`Ingest.prepare` の attempted / succeeded / empty / failed は tick 限りの `IngestTickReport` で、次の取得時刻と backoff もメモリだけにある。`alert_state` の `fetch_attempt.*` は経済指標とニュースだけで、価格の key は無い。残るのは `ohlcv_cache` の足、`datafeed_outage_state`（1 行）と `datafeed_outage_gap`、activity の `datafeed_*`、技術ログの `ingest failed for` だけである。
+- `ohlcv_cache`（USDJPY、`mt5-live`）: 1m 30,922 行（2026-10-04T21:00Z〜11-03T11:03Z）、15m 2,072 行、1h 518 行。`ohlcv_history` の USDJPY 1m は 99,411 行で 2026-05-28〜09-02 だけ（他は 5m）。
+- `datafeed_outage_gap`: 86 行 = 43 epoch × 2 key（1m / 15m）。`replay_through` は全行 NULL。activity は `datafeed_degraded` 7 行・`datafeed_restricted` 37 行で、`failed=` に key が入るのは epoch 14（10-07）、24（10-14）、43（11-03）の 3 本。技術ログの `ingest failed for` は 8 行で、日付はこの 3 本と一致する。
+- 1m cache の保持範囲内で `market_hours.is_market_open` が真の minute は 31,024、そのうち足の無い minute は 106（58 連）。連の長さは 1 分 39 連、2 分 11 連、4 分 3 連、5 分 3 連、9 分 2 連。96 minute は NY 17 時台（開場直後）。9 分の 2 連は 2026-10-16T09:04〜09:12Z（平日。epoch 26 は停滞だけで、取得失敗の記録は無い）と 10-25T21:20〜21:28Z（日曜の開場直後）。
+- 閉場 minute にある 1m 行は 4 行（2026-11-01T21:01〜21:04Z、DST 設計の C2）。C1 の 900 本（10-02〜10-03）は保持期限で cache から消えており、0 行。
+- 切替 marker `market_hours_ny_rule_v1` の `applied_at`（T_c）は 2026-11-03T07:56:52Z、過渡期間の終わり T_b は 11-03T22:00Z。
 
 ## 1. 現物の確認（file:line）
 
@@ -69,7 +81,14 @@
 | `src/agentic_fx/core/contracts.py:73-78` / `src/agentic_fx/datafeed/sources.py:117-150` | `Quote` は bid / ask / ts / source を持つ。mt5 は実 bid / ask、yfinance は 1m close を bid と ask の両方に入れる |
 | `src/agentic_fx/store/db.py:124-140,677-692` | `ohlcv_cache` に spread 列は無く、`ohlcv_history.spread` は nullable。数値一致は `FLOAT_TOL=1e-9` の `values_match` を共有する |
 | `src/agentic_fx/service.py:2171-2251` | scheduler の遅延 callable も同じ scheduler thread で同期実行される。長い resolver を置くと次 tick の kill switch・SL / TP 判定を遅らせる |
-| `src/agentic_fx/store/db.py:446-452` | `datafeed_outage_gap` が feed 障害区間の正本として存在する |
+| `src/agentic_fx/store/db.py:671-678` / `src/agentic_fx/datafeed/outage.py:292-306,507-529,550-562` | `datafeed_outage_gap` は `(pair, interval, epoch)` が PK で、列は `gap_start` と `replay_through` だけ。終わりの時刻は無い。`_open_gaps` は episode 突入時に直近 watermark を `gap_start` として 1 行書く。episode は hard key の取得失敗・空応答・停滞（`next_bar_confirmation(watermark)` を過ぎても新しい足が無い）のどれでも開く |
+| `src/agentic_fx/datafeed/ingest.py:129-274,284-289` | `prepare` は市場が閉じていれば何も取りに行かない。開場中は key ごとに `[watermark − 足幅, now)`（watermark が無ければ `now − plan.days` から）を要求し、閉じた足だけに正規化して `_pending` に置く。成功・空・失敗は tick 限りの `IngestTickReport` にだけ入り、DB には残らない。`commit` は `_pending` の足を key ごとに `upsert_cache_bars` する |
+| `src/agentic_fx/service.py:2341-2390` | tick は lock 外で `prepare` → core lock 内で `commit` → `outage.observe` の順。`prepare` が例外なら全 hard key 失敗の report を合成し、`commit` は呼ばない。`commit` が例外でも同じ合成 report で observe へ進む |
+| `src/agentic_fx/store/ohlcv.py:125-148,197-229` / `src/agentic_fx/service.py:1768,1832-1836` | `upsert_cache_bars` は呼ぶたびに commit する。保持は起動時に作る `RetentionPlan` の `(source, interval)` ごとの cutoff で、maintenance hook が `prune_cache(plan=...)` を呼ぶ。example 設定は `cache_retention_days: 30` |
+| `src/agentic_fx/datafeed/price_provider.py:219-221,425-426` / `src/agentic_fx/store/ohlcv.py:308-381` | ingest の外でも cache に足を書く経路（`PriceProvider.get_bars` / `_derive`、読取り専用の mission では書かない）と、`ohlcv_history` へ書く一括 import がある。どちらも足を足すだけで、取得の記録は残さない |
+| `mt5_bridge/server.py:357-396` / `mt5_bridge/mt5_client.py:228-240` | `/ohlcv` は bridge 内の接続フラグ（初期化時に立つ）と時刻 offset の検査だけを見て、`copy_rates_range` の結果を 200 で返す。terminal と broker の接続は見ない（`terminal_info()` は `/health` の ping だけが呼ぶ）。したがって成功応答に足が無いことは、市場に tick が無かったことの証明にはならない |
+| `src/agentic_fx/core/market_hours.py:25-43,55-61` / `src/agentic_fx/core/time_cutover.py:84-94,141-146` | 市場の開閉と日次境界は NY 17:00（夏 21:00Z / 冬 22:00Z）。`is_market_open` は金曜 17:00 NY〜日曜 17:00 NY と、取引日ラベル 12/25・1/1 を閉場にする。`trading_date` は NY + 7h の日付。`daily_label` は過渡期間 `[T_c, T_b)` だけ旧新ラベルの遅い方を返す |
+| `src/agentic_fx/core/scheduler.py:454-528` / `src/agentic_fx/signal_admission.py:250-277` | 日次 report の直近 close は NY 日付で 1 日ずつ遡る。marker は「終端 1 分前の `trading_date`」で比べ、過渡期間は旧規則の読みとの遅い方。wait-budget の運用日 key は `YYYY-MM-DD`、旧版の ISO key は `legacy_operating_day` で読み替える（8ceca972） |
 | `src/agentic_fx/datafeed/econ_calendar.py:17-18,41` / `src/agentic_fx/store/econ_events.py:7-16` / `src/agentic_fx/store/db.py:371-377` | 取得元は ForexFactory の今週分 JSON で、項目は title / country / date / impact / forecast / previous の 6 つ。安定 event ID は無い。`econ_events` は `(ts,country,name)` UNIQUE の upsert |
 | DB 実測 `econ_events` | importance=3 は全通貨で 117 件（2026-08-26〜2026-10-30、約 53 件 / 月）、importance=2 は 121 件、importance=1 は 766 件 |
 | `src/agentic_fx/loops/improve_context.py:121-162` / `src/agentic_fx/loops/trade_loop.py:79-93` | improve report は全 trade intent の hold_rate / reject_breakdown を数え、gate reject streak は全拒否を通知対象にする |
@@ -123,6 +142,9 @@ cron mission は signal の有無にかかわらず signal を claim・注入せ
 2. event `ts` の帯は inclusive な `[ts-before_min, ts+after_min]`。重なる帯は推移的な和集合へまとめる。
 3. 時刻 `now` で判定するとき（signal runner 前、OPEN commit）の候補は `[now-after_min, now+before_min]`、足 `[b,b+1m]` で判定するとき（limit fill）の候補は `[b-after_min, b+1m+before_min]` から取る。どちらも対象通貨・importance・`superseded_by IS NULL` を再確認する。次の対象 event は同条件で 7 日先まで検索する。
 4. signal runner 前、OPEN commit、limit fill は同じ純粋判定を使う。signal accept は intent 記録前に lock 内で再判定し、帯内なら system reject + shadow へ切り替える。裁量 OPEN は lock 内で判定結果を `GateContext` に渡し、その後に intent を記録する。risk gate は純関数のままにする。
+   - 裁量 OPEN の判定は cron の commit-core で、intent 記録の前に OPEN だけを対象に行う。判定結果は `open_from_snapshot` の引数で executor へ渡し、executor が `GateContext` の任意 field（既定 None = 判定対象外）に詰める。None のままの経路は backtest runner・`handle_intent`・`_open` と signal accept（直前の再判定で帯外が確定済み）で、gate は帯を見ない。
+   - gate は帯内なら固定理由を加えるが、評価を短絡しない（kill switch の latch 判定を保つ）。`_validate_context` の fail-closed 短絡は従来どおり `risk_gate`。帯内の却下は、他の gate 理由が同時に出ていても `reject_category=econ_window` とし、`reject_reason` には全理由を残す。activity は `open_rejected_econ_window` だけを書き、`gate_rejected` は書かない（§2.3 の「混ぜない」）。
+   - 判定そのものの例外（保存済み event を読めない等）は OPEN を fail-closed で却下する。intent は記録し、固定文言で `reject_category=execution`・`gate_rejected` とする（gate streak に数え、持続する故障を通知で見せる）。limit fill の抑止判定（T2a-2）と対称で、calendar 取得の fail-open（未取得の event を仮定しない）とは別の事象である。
 5. limit は処理足の閉区間 `[b,b+1m]`（b は足の開始時刻）と inclusive な帯の交差で抑止し、候補は 3 の足区間基準で取る。`now` は使わないので、5 分遅れの fresh bar で帯の後端を跨ぐ足も同じ判定になる。抑止足は既存 processed-bar 規則どおり再処理しない。抑止通知の dedupe 状態（order、固定した成分 ID、成分の event 集合）は DB の既存 key-value 表に保存する（§2.4）。
 6. calendar freshness の正本は `fetch_attempts` の `ECON_KEY`。attempt、success、failure を残し、初回成功なしは `unknown`、直近失敗または最終成功から refresh 周期 6h × 2 = 12h 超は `stale`、それ以外は `fresh`。保存済み event は stale でも帯を作り、未知 event は仮定しない。
 7. 取得元に安定 ID が無いので、時刻変更は refresh が取得結果の全 row を保存し終えた直後の pass（§3.5-5）で、取得結果全体を入力に判定する。保存が途中で失敗した refresh では判定しない。次の条件をすべて満たす旧 row だけを置換候補とする: refresh で新しく入った row と同じ `(country,name)`、`superseded_by IS NULL`、refresh 時点で未発表（`ts > now`）、新 row との時刻差が 7 日以内、今回の取得結果に含まれない。候補が複数なら時刻差最小（同差は id 最小）の 1 行だけに新 row の id を `superseded_by` として保存し、削除しない。既発表の同名 row、7 日を超えて離れた同名 row、同じ取得結果に並ぶ同名 row は別インスタンスとして残る。window / reaction は有効 row だけを読む。
@@ -146,7 +168,7 @@ cron mission は signal の有無にかかわらず signal を claim・注入せ
 4. f までに claim されなかった signal は claim されない（claim 条件に鮮度がある）。f 後の最初の maintenance（f + T 以内）で abandoned になる。したがって ready 中の eligible signal は「f までに claim」か「f + T までに abandoned」のどちらかに必ず入る。data state が ready でない間は maintenance も専用 mission も走らないので、pending は claim されないまま f + T を越えて残り、ready に戻った最初の maintenance で abandoned になる（claim されないので安全側）。tick が T を超えて伸びた分も同じだけ遅れる。
 5. f は claim と decision の両方の期限である。15m・k=2 では c から f までの余地は 900 秒。専用 mission は core lock と name lock を取った後の commit-core で時刻が f を過ぎていれば、decision / shadow を書かず signal を abandoned にする（現物の stale 分岐、§3.3）。したがって q で claim した signal が decision に届くのは、q + runner の所要 + core lock 待ち（scheduler tick 1 本分、上の条件で T 未満）+ name lock 待ち（Pl 以下）が f 以内のときだけである。異常終了は既存の signal lease L で回収して requeue し、再 claim は f 以前だけ、f 後なら abandoned にする。example 設定は Cw=405 秒、L=900 秒、Pl=2 秒。
 6. **静的保証と稼働 warning を分ける。** 承認済み strategy の最小足幅 w について `Cd + 3T + R + Cw + Pl ≥ w·(k−1)`、または `Cd + T ≥ 判断足幅` なら、起動は止めず status の `worst_case_guarantee_unavailable=true` を恒常表示する。これは最大値による静的な「保証不能」の表示であり、activity warning にはしない。承認済み strategy が 0 本なら静的 status は `n/a`、稼働 warning は inactive とする。example 設定（Cd 1630 秒、R 600 秒、Cw 405 秒、Pl 2 秒）は 15m・k=2 で 2,817 ≥ 900 となる。
-7. **稼働 warning は実測で出す。** 直近 14 運用日の actor=`llm` の final decision について `eligible→claim = signals.claimed_at − signals.created_at` と `claim→decision commit = signal_decisions.decided_at − signals.claimed_at` を直接測る。100 件以上なら各 p95 の和が承認済み strategy の最小 `w·(k−1)` 以上、または同期間に `abandoned_at` が入る `freshness_expired` / `requeued_expired` が 1 件以上なら `signal_wait_budget_warning` を出す。100 件未満だけは、終了済み trade mission の `started_at` から、同じ dispatch に続く最後の reflection mission の `finished_at` まで（reflection が無ければ trade mission 自身の `finished_at` まで）を dispatch 所要として、その p95 + R + Cw を代用する。reflection は capacity 1 の直列性を使い、対象 trade mission の `finished_at` 以後かつ次の trade mission の `started_at` より前に開始した `loop='reflection'` を時間隣接で結ぶ。p95 の標本数、2 latency、freshness 系件数、直接観測か代用かを status / web / 親 report に出す。評価は final decision / freshness 系 abandoned の確定時と運用日境界に行う。dedupe key は「判定に使う設定値の canonical fingerprint、signal 日次上限と同じ境界の運用日」の組で、同じ key では 1 回だけ、fingerprint または運用日が変わったときだけ再通知する。直近 key と時刻は DB の既存 key-value 表に保存する。
+7. **稼働 warning は実測で出す。** 直近 14 運用日の actor=`llm` の final decision について `eligible→claim = signals.claimed_at − signals.created_at` と `claim→decision commit = signal_decisions.decided_at − signals.claimed_at` を直接測る。100 件以上なら各 p95 の和が承認済み strategy の最小 `w·(k−1)` 以上、または同期間に `abandoned_at` が入る `freshness_expired` / `requeued_expired` が 1 件以上なら `signal_wait_budget_warning` を出す。100 件未満だけは、終了済み trade mission の `started_at` から、同じ dispatch に続く最後の reflection mission の `finished_at` まで（reflection が無ければ trade mission 自身の `finished_at` まで）を dispatch 所要として、その p95 + R + Cw を代用する。reflection は capacity 1 の直列性を使い、対象 trade mission の `finished_at` 以後かつ次の trade mission の `started_at` より前に開始した `loop='reflection'` を時間隣接で結ぶ。p95 の標本数、2 latency、freshness 系件数、直接観測か代用かを status / web / 親 report に出す。直近 14 運用日の始点は、`market_hours.trading_day_start(now)` の NY 日付から 13 日遡った日の NY 17:00 を UTC に戻した境界とする（`session_boundary_utc(NY 日付 − 13 日)`）。現行の `signal_admission.window_start`（`:275-277`）は UTC の境界から 13 × 24 時間を引くので、夏冬の切替をまたぐと秋は先頭の 1 時間を落とし、春は 1 時間余分に含める（例: `now`=2026-11-03T12:00Z で現行 10-20T22:00Z / 契約 10-20T21:00Z、`now`=2026-03-10T12:00Z で現行 02-24T21:00Z / 契約 02-24T22:00Z）。標本数・p95・freshness 系件数が変わり得るので T2a-3 が直す。これは日次ラベルの是正（済み 8ceca972、下記）とは別の未是正である。評価は final decision / freshness 系 abandoned の確定時と運用日境界に行う。dedupe key は「判定に使う設定値の canonical fingerprint、運用日」の組で、同じ key では 1 回だけ、fingerprint または運用日が変わったときだけ再通知する。運用日は `market_hours.trading_date(now)` の日付ラベル（`YYYY-MM-DD`）で、切替の過渡期間 `[T_c, T_b)` は `time_cutover.daily_label`（旧新ラベルの遅い方）を使う。旧版が書いた key（取引日の開始 ISO）は「開始 + 24h − 1 分の `trading_date`」に読み替え、同じ日・同じ fingerprint なら通知済みとして扱う（DST §3.6-f、済み 8ceca972、`signal_admission.py:250-271`）。直近 key と時刻は DB の既存 key-value 表に保存する。
 
 **排他。**
 
@@ -155,7 +177,7 @@ cron mission は signal の有無にかかわらず signal を claim・注入せ
 
 **spread の記録。** 専用 mission は commit-core の前に lock の外で、鮮度と `bid ≤ ask` を検査する既存の quote 取得経路（§1）から対象 pair の quote を 1 回取る。source 関数を直接呼ばない。bid・ask が有限で `ask > bid > 0` なら `(ask-bid)/pip_size` を `spread_source=quote` で、取れない・条件を満たさない（既存の検査が通す bid = ask を含む）なら `risk.pair_rules` の assumed spread を `spread_source=assumed` で shadow に保存する。system reject も同じにする。
 
-Claude backend に渡す schema は最上位を object とし、全 property に型を持たせる。
+Claude backend に渡す schema は最上位を object とし、全 property に型を持たせる。Anthropic API は `--json-schema` の最上位 `anyOf` / `allOf` / `oneOf` を 400（`input_schema does not support oneOf, allOf, or anyOf at the top level`）で拒否し、最上位 `type: object` を要求する。実 CLI で最上位の `if` / `then` / `else` は受理され、accept / reject 両 prompt で正しい構造化出力を得た（実測）。そのため相関は最上位の if/then/else で持つ。
 
 ```json
 {
@@ -168,7 +190,10 @@ Claude backend に渡す schema は最上位を object とし、全 property に
       "enum": [null, "news_shock", "opposite_position"]
     }
   },
-  "required": ["decision", "reject_code"]
+  "required": ["decision", "reject_code"],
+  "if": {"properties": {"decision": {"const": "accept"}}},
+  "then": {"properties": {"reject_code": {"type": "null"}}},
+  "else": {"properties": {"reject_code": {"type": "string"}}}
 }
 ```
 
@@ -204,7 +229,7 @@ CHECK は全 nullable 列に `IS NULL` / `IS NOT NULL` を明示し、accept、L
 
 | 列 | 契約 |
 |---|---|
-| `id` / `decision_id` / `signal_id` | 主キー、decision への UNIQUE FK、signal への UNIQUE FK |
+| `id` / `decision_id` / `signal_id` | 主キー、decision への UNIQUE FK、signal への UNIQUE FK。`(decision_id, signal_id)` は `signal_decisions(id, signal_id)` への複合 FK で、別 signal の decision を指せない |
 | `decision` | `accept` / `reject` snapshot |
 | `actor` | decision と同じ値域 `llm` / `system` の snapshot。accept は常に `llm` |
 | `reject_code` | accept は NULL、reject は decision と同じ固定語 |
@@ -231,8 +256,8 @@ CHECK は全 nullable 列に `IS NULL` / `IS NOT NULL` を明示し、accept、L
 | `id` | 主キー |
 | `event_id` / `shadow_id` | 片方だけ NOT NULL の FK。UNIQUE は `(event_id,pair)` と `shadow_id` |
 | `pair` | settings pair |
-| `range_start` / `range_end` | UTC の半開区間。event は `[ts-15m,ts+4h)`、shadow は §3.4 の区間 |
-| `expected_rows` | 区間の分数 |
+| `range_start` / `range_end` | UTC の半開区間で `range_start < range_end`。event は `[ts-15m,ts+4h)`、shadow は §3.4 の区間 |
+| `expected_rows` | 区間内で `market_hours.is_market_open` が真の minute 数（既知閉場は数えない、§3.5-3）。0 以上 |
 | `state` | `awaiting` / `staging` / `complete` / `unrecoverable` / `cancelled`。`cancelled` は対象外になった event set の状態で、worker の候補にならない。設定変更で再び対象になれば、slice 行が 0 件であることを確認して `completed_at=NULL`、`generation=NULL`、`purged_at=NULL` として `awaiting` に戻す。発表前に記録済みの spread は保持する（§3.5-5） |
 | `generation` | staging 中だけ値を持つ。staging 行を書いた worker 起動の世代で、`ohlcv_slice_generations.id` への FK |
 | `spread_pips` / `spread_source` | event だけ値を持つ（§3.5）。shadow は NULL（shadow 行が持つ） |
@@ -251,11 +276,11 @@ CHECK は全 nullable 列に `IS NULL` / `IS NOT NULL` を明示し、accept、L
 |---|---|
 | `set_id` | `ohlcv_slice_sets` への FK。NOT NULL |
 | `bar_time` | UTC 1 分境界 |
-| `open` / `high` / `low` / `close` / `volume` | observed / no-tick flat では NOT NULL。outage marker では NULL |
-| `source` | 代表 source（§3.5）。flat / outage も由来 source を保持 |
-| `quality` | `observed` / `no_tick_flat` / `datafeed_outage_gap` |
+| `open` / `high` / `low` / `close` / `volume` | observed では NOT NULL。outage marker では NULL |
+| `source` | 代表 source（§3.5）。障害欠損の marker は pair の live 保存 source（`mt5` なら `mt5-live`） |
+| `quality` | `observed` / `datafeed_outage_gap` |
 
-UNIQUE は `(set_id,bar_time)`。quality と OHLC の NULL 対応を CHECK する。
+UNIQUE は `(set_id,bar_time)`。quality と OHLC の NULL 対応を CHECK する。行は開場 minute にだけ作り、既知閉場の minute には作らない。`datafeed_outage_gap` は §3.5-3 の障害欠損を表す値の名前で、同名の表を参照する意味は無い（T1a の DDL の値をそのまま使う、`db.py:285-306`）。T1a の DDL（`db.py:281-306`）と T1c の store（`ohlcv_slices.py:39-41,91-103`）にある `no_tick_flat` の値と、その 4 値同一・volume=0 の CHECK は、読み手も書き手も無い値になるので T4a が除く（§4）。econ-b1 は未配備で、本機の DB に `ohlcv_slices` は無い（`mode=ro` で確認）ので、既存行の移行は要らない。別版で flat を足すときに値と CHECK を戻す。
 
 `econ_reaction_keys`（束 2 が書く）は反応集計の一意キーと canonical pair の対応で、算定時点に 1 回だけ書いて変えない。
 
@@ -279,6 +304,7 @@ UNIQUE は `(set_id,bar_time)`。quality と OHLC の NULL 対応を CHECK す�
 | 表 | 変更・遷移 |
 |---|---|
 | `econ_events` | nullable FK `superseded_by` を追加。有効 row は NULL |
+| `datafeed_outage_gap` | 変えない。outage episode の表示と再開判定の用途だけに残し、econ の欠損分類では読まない |
 | `trade_intents` | `reject_category` に `econ_window` を追加し、NULL 三値を明示した CHECK へ rebuild |
 | `missions` | 専用 mission の帯内終端に `system_filtered` を追加。既存 status は維持し、全 reader で terminal success/filter として扱う |
 | `signals` | status CHECK の 4 値は変えず、`trade_intents` と同じ手順で table を rebuild する（既存行があると CHECK 付きの列追加は失敗するため）。nullable な `contract_version`（NULL か `executable_v1`）、`abandon_reason`、`abandoned_at` を加える。`abandon_reason` は status=abandoned のときだけ NOT NULL で、値は `freshness_expired` / `requeued_expired` / `retry_exhausted` / `source_inactive` / `normalization_failed` / `deploy_op` / `deploy_linked` / `ineligible_cleanup` / `legacy_unknown` のいずれか。他の status では NULL。`abandoned_at` は status が abandoned 以外なら NULL、abandoned なら NOT NULL。ただし既存 abandoned は copy 時に reason=`legacy_unknown`、`abandoned_at=NULL` を許す。確定採否は `claimed→consumed`、retry は `claimed→pending`、cron は遷移させない |
@@ -315,7 +341,8 @@ abandoned は対象側の eligibility を満たす signal だけを `abandon_rea
 1. decision 時刻を次の UTC 分境界へ切り上げた `t0` を観測開始とする。分境界ちょうどならその時刻。
 2. market は `t0` の最初の完全な 1m open に half spread を適用する。limit は `[t0,t0+4h)` の最初の到達足で、live paper fill と同じ gap / spread 保守則を使う。spread は shadow 行の保存値を使う。
 3. fill 足で SL と TP の両方が見えれば SL。TP だけなら entry と TP の順序不明なので、その足では TP を確定しない。fill 後も同時 SL / TP は SL、gap は open で不利に滑らせる。
-4. day close は live と同じ規則で、起点の次の rollover から live と同じ buffer を引いた時刻と、その前の最後の完全足を使う。起点は market が `t0`、limit が fill 足の時刻である（rollover 後に約定した limit は翌 rollover まで続く）。filled は SL / TP が無くても day close で必ず終端する。
+4. day close は live と同じ規則で、起点の次の rollover（`market_hours.next_rollover`、NY 17:00 で夏 21:00Z / 冬 22:00Z）から live と同じ buffer を引いた時刻と、その前の最後の完全足を使う。起点は market が `t0`、limit が fill 足の時刻である（rollover 後に約定した limit は翌 rollover まで続く）。filled は SL / TP が無くても day close で必ず終端する。winter の fixture は 22:00Z を期待値にする（DST §3.6-c。scheduler 側の期待値は済み 8ceca972、shadow 側は T4a / T4b が最初から新規則で書く）。切替の過渡規則（`time_cutover.day_close_rollover`）は shadow に使わない。過渡規則は起点が T_c より前の建玉だけに効き、shadow は econ-b1 の配備後（T_c 以後）にしか作られないからである。
+   既知閉場の minute（`is_market_open` が偽）は足として扱わず、entry・fill・SL / TP・day close の候補にならない。market の entry は `t0` 以後の最初の開場 minute の open で、その minute が `t0` 起点の day close 以後なら `expired` / `no_fill` で終える。limit の到達判定は `[t0,t0+4h)` の開場 minute だけを見る。filled の day close は金曜と休場前日でも閉場の前に来るので、filled の区間は閉場をまたがない。
 5. 判定に必要な最後の足の終端から backfill 猶予 1 日までは不足を確定しない。猶予内の backfill は採る。猶予後は `data_insufficient` / 除外を確定し、後から足が来ても再計算しない。
 6. shadow の slice 区間は、market が `[t0, t0 起点の day close)`、limit filled が `[t0, fill 時刻起点の day close)`、limit no-fill が `[t0, expiry)`。limit の区間終端は fill の有無が決まってから決まる（fill 足が見えた時点、または expiry を過ぎて no-fill）。1 owner の行数上限は limit filled の 240 + 1,440 = 1,680 行。最終確定点は区間終端 + 1 日。早期に見えた SL / TP は候補として保持し、slice set の完備 CAS と同じ transaction で終端を commit する。
 7. `pnl_pips` は long `(exit-entry)/pip_size`、short `(entry-exit)/pip_size`。手数料・swap・lot は含めない。
@@ -330,15 +357,19 @@ abandoned は対象側の eligibility を満たす signal だけを `abandon_rea
 6. **回収と cancelled 掃除**: worker は起動ごとに世代台帳へ 1 行を commit し、その id を現世代とする。世代は DB に永続し単調増加なので、旧世代の staging を現世代と誤認しない。起動時は旧世代の `staging` set を、毎 cycle は `cancelled` set に残る staging 行を、lock 外で 240 行ずつ消す。event set は spread 列を保持したまま `awaiting` に戻し（世代は NULL）、shadow set は set 行も消して候補として作り直す。記録済みの発表前 spread は再起動で失われない。`awaiting`・complete / unrecoverable は変えない。`cancelled` は slice 行だけを掃除し、状態は変えない。
 7. **競合**: 2 worker が同じ owner を処理しても、世代と期待 state の CAS で成功は 1 回だけになる。
 
-scheduler 専用の write 接続は無い。scheduler は executor・broker・trade loop・reflection・calendar・news と共有する core 接続で書き、signal maintenance は同じ tick の中で signal 用の接続から書く（§1）。scheduler は writer admission mutex の中で、DB write を含み得る tick の開始前に書込み要求フラグを立て、mutex を解放してから書く。フラグはその tick で 2 接続が開いた write transaction がすべて commit / rollback するまで維持し、最後に同 mutex 内で下ろす。登録は writer 取得試行より必ず先で、worker の確認と BEGIN に対して全順序になる。既存接続の busy timeout 5000ms は変えない。新設の worker write 接続だけを busy timeout 0 にし、競合は即 rollback する。フラグを持たない既存 writer（improve の長い `BEGIN IMMEDIATE`、ops audit、outage 観測、別プロセスの news 操作）と scheduler の競合は現行どおり 5000ms の中で吸収する。worker はそれらと競合すれば即 rollback するので、scheduler の待ちを増やさない。worker transaction 中に要求が来た場合だけ、scheduler は残りの commit 前 50ms 以下と worker の commit 所要を待ち得るが、新しい worker batch は入らない。scheduler の待ちは、tick 内の各 write transaction の最初の文を出してから戻るまでの時間として測る（§5-12）。kill switch・day close・SL / TP の scheduler thread は worker の完了通知を待たない。tick 中の印と次 tick 予定は負荷抑制の観測値として残すが、writer 排他の正しさには使わない。
+scheduler 専用の write 接続は無い。scheduler は executor・broker・trade loop・reflection・calendar・news と共有する core 接続で書き、signal maintenance は同じ tick の中で signal 用の接続から書く（§1）。scheduler は writer admission mutex の中で、DB write を含み得る tick の開始前に書込み要求フラグを立て、mutex を解放してから書く。フラグはその tick で 2 接続が開いた write transaction がすべて commit / rollback するまで維持し、最後に同 mutex 内で下ろす。登録は writer 取得試行より必ず先で、worker の確認と BEGIN に対して全順序になる。既存接続の busy timeout 5000ms は変えない。新設の worker write 接続だけを busy timeout 0 にし、競合は即 rollback する。フラグを持たない既存 writer（improve の長い `BEGIN IMMEDIATE`、ops audit、outage 観測、別プロセスの news 操作）と scheduler の競合は現行どおり 5000ms の中で吸収する。worker はそれらと競合すれば即 rollback するので、scheduler の待ちを増やさない。worker の admission は BEGIN の前から commit / rollback の後まで続く lease で、要求の登録は新規開始を閉じたうえで既存 lease の終了を上限 200ms で待つ（超過は記録し、待たずに進む）。worker transaction 中に要求が来た場合だけ、scheduler は残りの commit 前 50ms 以下と worker の commit 所要を待ち得るが、新しい worker batch は入らない。scheduler の待ちは、tick 内の各 write transaction の最初の文を出してから戻るまでの時間として測る（§5-12）。kill switch・day close・SL / TP の scheduler thread は worker の完了通知を待たない。tick 中の印と次 tick 予定は負荷抑制の観測値として残すが、writer 排他の正しさには使わない。
 
 ### 3.5 1m 共通規則、退避、反応統計
 
 1. 足は tz-aware UTC の `[bar_time,bar_time+1m)`。OHLC は有限正数で high / low の整合を満たす。
-2. 同じ pair / minute の複数 source は、OHLC が既存の数値一致（許容誤差 1e-9）で一致すれば 1 本へ畳み、不一致なら障害欠損と同じ unresolvable にする。畳んだ行の代表 source は、live cache の保存 source、次に history の source 名の昇順で選ぶ。
-3. 足が無い minute が `datafeed_outage_gap` に含まれる場合は障害欠損とし、shadow は `data_insufficient`、reaction window は `unresolvable` で除外する。それ以外は rollover など tick 無しとし、直前 close の flat OHLC、volume=0 で前値保持する。先頭 minute で直前 close も無ければ `unresolvable`。gap-open は次の observed open をそのまま使う。この分類は shadow / reaction で共有する。
+2. 同じ pair / minute の複数 source は、OHLC が既存の数値一致（許容誤差 1e-9）で一致すれば 1 本へ畳み、不一致なら障害欠損と同じ unresolvable にする。畳んだ行の代表 source は、live cache の保存 source、次に history の source 名の昇順で選ぶ。shadow と event の区間は確定が区間終端 + 1 日なので、読むのは実質 cache の live 行である（DST §3.6-a）。本機の `ohlcv_history` の 1m は 2026-05-28〜09-02 だけで、5m の履歴は読まない。
+3. **欠損の分類。** shadow / reaction で共有し、T4a の `econ_bars` が 1 か所で決める。分類は次の 2 つだけである。
+   - **(i) 既知閉場:** `market_hours.is_market_open(minute)` が偽の minute。期待格子（`expected_rows`）にも障害欠損にも入れず、slice 行を作らない。cache にその minute の行があっても読まない（DST §3.6-b / d。本機では C2 の 4 行がこれに当たる、§0.2）。
+   - **(ii) 障害欠損:** 開場 minute の欠落はすべて障害欠損とする。tick 不在によるものか取得の障害によるものかを区別する情報が無いからである。取得の成功は terminal と broker の接続を示さない（§1）。仮に取得時点の接続が分かっても、ingest は履歴の範囲 `[watermark − 足幅, now)` を要求し（`ingest.py:200-210`）、bridge はそれ以前の切断区間を含む疎な履歴を返し得るので、過去の minute の tick 不在は証明できない。shadow は `data_insufficient`、reaction window は `unresolvable` で除外する。slice 行は quality=`datafeed_outage_gap` の marker にする。gap-open（欠落の後の最初の足）は observed の open をそのまま使う。
+   - 判定は §3.4-5 の猶予（判定に必要な最後の足の終端 + 1 日）まで確定しない。猶予内に来た足は採る。分類は `datafeed_outage_gap` を読まない。
+   - **保守側を既定にする理由。** 反応統計は人間面だけでなく cron trade agent にも開示される（§3.5-10、§3.6）。不確実な flat を入れると値幅を小さく見せた統計が裁量判断に入り、発注に間接に影響する。shadow も約定・終端を誤る。欠落を除外する側の誤りは標本数の減少として表に出る（`data_insufficient` / unresolvable の件数）ので、見えない誤差より扱いやすい。本機の 1m cache では、開場中の欠落 106 minute のうち 96 minute が NY 17 時台（取引日の最初の 1 時間）にあり、22 取引日のうち 15 日に欠落がある。この時間帯を区間に含む shadow（rollover をまたいで pending の limit、rollover 後に約定した limit、NY 17 時台に出た signal）は v1 で `data_insufficient` になりやすい。平日の欠落は 10-04T22:33Z の 1 minute と 10-16T09:04〜09:12Z の 9 minute だけで、reaction の窓への影響は小さい。
 4. 区間の先頭が cache / history の保持範囲（その pair の最古の 1m 足）より前なら、元足は保持で消えているので set を `unrecoverable` で終端し、shadow は `data_insufficient`、reaction の 3 窓は unresolvable に数える。
-5. event の退避対象は、importance が `econ.window.importance_min` 以上、country が settings pair の通貨か `All`、`superseded_by IS NULL` の row で、対象 pair ごとに 1 set とする。set の作成は event 保存と同じ transaction を要求しない（event 保存は 1 行ごとに commit する、§1）。calendar refresh が取得結果の全 row を保存し終えた直後に、取得結果全体を入力とする冪等な 1 transaction の pass で、§3.1-7 の supersede、対象 event × pair の `awaiting` set の作成（既存 set は UNIQUE で作らない）、superseded になった event と importance 低下・pair 削除で対象外になった event の `awaiting` / `staging` set の `cancelled` 化を行う。保存が途中で失敗した refresh ではこの pass を行わず、保存済み row は次の refresh か worker 起動時の補完で拾う。worker 起動時は supersede を除く同じ pass（作成と cancelled 化）を保存済み row 全体に行い、設定変更・旧 event による不足 set を補う。`cancelled` の set の event が設定変更（importance_min の引き下げ、pair の再追加）で再び対象になれば、pass は §3.4-6 の毎 cycle 掃除後に slice 行が 0 件であることを確認し、0 件なら `completed_at` / `generation` / `purged_at` を NULL にして同じ set を `awaiting` に戻す（UNIQUE のため新しい set は作らない）。行が残れば `cancelled` のまま見送り、次の pass で再試行する。発表前に記録済みの `spread_pips` / `spread_source` は保持する。superseded 由来の `cancelled` は復帰させない。区間は `[ts-15m,ts+4h)` の 255 本、確定は `ts+4h+1 日`。元足が保持範囲に残る過去 event も同じ規則で退避する。
+5. event の退避対象は、importance が `econ.window.importance_min` 以上、country が settings pair の通貨か `All`、`superseded_by IS NULL` の row で、対象 pair ごとに 1 set とする。set の作成は event 保存と同じ transaction を要求しない（event 保存は 1 行ごとに commit する、§1）。calendar refresh が取得結果の全 row を保存し終えた直後に、取得結果全体を入力とする冪等な 1 transaction の pass で、§3.1-7 の supersede、対象 event × pair の `awaiting` set の作成（既存 set は UNIQUE で作らない）、superseded になった event と importance 低下・pair 削除で対象外になった event の `awaiting` / `staging` set の `cancelled` 化を行う。保存が途中で失敗した refresh ではこの pass を行わず、保存済み row は次の refresh か worker 起動時の補完で拾う。worker 起動時は supersede を除く同じ pass（作成と cancelled 化）を保存済み row 全体に行い、設定変更・旧 event による不足 set を補う。`cancelled` の set の event が設定変更（importance_min の引き下げ、pair の再追加）で再び対象になれば、pass は §3.4-6 の毎 cycle 掃除後に slice 行が 0 件であることを確認し、0 件なら `completed_at` / `generation` / `purged_at` を NULL にして同じ set を `awaiting` に戻す（UNIQUE のため新しい set は作らない）。行が残れば `cancelled` のまま見送り、次の pass で再試行する。発表前に記録済みの `spread_pips` / `spread_source` は保持する。superseded 由来の `cancelled` は復帰させない。区間は `[ts-15m,ts+4h)` の 255 minute で、`expected_rows` はそのうちの開場 minute 数（閉場を含まなければ 255、金曜午後・休場前日の event では少なくなる）、確定は `ts+4h+1 日`。元足が保持範囲に残る過去 event も同じ規則で退避する。
 6. event の spread は、worker が `[ts-5m,ts)` に対象 pair の quote を §3.2 と同じ取得経路で取り、同じ条件で `quote` / `assumed` を決め、spread が NULL の `awaiting` set に 1 回だけ CAS 保存する。再起動時も NULL でまだ同区間なら再試行する。ts までに記録できなかった set は ts 以後の最初の cycle で assumed spread と `assumed` を CAS 保存し、後から quote へ置換しない。spread 候補は成熟済み slice の解決より常に先に処理する。
 7. 反応値の式（pip は pair の pip_size、窓 H ∈ {15,60,240} 分）:
    - 基準 close B = `[ts-1m,ts)` 足の close
@@ -347,7 +378,8 @@ scheduler 専用の write 接続は無い。scheduler は executor・broker・tr
    - `close_change_pips` = (C_H − B) / pip。C_H は開始 `ts+H-1m` の足の close
    - `abs_close_change_pips` = |close_change_pips|
    - `net_abs_close_change_pips` = abs_close_change_pips − set の `spread_pips`（往復 1 回分の全幅）。負値もそのまま残す
-   - 基準足か対象足に outage marker、source 不一致、前値の無い先頭 flat があれば、その窓は unresolvable
+   - 基準足か対象足に outage marker か source 不一致があれば、その窓は unresolvable
+   - `[ts-1m,ts+H)` に既知閉場の minute が 1 つでもあれば、その窓は unresolvable（閉場をまたぐ窓は H 分の取引にならず、他の event と比べられない）。平日の NY 17:00 は閉場ではないので、日次境界をまたぐ窓は解決できる
 8. 3 窓は set が complete になった直後の worker cycle で `econ_reaction_values` に 1 回書き、以後変えない。集計は窓 × 束ごとに range / abs / net の median / p75 と、符号付き close_change の median を返す。
 9. 集計の一意キーは `(event_id,currency)`。通常 event は country の 1 通貨、`All` は settings pairs に含まれる全通貨へ 1 回ずつ展開する。各通貨の価格系列は、反応値を書く時点の settings pairs の並びでその通貨を含む最初の pair を canonical pair とし、`(event_id,currency)` → set の対応を、その canonical pair の set の反応値と同じ transaction で 1 回だけ保存する（先に完備した別 pair の set には結ばない）。後から pair の並びや集合が変わっても保存済みの対応は変えず、集計は保存済みの対応だけを使う。同じ event の別 pair set は保存しても同じ通貨束へ重複加算しない。束は `(currency,importance)` と `(currency,name)`。superseded row は除外し、同時刻の別名は別 event。人間面は `n` / `unique_ts_n` を併記する。
 10. trade agent の開示床は束 × 窓で n>=20。床未満は `status=insufficient` だけ、人間面は n と数値を出す。pair 入力には、その base / quote currency の束を返し、値は 9 の canonical pair から算出する。pair は `settings.pairs` の enum に限定し、watch symbols は受けない。cron trade mission にだけ見せ、ask / improve / 専用採否 mission へ登録しない。
@@ -385,6 +417,12 @@ activity 固定語は次の 9 個だけ追加する: `signal_filtered_econ_windo
 
 親専有 report は既存 baseline monitor と同じ親プロセス側の owner-only 領域へ出す。T2a-2 が scheduler / service に「市場の当日 close 後に 1 回」と「起動時に当日分が無ければ 1 回」の hook API を置き、T5 はその hook に生成関数を差す。RAG / tool / worker へ保存先を渡さない。
 
+日次 report の日付の規則は次のとおり（DST §3.6-e / f、済み 8ceca972、`scheduler.py:454-528`）。
+
+- 「当日 close」は `now` 以前で最後に閉じた取引日の終端（NY 17:00、夏 21:00Z / 冬 22:00Z）。直前の 1 分が開場だった境界だけを数え、NY の日付で 1 日ずつ遡る（24 時間の固定幅で遡らない）。
+- report の取引日ラベルは「終端 1 分前の `trading_date`」。旧 21:00Z と新 22:00Z の終端は同じ取引日になる。marker（`alert_state` の終端 ISO 値）も同じ式で読み、旧版が書いた値も同じ式で読み替える。読めない値は未記録とし、1 回だけ追いつく。
+- 切替の過渡期間は、`now` が `[T_c, T_b)` に入っているかで決める。入っている間は marker の読みを「新規則の読み」と「旧規則の `legacy_trading_date(終端 − 1 分)`」の遅い方にする。report の側に `daily_label(conn, 記録の終端 − 1 分)` は使わない。使うと、過渡期間中に新版が書いた 22:00Z の終端が旧ラベル（翌日）で読まれ、翌日の report を落とすからである。`daily_label` は wait-budget の運用日（§3.2-7）にだけ使う。
+
 ## 4. 配線表
 
 配線表は実在ファイルと新規ファイルだけを列挙する。関数名は実装時に各ファイルの既存流儀へ合わせる。「所有」列は §7 の task で、1 ファイルを持つ task は 1 つだけとする（例外は行内に書く）。
@@ -392,23 +430,25 @@ activity 固定語は次の 9 個だけ追加する: `signal_filtered_econ_windo
 | 場所 | 配線 | 所有 |
 |---|---|---|
 | `src/agentic_fx/config.py` / `config/settings.yaml.example` / `tests/fixtures/settings_examples/v5.yaml` | 任意 `econ.window`、3 既定値、任意 `econ.signal_capacity_daily_max`。config 層は容量上書きを整数 1 以上とだけ検査し、`S_producer` との比較はしない。schema_version は 5 のまま、example と v5 fixture は byte 同期し、v4 → v5 migrate chain は `econ` を注入しない | 束1 T1a |
-| `src/agentic_fx/store/db.py` | `signal_decisions`、`signal_shadow`、`ohlcv_slice_sets`、`ohlcv_slices`、`ohlcv_slice_generations`、`econ_reaction_keys`、`econ_reaction_values` の fresh DDL / index / CHECK / table list。`econ_events.superseded_by`。`trade_intents` の `econ_window` CHECK rebuild と、`signals` の rebuild（`contract_version`・`abandon_reason`・`abandoned_at` と CHECK、既存 abandoned は reason=`legacy_unknown` / `abandoned_at=NULL`）。`_SIGNALS_V2_DDL` は変えず `{ine}{name}` 型の v3 DDL を別に置き、fresh は v3、既存は `_migrate_signals_fk` の後に v3 rebuild とする。T1a は §3.3 の PK / UNIQUE だけを作り、候補抽出 index が必要なら T4c bench 前に ownership を戻して追加する。busy timeout は変えない。既存 `data_migrations` に対する name 引数の冪等 helper と `init_db` の呼出し順を T1a が置き、T1b が正規化 migration の lazy-import 呼出し 1 行だけを引き継ぐ | 束1 T1a → T1b（呼出し 1 行）→ T4c（追加 index が必要な場合だけ） |
+| `src/agentic_fx/store/db.py` | `signal_decisions`、`signal_shadow`、`ohlcv_slice_sets`、`ohlcv_slices`、`ohlcv_slice_generations`、`econ_reaction_keys`、`econ_reaction_values` の fresh DDL / index / CHECK / table list。`econ_events.superseded_by`。`trade_intents` の `econ_window` CHECK rebuild と、`signals` の rebuild（`contract_version`・`abandon_reason`・`abandoned_at` と CHECK、既存 abandoned は reason=`legacy_unknown` / `abandoned_at=NULL`）。`_SIGNALS_V2_DDL` は変えず `{ine}{name}` 型の v3 DDL を別に置き、fresh は v3、既存は `_migrate_signals_fk` の後に v3 rebuild とする。`signal_decisions` は `UNIQUE(id, signal_id)` を持ち、`signal_shadow` は `(decision_id, signal_id)` の複合 FK で結ぶ（decision / actor / reject_code の snapshot 一致は T1c の writer 契約）。`ohlcv_slice_sets` は `expected_rows >= 0` と `range_start < range_end` の CHECK を持つ。T1a は §3.3 の PK / UNIQUE だけを作り、候補抽出 index が必要なら T4c bench 前に ownership を戻して追加する。busy timeout は変えない。既存 `data_migrations` に対する name 引数の冪等 helper と `init_db` の呼出し順を T1a が置き、T1b が正規化 migration の lazy-import 呼出し 1 行だけを引き継ぐ | 束1 T1a → T1b（呼出し 1 行）→ T4a（`ohlcv_slices` の quality の CHECK から `no_tick_flat` を除くだけ、§3.3）→ T4c（追加 index が必要な場合だけ） |
 | `src/agentic_fx/store/signals.py` | T1a は現存する abandoned 書込み（`expire_stale`、requeue / lease 回収の共有式、claimed 即時 abandoned、deploy op pending abandoned）へ reason と `abandoned_at` を付ける最小変更だけを行う。`abandon_claimed()` は store 側で理由を判別できないので、UTC 時刻と reason を引数で受ける形に変え、reason を知る呼出側 `loops/trade_loop.py` の 3 箇所（source inactive / stale の 2 箇所と maintenance の 1 箇所）の引数追加も同じ T1a が行う（`trade_loop.py` のこの 3 行だけ。T1a → T2b-1 に引き渡す）。T1b は eligibility / migration / cleanup の共通分類 query、tx 合成できる consume、集計、旧 payload の正規化 migration / `normalization_failed` を実装する | 束1 T1a → T1b |
 | `src/agentic_fx/store/missions.py` | T1a は起動時の中断回収で abandoned にする既存経路へ reason と `abandoned_at` を付ける最小変更だけを行う。T1b は `system_filtered` 終端と commit を外側へ委ねる終端、signal rate から `system_filtered` を除外する | 束1 T1a → T1b |
+| `src/agentic_fx/signal_admission.py` | wait-budget の評価・dedupe・運用日 key（T2a-2、済み）。T2a-3 は `window_start` を NY 日付で 13 日遡る形に変える（§3.2-7）だけ | 束1 T2a-2 → T2a-3（`window_start` だけ） |
 | `src/agentic_fx/store/signal_decisions.py`（新規） | 3 正規形、signal 一意性、decision / shadow / consume / mission の tx | 束1 T1c |
 | `src/agentic_fx/store/signal_shadow.py`（新規） | accept / reject shadow、spread snapshot、候補 query、CAS | 束1 T1c |
-| `src/agentic_fx/store/ohlcv_slices.py`（新規） | set 台帳、refresh 後 pass と起動時補完の store 操作（awaiting 作成・cancelled 化・再有効化）、staging 行の `BEGIN IMMEDIATE` 小分け書込み、完備 CAS、世代台帳と回収、保持期限の purge、S / C / B0 / β による容量算定 | 束1 T1c |
+| `src/agentic_fx/store/ohlcv_slices.py`（新規） | set 台帳、refresh 後 pass と起動時補完の store 操作（awaiting 作成・cancelled 化・再有効化）、staging 行の `BEGIN IMMEDIATE` 小分け書込み、完備 CAS、世代台帳と回収、保持期限の purge、S / C / B0 / β による容量算定。T4a は期待行数の算定（`_range_minutes` `:142-150` と `_shadow_range_minutes` `:489-494` を、区間の分数から開場 minute 数へ。呼出元は event set 作成 `:246`、shadow staging `:526`、shadow unrecoverable `:666`）と、`no_tick_flat` の定数と検査（`:39-41,91-103`）の除去、それらの store test（`tests/store/test_ohlcv_slices.py`、`tests/store/test_econ_signal_schema.py` の `no_tick_flat` の case）だけを変える。1,680 の上限検査は区間の分数のまま。本番 DB には slice 表がまだ無く、旧い期待行数の行を移行する必要は無い | 束1 T1c → T4a（期待行数の算定と `no_tick_flat` の除去だけ） |
 | `src/agentic_fx/plugin/signal_producer.py` / `src/agentic_fx/plugin/strategy_adapter.py` | live の執行可能 payload を backtest と同じ規則で保存前に正規化し `contract_version` を記録。adapter の replay 挙動は変更しない | 束1 T1b |
 | `src/agentic_fx/core/econ_window.py`（新規） | inclusive window、All、連結成分、bar 区間交差の純粋判定 | 束1 T2a-1 |
 | `src/agentic_fx/store/econ_events.py` / `src/agentic_fx/store/fetch_attempts.py` / `src/agentic_fx/datafeed/econ_calendar.py` | 発表後を含む範囲、All、importance、superseded 除外、7 日 next event、fetch attempts の success / failure。全 row 保存に成功した refresh の直後に、supersede（未発表・7 日以内だけ）・awaiting 作成・cancelled 化・再有効化の pass を配線する | 束1 T2a-1 |
-| `src/agentic_fx/core/scheduler.py` | cron 優先と signal 後続の維持、足区間基準の候補と bar 区間 limit 抑止、抑止通知の dedupe を `alert_state` に保存、resolver を同期 hook にしない。市場の当日 close 後 1 回だけ親 report callback を呼べる hook API を T2a-2 の出力にする | 束1 T2a-2 |
+| `src/agentic_fx/core/scheduler.py` | cron 優先と signal 後続の維持、足区間基準の候補と bar 区間 limit 抑止、抑止通知の dedupe を `alert_state` に保存、resolver を同期 hook にしない。市場の当日 close 後に親 report callback を呼べる hook API を T2a-2 の出力にする。日次 report の callback は取引日ごとに at-least-once で呼ばれ、冪等であること（生成側が取引日で一意化する）。marker は callback が正常に return した後にだけ書き、同一取引日の試行は最大 3 回。直近 close の NY 日付遡りと marker の取引日ラベル（§3.6、DST §3.6-e / f）は main 取り込み時に実装済み（8ceca972） | 束1 T2a-2 |
 | `src/agentic_fx/service.py` | T2a-2: signal 起動判定を eligible + rate に変更、静的保証 status と実測 warning / dedupe、起動時 / 実行中の S と `S_producer` の比較、signal id と終端種別を受けて commit 後に core lock 外で呼ぶ warning 評価境界（maintenance 終端は service 内から呼ぶ）、scheduler の DB 書込み要求フラグ（`conn_core` と `conn_signal` の両方を覆う）・tick 中の印・次 tick 予定の公開、親 report の close 後 1 回 + 起動時 catch-up hook API。T4c: slice worker の起動・停止・catch-up、worker 専用の read-only / write 接続（write だけ busy timeout 0）、起動時の補完 passを追加し hook を保つ。T5: report 生成関数を hook に差す | 束1 T2a-2 → T4c → T5 |
 | `src/agentic_fx/loops/signal_decision_contract.py`（新規） / `src/agentic_fx/loops/summary.py` | 専用採否 schema と parser、orders 照合。cron は従来 schema。calendar summary を pair view に変更（summary は mission status を読まないので `system_filtered` の変更は無い） | 束1 T3 |
 | `src/agentic_fx/loops/trade_loop.py` / `src/agentic_fx/loops/mission_finalize.py` | T2b-1: claim する trigger から cron を外して cron の claim / injection を廃止、cron / ask / 専用採否 mission の tool 一覧を分離、専用採否の claim と tx flow。T2b-2: commit-core の f 判定、quote spread snapshot、commit 前 window 再判定、gate reject streak の `econ_window` 除外、固定 activity、decision / freshness 系 abandoned の commit 成功後に T2a-2 の warning 評価境界を core lock 外で呼ぶ。T2b-1 から T2b-2、束1完了後に束2 T3へ順次引き渡す | 束1 T2b-1 → T2b-2 → 束2 T3 |
-| `src/agentic_fx/core/risk_gate.py` | `GateContext` の window 結果で裁量 OPEN だけを拒否 | 束1 T2b-2 |
-| `src/agentic_fx/loops/prompts/trade_mission.md` | 15m 表記、帯内新規 entry 禁止、帯外では指標だけを理由に見送らない、cron と signal 契約の分離 | 束1 T2b-2 |
+| `src/agentic_fx/core/risk_gate.py` | `GateContext` の任意 field（既定 None）の window 結果で裁量 OPEN だけを拒否、`GateResult` に帯内却下の印（§3.1-4） | 束1 T2b-2 |
+| `src/agentic_fx/core/executor.py` | `open_from_snapshot` に帯判定結果の任意引数、`GateContext` への詰め替え、`_evaluate_and_execute_open` での `econ_window` category と `open_rejected_econ_window` の写像だけ。`_open` / `handle_intent` は変えない | 束1 T2b-2 |
+| `src/agentic_fx/loops/prompts/trade_mission.md` | 「1 時間毎」を判断足ごとに（足は `_build_prompt` が注入済み）、帯内新規 entry 禁止（出してもシステムが拒否する）、帯外では指標だけを理由に見送らない、cron と signal 契約の分離（strategy の signal は別の採否 mission が扱う）。`trade_loop._build_prompt` の get_signals の文は ask だけに付ける（cron と専用採否は get_signals を持たない、§3.6） | 束1 T2b-2 |
 | `src/agentic_fx/core/econ_slice_worker.py`（新規） | §3.4 の writer 優先制御、worker cycle、shadow 終端、発表前 spread の優先 CAS、読戻し不一致の破棄、世代回収、cancelled の後始末、complete set の後処理差込口 | 束1 T4b |
-| `src/agentic_fx/datafeed/econ_bars.py`（新規） | cache / history、outage / no-tick 分類、保持範囲判定、代表 source、slice 用 1m 正規化 | 束1 T4a |
+| `src/agentic_fx/datafeed/econ_bars.py`（新規） | cache / history、欠損の分類（既知閉場の除外、開場中の欠落は障害欠損、§3.5-3）、開場 minute だけの期待格子、保持範囲判定、代表 source、slice 用 1m 正規化 | 束1 T4a |
 | `src/agentic_fx/core/paper_fills.py` | live / shadow の limit / exit 保守則を共用 | 束1 T4a |
 | `src/agentic_fx/loops/improve_context.py` / `src/agentic_fx/loops/prompts/improve_mission.md` | hold_rate / reject_breakdown の新しい母集団 | 束1 T5 |
 | `src/agentic_fx/ops/trade_event_sink.py` / `src/agentic_fx/status.py` / `src/agentic_fx/commands.py` | trigger / `system_filtered` / abandoned / 容量警告 / 小集計の既存 reader 更新 | 束1 T5 |
@@ -420,15 +460,16 @@ activity 固定語は次の 9 個だけ追加する: `signal_filtered_econ_windo
 | `policy/directives.md` | 追跡外の利用者データで、コードは読み書きしない。既定文は §8 J3 の全文（承認を前提）と fixture。配備時に利用者が `afx ctl policy add` で登録し、旧 1 行目を手で消す | 利用者 |
 | `tests/fixtures/econ_signal_policy_default.txt` / `econ_signal_claude_accept.json` / `econ_signal_claude_reject.json`（新規） | §8 J3 の既定文、T3 が 1 回だけ抽出して追跡する §5-4 の実 CLI transcript 由来固定 JSON。merge 前 job は tmp 出力を照合するだけで追跡 fixture を書き換えない | 束1 T3 |
 | `tests/fixtures/econ_window_history_20261016_1031.sqlite` / `tests/fixtures/build_econ_window_history_fixture.py` / `tests/audit/test_econ_history_regeneration.py`（新規） | §5-14 の列 allowlist 抽出スクリプト、read-only 履歴 snapshot、970 / 3 / 57 再生成。snapshot は missions=`id,loop,trigger,status,started_at`、trade_intents=`id,mission_id,action`、signals=`id,status,kind,claimed_by_mission_id` だけを保持し、payload / output / transcript と他表を含めない | 束1 T5 |
-| `tests/store/test_econ_signal_schema.py`（新規） | schema / rebuild / migration / store の test。所有は T1a → T1b → T1c の順に引き渡す | 束1 T1a → T1b → T1c |
+| `tests/store/test_econ_signal_schema.py`（新規） | schema / rebuild / migration / store の test。所有は T1a → T1b → T1c の順に引き渡す | 束1 T1a → T1b → T1c → T4a（`no_tick_flat` の case のみ） |
 | `tests/core/test_econ_window.py`（新規） / `tests/core/test_signal_wait_budget.py`（新規） | 前者は T2a-1、後者は T2a-2 が所有し、それぞれの出力と一緒に後続へ渡す | 束1 T2a-1 / T2a-2 |
 | `tests/loops/test_signal_decision_flow.py`（新規） | contract / realbackend case を T3、claim〜未確定 flow を T2b-1、commit-core と warning 評価呼出しを T2b-2 が順に追加し、file ownership も同順で渡す | 束1 T3 → T2b-1 → T2b-2 |
+| `tests/test_wait_budget.py` | §5-40 の春秋 2 例を足す | 束1 T2a-3 |
 | `tests/core/test_econ_shadow_worker.py`（新規） | 1m / fill fixture は T4a、worker state は T4b、service / 実ディスク / 容量は T4c が順に追加し、file ownership も同順で渡す | 束1 T4a → T4b → T4c |
 | `tests/analytics/test_econ_reactions.py`（新規） / `tests/test_econ_agent_isolation.py`（新規） | 前者は束2 T1 → T2、後者は束1 T5 → 束2 T4 の順に引き渡す。実ディスク・容量・履歴再生成は既存 `bench` marker、Claude 実往復は既存 `realbackend` marker で通常 suite から外す | 束2 T1 → T2 / 束1 T5 → 束2 T4 |
 
 新規の `tests/audit/` と `tests/analytics/` にはそれぞれ `__init__.py` を置き、既存 tests の package 収集規約を保つ。
 
-DB migration は `db.py` の既存流儀に従う。新 7 表 / index は fresh schema と `CREATE TABLE IF NOT EXISTS` を同じ DDL から作る。列追加は冪等に行う。`trade_intents` と `signals` の rebuild は共通 DDL、事前 backup、FK 無効化を transaction 外で行い、新表作成 → 全行 copy → 行数照合 → 旧表 drop → rename → DB 全体の FK 検査 → commit、finally で FK を戻す。signals は RENAME 先行の `_migrate_signals_fk` ではなく、参照される表を扱う `_migrate_trade_intents_observability`（§1）を前例にする。signals の copy では既存 abandoned に reason=`legacy_unknown` / `abandoned_at=NULL`、それ以外に両方 NULL を入れ、`contract_version` は NULL で写す。CHECK 本文も冪等 guard に含め、2 回目初期化で rebuild しない。`missions.status` は現行に CHECK が無いため DDL rebuild をせず reader と test を更新する。`signals.status` の 4 値は変えない。T1a は v3 rebuild と既存 `data_migrations` 用 helper・呼出し順の枠までを作り、旧 payload の正規化は T1b が live 保存規則と一緒に実装して v3 rebuild の直後に走らせ、key と記録行を所有して 2 回目は何もしない。
+DB migration は `db.py` の既存流儀に従う。新 7 表 / index は fresh schema と `CREATE TABLE IF NOT EXISTS` を同じ DDL から作る。列追加は冪等に行う。`trade_intents` と `signals` の rebuild は共通 DDL、事前 backup、FK 無効化を transaction 外で行い、新表作成 → 全行 copy → 行数照合 → 旧表 drop → rename → signals を参照する子表 3 本（`plugin_deploy_op_signals` / `signal_decisions` / `signal_shadow`）の FK 検査 → commit、finally で FK を戻す。子表 3 本の違反は失敗、signals と無関係な表の既存違反は数えて技術ログに warning を出し、移行を止めない。CHECK 本文の冪等 guard は文字列リテラルの中を 1 文字も変えず、リテラル外だけ空白を落としてキーワードの大小を畳み、列レベルと表レベルの CHECK を区別せず集合で比べる。signals は RENAME 先行の `_migrate_signals_fk` ではなく、参照される表を扱う `_migrate_trade_intents_observability`（§1）を前例にする。signals の copy では既存 abandoned に reason=`legacy_unknown` / `abandoned_at=NULL`、それ以外に両方 NULL を入れ、`contract_version` は NULL で写す。CHECK 本文も冪等 guard に含め、2 回目初期化で rebuild しない。`missions.status` は現行に CHECK が無いため DDL rebuild をせず reader と test を更新する。`signals.status` の 4 値は変えない。T1a は v3 rebuild と既存 `data_migrations` 用 helper・呼出し順の枠までを作り、旧 payload の正規化は T1b が live 保存規則と一緒に実装して v3 rebuild の直後に走らせ、key と記録行を所有して 2 回目は何もしない。
 
 ## 5. 受入条件
 
@@ -452,13 +493,18 @@ DB migration は `db.py` の既存流儀に従う。新 7 表 / index は fresh 
 
 2. cron と専用採否 mission を同じ判断足で due にし、cron が先に 1 回受理され watermark が進み、通常 schema で裁量判断すること、cron が signal を claim しないこと、signal が pending のまま次の idle tick で専用 mission に 1 件だけ claim されることを test する。2 mission は同時に runner / commit-core へ入らない。cron mission の tool 一覧に signal 一覧が無く、ask の一覧には残り、専用採否 mission の一覧はニュース検索と建玉一覧だけであることも確かめる。
 3. 専用 schema は accept+null / reject+2 語だけを通す。未知 key/code、相関不一致、hold、通常 intent は schema / Python の片方だけを迂回しても失敗する。逆建玉なしの `opposite_position` も `signal_decision_invalid`、failed、requeue になる。
-4. **Claude 実往復（merge 前必須、`realbackend` profile）。** `runner.trade.backend=claude`、設定済み `runner.claude.bin`、サブスクリプション認証だけを使い、accept と reject を各 1 往復する。reject 入力は同じ pair に逆方向の `OPEN` order がある場面へ固定し、最大 3 往復で正しい reject が 1 回も得られなければ fail とする。両 case で実 CLI に `--json-schema` を渡し、最上位 type、property type、local 条件節の typed const、parser の相関を検証する。sanitized transcript と CLI version / model / schema hash は `tmp/econ-window-acceptance/claude/` にだけ出す。追跡する固定 JSON は T3 が最初の確定時に 1 回だけ抽出して commit 対象へ置き、merge 前 job は tmp の応答をその形と照合するだけで `tests/fixtures/econ_signal_claude_accept.json` / `econ_signal_claude_reject.json` を書き換えない。通常 suite では既存 `realbackend` marker により除外してよいが、§7 の merge 前 job は `--fail-on-skip` で両 case の成功を必須にする。Anthropic API key は使わない。
+4. **Claude 実往復（merge 前必須、`realbackend` profile）。** `runner.trade.backend=claude`、設定済み `runner.claude.bin`、サブスクリプション認証だけを使い、accept と reject を各 1 往復する。reject 入力は同じ pair に逆方向の `OPEN` order がある場面へ固定し、最大 3 往復で正しい reject が 1 回も得られなければ fail とする。両 case で実 CLI に `--json-schema` を渡し、最上位 type が object で anyOf / allOf / oneOf を持たないこと（実測では最上位 anyOf 等は 400）、property type、最上位 if/then/else による相関、parser の相関を検証する。sanitized transcript と CLI version / model / schema hash は `tmp/econ-window-acceptance/claude/` にだけ出す。追跡する固定 JSON は T3 が最初の確定時に 1 回だけ抽出して commit 対象へ置き、merge 前 job は tmp の応答をその形と照合するだけで `tests/fixtures/econ_signal_claude_accept.json` / `econ_signal_claude_reject.json` を書き換えない。通常 suite では既存 `realbackend` marker により除外してよいが、§7 の merge 前 job は `--fail-on-skip` で両 case の成功を必須にする。Anthropic API key は使わない。
 5. accept は intent 記録前に window を再判定し、帯へ入っていれば intent 0、system reject、reject shadow、consume、`system_filtered`。帯外なら intent / decision / accept shadow / consume / completed が同じ transaction で確定後に executor が走る。通常の資金 gate 拒否でも decision=accept と accept shadow は残る。
 6. lock timeout、snapshot stale、source inactive、signal stale、data state not ready、未 claim の鮮度切れの表を test し、decision / shadow が 0、signal が指定どおり requeue / abandoned になり、reason が §3.3 の表どおりになる。signal stale は commit-core の時刻 > f で判定し、runner が f 後に戻った場合も abandoned、requeue 歴の有無で `freshness_expired` / `requeued_expired` に分かれる。abandoned は decision 分母に入らない。
 7. 任意の decision / shadow / consume / mission 書込み失敗で transaction 全体が rollback し、finalized / consumed は false。retry しても decision は signal ごとに最大 1 行。DB CHECK は NULL 三値を含む不正形を拒否する。
 8. shadow fixture は accept / reject、market、limit 未到達、gap fill、同一足 SL+TP、TP のみ、day close、rollover 後に約定した limit（翌 rollover の day close まで、1,680 行以内）、long / short、spread `quote` / `assumed`（bid = ask の quote と鮮度切れ quote は assumed）を通す。accept shadow の actor は `llm`。2 worker の CAS 成功は 1 回。filled は day close + 猶予後に必ず終端する。
-9. 欠損を 2 分類する。`datafeed_outage_gap` に重なる minute は shadow `data_insufficient` / reaction `unresolvable`、gap 外の no-tick minute は前値 flat で解決する。猶予前の backfill は正常解決、猶予後の backfill は確定値を変えない。区間先頭が保持範囲より前の owner は `unrecoverable`。
-10. 前半（束1 T2a-1 の所有）: 全 row を保存した refresh の直後の pass で対象 event × pair の `awaiting` set ができ、2 回目の pass で増えない。superseded になった event と importance 低下で対象外になった event の未完 set は `cancelled` になり、worker の候補から外れる。保存が途中で失敗した refresh では pass が走らず、次の refresh で補われる。後半（束1 T4b の所有）: `[ts-5m,ts)` の spread 候補と成熟済み slice を同時に積み、spread が先に 1 回だけ CAS 記録されること、記録前の再起動は同区間なら再試行すること、ts までの取り逃しは `assumed` で固定されることを通す。その後 event `[ts-15m,ts+4h)` の 255 本と shadow の §3.4 区間を退避し、元 cache / history を消しても同じ結果を再現する。staging 途中の停止では未完行が reader から見えず、再起動後に記録済み spread が残ったまま set が `awaiting` へ戻り、同じ結果へ戻る。世代台帳の id は再起動ごとに増え、旧世代の staging 行を現世代として完備にしない。
+9. **欠損の分類（§3.5-3）。** fixture は週末（金曜 17:00 NY〜日曜 17:00 NY）、12/25、1/1、夏時間の開始と終了の両方を通し、夏冬それぞれの境界（21:00Z / 22:00Z）を期待値に書く。分類の判定だけでなく、event set の作成（refresh 後 pass）と shadow set の staging から完備 CAS までを通す。
+   - set 作成時の `expected_rows` は区間内の開場 minute 数になる。event `[ts-15m,ts+4h)` が閉場をまたがなければ 255、金曜午後・休場前日の event では少ない。shadow も同じ。区間の分数（閉場を含む）では作らない。
+   - 既知閉場の minute は slice 行にならない。閉場 minute に cache 行があっても読まない（C2 型の 4 行を入れて set が変わらない）。冬の日曜 21:00〜22:00Z に marker を作らない。閉場をまたぐ set が、開場 minute 数と同じ行数で完備 CAS を通って `complete` になる。
+   - 開場 minute の欠落は、前後の足が cache にあっても、`datafeed_outage_gap` に行があっても無くても、marker になり、shadow `data_insufficient` / reaction `unresolvable` になる。quality=`no_tick_flat` の行は fresh DB の CHECK と store の検査が拒否する。
+   - 猶予前に来た足は採り、猶予後に来たものは確定値を変えない。区間先頭が保持範囲より前の owner は `unrecoverable`。
+   - reaction の窓 `[ts-1m,ts+H)` に閉場 minute があればその窓は unresolvable、平日 NY 17:00 をまたぐ窓は解決する。market shadow の `t0` が閉場で、次の開場 minute が day close 以後なら `expired` / `no_fill`。
+10. 前半（束1 T2a-1 の所有）: 全 row を保存した refresh の直後の pass で対象 event × pair の `awaiting` set ができ、2 回目の pass で増えない。superseded になった event と importance 低下で対象外になった event の未完 set は `cancelled` になり、worker の候補から外れる。保存が途中で失敗した refresh では pass が走らず、次の refresh で補われる。後半（束1 T4b の所有）: `[ts-5m,ts)` の spread 候補と成熟済み slice を同時に積み、spread が先に 1 回だけ CAS 記録されること、記録前の再起動は同区間なら再試行すること、ts までの取り逃しは `assumed` で固定されることを通す。その後 event `[ts-15m,ts+4h)` の開場 minute（閉場を含まなければ 255 本）と shadow の §3.4 区間を退避し、元 cache / history を消しても同じ結果を再現する。staging 途中の停止では未完行が reader から見えず、再起動後に記録済み spread が残ったまま set が `awaiting` へ戻り、同じ結果へ戻る。世代台帳の id は再起動ごとに増え、旧世代の staging 行を現世代として完備にしない。
 11. reaction fixture は 15 / 60 / 240 本、基準 close、range = max(high) − min(low)、終端 close、net が負になる例、重複一致（代表 source の選択）/ 競合、同時刻別 event を固定する。同じ通貨を含む複数 pair では settings 順の canonical pair だけが `(event_id,currency)` に 1 回入り、`All` は全対象通貨へ各 1 回入る。pair 入力から base / quote の束へ写す fixture も固定する。退避 fixture で importance=3 の USD 22/38、JPY 9/12 を再現する。床 19 は数値非開示、20 は n / median / p75 開示。pair は settings pairs だけで、ask / improve / 専用採否 mission の tool list には存在しない。
 12. **writer 優先の実ディスク実測（merge 前必須、`bench` profile）。** 本番の `data/` と同じ filesystem、同じ journal / synchronous 設定の実 SQLite file で測る。tmpfs では判定しない。通常 suite では既存 `bench` marker により除外してよい。§7 の merge 前 job は project 配下 `tmp/econ-window-acceptance/disk/basetemp` を `--basetemp` に指定し、試験自身が `data/` と `st_dev` の一致を検査する。不一致・必要条件不足・skip は fail とする。試験は自分で作ったファイルだけを終了時に消し、測定 JSON は `tmp/econ-window-acceptance/disk/` に残す。同じ job ではこの latency 測定を §5-20 の capacity 投入より先に完了し、両者の間で `sync` を実行する。drop_caches は使わない。最大量（25 owner × 1,680 行）の staging と scheduler writer を並行させ、次の 3 場面を測る。
     - worker と scheduler だけ: worker transaction 中に scheduler が書込み要求を登録する最悪 interleaving で、その後に新規 worker batch が始まらず、既存 batch の commit 前経過が 50ms 以内に終わって scheduler が取得する。scheduler の write 待ち p99 ≤ 50ms、最大 ≤ 100ms、待ち発生 ≤ 1 回 / tick。
@@ -467,7 +513,7 @@ DB migration は `db.py` の既存流儀に従う。新 7 表 / index は fresh 
     共通: scheduler 側 `SQLITE_BUSY` 0、core lock 待ち p99 ≤ 10ms、tick 最大所要 ≤ worker 無し対照 + 100ms、既存接続の busy timeout は 5000ms のまま。worker は要求フラグ時に yield、各 transaction は `BEGIN IMMEDIATE`・240 行以下・commit 前 50ms 以下で、commit 所要が記録される。core lock 50ms 以下、1 cycle 25 owner / DB 作業 250ms 上限を満たす。
 13. calendar は unknown、fresh、直近 failure、12h stale、回復を通す。固定 activity は §3.6 の 9 語だけ。`econ_window` は gate streak / Discord / improve reject_breakdown に入らず、signal mission は hold_rate 分母に入らない。`system_filtered` は status / web / ctl の mission 表示で既知 terminal として表示する。
 14. **履歴 DB 再生成（merge 前必須、`bench` audit profile）。** 入力は本機 DB から追跡する抽出スクリプトで固定した read-only snapshot `tests/fixtures/econ_window_history_20261016_1031.sqlite` とし、test はこの fixture を変更しない。保持するのは missions の `id / loop / trigger / status / started_at`、trade_intents の `id / mission_id / action`、signals の `id / status / kind / claimed_by_mission_id` だけで、payload / output / transcript 列と他の全表は落とす。test は抽出スクリプトの列 allowlist と snapshot schema をこの一覧へ固定する。`[2026-10-16T00:00Z,2026-10-31T00:00Z)` では、trade_intents を missions に結び `missions.started_at` で切った intent が hold 970 / open 3 / 計 973、trade mission は 1,033 本、`signals.claimed_by_mission_id` 基準の signal-linked 57 になることを再生成し、query、fixture SHA-256、母集団別件数を `tmp/econ-window-acceptance/history/summary.json` に出す。signal 57 は全件を移行前 cron 由来 consumed の 1 区分とし、新分類の system reject / LLM accept / LLM reject / abandoned は各 0 と照合する。944 は期待値に使わない。通常 suite では `bench` marker により除外してよいが、§7 の merge 前 job は `--fail-on-skip` でこれらの一致を必須にする。
-15. settings の `econ` 省略時は 3 既定値、範囲外は起動前拒否、`signal_capacity_daily_max` は config 層で整数 1 以上だけを検査し、example と model は同期し、schema_version は 5 のまま。fresh / existing DB の新表・列・CHECK・index が同形で、2 回目 init は行を変えない。signals rebuild 後の `sqlite_master` / FK metadata を検査し、子表 `plugin_deploy_op_signals` / `signal_decisions` / `signal_shadow` の参照先がいずれも `signals` で、`signals_v1` や新表の一時名を指さないことを確かめる。
+15. settings の `econ` 省略時は 3 既定値、範囲外は起動前拒否、`signal_capacity_daily_max` は config 層で整数 1 以上だけを検査し、example と model は同期し、schema_version は 5 のまま。fresh / existing DB の新表・列・CHECK・index が同形で、2 回目 init は行を変えない。signals rebuild 後の `sqlite_master` / FK metadata を検査し、子表 `plugin_deploy_op_signals` / `signal_decisions` / `signal_shadow` の参照先がいずれも `signals` で、`signals_v1` や新表の一時名を指さないことを確かめる。子表 3 本の FK 違反では rebuild が失敗し、無関係な表の既存違反では warning を出して完了する。
 16. agent 面 canary は shadow pnl / 勝率 / 件数、strategy 別率、床未満 n、親 report 固有値を埋め、trade prompt / summary / reflection / RAG / improve / ask / activity を全探索して 0 件。status / web は同じ DTO、壊れた集計は該当節だけ unavailable で取引を止めない。
 17. **起動条件、claim 期限、decision 期限。** 注入時計で次を通す。
     - flat book: 建玉・注文 0 件で eligible signal 1 件 → 次の idle tick に専用 mission が claim する。
@@ -486,7 +532,7 @@ DB migration は `db.py` の既存流儀に従う。新 7 表 / index は fresh 
 22. **abandoned の理由と観測。** §3.3 の 6 経路を 1 件ずつ通し、`freshness_expired`、`requeued_expired`、`retry_exhausted`、`source_inactive`、`deploy_op`、`deploy_linked` が付くこと、deploy op の approve / revoke の transaction が CHECK で落ちないこと、deploy に結ばれ上限も超えた行が `deploy_linked` になることを確かめる。migration の `normalization_failed`、`ineligible_cleanup` も各 1 件作る。新しい abandoned は reason と `abandoned_at` の両方を持つ。abandoned で reason が NULL、abandoned 以外で reason または `abandoned_at` が非 NULL、reason が `legacy_unknown` 以外の abandoned で `abandoned_at` が NULL の行は DB が拒否する。既存 `legacy_unknown` だけは `abandoned_at=NULL` で copy できる。status / web / 親 report の理由別件数、cleanup と `legacy_unknown` の分離、`abandoned_at` 基準の期間合計と直近運用日を照合する。accept / reject の分母は変わらず、warning の恒常表示も agent 面 canary へ漏れない。
 23. **連結成分。** 重なる 3 帯（A と B、B と C が重なり、A と C は重ならない）が 1 成分になり、ID は最小 event id。抑止中の order に新しい event が合流しても、supersede で最小 id の event が消えても、ID は最初の抑止時の値のまま通知 1 回。成分が切れて別の帯で抑止されれば 1 回増える。
 24. **次 event の 7 日検索。** 次の対象 event が `now + 7 日` ちょうどなら返し、1µs 後なら返さない。対象外通貨・importance 未満・superseded は次 event にならない。
-25. **裁量 OPEN の帯内拒否。** cron mission の OPEN が帯内なら、lock 内の判定結果が gate の入力に入り、intent は `reject_category=econ_window` で記録され、注文は 0、`open_rejected_econ_window` が 1 回。帯外の OPEN と、帯内の close / cancel / hold は従来どおり通る。gate 自体は DB を読まない。
+25. **裁量 OPEN の帯内拒否。** cron mission の OPEN が帯内なら、lock 内の判定結果が gate の入力に入り、intent は `reject_category=econ_window` で記録され、注文は 0、`open_rejected_econ_window` が 1 回。帯外の OPEN と、帯内の close / cancel / hold は従来どおり通る。gate 自体は DB を読まない。帯内かつ他の gate 理由（例: SL の向き）がある OPEN も `econ_window` で、`reject_reason` に両方が残り、`gate_rejected` は 0。帯内の OPEN は gate reject streak に数えない（cron の trade loop test で intent 記録から streak まで 1 本で踏む）。帯判定が例外を投げた OPEN は intent が `execution` で記録され、`gate_rejected` が 1 回、streak に数える。`GateContext` の帯 field が None の gate 評価（backtest、signal accept）は帯を見ない。
 26. **agent 表現の絞り込み。** CAD の importance 3、USD の importance 2、USD の importance 3 を保存し USDJPY で描画すると、state summary と calendar tool の両方に USD の importance 3 だけが出て、他 2 件の name は文字列としても出ない。
 27. **live と backtest の正規化一致。** 同じ strategy 結果（market / limit、TP あり / なし）を live producer と backtest 変換に通すと、horizon・limit expiry・SL・TP・entry が一致し、live 側だけに `contract_version=executable_v1` が付く。
 28. **t0 の切り上げ。** decision が分境界ちょうどなら t0 はその時刻、1µs 後なら次の分境界。
@@ -495,11 +541,13 @@ DB migration は `db.py` の既存流儀に従う。新 7 表 / index は fresh 
 31. **反応値は 1 回だけ。** 反応値を書いた後に backfill や再算定を走らせても値と `computed_at` は変わらない。settings pairs を並べ替えても既存の `(event_id,currency)` 対応と集計値は変わらない。
 32. **既存 abandoned の移行。** 理由の無い abandoned を複数（kind・requeue 歴の違うもの）持つ旧 DB を初期化すると、全件が `legacy_unknown` になり、行数と他の列は一致し、2 回目の初期化は行を変えない。
 33. **trade event sink の origin。** 専用採否 mission の accept から生じた intent・注文の event は signal origin、cron の OPEN は cron origin として出る。
-34. **親専有 report の生成時点。** 市場の当日 close 後に 1 回だけ生成し、同じ日に 2 回目は作らない。起動時に当日分が無ければ 1 回 catch-up し、有れば作らない。
+34. **親専有 report の生成時点。** 市場の当日 close 後に 1 回だけ生成し、同じ日に 2 回目は作らない。起動時に当日分が無ければ 1 回 catch-up し、有れば作らない。日付の規則（§3.6）は §5-39 の test で守る。
 35. **improve allowlist の非交差。** improve の tool allowlist と禁止集合（signal・decision・shadow・reaction 系）の積は空で、禁止 tool を allowlist に 1 つ加える変異で import 時か test が落ちる。
-36. **OHLC の入力制約。** observed / no-tick flat の OHLC は有限正数で `low ≤ open,close ≤ high` を満たす。NaN、無限、0 以下、high / low 逆転を入れると set は complete にならず unresolvable になる。
+36. **OHLC の入力制約。** observed の OHLC は有限正数で `low ≤ open,close ≤ high` を満たす。NaN、無限、0 以下、high / low 逆転を入れると set は complete にならず unresolvable になる。
 37. **decision と intent の対応。** accept decision の `trade_intent_id` は同じ signal 採否 transaction で作った intent だけを指す。別 mission / 別 signal の intent、存在しない intent、reject の非 NULL は store または DB test が拒否する。
 38. **抑止足は再処理しない。** limit fill を回避帯で抑止した足は processed-bar 状態が進み、同じ足を次 tick や再起動後に再入力しても fill 判定・activity・期限を再実行しない。新しい足だけが次の fill 候補になる。
+39. **日次ラベルの DST 規則（済み 8ceca972、DST AC 22 の econ 側）。** `tests/core/test_scheduler_econ_window.py` の `test_the_latest_close_steps_back_by_new_york_dates_in_winter`、`test_the_latest_close_crosses_the_daylight_saving_change_by_date`、`test_a_winter_marker_from_the_old_rule_is_the_same_trading_day_as_the_new_close`、`test_a_summer_marker_from_the_old_rule_reads_as_its_own_trading_day`、`test_an_unreadable_marker_value_catches_up_once`、`test_holiday_boundaries_do_not_fire_and_survive_a_restart` の 2 パラメータ（12/25・1/1、期待値 22:00Z）と、`tests/test_wait_budget.py` の `test_a_notice_keyed_by_the_old_rule_is_not_repeated_after_the_cutover`、`test_the_operating_day_is_the_trading_date_label_in_both_seasons` が green であること。以後の task はこれらを変えない。
+40. **14 運用日の始点（T2a-3）。** `window_start(2026-11-03T12:00Z)` = 2026-10-20T21:00Z、`window_start(2026-03-10T12:00Z)` = 2026-02-24T22:00Z。夏冬の切替をまたがない日では現行と同じ値になる。この始点で数えた標本と freshness 系件数が、24 時間 × 13 で数えた場合と切替の前後 1 時間ぶん違う fixture で、warning 判定がこの始点に従う。
 
 ## 6. 残余
 
@@ -509,7 +557,8 @@ DB migration は `db.py` の既存流儀に従う。新 7 表 / index は fresh 
 - improve 非交差 assert は現物に無く、本束で実装し §5-35 で test する。
 - trade prompt の「1 時間毎」は 15m 判断足と不一致。本束で直す。
 - calendar の fail-open は未知 event を止められない。freshness は安全保証ではなく観測状態である。
-- 1m の障害欠損は補間しない。no-tick flat は障害補間ではなく tick 不在の明示的規則である。
+- 1m の欠落は補間しない。v1 は開場中の欠落をすべて障害欠損として除外し、tick 無しの flat を作らない。
+- **tick 無しの flat を足す別版の要件。** bridge 側の改修が 2 つ要り、別のものである。(1) 現在の接続確認: `/ohlcv` の応答時に terminal と broker が接続しているか（現物は bridge 内の接続フラグと offset だけを見る、§1）。(2) 過去区間の完全性保証: 返した履歴範囲の中で terminal が tick を受け続けていたか（切断の区間を含まないか）。(1) だけでは、応答時に接続していても範囲内の過去の切断区間を除けない。別版では、このときに ingest が取得 1 回ごとの証跡（要求範囲・結果・返した足の範囲・(2) の保証）を記録し始め、保証された範囲の中で前後の足があるのに無い minute だけを flat にし、`no_tick_flat` の値と CHECK を戻す。今から証跡を貯めても (2) を持たないので、遡って flat にはできない。
 - accept / reject shadow の market entry は次の 1m open + half spread、live 注文は gate 時点 quote であり価格は一致しない。shadow は decision 時の quote spread、live paper fill は assumed spread を使うので物差しも違う。同じ shadow 同士の比較を選別指標とし、実注文との差を因果効果と解釈しない。
 - cron / signal の順序は案 (a)「cron 優先維持 + 警告」に固定する。2026-10-16 以降の trade mission 1,033 件は平均 127 秒、最大 310 秒、600 秒超 0 件で、Cd=1630 秒は実態ではなく上限だった。15m・k=2 の claim 余地 900 秒は通常満たされ、close / cancel の資金保護を後退させない。一方で混雑時の abandoned 偏りは残るため、理由別件数と warning の恒常表示を必須とし、鮮度内採否そのものは保証しない。
 - event の spread は発表直前 1 回の quote で、発表時の拡大は捉えない。記録できなかった event は assumed spread になる。
@@ -523,6 +572,9 @@ DB migration は `db.py` の既存流儀に従う。新 7 表 / index は fresh 
 - フラグを持たない既存 writer（improve 等）が書込みを保持する間、scheduler は現行どおり最大 5 秒待ち得る。本束はこの待ちを増やさないが、減らしもしない。
 - canonical pair は反応値の算定時点で固定し、遡って変えない。pair の並びを変えると、変更の前後で同じ通貨の canonical pair が違う event が混ざる。
 - cron mission は signal 一覧を見なくなる。pending signal の採否は専用 mission だけが扱う。
+- 開場直後の 1 時間の欠落（実測で 22 取引日中 15 日）により、その時間帯を含む shadow は `data_insufficient` が多くなる（§3.5-3）。件数は status / 親 report の除外件数で見る。
+- `datafeed_outage_gap` は終わりの時刻を持たないまま表示用に残る。ohlcv_slices の quality 値 `datafeed_outage_gap` は表と同名だが、§3.5-3 の障害欠損を指す。
+
 
 ## 7. 変更一覧と task 分割
 
@@ -538,14 +590,27 @@ DB migration は `db.py` の既存流儀に従う。新 7 表 / index は fresh 
 | T2a-1 window / calendar / refresh | 純粋 window、候補 query / freshness、supersede、refresh 後 pass、awaiting / cancelled / 設定由来の再有効化 | 350 | sonnet | `core/econ_window.py`、`store/econ_events.py`、`store/fetch_attempts.py`、`datafeed/econ_calendar.py` と window test | event / pair / 時刻・足区間 → window view、次 event、freshness、refresh 後 set 差分。T2a-2 / T2b-2 / T4b へ渡す | T1c |
 | T2a-2 scheduler / service admission | cron 優先、signal 起動条件、足区間 limit 抑止、静的保証 status、実測 p95 warning、S の実行時再計算、writer admission、tick / next tick 観測、親 report の市場 close 後 1 回 + 起動時 catch-up hook API | 370 | sonnet | `core/scheduler.py`、`service.py`、wait-budget test | T1b signal 集合 + T2a-1 window → scheduler 起動判定、warning snapshot、signal id / 終端種別を受け commit 後に core lock 外で呼ぶ評価境界、writer 要求フラグ、report hook。評価境界を T2b-2、hook API を T5、`service.py` の ownership を T4c へ渡す | T2a-1 |
 | T3 採否 contract | Claude schema、Python parser、orders 照合、summary の pair view、方針既定文 fixture、`realbackend` test | 400 | codex terra | `loops/signal_decision_contract.py`、`loops/summary.py`、policy fixture、contract test | LLM JSON + orders → accept / reject+code / invalid detail。T2b-1 へ contract を渡す | T2a-2 |
-| T2b-1 mission 分離 / claim / tx flow | cron claim 廃止、cron / ask / 専用 mission の tool 集合分離、専用 mission の claim / 排他 / 既存分岐、tx 終端 | 460 | codex terra | `loops/trade_loop.py`、`loops/mission_finalize.py` の claim〜transaction 部分と flow test | T1c store + T3 contract → signal 1 件の未確定 flow。両ファイルの ownership と commit-core 差込点を T2b-2 へ渡す | T3 |
-| T2b-2 commit-core / gate / prompt | f 判定と理由・`abandoned_at` 付き abandoned、quote spread、commit 前 window 再判定、`GateContext`、activity、gate streak 除外、commit 後 warning 評価、prompt | 390 | codex terra | T2b-1 から受けた 2 ファイル、T2a-2 の評価境界、`core/risk_gate.py`、trade prompt と flow test | 未確定 flow + T2a-1 window → decision 1 行 + shadow 1 行、または requeue / abandoned。commit 成功後に signal id / 終端種別を評価境界へ渡し、`trade_loop.py` の ownership を束2 T3 へ渡す | T2b-1 |
-| T4a 1m 正規化 / fill 共用 | cache / history、outage / no-tick、保持範囲、source 選択、live / shadow の limit / exit 保守則共用 | 320 | codex terra | `datafeed/econ_bars.py`、`core/paper_fills.py` と純粋 fixture | 生 1m 足 + owner 範囲 → 正規化済み足 / unresolvable と fill 判定。T4b へ渡す | T2b-2 |
+| T2a-3 14 運用日の始点 | `signal_admission.window_start` を NY 日付で 13 日遡った境界に（§3.2-7）、春秋の 2 例の test | 40 | codex terra | `signal_admission.py`（`window_start` だけ。T2a-2 から受ける）、`tests/test_wait_budget.py` | 現行の 24 時間 × 13 → NY 日付の境界（§5-40）。T2b-1 に渡すものは無い | T3 |
+| T2b-1 mission 分離 / claim / tx flow | cron claim 廃止、cron / ask / 専用 mission の tool 集合分離、専用 mission の claim / 排他 / 既存分岐、tx 終端 | 460 | codex terra | `loops/trade_loop.py`、`loops/mission_finalize.py` の claim〜transaction 部分と flow test | T1c store + T3 contract → signal 1 件の未確定 flow。両ファイルの ownership と commit-core 差込点を T2b-2 へ渡す | T2a-3 |
+| T2b-2 commit-core / gate / prompt | f 判定と理由・`abandoned_at` 付き abandoned、quote spread、commit 前 window 再判定、`GateContext`、activity、gate streak 除外、commit 後 warning 評価、prompt | 390 | codex terra | T2b-1 から受けた 2 ファイル、T2a-2 の評価境界、`core/risk_gate.py`、`core/executor.py`（§4 の 3 点だけ）、trade prompt と flow test | 未確定 flow + T2a-1 window → decision 1 行 + shadow 1 行、または requeue / abandoned。commit 成功後に signal id / 終端種別を評価境界へ渡し、`trade_loop.py` の ownership を束2 T3 へ渡す | T2b-1 |
+| T4a 1m 正規化 / fill 共用 / 期待行数 | cache / history、既知閉場の除外と開場中の欠落の障害欠損化（§3.5-3）、開場 minute だけの期待格子、store の期待行数の算定（開場 minute 数）と `no_tick_flat` の値・CHECK・検査の除去、保持範囲、source 選択、live / shadow の limit / exit 保守則共用、閉場 minute を entry・fill・終端の候補にしない | 370 | codex terra | `datafeed/econ_bars.py`、`core/paper_fills.py`、`store/ohlcv_slices.py` の期待行数の算定と `no_tick_flat` の除去だけ（T1c から受ける）、`store/db.py` の `ohlcv_slices` の quality CHECK だけ（T1b から受け、T4c へ渡す）、2 つの store test の該当 case（§4）と純粋 fixture | 生 1m 足 + owner 範囲 → 正規化済み足 / unresolvable と fill 判定、開場 minute 数の `expected_rows`（§5-9 の fixture を set 作成から完備 CAS まで）。T4b へ渡す | T2b-2 |
 | T4b worker state / CAS / recovery | worker cycle、shadow 終端、event spread、読戻し、完備 CAS、世代回収、cancelled staging の毎 cycle 掃除、後処理差込口 | 500 | sonnet | `core/econ_slice_worker.py` と T4a から受けた worker state test | T1c store + T2a-1 set + T4a 1m 規則 → complete / unrecoverable set、掃除後の再有効化、shadow 終端。T4c へ worker lifecycle を渡す | T4a |
 | T4c service / 実ディスク / purge・容量受入 | worker 起動停止 / catch-up / 接続、起動時補完、最悪 interleaving、purge、B0 / β 上包絡・外挿、4 時間 / 4 GiB 上限、実ディスク成果物 | 380 | sonnet | T2a-2 から受けた `service.py`、T4b から受けた shadow worker integration / `bench` test | T4b worker + T1c purge / 容量 store → service wiring と §5-12 / 20 の必須 job。T2a-2 の report hook を保ち、`service.py` と集計可能な store を T5 へ渡す | T4b |
-| T5 人間面 / reader / 遮断 | status、親 report、web、improve / event sink / mission reader、abandoned、静的 status / 実測 warning、容量、列 allowlist の履歴 snapshot 抽出 / 再生成、非交差 assert、canary。T2a-2 の hook API に report 生成関数を差す | 820 | sonnet | T4c から受けた `service.py`、§4 の他の T5 所有ファイル、履歴抽出スクリプト / audit fixture / test、isolation test | store 集計 + close / catch-up hook → 1 日 1 回の DTO / report と 970 / 3 / 57 / 1,033 成果物。report / status 群の ownership を束2 T4 へ渡す | T4c |
+| T5 人間面 / reader / 遮断 | status、親 report、web、improve / event sink / mission reader、abandoned、静的 status / 実測 warning、容量、列 allowlist の履歴 snapshot 抽出 / 再生成、非交差 assert、canary。T2a-2 の hook API に report 生成関数を差す（日次 report の callback は取引日ごとに at-least-once で呼ばれ、冪等であること（生成側が取引日で一意化する）。marker は callback が正常に return した後にだけ書き、同一取引日の試行は最大 3 回。）| 820 | sonnet | T4c から受けた `service.py`、§4 の他の T5 所有ファイル、履歴抽出スクリプト / audit fixture / test、isolation test | store 集計 + close / catch-up hook → 1 日 1 回の DTO / report と 970 / 3 / 57 / 1,033 成果物。report / status 群の ownership を束2 T4 へ渡す | T4c |
 
-束 1 は表の順に直列で渡す。小 task に分けても migration、signal lifecycle、worker、service を同じ受入単位へ戻さない。
+束 1 は表の順に直列で渡す。小 task に分けても migration、signal lifecycle、worker、service を同じ受入単位へ戻さない。T2a-3 は次に走る T2b-1 の前に置く（ファイルが重ならず、wait-budget の閉じた是正なので先に済ませる）。
+
+DST 是正（`2026-11-02-utc-time-rules-dst-design.md` §3.6）の引渡しの状況（2026-11-03）:
+
+| 項目 | 状況 | 本書の該当 |
+|---|---|---|
+| (a) shadow / reaction は cache の live 行を読む | 規則として反映。履歴 5m は読まない | §3.5-2 |
+| (b) 第三分類「既知閉場」 | 反映。閉場は期待格子から除き、開場中の欠落はすべて障害欠損（tick 無しは v1 で作らない）。T4a が実装 | §3.5-3、§5-9 |
+| (c) shadow の day close は `next_rollover` を共有、冬は 22:00Z | scheduler 側の期待値は済み（8ceca972）。shadow 側は T4a / T4b が新規則で書く | §3.4-4 |
+| (d) C1 の偽の足を閉場として読まない | (b) の規則で閉場の行を読まない。C1 は保持期限で cache から消えており、残る閉場行は C2 の 4 行 | §0.2、§3.5-3 |
+| (e) 直近 close を NY 日付で遡る | 済み（8ceca972） | §3.6、§5-39 |
+| (f) 日次ラベルを `trading_date` に統一 | 済み（8ceca972）。report は `now` が過渡期間かで旧新の遅い方を読み、`daily_label` は wait-budget にだけ使う（DST 設計の書き方から実装に合わせて変えた） | §3.2-7、§3.6、§5-39 |
+| (g) merge の順 | R1 が先に main に入り、econ-b1 が 8ceca972 で取り込んだ。econ-b1 の merge 条件は §5-39 の test が green であること | §5-39 |
 
 ### 束 2: 反応統計
 
@@ -561,6 +626,7 @@ DB migration は `db.py` の既存流儀に従う。新 7 表 / index は fresh 
 ### 配備手順
 
 1. **merge 前必須 job を 3 本とも成功させる。** skip / xfail / 成果物欠落は不合格。
+   - 実行前に成果物と `--basetemp` の親 directory を作る: `mkdir -p tmp/econ-window-acceptance/claude tmp/econ-window-acceptance/history tmp/econ-window-acceptance/disk`
    - Claude 実往復: `uv run pytest tests/loops/test_signal_decision_flow.py -m realbackend -p no:cacheprovider -rs --fail-on-skip --basetemp=tmp/econ-window-acceptance/claude/basetemp`
    - 履歴 DB 再生成: `uv run pytest tests/audit/test_econ_history_regeneration.py -m bench -p no:cacheprovider -rs --fail-on-skip --basetemp=tmp/econ-window-acceptance/history/basetemp`
    - 実ディスク writer / 容量: `uv run pytest tests/core/test_econ_shadow_worker.py -m bench -p no:cacheprovider -rs --fail-on-skip --basetemp=tmp/econ-window-acceptance/disk/basetemp`
@@ -595,6 +661,10 @@ J1〜J3 は 2026-11-01 に利用者が推奨どおり承認した。本書の該
 
 ### 技術上の決定
 
+**開場中の欠落はすべて障害欠損とする（安全側の既定、2026-11-03 指揮者裁定）。** v0.10 では「取得は成功したが足が無い」を tick 無しの flat とする規則を利用者判断（J4）にしていたが、問わずに技術上の既定として決める。理由: (1) tick 不在を証明する情報が無い。取得の成功は terminal と broker の接続を示さず、取得時点の接続が分かっても、要求する履歴範囲に過去の切断区間が含まれ得る（§3.5-3）。(2) 反応統計は cron trade agent に開示されるので、不確実な flat は取引判断に間接に入る。(3) 除外する側の誤りは件数として見え、後から別版で flat を足せる（§6）が、flat にした誤りは値に溶けて見えない。§8 に利用者判断待ちの問いは残らない。
+
+取得の証跡（取得 1 回ごとの結果の記録）は v1 に入れない（2026-11-03 指揮者裁定）。v1 の分類は証跡を読まず、証跡が意味を持つのは bridge が過去区間の完全性保証を返す別版からで、そのときに記録を始めれば足りる（今から貯めても遡って flat にはできない、§6）。
+
 J1〜J3 以外の境界、欠損、CAS、calendar fail-open、limit 非取消、agent 隔離、床未満 projection、待機上限、slice の lock 規約、保持容量は、ユーザー裁定 1〜6 と設計レビューの裁定に基づき本書の規則で決める。
 
 ## 9. 変更履歴
@@ -611,3 +681,11 @@ J1〜J3 以外の境界、欠損、CAS、calendar fail-open、limit 非取消、
 | 2026-11-01 | v0.8 C0 | signals v3 rebuild と既存 abandoned 書込みの所有、参照元 FK を保つ移行前例、shadow state 正規形、payload migration / report hook の引渡し、容量算定とブリーフ注記を確定 | 設計レビュー 7 周目 Critical 2 / Important 5 / Minor 4 を全件反映 | — |
 | 2026-11-01 | v0.8.1 C0 | `abandon_claimed()` に UTC 時刻と reason を引数で渡し、`trade_loop.py` の呼出側 3 箇所を T1a の所有に含めて T2b-1 へ引き渡す | 設計レビュー 8 周目 (閉鎖確認) の残り Critical 1 | — |
 | 2026-11-01 | v0.9 C0 | J1〜J3 を利用者承認済（推奨どおり: reject code 2 語、帯 3 / 30 / 15、方針既定文）に | ユーザー承認、実装着手 | — |
+| 2026-11-01 | v0.9.1 C0 | v3 rebuild の FK 検査を子表 3 本に訂正（他表の違反は warning）、CHECK 正規化の規則、`signal_shadow` の複合 FK、slice set の値域 CHECK を足す | T1a /code-review 2 周目の裁定 | — |
+| 2026-11-01 | v0.9.2 C0 | §3.2 の Claude 向け schema を最上位 object + if/then/else の 1 本にし、§5-4 に最上位 anyOf / allOf / oneOf が 400 になる実測を足す | claude --json-schema の実測で最上位 anyOf/allOf/oneOf は 400、if/then/else は受理 | — |
+| 2026-11-02 | v0.9.3 C0 | 日次 report callback の契約を at-least-once・冪等・正常 return 後のみ marker・同日最大 3 回に定め、worker admission を transaction lease にして要求が上限 200ms で既存 lease を待つ | T2a-2 閉鎖確認の Important 3 件の裁定 | — |
+| 2026-11-03 | v0.10 C0 | 欠損を既知閉場 / tick 無し / 障害欠損の 3 分類にし、新しい表 `datafeed_fetch_evidence`（ingest の commit が key ごとに足と同じ transaction で書く、保持は cache と同じ cutoff）を分類の正本にする。`datafeed_outage_gap` は表示用に降格。`expected_rows` を開場 minute 数に、閉場をまたぐ reaction 窓は unresolvable、閉場 minute は shadow の候補にしない。新 task T4a-0、§5-9 改訂と §5-39 / 40 追加。DST §3.6-a〜g を反映し、(e)(f)(g) は済み（8ceca972）、日次 report の規則は実装（`now` が過渡期間かで旧新の遅い方、`daily_label` は wait-budget だけ）に合わせた。ingest の記録の実測を §0.1 に。§8 に J4 | DST 是正の引渡し（DST 設計 §3.6）、r1 裁定 I-8（outage_gap は停滞も失敗も記録し終わりを持たず正本にならない）、main 取り込み報告の食い違い | — |
+| 2026-11-03 | v0.10.1 C0 | 証明できない開場中の欠落はすべて障害欠損にし、tick 無しの flat は v1 で作らない（`no_tick_flat` は DDL に残す）。J4 を §8 から除き安全側の既定として理由を書く。別版の要件として bridge の「現在の接続確認」と「過去区間の完全性保証」を分けて §6 に。14 運用日の始点を NY 日付で遡る契約と T2a-3・§5-41。`expected_rows` の算定変更を T4a に（`ohlcv_slices.py` の所有例外）し、§5-9 を set 作成から完備 CAS まで通す。§5-39 を試行した key だけに。証跡の保持行数を日次増分と固定 cutoff 下の総保持量に分ける | r9 sol の Important 4 / Minor 2 と指揮者裁定（全採用、J4 は問わず保守側） | — |
+| 2026-11-03 | v0.10.2 C0 | 取得の証跡（`datafeed_fetch_evidence`、T4a-0、§5-39）を v1 から除き、別版の要件（bridge の現在の接続確認と過去区間の完全性保証、そのときに証跡を記録し始める）を §6 の 1 項にまとめる。分類を「閉場は除外、開場中の欠落はすべて障害欠損」の 2 つにし、`no_tick_flat` の値・CHECK・store の検査を T4a が除く。T4a の依存を T2b-2、見積を 370 に。AC 40 / 41 を 39 / 40 に振り直す | 指揮者裁定（v1 の分類は証跡を読まず、証跡が意味を持つのは別版から） | — |
+| 2026-11-03 | v0.10.3 C0 | 閉鎖確認の指摘を反映。§6 の残余のうち no-tick の規則と無関係な項目（shadow と実注文の価格差、cron 優先、spread の限界、保持期限後の再計算不可、床と p75、既存 writer の待ちなど）を v0.9.3 の文で戻した。§4 の `test_econ_signal_schema.py` の配線に T4a を追記。§0.1 への参照を実測の新見出し §0.2 に直した | 閉鎖確認（r10）の新指摘 3 件 | — |
+| 2026-11-05 | v0.10.4 C0 | 裁量 OPEN の帯内拒否の配線を §3.1-4 に（判定は cron commit-core で OPEN だけ、executor の任意引数から `GateContext` の任意 field へ、帯で短絡しない、他理由と同時でも `econ_window`、activity は `open_rejected_econ_window` だけ、判定例外は `execution` で記録）。§4 に `core/executor.py` の行（所有 T2b-2）、trade prompt の行に「判断足ごと」と get_signals 文の ask 限定。AC 25 に混在・例外・None 経路・streak。T2b-2 の所有に executor | T2b-2 実装で配線表に executor が無く、category の写像が未定だった | — |

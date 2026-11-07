@@ -43,9 +43,10 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from agentic_fx.backtest.timeframes import PLUGIN_TIMEFRAMES, TF_MINUTES
+from agentic_fx.store.db import SIGNAL_ABANDON_REASONS
 
 # timeframe → 分数の CASE 式。鮮度・失効判定はここだけを参照する
 # (式を複製すると将来 timeframe を追加したときに片方だけ更新され乖離する
@@ -82,6 +83,34 @@ _DEPLOY_LINKED_ANTI_JOIN = (
     "WHERE deploy_links.signal_id=signals.id)"
 )
 
+# signal 行の分類の唯一の出所。abandoned 行は理由が終端の分類を決める
+# (`normalization_failed` は運用者に報告する対象で cleanup ではない、
+# `legacy_unknown` は時刻を持たない別枠)。それ以外は種別と契約版で決める。
+# 実行可能 (strategy かつ executable_v1) でない行はすべて cleanup に倒す。
+# 第 3 の分類を置かないので、claim も掃除もされず pending に残る行は無い。
+def _eligibility_case(prefix: str = "") -> str:
+    """`prefix` は列名の前置 (JOIN で曖昧にならないよう "signals." を渡す)。"""
+    status, reason = f"{prefix}status", f"{prefix}abandon_reason"
+    kind, version = f"{prefix}kind", f"{prefix}contract_version"
+    return (
+        "CASE "
+        f"WHEN {status}='abandoned' AND {reason}='normalization_failed' "
+        "THEN 'normalization_failed' "
+        f"WHEN {status}='abandoned' AND {reason}='legacy_unknown' "
+        "THEN 'legacy_unknown' "
+        f"WHEN {kind}='strategy' AND {version}='executable_v1' THEN 'eligible' "
+        "ELSE 'ineligible_cleanup' END")
+
+
+_ELIGIBILITY_CASE = _eligibility_case()
+_ELIGIBLE_CONDITION = f"({_ELIGIBILITY_CASE})='eligible'"
+_CLEANUP_CONDITION = f"({_ELIGIBILITY_CASE})='ineligible_cleanup'"
+_LEGACY_UNKNOWN_CONDITION = f"({_ELIGIBILITY_CASE})='legacy_unknown'"
+# 運用者に報告する abandoned (cleanup と legacy_unknown を除く)。
+_REPORTABLE_ABANDONED_CONDITION = (
+    f"status='abandoned' AND NOT ({_CLEANUP_CONDITION}) "
+    f"AND NOT ({_LEGACY_UNKNOWN_CONDITION})")
+
 # requeue / reclaim_expired 共有の遷移式 (controller 解決 #6 逐語):
 # requeue_count >= max_requeue なら abandoned (増分なし)、
 # 未満なら pending + requeue_count+1。
@@ -89,16 +118,92 @@ _DEPLOY_LINKED_EXISTS = (
     "EXISTS (SELECT 1 FROM plugin_deploy_op_signals AS deploy_links "
     "WHERE deploy_links.signal_id=signals.id)"
 )
+REASON_DEPLOY_LINKED = "deploy_linked"
+REASON_RETRY_EXHAUSTED = "retry_exhausted"
+REASON_REQUEUED_EXPIRED = "requeued_expired"
+REASON_FRESHNESS_EXPIRED = "freshness_expired"
+
 # deploy 付随表に結ばれた signal は pending に戻すと anti-join で永久に
 # 不可視になるので、上限に関係なく abandoned で終端する (増分なし)。
-_REQUEUE_STATUS_EXPR = (
-    f"CASE WHEN requeue_count >= :max_requeue OR {_DEPLOY_LINKED_EXISTS} "
-    "THEN 'abandoned' ELSE 'pending' END"
+# 規則表 (上から最初に当たったものが理由): deploy に結ばれていれば
+# (上限超過を兼ねても) `deploy_linked`、そうでなく上限以上なら
+# `retry_exhausted`。どれにも当たらなければ pending + requeue_count+1。
+# SQL の CASE と `requeue_outcome` はこの表だけから作る。
+# 各行は (理由, SQL 述語, Python 述語(requeue_count, max_requeue, deploy_linked))。
+_REQUEUE_RULES = (
+    (REASON_DEPLOY_LINKED, _DEPLOY_LINKED_EXISTS,
+     lambda count, limit, linked: linked),
+    (REASON_RETRY_EXHAUSTED, "requeue_count >= :max_requeue",
+     lambda count, limit, linked: count >= limit),
 )
-_REQUEUE_COUNT_EXPR = (
-    f"CASE WHEN requeue_count >= :max_requeue OR {_DEPLOY_LINKED_EXISTS} "
-    "THEN requeue_count ELSE requeue_count + 1 END"
+
+
+def _requeue_set_sql(rules=_REQUEUE_RULES) -> str:
+    """規則表から requeue / reclaim_expired の SET 句を作る。"""
+    any_rule = " OR ".join(sql for _, sql, _ in rules)
+    reason = "CASE " + " ".join(
+        f"WHEN {sql} THEN '{name}'" for name, sql, _ in rules) + " END"
+    return (
+        f"status = CASE WHEN {any_rule} THEN 'abandoned' ELSE 'pending' END, "
+        f"requeue_count = CASE WHEN {any_rule} "
+        "THEN requeue_count ELSE requeue_count + 1 END, "
+        f"abandon_reason = {reason}, "
+        f"abandoned_at = CASE WHEN {any_rule} THEN :abandoned_at END, "
+        "claimed_by_mission_id=NULL, claimed_at=NULL"
+    )
+
+
+_REQUEUE_SET = _requeue_set_sql()
+
+REASON_INELIGIBLE_CLEANUP = "ineligible_cleanup"
+
+
+def _is_cleanup_row(row) -> bool:
+    return not (row["kind"] == "strategy"
+                and row["contract_version"] == "executable_v1")
+
+
+# 鮮度切れの abandoned の理由の規則表 (上から最初に当たったものが理由)。
+# 実行可能でない行は `ineligible_cleanup`、そうでなく requeue 歴があれば
+# `requeued_expired`、無ければ `freshness_expired`。SQL の CASE と
+# `freshness_abandon_reason` はこの表だけから作る。
+# 各行は (理由, SQL 述語, Python 述語(signal 行))。
+_FRESHNESS_RULES = (
+    (REASON_INELIGIBLE_CLEANUP, _CLEANUP_CONDITION, _is_cleanup_row),
+    (REASON_REQUEUED_EXPIRED, "requeue_count > 0",
+     lambda row: row["requeue_count"] > 0),
+    (REASON_FRESHNESS_EXPIRED, "1", lambda row: True),
 )
+_FRESHNESS_REASON_EXPR = "CASE " + " ".join(
+    f"WHEN {sql} THEN '{name}'" for name, sql, _ in _FRESHNESS_RULES) + " END"
+
+
+def requeue_outcome(*, requeue_count: int, max_requeue: int,
+                    deploy_linked: bool,
+                    rules=_REQUEUE_RULES) -> tuple[str, str | None]:
+    """claimed の signal を戻すときの `(遷移後 status, abandon_reason)`。
+
+    `_REQUEUE_RULES` を上から評価する。SQL 側 (`_requeue_set_sql`) と
+    `missions.recover_interrupted` が同じ表を使う。"""
+    for name, _, hit in rules:
+        if hit(requeue_count, max_requeue, deploy_linked):
+            return "abandoned", name
+    return "pending", None
+
+
+def utc_iso(now: datetime) -> str:
+    """abandoned_at 等に書く UTC の ISO 文字列。naive は拒否する。"""
+    _require_aware(now, "now")
+    return now.astimezone(timezone.utc).isoformat()
+
+
+def freshness_abandon_reason(signal: dict) -> str:
+    """鮮度切れで abandoned にする signal 行の理由。`_FRESHNESS_RULES` を
+    上から評価する (SQL 側 `_FRESHNESS_REASON_EXPR` と同じ表)。"""
+    for name, _, hit in _FRESHNESS_RULES:
+        if hit(signal):
+            return name
+    raise AssertionError("freshness rules end with a catch-all")
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,9 +214,17 @@ class AbandonedRow:
 
 
 @dataclass(frozen=True, slots=True)
+class TerminalRow:
+    """`expire_stale` が abandoned にした行の id と理由。"""
+    id: int
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class ExpireResult:
     total: int
     invalid_timeframe: tuple[AbandonedRow, ...]
+    terminal: tuple[TerminalRow, ...] = ()
 
 
 def _require_aware(dt: datetime, label: str) -> None:
@@ -180,7 +293,7 @@ def freshness_window(timeframe: str, bar_ts: str,
 
 def add(conn: sqlite3.Connection, *, plugin: str, content_hash: str,
         pair: str, timeframe: str, bar_ts: str, kind: str, payload: dict,
-        now: datetime) -> int | None:
+        now: datetime, contract_version: str | None = None) -> int | None:
     """signal を 1 件追加する。重複キー (plugin, content_hash, pair,
     timeframe, bar_ts) は INSERT OR IGNORE で無視し None を返す。
 
@@ -201,9 +314,9 @@ def add(conn: sqlite3.Connection, *, plugin: str, content_hash: str,
     cur = conn.execute(
         "INSERT OR IGNORE INTO signals "
         "(plugin, content_hash, pair, timeframe, bar_ts, kind, "
-        "payload_json, created_at) VALUES (?,?,?,?,?,?,?,?)",
+        "payload_json, created_at, contract_version) VALUES (?,?,?,?,?,?,?,?,?)",
         (plugin, content_hash, pair, timeframe, bar_ts, kind,
-         json.dumps(payload, ensure_ascii=False), now.isoformat()))
+         json.dumps(payload, ensure_ascii=False), now.isoformat(), contract_version))
     conn.commit()
     return cur.lastrowid if cur.rowcount > 0 else None
 
@@ -251,11 +364,13 @@ def expire_stale(conn: sqlite3.Connection, *, now: datetime,
     """
     _require_aware(now, "now")
     cur = conn.execute(
-        "UPDATE signals SET status='abandoned' "
+        "UPDATE signals SET status='abandoned', "
+        f"abandon_reason={_FRESHNESS_REASON_EXPR}, abandoned_at=:abandoned_at "
         f"WHERE status='pending' AND {_STALE_CONDITION} "
         f"RETURNING id, plugin, timeframe, ({_TF_MINUTES_CASE} IS NULL) "
-        "AS invalid_timeframe",
-        {"now": now.isoformat(), "freshness_bars": freshness_bars})
+        "AS invalid_timeframe, abandon_reason",
+        {"now": now.isoformat(), "freshness_bars": freshness_bars,
+         "abandoned_at": utc_iso(now)})
     rows = cur.fetchall()  # RETURNING を伴う文は commit 前に fetch する
     conn.commit()
     # RETURNING 列は位置で読む — row_factory を設定していない素の接続でも
@@ -264,22 +379,40 @@ def expire_stale(conn: sqlite3.Connection, *, now: datetime,
         AbandonedRow(id=row[0], plugin=row[1], timeframe=row[2])
         for row in rows if row[3]
     )
-    return ExpireResult(total=len(rows), invalid_timeframe=invalid_timeframe)
+    terminal = tuple(TerminalRow(id=row[0], reason=row[4]) for row in rows)
+    return ExpireResult(total=len(rows), invalid_timeframe=invalid_timeframe,
+                        terminal=terminal)
 
 
-def consume(conn: sqlite3.Connection, signal_id: int, *, mission_id: int,
-            now: datetime) -> None:
-    """claimed かつ claimed_by 一致の行だけを consumed にする (fail closed)。
-
-    ``now`` は他 store モジュールの書き込み関数との呼び出し規約統一のため
-    受け取るが、signals テーブルに updated_at 相当の列が無いため未使用。
-    """
+def _consume_update(conn: sqlite3.Connection, signal_id: int,
+                    mission_id: int) -> int:
     cur = conn.execute(
         "UPDATE signals SET status='consumed' "
         "WHERE id=? AND status='claimed' AND claimed_by_mission_id=?",
         (signal_id, mission_id))
+    return cur.rowcount
+
+
+def consume_in_tx(conn: sqlite3.Connection, signal_id: int, *, mission_id: int,
+                  now: datetime) -> None:
+    """claimed かつ claimed_by 一致の行だけを consumed にする (fail closed)。
+
+    commit も rollback もしない (外側の transaction に従う)。``now`` は他
+    store モジュールの書き込み関数との呼び出し規約統一のため受け取るが、
+    signals テーブルに updated_at 相当の列が無いため未使用。
+    """
+    if _consume_update(conn, signal_id, mission_id) == 0:
+        raise ValueError(
+            f"signal {signal_id} is not claimed by mission {mission_id}")
+
+
+def consume(conn: sqlite3.Connection, signal_id: int, *, mission_id: int,
+            now: datetime) -> None:
+    """`consume_in_tx` と同じ更新を commit まで行う。CAS が合わなくても共有
+    接続の他の未 commit の書き込みは巻き戻さず、commit してから例外にする。"""
+    changed = _consume_update(conn, signal_id, mission_id)
     conn.commit()
-    if cur.rowcount == 0:
+    if changed == 0:
         raise ValueError(
             f"signal {signal_id} is not claimed by mission {mission_id}")
 
@@ -290,20 +423,15 @@ def requeue(conn: sqlite3.Connection, signal_id: int, *, now: datetime,
 
     上限判定: 現在の requeue_count が max_requeue 以上なら abandoned
     (増分なし)、未満なら pending + requeue_count+1。対象が claimed で
-    なければ ValueError (fail closed)。
-
-    ``now`` は他 store モジュールとの呼び出し規約統一のため受け取るが、
-    signals テーブルに updated_at 相当の列が無いため未使用 (brief 逐語の
-    シグネチャを保つ)。
+    なければ ValueError (fail closed)。abandoned にしたときは ``now`` を
+    ``abandoned_at`` に書く。
     """
     cur = conn.execute(
-        "UPDATE signals SET "
-        f"status = {_REQUEUE_STATUS_EXPR}, "
-        f"requeue_count = {_REQUEUE_COUNT_EXPR}, "
-        "claimed_by_mission_id=NULL, claimed_at=NULL "
+        f"UPDATE signals SET {_REQUEUE_SET} "
         "WHERE id=:id AND status='claimed' "
         "RETURNING status",
-        {"id": signal_id, "max_requeue": max_requeue})
+        {"id": signal_id, "max_requeue": max_requeue,
+         "abandoned_at": utc_iso(now)})
     row = cur.fetchone()  # RETURNING を伴う文は commit 前に fetch する
     conn.commit()
     if row is None:
@@ -311,17 +439,116 @@ def requeue(conn: sqlite3.Connection, signal_id: int, *, now: datetime,
     return row["status"]
 
 
-def abandon_claimed(conn: sqlite3.Connection, signal_id: int) -> None:
+def abandon_claimed(conn: sqlite3.Connection, signal_id: int, *,
+                    now: datetime, reason: str) -> None:
     """claimed の行を requeue_count を増やさず abandoned にする。対象が
-    claimed でなければ ValueError (fail closed)。鮮度切れが確定した signal を
-    pending に戻して再 claim の候補にしないために使う。"""
+    claimed でなければ ValueError (fail closed)。鮮度切れや source の失効が
+    確定した signal を pending に戻して再 claim の候補にしないために使う。
+    理由は store では判別できないので呼び出し側が渡す
+    (鮮度切れは ``freshness_abandon_reason``)。語彙外の理由は書く前に
+    ValueError にする。"""
+    if reason not in SIGNAL_ABANDON_REASONS:
+        raise ValueError(f"unknown signal abandon reason: {reason!r}")
+    abandoned_at = utc_iso(now)
     cur = conn.execute(
         "UPDATE signals SET status='abandoned', "
+        "abandon_reason=?, abandoned_at=?, "
         "claimed_by_mission_id=NULL, claimed_at=NULL "
-        "WHERE id=? AND status='claimed'", (signal_id,))
+        "WHERE id=? AND status='claimed'", (reason, abandoned_at, signal_id))
     conn.commit()
     if cur.rowcount == 0:
         raise ValueError(f"signal {signal_id} is not claimed")
+
+
+def abandoned_counts(conn: sqlite3.Connection, *, since: datetime,
+                     until: datetime) -> dict[str, int]:
+    """`[since, until)` に abandoned になった signal の件数を理由別に返す。
+
+    `abandoned_at` は UTC、`created_at` / `claimed_at` / `bar_ts` は clock の
+    オフセットのままなので、期間の比較や集計は生の文字列でなく必ず
+    ``datetime()`` で両辺を正規化する。この関数と `abandon_lag_seconds` が
+    その規律の置き場で、abandoned の期間 query はここを経由する。"""
+    _require_aware(since, "since")
+    _require_aware(until, "until")
+    return _totals_by_reason(abandoned_counts_by_strategy(
+        conn, since=since, until=until))
+
+
+def abandoned_counts_by_strategy(
+        conn: sqlite3.Connection, *, since: datetime,
+        until: datetime) -> dict[str, dict[str, int]]:
+    """`abandoned_counts` と同じ分類で、strategy (plugin) × 理由に分けて返す。
+    cleanup と legacy_unknown は含めない (別枠)。"""
+    _require_aware(since, "since")
+    _require_aware(until, "until")
+    rows = conn.execute(
+        "SELECT plugin, abandon_reason, COUNT(*) FROM signals "
+        f"WHERE {_REPORTABLE_ABANDONED_CONDITION} AND abandoned_at IS NOT NULL "
+        "AND datetime(abandoned_at) >= datetime(:since) "
+        "AND datetime(abandoned_at) < datetime(:until) "
+        "GROUP BY plugin, abandon_reason ORDER BY plugin, abandon_reason",
+        {"since": since.isoformat(), "until": until.isoformat()}).fetchall()
+    out: dict[str, dict[str, int]] = {}
+    for plugin, reason, count in rows:
+        out.setdefault(plugin, {})[reason] = count
+    return out
+
+
+def _totals_by_reason(by_strategy: dict[str, dict[str, int]]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for reasons in by_strategy.values():
+        for reason, count in reasons.items():
+            out[reason] = out.get(reason, 0) + count
+    return out
+
+
+def human_signal_aggregates(conn: sqlite3.Connection, *, since: datetime,
+                            until: datetime) -> dict:
+    """Read human-only decision and abandonment counts for a UTC interval."""
+    _require_aware(since, "since")
+    _require_aware(until, "until")
+    params = {"since": since.isoformat(), "until": until.isoformat()}
+    eligible = f"({_eligibility_case('signals.')})='eligible'"
+    decisions = conn.execute(
+        "SELECT signals.plugin, signal_decisions.decision, "
+        "signal_decisions.actor, signal_decisions.reject_code, COUNT(*) AS count "
+        "FROM signal_decisions JOIN signals ON signals.id=signal_decisions.signal_id "
+        f"WHERE {eligible} "
+        "AND datetime(signal_decisions.decided_at) >= datetime(:since) "
+        "AND datetime(signal_decisions.decided_at) < datetime(:until) "
+        "GROUP BY signals.plugin, signal_decisions.decision, "
+        "signal_decisions.actor, signal_decisions.reject_code "
+        "ORDER BY signals.plugin, signal_decisions.decision, signal_decisions.actor, "
+        "signal_decisions.reject_code", params).fetchall()
+    cleanup = conn.execute(
+        f"SELECT COUNT(*) FROM signals WHERE status='abandoned' "
+        f"AND {_CLEANUP_CONDITION} "
+        "AND datetime(abandoned_at) >= datetime(:since) "
+        "AND datetime(abandoned_at) < datetime(:until)", params).fetchone()[0]
+    legacy_unknown_total = conn.execute(
+        f"SELECT COUNT(*) FROM signals WHERE {_LEGACY_UNKNOWN_CONDITION}"
+        ).fetchone()[0]
+    by_strategy = abandoned_counts_by_strategy(conn, since=since, until=until)
+    return {
+        "decisions": [dict(row) for row in decisions],
+        "abandoned": _totals_by_reason(by_strategy),
+        "abandoned_by_strategy": by_strategy,
+        "cleanup": cleanup,
+        # 期間を持たない行の累計。期間集計には混ぜない。
+        "legacy_unknown_total": legacy_unknown_total,
+    }
+
+
+def abandon_lag_seconds(conn: sqlite3.Connection, signal_id: int) -> int | None:
+    """signal が作られてから abandoned になるまでの秒数。abandoned でない、
+    または時刻を持たない (`legacy_unknown`) ときは None。`created_at` との
+    比較は ``datetime()`` で正規化する (オフセットが違っても正しい)。"""
+    row = conn.execute(
+        "SELECT CAST(strftime('%s', abandoned_at) AS INTEGER) "
+        "- CAST(strftime('%s', created_at) AS INTEGER) "
+        "FROM signals WHERE id=? AND status='abandoned'",
+        (signal_id,)).fetchone()
+    return None if row is None or row[0] is None else row[0]
 
 
 def reclaim_expired(conn: sqlite3.Connection, *, now: datetime,
@@ -334,15 +561,12 @@ def reclaim_expired(conn: sqlite3.Connection, *, now: datetime,
     """
     _require_aware(now, "now")
     cur = conn.execute(
-        "UPDATE signals SET "
-        f"status = {_REQUEUE_STATUS_EXPR}, "
-        f"requeue_count = {_REQUEUE_COUNT_EXPR}, "
-        "claimed_by_mission_id=NULL, claimed_at=NULL "
+        f"UPDATE signals SET {_REQUEUE_SET} "
         "WHERE status='claimed' AND datetime(claimed_at) <= "
         "datetime(:now, '-' || :lease_min || ' minutes') "
         "RETURNING status",
         {"now": now.isoformat(), "lease_min": lease_min,
-         "max_requeue": max_requeue})
+         "max_requeue": max_requeue, "abandoned_at": utc_iso(now)})
     rows = cur.fetchall()  # RETURNING を伴う文は commit 前に fetch する
     conn.commit()
     return [r["status"] for r in rows]
@@ -353,7 +577,8 @@ def _claimable_where(freshness_bars: int | None, params: dict) -> str:
     if freshness_bars is not None:
         params["freshness_bars"] = freshness_bars
         freshness_clause = f" AND {_FRESH_CONDITION}"
-    return f"status='pending'{freshness_clause} AND {_DEPLOY_LINKED_ANTI_JOIN}"
+    return (f"status='pending' AND {_ELIGIBLE_CONDITION}{freshness_clause} "
+            f"AND {_DEPLOY_LINKED_ANTI_JOIN}")
 
 
 def pending_exists(conn: sqlite3.Connection, *, now: datetime,
@@ -364,6 +589,72 @@ def pending_exists(conn: sqlite3.Connection, *, now: datetime,
         "SELECT 1 FROM signals WHERE "
         f"{_claimable_where(freshness_bars, params)} LIMIT 1", params).fetchone()
     return row is not None
+
+
+def normalize_legacy_strategy_payloads(
+        conn: sqlite3.Connection, *, now: datetime | None = None) -> None:
+    """Upgrade pending/claimed legacy strategy payloads without committing."""
+    from agentic_fx.plugin.sandbox import validate_strategy_result
+    from agentic_fx.plugin.strategy_adapter import normalize_strategy_payload
+
+    migrated_at = utc_iso(now or datetime.now(timezone.utc))
+    rows = conn.execute(
+        "SELECT id,pair,payload_json FROM signals "
+        "WHERE kind='strategy' AND contract_version IS NULL "
+        "AND status IN ('pending','claimed')").fetchall()
+    for row in rows:
+        try:
+            legacy = json.loads(row["payload_json"])
+            if not isinstance(legacy, dict):
+                raise ValueError("legacy payload is not an object")
+            provenance = {
+                "live_source": legacy["live_source"],
+                "source": legacy["source"],
+                "interval": legacy["interval"],
+                "bar_time": legacy["bar_time"],
+                "bars_origin": legacy["bars_origin"],
+            }
+            validated = validate_strategy_result(
+                {k: v for k, v in legacy.items() if k not in provenance})
+            payload = normalize_strategy_payload(validated, row["pair"], provenance)
+            if payload is None:
+                raise ValueError("hold is not executable")
+        except Exception:  # 1 行の異常で移行全体を止めない
+            conn.execute(
+                "UPDATE signals SET status='abandoned', "
+                "abandon_reason='normalization_failed', abandoned_at=?, "
+                "claimed_by_mission_id=NULL, claimed_at=NULL WHERE id=?",
+                (migrated_at, row["id"]))
+        else:
+            conn.execute(
+                "UPDATE signals SET payload_json=?, contract_version='executable_v1' "
+                "WHERE id=?", (json.dumps(payload, ensure_ascii=False), row["id"]))
+
+
+def producer_daily_signal_max(strategies, settings_pairs) -> int:
+    """承認済み strategy の識別集合から日次の最大 signal 件数を返す。
+
+    式は Σ (|pairs ∩ settings_pairs| × ceil(1440 / timeframe 分)) を
+    (name, content_hash) ごとに 1 回だけ足す。同一 identity は strategy 行が
+    重複しても 1 度しか数えず、bar ごと・pair ごとの上限は signals の UNIQUE
+    制約が保証する。content hash が更新された直後は新 hash の cursor が鮮度窓
+    を再評価するため、更新 1 回につき最大 k (鮮度 bar 数) × pair 数 本だけ
+    この値を超え得る。その超過はここに含めず、容量 80% 警告の範囲で扱う。
+    """
+    seen: set[tuple[str, str]] = set()
+    allowed_pairs = set(settings_pairs)
+    total = 0
+    for strategy in strategies:
+        if getattr(strategy, "kind", None) != "strategy":
+            continue
+        identity = (strategy.name, strategy.content_hash)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        pairs = set(strategy.pairs) & allowed_pairs
+        total += len(pairs) * ((1440 + TF_MINUTES[strategy.timeframe] - 1)
+                               // TF_MINUTES[strategy.timeframe])
+    return total
 
 
 def recent(conn: sqlite3.Connection, pair: str, *, since: datetime,
@@ -386,7 +677,8 @@ def recent(conn: sqlite3.Connection, pair: str, *, since: datetime,
 
 
 def _abandon_pending_where(conn: sqlite3.Connection, predicate: str, params: tuple,
-                           *, op_id: int, commit: bool) -> None:
+                           *, op_id: int, now: datetime, commit: bool) -> None:
+    abandoned_at = utc_iso(now)
     rows = conn.execute(
         "SELECT id, status FROM signals WHERE status IN ('pending','claimed') "
         f"AND ({predicate})", params).fetchall()
@@ -396,8 +688,9 @@ def _abandon_pending_where(conn: sqlite3.Connection, predicate: str, params: tup
         ((op_id, row["id"], row["status"]) for row in rows),
     )
     conn.execute(
-        "UPDATE signals SET status='abandoned' WHERE status='pending' "
-        f"AND ({predicate})", params)
+        "UPDATE signals SET status='abandoned', abandon_reason='deploy_op', "
+        "abandoned_at=? WHERE status='pending' "
+        f"AND ({predicate})", (abandoned_at, *params))
     if commit:
         conn.commit()
 
@@ -409,9 +702,11 @@ def abandon_pending_for_identities(
         return
     predicate = " OR ".join("(plugin=? AND content_hash=?)" for _ in identities)
     params = tuple(value for identity in identities for value in identity)
-    _abandon_pending_where(conn, predicate, params, op_id=op_id, commit=commit)
+    _abandon_pending_where(conn, predicate, params, op_id=op_id, now=now,
+                           commit=commit)
 
 
 def abandon_pending_for_name(conn: sqlite3.Connection, name: str, *, op_id: int,
-                             commit: bool = True) -> None:
-    _abandon_pending_where(conn, "plugin=?", (name,), op_id=op_id, commit=commit)
+                             now: datetime, commit: bool = True) -> None:
+    _abandon_pending_where(conn, "plugin=?", (name,), op_id=op_id, now=now,
+                           commit=commit)

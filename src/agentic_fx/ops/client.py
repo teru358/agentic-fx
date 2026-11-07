@@ -37,7 +37,9 @@ from agentic_fx.core.display_time import (
     PRECISION_MINUTE, PRECISION_SECOND, TIME_FIELDS, convert_activity_line,
     convert_log_line, convert_time, display_header, effective_tz_name)
 from agentic_fx.display_tz import region_name_warning
+from agentic_fx.core.econ_window import FRESHNESS_UNKNOWN, FRESHNESS_VALUES
 from agentic_fx.datafeed.reference_status import REFERENCE_STATES
+from agentic_fx.loops.econ_signal_report import format_econ_lines
 from agentic_fx.loops import approval_facts
 from agentic_fx.loops.approval_facts import display_text
 from agentic_fx.cli_surface import render_ctl_help
@@ -682,6 +684,47 @@ def _references_line(rows) -> str | None:
     return "references: " + " ".join(parts) + (f" … 他 {extra} 件" if extra > 0 else "")
 
 
+def _flag(value) -> str:
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return "n/a" if value == "n/a" else "-"
+
+
+def _calendar_word(window) -> str:
+    """経済指標 calendar の鮮度。unknown / fresh / stale 以外は unknown に倒す。"""
+    state = window.get("freshness") if isinstance(window, dict) else None
+    return state if state in FRESHNESS_VALUES else FRESHNESS_UNKNOWN
+
+
+def _econ_lines(econ, tz: str = "UTC") -> list[str]:
+    if not isinstance(econ, dict):
+        return []
+    try:
+        return [line[:len(line) - len(line.lstrip())] + display_text(line.strip(), 400)
+                for line in format_econ_lines(econ, tz)]
+    except Exception:  # noqa: BLE001 — a rendering fault must not break status
+        return ["econ signal: 表示できません"]
+
+
+def _admission_line(data: dict) -> str | None:
+    """signal 起動と指標回避帯の最小表示。キーが無い (古い daemon) ときは出さない。"""
+    guarantee = data.get("worst_case_guarantee_unavailable")
+    window = data.get("window") if isinstance(data.get("window"), dict) else None
+    if guarantee is None and window is None:
+        return None
+    parts = [f"worst_case_guarantee_unavailable={_flag(guarantee)}",
+             "capacity_override_below_producer="
+             f"{_flag(data.get('capacity_override_below_producer'))}"]
+    if window is not None:
+        parts.append(f"in_window={_flag(window.get('in_window'))} "
+                     f"(event {_num(window.get('active_events'))} 件)")
+    parts.append(f"calendar={_calendar_word(window)}")
+    parts.append(f"抑止中 limit={_num(data.get('suppressed_limits'))}")
+    return "signal/指標回避帯: " + " ".join(parts)
+
+
 def format_status(data: dict) -> str:
     tz = _tz_of(data)
     kill = data.get("kill_switch") if isinstance(data.get("kill_switch"), dict) else {}
@@ -718,6 +761,10 @@ def format_status(data: dict) -> str:
     if isinstance(trade_events, dict):
         lines.append("取引 event の欠落: " + " ".join(
             f"{name}={_num(trade_events.get(name))}" for name in DROP_REASONS))
+    admission = _admission_line(data)
+    if admission is not None:
+        lines.append(admission)
+    lines.extend(_econ_lines(data.get("econ_signal"), tz))
     lines.extend(_deploy_ops_lines(data.get("plugin_deploy_ops")))
     repeat = data.get("improve_repeat")
     if isinstance(repeat, dict):

@@ -27,7 +27,9 @@ FK の影響を受けないため変更していない。
 from __future__ import annotations
 
 import re
+import sqlite3
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -49,11 +51,12 @@ def _iso(dt: datetime) -> str:
 
 
 def _add(conn, *, bar_ts: datetime, content_hash="h1", pair="USDJPY",
-         timeframe="1h", kind="signal", payload=None, now=NOW):
+         timeframe="1h", kind="strategy", payload=None, now=NOW):
     return signals.add(
         conn, plugin="p.py", content_hash=content_hash, pair=pair,
         timeframe=timeframe, bar_ts=_iso(bar_ts), kind=kind,
-        payload=payload or {"x": 1}, now=now)
+        payload=payload or {"x": 1}, now=now,
+        contract_version="executable_v1" if kind == "strategy" else None)
 
 
 def _mid(conn) -> int:
@@ -220,13 +223,13 @@ def test_abandon_claimed_ends_the_signal_without_spending_a_requeue(tmp_path):
     sid = _add(conn, bar_ts=NOW)
     signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW, freshness_bars=None)
 
-    signals.abandon_claimed(conn, sid)
+    signals.abandon_claimed(conn, sid, now=NOW, reason="freshness_expired")
 
     row = conn.execute("SELECT status, requeue_count, claimed_by_mission_id, claimed_at "
                        "FROM signals WHERE id=?", (sid,)).fetchone()
     assert tuple(row) == ("abandoned", 0, None, None)
     with pytest.raises(ValueError, match="is not claimed"):
-        signals.abandon_claimed(conn, sid)
+        signals.abandon_claimed(conn, sid, now=NOW, reason="freshness_expired")
 
 
 # ---------------------------------------------------------------------
@@ -527,6 +530,95 @@ def test_pending_exists(tmp_path):
     assert signals.pending_exists(conn, now=NOW, freshness_bars=1) is True
 
 
+def test_only_executable_strategy_is_claimable_and_reference_payload_is_cleaned(
+        tmp_path):
+    conn = _conn(tmp_path)
+    reference = _add(conn, bar_ts=NOW - timedelta(hours=4), kind="signal",
+                     content_hash="reference")
+    legacy = _add(conn, bar_ts=NOW - timedelta(hours=3), kind="strategy",
+                  content_hash="legacy")
+    executable = _add(conn, bar_ts=NOW - timedelta(hours=2), kind="strategy",
+                      content_hash="executable")
+    conn.execute("UPDATE signals SET contract_version=NULL WHERE id=?", (legacy,))
+    conn.execute("UPDATE signals SET contract_version='executable_v1' WHERE id=?",
+                 (executable,))
+    conn.commit()
+
+    assert signals.pending_exists(conn, now=NOW, freshness_bars=None)
+    claimed = signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW,
+                                   freshness_bars=None)
+    assert claimed["id"] == executable
+
+    result = signals.expire_stale(conn, now=NOW, freshness_bars=1)
+    assert result.total == 2
+    rows = {r["id"]: dict(r) for r in conn.execute(
+        "SELECT id,status,abandon_reason FROM signals")}
+    assert rows[reference]["abandon_reason"] == "ineligible_cleanup"
+    assert rows[legacy]["abandon_reason"] == "ineligible_cleanup"
+
+
+def test_consume_in_tx_and_finish_in_tx_rollback_together(tmp_path):
+    conn = _conn(tmp_path)
+    sid = _add(conn, bar_ts=NOW, kind="strategy", content_hash="executable")
+    conn.execute("UPDATE signals SET contract_version='executable_v1' WHERE id=?", (sid,))
+    conn.commit()
+    mid = _mid(conn)
+    signals.claim_oldest(conn, mission_id=mid, now=NOW, freshness_bars=None)
+
+    conn.execute("BEGIN")
+    signals.consume_in_tx(conn, sid, mission_id=mid, now=NOW)
+    assert missions.finish_system_filtered_in_tx(conn, mid, None, [], NOW)
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO signals (plugin,content_hash,pair,timeframe,bar_ts,kind,"
+                     "payload_json,status,created_at) VALUES ('bad','x','USDJPY','1h',"
+                     "'not-a-date','signal','{}','oops','bad')")
+    conn.rollback()
+
+    assert conn.execute("SELECT status FROM signals WHERE id=?", (sid,)
+                        ).fetchone()["status"] == "claimed"
+    assert conn.execute("SELECT status FROM missions WHERE id=?", (mid,)
+                        ).fetchone()["status"] == "running"
+
+
+def test_producer_daily_signal_max_deduplicates_strategy_identity_and_pairs():
+    strategies = [
+        SimpleNamespace(name="fifteen", content_hash="a", kind="strategy",
+                        pairs=("USDJPY", "EURUSD", "XAUUSD"), timeframe="15m"),
+        SimpleNamespace(name="fifteen", content_hash="a", kind="strategy",
+                        pairs=("USDJPY",), timeframe="15m"),
+        SimpleNamespace(name="hourly", content_hash="b", kind="strategy",
+                        pairs=("EURUSD",), timeframe="1h"),
+        SimpleNamespace(name="reference", content_hash="c", kind="signal",
+                        pairs=("USDJPY",), timeframe="15m"),
+    ]
+    assert signals.producer_daily_signal_max(strategies, ("USDJPY", "EURUSD")) == 216
+
+
+def test_human_aggregate_separates_cleanup_from_abandoned_counts(tmp_path):
+    conn = _conn(tmp_path)
+    eligible = _add(conn, bar_ts=NOW, content_hash="eligible")
+    cleanup = _add(conn, bar_ts=NOW - timedelta(hours=4), kind="signal",
+                   content_hash="reference")
+    mid = _mid(conn)
+    claimed = signals.claim_oldest(conn, mission_id=mid, now=NOW,
+                                   freshness_bars=None)
+    signals.consume(conn, claimed["id"], mission_id=mid, now=NOW)
+    conn.execute(
+        "INSERT INTO signal_decisions (mission_id,signal_id,trade_intent_id,"
+        "decision,actor,reject_code,decided_at) VALUES (?,?,NULL,'reject',"
+        "'system','econ_window',?)", (mid, eligible, NOW.isoformat()))
+    conn.commit()
+    signals.expire_stale(conn, now=NOW, freshness_bars=1)
+
+    report = signals.human_signal_aggregates(
+        conn, since=NOW - timedelta(days=1), until=NOW + timedelta(days=1))
+    assert report["decisions"] == [{
+        "plugin": "p.py", "decision": "reject", "actor": "system",
+        "reject_code": "econ_window", "count": 1}]
+    assert report["abandoned"] == {}
+    assert report["cleanup"] == 1
+
+
 def test_recent_filters_by_pair_and_bar_ts_since(tmp_path):
     """recent() は bar_ts を鮮度軸に使う (claim/freshness/staleness と同じ
     時間軸)。created_at (格納時刻) が新しくても bar_ts が古ければ「recent」
@@ -718,3 +810,66 @@ def test_claim_oldest_accepts_row_exactly_at_fresh_until_and_not_after(tmp_path)
     claimed = signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW,
                                    freshness_bars=2)
     assert claimed["id"] == sid
+
+
+@pytest.mark.parametrize("timeframe,bars", [("15m", 96), ("1h", 24), ("4h", 6),
+                                            ("1d", 1)])
+def test_producer_daily_signal_max_formula_per_timeframe(timeframe, bars):
+    strategy = SimpleNamespace(name="s", content_hash="h", kind="strategy",
+                               pairs=("USDJPY", "EURUSD", "GBPUSD"),
+                               timeframe=timeframe)
+    assert signals.producer_daily_signal_max(
+        [strategy], ("USDJPY", "EURUSD")) == 2 * bars
+    assert signals.producer_daily_signal_max(
+        [strategy, strategy], ("USDJPY", "EURUSD")) == 2 * bars
+
+
+def test_producer_daily_signal_max_counts_a_new_hash_as_a_new_identity():
+    old = SimpleNamespace(name="s", content_hash="h1", kind="strategy",
+                          pairs=("USDJPY",), timeframe="1h")
+    new = SimpleNamespace(name="s", content_hash="h2", kind="strategy",
+                          pairs=("USDJPY",), timeframe="1h")
+    other = SimpleNamespace(name="t", content_hash="h1", kind="strategy",
+                            pairs=("USDJPY",), timeframe="1h")
+    assert signals.producer_daily_signal_max([old, new], ("USDJPY",)) == 48
+    assert signals.producer_daily_signal_max([old, other], ("USDJPY",)) == 48
+    assert signals.producer_daily_signal_max([], ("USDJPY",)) == 0
+
+
+def test_reference_kind_with_a_contract_version_is_still_cleaned_up(tmp_path):
+    conn = _conn(tmp_path)
+    sid = _add(conn, bar_ts=NOW - timedelta(hours=4), kind="signal",
+               content_hash="ref")
+    conn.execute("UPDATE signals SET contract_version='executable_v1' WHERE id=?",
+                 (sid,))
+    conn.commit()
+    assert signals.pending_exists(conn, now=NOW, freshness_bars=None) is False
+    signals.expire_stale(conn, now=NOW, freshness_bars=1)
+    assert conn.execute("SELECT abandon_reason FROM signals WHERE id=?", (sid,)
+                        ).fetchone()[0] == "ineligible_cleanup"
+
+
+def test_cleanup_rows_decisions_are_not_in_the_decision_population(tmp_path):
+    conn = _conn(tmp_path)
+    legacy = _add(conn, bar_ts=NOW, content_hash="legacy")
+    conn.execute("UPDATE signals SET contract_version=NULL WHERE id=?", (legacy,))
+    mid = _mid(conn)
+    conn.execute(
+        "INSERT INTO signal_decisions (mission_id,signal_id,trade_intent_id,"
+        "decision,actor,reject_code,decided_at) VALUES (?,?,NULL,'reject',"
+        "'system','econ_window',?)", (mid, legacy, NOW.isoformat()))
+    conn.commit()
+    report = signals.human_signal_aggregates(
+        conn, since=NOW - timedelta(days=1), until=NOW + timedelta(days=1))
+    assert report["decisions"] == []
+
+
+def test_consume_wrapper_commits_so_a_later_rollback_keeps_it(tmp_path):
+    conn = _conn(tmp_path)
+    sid = _add(conn, bar_ts=NOW, content_hash="x")
+    mid = _mid(conn)
+    signals.claim_oldest(conn, mission_id=mid, now=NOW, freshness_bars=None)
+    signals.consume(conn, sid, mission_id=mid, now=NOW)
+    conn.rollback()
+    assert conn.execute("SELECT status FROM signals WHERE id=?", (sid,)
+                        ).fetchone()[0] == "consumed"

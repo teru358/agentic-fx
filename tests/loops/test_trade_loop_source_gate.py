@@ -1,126 +1,421 @@
-"""Claim 済み signal を使う OPEN の source gate 回帰テスト。"""
+"""専用 signal 採否の source lock と claim 後の終端条件。"""
 from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+import threading
+from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.core.executor import snapshot_age_exceeded
+from agentic_fx.loops import trade_loop
 from agentic_fx.plugin import switch
 from agentic_fx.runners.base import MissionResult
-from agentic_fx.store import orders, plugin_deploy_ops, signals
+from agentic_fx.store import plugin_deploy_ops, signal_decisions, signals
 
 from tests.loops.test_trade_loop import NOW, SETTINGS, _loop
+from tests.loops.test_trade_loop_signal import _add_signal
 
 
-OPEN = {
-    "action": "open", "pair": "USDJPY", "direction": "long",
-    "entry_type": "market", "horizon": "day", "stop_loss": 147.0,
-    "take_profit": 149.0, "reasoning": "test",
-}
+ACCEPT = {"decision": "accept", "reject_code": None}
 
 
-def _add(conn, *, bar_ts=NOW):
-    return signals.add(
-        conn, plugin="strategy", content_hash="a" * 64, pair="USDJPY",
-        timeframe="1h", bar_ts=bar_ts.isoformat(), kind="strategy",
-        payload={"direction": "long"}, now=NOW)
-
-
-def _last_intent(conn):
-    return conn.execute(
-        "SELECT gate_result,reject_reason,reject_category FROM trade_intents "
-        "ORDER BY id DESC LIMIT 1").fetchone()
-
-
-def test_open_abandons_claim_when_source_becomes_inactive(tmp_path, monkeypatch):
-    """source 再検証を外す変異は、無効化済み signal で OPEN してしまう。"""
-    conn, loop, _, _ = _loop(tmp_path, [MissionResult("completed", OPEN, [])])
-    _add(conn)
+def _prepare(tmp_path, *, requeue_count=0):
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult("completed", ACCEPT, [])])
+    signal_id = _add_signal(conn)
+    if requeue_count:
+        conn.execute("UPDATE signals SET requeue_count=? WHERE id=?",
+                     (requeue_count, signal_id))
+        conn.commit()
     loop._plugins_root = tmp_path / "plugins"
-    monkeypatch.setattr(
-        "agentic_fx.loops.trade_loop.signal_source_active", lambda *_args: False)
-
-    out = loop.run_once("signal")
-
-    assert out == {"result": "rejected", "order_id": None,
-                   "reasons": ["signal_source_inactive"]}
-    assert conn.execute("SELECT status FROM signals").fetchone()[0] == "abandoned"
-    assert dict(_last_intent(conn)) == {
-        "gate_result": "rejected", "reject_reason": "signal_source_inactive",
-        "reject_category": "signal",
-    }
+    loop.econ.window_view.return_value.in_window = False
+    loop.executor.gather_open_snapshot = lambda *args, **kwargs: SimpleNamespace(
+        captured_at=NOW)
+    loop.executor.open_from_snapshot = lambda *args, **kwargs: {
+        "result": "submitted", "order_id": None, "reasons": []}
+    return conn, loop, signal_id
 
 
-def test_open_requeues_claim_when_source_name_lock_times_out(tmp_path, monkeypatch):
-    """source lock timeout は consume せず、既存の requeue 経路へ渡す。"""
-    conn, loop, _, _ = _loop(tmp_path, [MissionResult("completed", OPEN, [])])
-    sid = _add(conn)
-    loop._plugins_root = tmp_path / "plugins"
+def _row(conn, signal_id):
+    return dict(conn.execute(
+        "SELECT status,requeue_count,abandon_reason,abandoned_at FROM signals "
+        "WHERE id=?", (signal_id,)).fetchone())
+
+
+def test_source_becoming_inactive_abandons_without_a_decision(tmp_path, monkeypatch):
+    conn, loop, signal_id = _prepare(tmp_path)
+    monkeypatch.setattr(trade_loop, "signal_source_active", lambda *_args: False)
+
+    loop.run_once("signal")
+
+    row = _row(conn, signal_id)
+    assert (row["status"], row["abandon_reason"], row["abandoned_at"]) == (
+        "abandoned", "source_inactive", NOW.isoformat())
+    assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM signal_shadow").fetchone()[0] == 0
+
+
+def test_source_lock_timeout_requeues_without_a_decision(tmp_path, monkeypatch):
+    conn, loop, signal_id = _prepare(tmp_path)
 
     @contextmanager
     def busy(*_args, **_kwargs):
         raise switch.PluginBusyError("held")
         yield
 
-    monkeypatch.setattr(switch, "_plugin_locks", busy)
-    out = loop.run_once("signal")
+    monkeypatch.setattr(trade_loop, "acquire_name_locks", busy)
+    loop.run_once("signal")
 
-    assert out["reasons"] == ["signal_source_lock_timeout"]
-    row = conn.execute(
-        "SELECT status,requeue_count FROM signals WHERE id=?", (sid,)).fetchone()
-    assert dict(row) == {"status": "pending", "requeue_count": 1}
+    assert _row(conn, signal_id)["status"] == "pending"
+    assert _row(conn, signal_id)["requeue_count"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM signal_shadow").fetchone()[0] == 0
+    assert "signal_source_lock_timeout" in (tmp_path / "a.log").read_text()
 
 
-def test_signal_staleness_wins_over_snapshot_staleness(tmp_path):
-    """同時 stale 時は signal を abandoned にし、snapshot 側へは進まない。"""
-    conn, loop, _, _ = _loop(tmp_path, [])
-    sid = _add(conn)
+@pytest.mark.parametrize("error", ["NotTradableSymbol", "ExposureNotTradableSymbol", "DataUnhealthy"])
+def test_snapshot_failure_requeues_and_records_the_reason(tmp_path, monkeypatch, error):
+    conn, loop, signal_id = _prepare(tmp_path)
+    exc_type = getattr(trade_loop, error)
+
+    def fail(*_args, **_kwargs):
+        raise exc_type("unavailable")
+
+    monkeypatch.setattr(loop.executor, "gather_open_snapshot", fail)
+    loop.run_once("signal")
+
+    assert _row(conn, signal_id)["status"] == "pending"
+    assert _row(conn, signal_id)["requeue_count"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
+    log = (tmp_path / "a.log").read_text()
+    assert "signal_snapshot_requeue" in log and error in log
+    assert "unavailable" not in log
+
+
+def test_spec_lookup_failure_requeues_and_records_the_reason(tmp_path, monkeypatch):
+    conn, loop, signal_id = _prepare(tmp_path)
+
+    def unknown(_pair):
+        raise trade_loop.DataUnhealthy("no spec for pair")
+
+    monkeypatch.setattr(loop.executor, "spec_fn", unknown)
+    loop.run_once("signal")
+
+    assert _row(conn, signal_id)["status"] == "pending"
+    assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
+    log = (tmp_path / "a.log").read_text()
+    assert "signal_snapshot_requeue" in log and "DataUnhealthy" in log
+    assert "no spec for pair" not in log
+
+
+def test_retry_limit_abandons_claim_with_reason_and_time(tmp_path, monkeypatch):
+    conn, loop, signal_id = _prepare(tmp_path, requeue_count=2)
+    loop.settings = SETTINGS.model_copy(deep=True)
+    loop.settings.plugin.signal_requeue_max = 2
+
+    @contextmanager
+    def busy(*_args, **_kwargs):
+        raise switch.PluginBusyError("held")
+        yield
+
+    monkeypatch.setattr(trade_loop, "acquire_name_locks", busy)
+    loop.run_once("signal")
+
+    row = _row(conn, signal_id)
+    assert (row["status"], row["abandon_reason"], row["abandoned_at"]) == (
+        "abandoned", "retry_exhausted", NOW.isoformat())
+    assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM signal_shadow").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(("requeue_count", "reason"), [
+    (0, "freshness_expired"), (1, "requeued_expired")])
+def test_commit_after_fresh_until_abandons_with_history_reason(
+        tmp_path, requeue_count, reason):
+    conn, loop, signal_id = _prepare(tmp_path, requeue_count=requeue_count)
+    late = NOW + timedelta(hours=2, seconds=1)
 
     class AdvancingRunner:
         def run(self, _mission):
-            late = NOW + timedelta(hours=3)
             loop.clock = FixedClock(late)
-            loop.executor.clock = FixedClock(late)
-            return MissionResult("completed", OPEN, [])
+            loop.executor.clock = loop.clock
+            return MissionResult("completed", ACCEPT, [])
 
     loop.runner = AdvancingRunner()
-    out = loop.run_once("signal")
+    loop.run_once("signal")
 
-    assert out["reasons"] == ["signal stale"]
-    assert conn.execute("SELECT status FROM signals WHERE id=?", (sid,)).fetchone()[0] == "abandoned"
-    assert _last_intent(conn)["reject_category"] == "signal"
+    row = _row(conn, signal_id)
+    assert (row["status"], row["abandon_reason"], row["abandoned_at"]) == (
+        "abandoned", reason, late.isoformat())
+    assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM signal_shadow").fetchone()[0] == 0
 
 
-def test_both_staleness_predicates_are_evaluated_then_signal_wins(tmp_path):
-    """両方 stale のとき両述語を評価し、優先順位は signal stale が先。"""
-    conn, loop, _, _ = _loop(tmp_path, [MissionResult("completed", OPEN, [])])
-    sid = _add(conn)
-    real_gather = loop.executor.gather_open_snapshot
+def test_runner_returning_after_fresh_until_abandons_from_one_minute_margin(
+        tmp_path):
+    conn, loop, signal_id = _prepare(tmp_path)
+    fresh_until = NOW + timedelta(hours=1)
+    loop.clock = FixedClock(fresh_until - timedelta(seconds=60))
+    loop.executor.clock = loop.clock
 
-    def gather_then_advance(*args, **kwargs):
-        snapshot = real_gather(*args, **kwargs)
-        late = NOW + timedelta(hours=3)
-        loop.clock = FixedClock(late)
-        loop.executor.clock = FixedClock(late)
-        return snapshot
+    class AdvancingRunner:
+        def run(self, _mission):
+            late = fresh_until + timedelta(seconds=67)
+            loop.clock = FixedClock(late)
+            loop.executor.clock = loop.clock
+            return MissionResult("completed", ACCEPT, [])
 
-    loop.executor.gather_open_snapshot = gather_then_advance
-    with patch("agentic_fx.loops.trade_loop.snapshot_age_exceeded",
-               wraps=snapshot_age_exceeded) as spy:
-        out = loop.run_once("signal")
+    loop.runner = AdvancingRunner()
+    loop.run_once("signal")
 
-    assert spy.call_count == 1
-    assert out["reasons"] == ["signal stale"]
-    row = conn.execute(
-        "SELECT status,requeue_count FROM signals WHERE id=?", (sid,)).fetchone()
-    assert dict(row) == {"status": "abandoned", "requeue_count": 0}
+    row = _row(conn, signal_id)
+    assert (row["status"], row["abandon_reason"], row["abandoned_at"]) == (
+        "abandoned", "freshness_expired",
+        (fresh_until + timedelta(seconds=67)).isoformat())
+    assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM signal_shadow").fetchone()[0] == 0
+
+
+def test_stale_snapshot_requeues_while_signal_is_fresh(tmp_path):
+    conn, loop, signal_id = _prepare(tmp_path)
+
+    class AdvancingRunner:
+        def run(self, _mission):
+            loop.clock = FixedClock(NOW + timedelta(seconds=31))
+            loop.executor.clock = loop.clock
+            return MissionResult("completed", ACCEPT, [])
+
+    loop.runner = AdvancingRunner()
+    loop.executor.gather_open_snapshot = lambda *args, **kwargs: SimpleNamespace(
+        captured_at=NOW)
+    loop.run_once("signal")
+
+    row = _row(conn, signal_id)
+    assert (row["status"], row["requeue_count"]) == ("pending", 1)
+    assert row["abandon_reason"] is None and row["abandoned_at"] is None
+    assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM signal_shadow").fetchone()[0] == 0
+
+
+def test_freshness_boundary_is_inclusive(tmp_path, monkeypatch):
+    conn, loop, signal_id = _prepare(tmp_path)
+    _, fresh_until = signals.freshness_window(
+        "1h", (NOW - timedelta(hours=1)).isoformat(),
+        SETTINGS.plugin.signal_freshness_bars)
+    boundary = datetime.fromisoformat(fresh_until)
+    loop.clock = FixedClock(boundary)
+    loop.executor.clock = loop.clock
+    loop.executor.gather_open_snapshot = lambda *args, **kwargs: SimpleNamespace(
+        captured_at=boundary)
+    monkeypatch.setattr(trade_loop, "signal_source_active", lambda *_args: True)
+
+    loop.run_once("signal")
+
+    assert _row(conn, signal_id)["status"] == "consumed"
+    assert conn.execute("SELECT decision FROM signal_decisions WHERE signal_id=?",
+                        (signal_id,)).fetchone()[0] == "accept"
+
+
+def test_signal_one_microsecond_after_freshness_boundary_is_abandoned(tmp_path):
+    conn, loop, signal_id = _prepare(tmp_path)
+    _, fresh_until = signals.freshness_window(
+        "1h", (NOW - timedelta(hours=1)).isoformat(),
+        SETTINGS.plugin.signal_freshness_bars)
+    boundary = datetime.fromisoformat(fresh_until) + timedelta(microseconds=1)
+    loop.clock = FixedClock(boundary)
+    loop.executor.clock = loop.clock
+    loop.executor.gather_open_snapshot = lambda *args, **kwargs: SimpleNamespace(
+        captured_at=boundary)
+
+    loop.run_once("signal")
+
+    row = _row(conn, signal_id)
+    assert (row["status"], row["abandon_reason"], row["abandoned_at"]) == (
+        "abandoned", "freshness_expired", boundary.isoformat())
+
+
+@pytest.mark.parametrize(("requeue_count", "reason"), [
+    (0, "freshness_expired"), (1, "requeued_expired")])
+def test_nonready_after_runner_abandons_an_expired_claim(
+        tmp_path, requeue_count, reason):
+    conn, loop, signal_id = _prepare(tmp_path, requeue_count=requeue_count)
+    late = NOW + timedelta(hours=2, microseconds=1)
+
+    class AdvancingRunner:
+        def run(self, _mission):
+            loop.clock = FixedClock(late)
+            loop.executor.clock = loop.clock
+            return MissionResult("completed", ACCEPT, [])
+
+    loop.runner = AdvancingRunner()
+    loop.executor.state_fn = lambda: "unavailable"
+    loop.run_once("signal")
+
+    row = _row(conn, signal_id)
+    assert (row["status"], row["abandon_reason"], row["abandoned_at"]) == (
+        "abandoned", reason, late.isoformat())
+    assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM signal_shadow").fetchone()[0] == 0
+
+
+def test_signal_staleness_takes_priority_when_snapshot_is_also_stale(
+        tmp_path, monkeypatch):
+    conn, loop, signal_id = _prepare(tmp_path)
+    late = NOW + timedelta(hours=2, seconds=1)
+    loop.executor.gather_open_snapshot = lambda *args, **kwargs: SimpleNamespace(
+        captured_at=NOW)
+
+    class AdvancingRunner:
+        def run(self, _mission):
+            loop.clock = FixedClock(late)
+            loop.executor.clock = loop.clock
+            return MissionResult("completed", ACCEPT, [])
+
+    loop.runner = AdvancingRunner()
+    reasons = []
+    real_age = trade_loop.snapshot_age_exceeded
+
+    def observe_age(snapshot, now, max_age):
+        reasons.append(real_age(snapshot, now, max_age))
+        return reasons[-1]
+
+    monkeypatch.setattr(trade_loop, "snapshot_age_exceeded", observe_age)
+    monkeypatch.setattr(trade_loop, "signal_source_active", lambda *_args: True)
+    loop.run_once("signal")
+
+    row = _row(conn, signal_id)
+    assert row["status"] == "abandoned"
+    assert row["abandon_reason"] == "freshness_expired"
+    assert reasons and reasons[-1] is not None
+    assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
+
+
+def test_scheduler_can_acquire_core_lock_while_source_lock_is_held(
+        tmp_path, monkeypatch):
+    conn, loop, _ = _prepare(tmp_path)
+    observations = []
+
+    @contextmanager
+    def held(*_args, **_kwargs):
+        acquired = []
+        def check():
+            value = loop._core_lock.acquire(blocking=False)
+            acquired.append(value)
+            if value:
+                loop._core_lock.release()
+        checker = threading.Thread(target=check)
+        checker.start()
+        checker.join(timeout=2)
+        observations.extend(acquired)
+        yield
+
+    monkeypatch.setattr(trade_loop, "acquire_name_locks", held)
+    monkeypatch.setattr(trade_loop, "signal_source_active", lambda *_args: True)
+    loop.run_once("signal")
+
+    assert observations == [True]
+
+
+def test_freshness_and_snapshot_gate_share_the_decision_timestamp(
+        tmp_path, monkeypatch):
+    conn, loop, signal_id = _prepare(tmp_path)
+    ticks = []
+
+    class SteppingClock:
+        def now(self):
+            value = NOW + timedelta(microseconds=len(ticks))
+            ticks.append(value)
+            return value
+
+    loop.clock = SteppingClock()
+    loop.executor.clock = loop.clock
+    loop.executor.gather_open_snapshot = lambda *args, **kwargs: SimpleNamespace(
+        captured_at=NOW)
+    gate_times = []
+    real_age = trade_loop.snapshot_age_exceeded
+
+    def observe_age(snapshot, now, max_age):
+        gate_times.append(now)
+        return real_age(snapshot, now, max_age)
+
+    monkeypatch.setattr(trade_loop, "snapshot_age_exceeded", observe_age)
+    monkeypatch.setattr(trade_loop, "signal_source_active", lambda *_args: True)
+    loop.run_once("signal")
+
+    decided_at = datetime.fromisoformat(conn.execute(
+        "SELECT decided_at FROM signal_decisions WHERE signal_id=?",
+        (signal_id,)).fetchone()[0])
+    assert len(gate_times) == 1
+    assert gate_times == [decided_at]
+
+
+@pytest.mark.parametrize("action", ["hold", "close", "cancel"])
+def test_cron_actions_do_not_acquire_plugin_name_locks(tmp_path, monkeypatch, action):
+    from agentic_fx.runners.base import MissionResult
+
+    output = ({"action": "hold", "reasoning": "wait"} if action == "hold"
+              else {"action": action, "order_id": 999})
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult("completed", output, [])])
+    calls = []
+
+    @contextmanager
+    def lock(*_args, **_kwargs):
+        calls.append(True)
+        yield
+
+    monkeypatch.setattr(trade_loop, "acquire_name_locks", lock)
+    if action == "close":
+        loop.executor.close_from_snapshot = lambda *args, **kwargs: {
+            "result": "rejected", "order_id": 999, "reasons": ["not_open"]}
+
+    loop.run_once("cron")
+
+    assert calls == []
+
+
+def test_invalid_signal_identity_is_rejected_before_stale_source_gate(
+        tmp_path, monkeypatch):
+    conn, loop, signal_id = _prepare(tmp_path)
+    conn.execute("UPDATE signals SET payload_json=? WHERE id=?",
+                 ('{"action":"open","pair":"EURUSD","direction":"long",'
+                  '"entry_type":"market","horizon":"day","stop_loss":147.0,'
+                  '"take_profit":151.5,"confidence":0.5,"reasoning":"bad"}',
+                  signal_id))
+    conn.commit()
+    late = NOW + timedelta(hours=2, seconds=1)
+
+    class AdvancingRunner:
+        def run(self, _mission):
+            loop.clock = FixedClock(late)
+            loop.executor.clock = loop.clock
+            return MissionResult("completed", ACCEPT, [])
+
+    loop.runner = AdvancingRunner()
+
+    def source_check(*_args):
+        raise AssertionError("source validation must follow signal identity checks")
+
+    monkeypatch.setattr(trade_loop, "signal_source_active", source_check)
+    loop.run_once("signal")
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM signal_decisions WHERE signal_id=?",
+        (signal_id,)).fetchone()[0] == 0
+    assert conn.execute("SELECT status FROM missions").fetchone()[0] == "failed"
+
+
+def test_snapshot_age_uses_a_strict_shared_boundary(tmp_path):
+    _, loop, _ = _prepare(tmp_path)
+    snapshot = SimpleNamespace(captured_at=NOW)
+    assert snapshot_age_exceeded(snapshot, NOW + timedelta(seconds=10), 10) is None
+    assert "execution snapshot is stale" in snapshot_age_exceeded(
+        snapshot, NOW + timedelta(seconds=10, microseconds=1), 10)
 
 
 def _plain_indicator_world(tmp_path):
-    """plain の indicator ディレクトリだけが live にある plugins root。"""
-    from types import SimpleNamespace
     root = tmp_path / "plugins"
     (root / "legacy_ind").mkdir(parents=True)
     resolved = SimpleNamespace(items=(SimpleNamespace(
@@ -138,290 +433,85 @@ def _approve_strategy(conn):
     conn.commit()
 
 
-def test_open_gate_accepts_strategy_depending_on_plain_indicator(tmp_path):
-    """plain の indicator は存在だけを見る (hash / 最新決定は照合しない)。"""
-    from agentic_fx.loops.trade_loop import signal_source_active
+def test_source_identity_accepts_a_matching_plain_indicator_dependency(tmp_path):
     from agentic_fx.plugin.source_state import source_state
-    conn, _loop_obj, _, _ = _loop(tmp_path, [])
+    conn, _, _ = _prepare(tmp_path)
     root, resolved = _plain_indicator_world(tmp_path)
-    live = type("Id", (), {"kind": "plain", "content_hash": "0" * 64,
-                           "artifact_hash": None})
-    strategy = type("Id", (), {"kind": "plain", "content_hash": "a" * 64,
-                               "artifact_hash": None})
+    strategy = SimpleNamespace(kind="plain", content_hash="a" * 64,
+                               artifact_hash=None)
+    live = SimpleNamespace(kind="plain", content_hash="0" * 64,
+                           artifact_hash=None)
     _approve_strategy(conn)
 
     def identity(_root, name):
         return strategy if name == "strategy" else live
 
     with patch.object(plugin_deploy_ops, "live_identity", identity):
-        assert signal_source_active(
+        assert trade_loop.signal_source_active(
             conn, root, "strategy", "a" * 64, resolved) is True
-        assert source_state(
-            conn, root, name="strategy", content_hash="a" * 64,
-            artifact_hash=None, indicators=resolved.items) is None
+        assert source_state(conn, root, name="strategy", content_hash="a" * 64,
+                            artifact_hash=None, indicators=resolved.items) is None
 
 
-def test_symlink_indicator_hash_mismatch_is_not_live(tmp_path):
-    from agentic_fx.loops.trade_loop import signal_source_active
-    conn, _loop_obj, _, _ = _loop(tmp_path, [])
+def test_source_identity_rejects_a_symlink_with_a_different_hash(tmp_path):
+    conn, _, _ = _prepare(tmp_path)
     root, resolved = _plain_indicator_world(tmp_path)
-    strategy = type("Id", (), {"kind": "plain", "content_hash": "a" * 64,
-                               "artifact_hash": None})
-    linked = type("Id", (), {"kind": "symlink", "content_hash": "0" * 64,
-                             "artifact_hash": "x"})
+    strategy = SimpleNamespace(kind="plain", content_hash="a" * 64,
+                               artifact_hash=None)
+    linked = SimpleNamespace(kind="symlink", content_hash="0" * 64,
+                             artifact_hash="artifact")
     _approve_strategy(conn)
 
     def identity(_root, name):
         return strategy if name == "strategy" else linked
 
     with patch.object(plugin_deploy_ops, "live_identity", identity):
-        assert signal_source_active(
+        assert trade_loop.signal_source_active(
             conn, root, "strategy", "a" * 64, resolved) is False
 
 
-def test_snapshot_age_helper_has_shared_strict_boundary(tmp_path):
-    """OPEN gate と executor が同じ helper を使い、等号は許可する。"""
-    conn, loop, _, _ = _loop(tmp_path, [])
-    snapshot = loop.executor.gather_open_snapshot(
-        type("Intent", (), {"pair": "USDJPY"})(), exposure_pairs=[])
-    assert snapshot_age_exceeded(snapshot, NOW + timedelta(seconds=10), 10) is None
-    assert "execution snapshot is stale" in snapshot_age_exceeded(
-        snapshot, NOW + timedelta(seconds=10, microseconds=1), 10)
+def test_source_lock_covers_accept_commit(tmp_path, monkeypatch):
+    conn, loop, signal_id = _prepare(tmp_path)
+    locked = False
+    observed = []
+
+    @contextmanager
+    def held(*_args, **_kwargs):
+        nonlocal locked
+        locked = True
+        try:
+            yield
+        finally:
+            locked = False
+
+    real_commit = signal_decisions.commit_accept
+
+    def commit(*args, **kwargs):
+        observed.append(locked)
+        return real_commit(*args, **kwargs)
+
+    monkeypatch.setattr(trade_loop, "acquire_name_locks", held)
+    monkeypatch.setattr(trade_loop, "signal_source_active", lambda *_args: True)
+    monkeypatch.setattr(signal_decisions, "commit_accept", commit)
+    loop.run_once("signal")
+
+    assert observed == [True]
+    assert _row(conn, signal_id)["status"] == "consumed"
 
 
-def test_snapshot_staleness_requeues_before_consume(tmp_path):
-    """snapshot helper を consume の後ろへ移す変異は signal を消費してしまう。"""
-    conn, loop, _, _ = _loop(tmp_path, [MissionResult("completed", OPEN, [])])
-    sid = _add(conn)
-    real_gather = loop.executor.gather_open_snapshot
-
-    def gather_then_advance(*args, **kwargs):
-        snapshot = real_gather(*args, **kwargs)
-        late = NOW + timedelta(seconds=31)
-        loop.clock = FixedClock(late)
-        loop.executor.clock = FixedClock(late)
-        return snapshot
-
-    loop.executor.gather_open_snapshot = gather_then_advance
-    out = loop.run_once("signal")
-
-    assert "execution snapshot is stale" in out["reasons"][0]
-    row = conn.execute(
-        "SELECT status,requeue_count FROM signals WHERE id=?", (sid,)).fetchone()
-    assert dict(row) == {"status": "pending", "requeue_count": 1}
-
-
-def test_hold_never_acquires_plugin_name_lock(tmp_path, monkeypatch):
-    """HOLD は source gate の対象外で、plugin lock を取らない。"""
-    conn, loop, _, _ = _loop(tmp_path, [MissionResult(
-        "completed", {"action": "hold", "reasoning": "wait"}, [])])
-    _add(conn)
-    loop._plugins_root = tmp_path / "plugins"
-
-    with patch("agentic_fx.loops.trade_loop.switch._plugin_locks") as locks:
-        out = loop.run_once("signal")
-
-    assert out["result"] == "hold"
-    locks.assert_not_called()
-
-
-def test_close_and_cancel_never_acquire_plugin_name_lock(tmp_path):
-    """Only OPEN has a source gate; closing paths remain available during deploy work."""
-    conn, loop, runner, _ = _loop(tmp_path, [])
-    open_id = orders.insert(
-        conn, pair="USDJPY", direction="long", entry_type="market", horizon="day",
-        status="open", now=NOW, quantity=0.1, avg_fill_price=148.5)
-    pending_id = orders.insert(
-        conn, pair="USDJPY", direction="long", entry_type="limit", horizon="day",
-        status="pending_fill", now=NOW, quantity=0.1, remaining_quantity=0.1,
-        requested_price=148.2, stop_loss=147.8, take_profit=149.0, expires_at=None)
-    for action, order_id, expected in (("close", open_id, "closed"),
-                                       ("cancel", pending_id, "cancelled")):
-        runner._results = [MissionResult(
-            "completed", {"action": action, "order_id": order_id,
-                          "reasoning": "risk reduction"}, [])]
-        with patch("agentic_fx.loops.trade_loop.switch._plugin_locks") as locks:
-            loop.run_once("cron")
-        locks.assert_not_called()
-        assert orders.get(conn, order_id)["status"] == expected
-
-
-def test_source_lock_oserror_is_recorded_as_a_signal_rejection(tmp_path, monkeypatch):
-    """lock 取得の想定外の例外も intent と gate 拒否を残し、発注しない。"""
-    conn, loop, _, _ = _loop(tmp_path, [MissionResult("completed", OPEN, [])])
-    sid = _add(conn)
-    loop._plugins_root = tmp_path / "plugins"
+@pytest.mark.parametrize("error", [OSError, ValueError])
+def test_lock_error_requeues_and_fails_closed(tmp_path, monkeypatch, error):
+    conn, loop, signal_id = _prepare(tmp_path)
 
     @contextmanager
     def broken(*_args, **_kwargs):
-        raise OSError("lock file unavailable")
+        raise error("lock file unavailable")
         yield
 
-    monkeypatch.setattr(switch, "_plugin_locks", broken)
-    out = loop.run_once("signal")
-
-    assert out == {"result": "rejected", "order_id": None,
-                   "reasons": ["signal_source_lock_error"]}
-    assert dict(_last_intent(conn)) == {
-        "gate_result": "rejected", "reject_reason": "signal_source_lock_error",
-        "reject_category": "signal",
-    }
-    assert conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 0
-    row = conn.execute(
-        "SELECT status,requeue_count FROM signals WHERE id=?", (sid,)).fetchone()
-    assert dict(row) == {"status": "pending", "requeue_count": 1}
-
-
-def test_source_lock_value_error_is_also_fail_closed(tmp_path, monkeypatch):
-    conn, loop, _, _ = _loop(tmp_path, [MissionResult("completed", OPEN, [])])
-    _add(conn)
-    loop._plugins_root = tmp_path / "plugins"
-
-    @contextmanager
-    def broken(*_args, **_kwargs):
-        raise ValueError("bad name")
-        yield
-
-    monkeypatch.setattr(switch, "_plugin_locks", broken)
-    out = loop.run_once("signal")
-
-    assert out["reasons"] == ["signal_source_lock_error"]
-    assert _last_intent(conn)["reject_reason"] == "signal_source_lock_error"
-
-
-def test_early_rejection_wins_over_stale_signal_and_inactive_source(
-        tmp_path, monkeypatch):
-    """origin 拒否などの early 結果は source ゲートで上書きしない。"""
-    import dataclasses
-    from agentic_fx.core.contracts import Origin
-    conn, loop, _, _ = _loop(tmp_path, [])
-    sid = _add(conn)
-    loop._plugins_root = tmp_path / "plugins"
-    monkeypatch.setattr(
-        "agentic_fx.loops.trade_loop.signal_source_active", lambda *_a: False)
-    real = loop.executor.record_and_validate_intent
-
-    def foreign_origin(intent, mission_id):
-        return real(dataclasses.replace(intent, origin=Origin.ASK), mission_id)
-
-    loop.executor.record_and_validate_intent = foreign_origin
-
-    class AdvancingRunner:
-        def run(self, _mission):
-            late = NOW + timedelta(hours=3)
-            loop.clock = FixedClock(late)
-            loop.executor.clock = FixedClock(late)
-            return MissionResult("completed", OPEN, [])
-
-    loop.runner = AdvancingRunner()
-    out = loop.run_once("signal")
-
-    assert out["reasons"] == ["origin rejected: only scheduler missions may trade"]
-    assert dict(_last_intent(conn)) == {
-        "gate_result": "rejected",
-        "reject_reason": "origin rejected: only scheduler missions may trade",
-        "reject_category": "origin",
-    }
-    assert conn.execute(
-        "SELECT status FROM signals WHERE id=?", (sid,)).fetchone()[0] != "abandoned"
-
-
-def test_source_name_lock_is_held_until_open_from_snapshot_returns(
-        tmp_path, monkeypatch):
-    """lock が解放された後に発注すると、deploy 操作と OPEN が交錯する。"""
-    from tests.plugin._conc_support import lock_is_free
-    conn, loop, _, _ = _loop(tmp_path, [MissionResult("completed", OPEN, [])])
-    _add(conn)
-    loop._plugins_root = tmp_path / "plugins"
-    monkeypatch.setattr(
-        "agentic_fx.loops.trade_loop.signal_source_active", lambda *_a: True)
-    real = loop.executor.open_from_snapshot
-    seen = []
-
-    def spy(*args, **kwargs):
-        seen.append(lock_is_free(loop._plugins_root, "strategy"))
-        return real(*args, **kwargs)
-
-    loop.executor.open_from_snapshot = spy
+    monkeypatch.setattr(trade_loop, "acquire_name_locks", broken)
     loop.run_once("signal")
 
-    assert seen == [False]
-    assert lock_is_free(loop._plugins_root, "strategy") is True
-
-
-def _fresh_until():
-    _, fresh_until = signals.freshness_window(
-        "1h", NOW.isoformat(), SETTINGS.plugin.signal_freshness_bars)
-    return datetime.fromisoformat(fresh_until)
-
-
-def _run_with_clock_at(tmp_path, monkeypatch, moment):
-    conn, loop, _, _ = _loop(tmp_path, [])
-    sid = _add(conn)
-    monkeypatch.setattr(
-        "agentic_fx.loops.trade_loop.signal_source_active", lambda *_a: True)
-
-    class AdvancingRunner:
-        def run(self, _mission):
-            loop.clock = FixedClock(moment)
-            loop.executor.clock = FixedClock(moment)
-            return MissionResult("completed", OPEN, [])
-
-    loop.runner = AdvancingRunner()
-    out = loop.run_once("signal")
-    status = conn.execute(
-        "SELECT status FROM signals WHERE id=?", (sid,)).fetchone()[0]
-    return out, status
-
-
-def test_signal_is_still_fresh_exactly_at_fresh_until(tmp_path, monkeypatch):
-    out, status = _run_with_clock_at(tmp_path, monkeypatch, _fresh_until())
-
-    assert "signal stale" not in out["reasons"]
-    assert status != "abandoned"
-
-
-def test_signal_is_stale_one_microsecond_after_fresh_until(tmp_path, monkeypatch):
-    out, status = _run_with_clock_at(
-        tmp_path, monkeypatch, _fresh_until() + timedelta(microseconds=1))
-
-    assert out["reasons"] == ["signal stale"]
-    assert status == "abandoned"
-
-
-def test_signal_and_snapshot_staleness_share_one_clock_reading(
-        tmp_path, monkeypatch):
-    """gate の 2 述語は同じ now で評価する (clock が進んでも食い違わない)。"""
-    conn, loop, _, _ = _loop(tmp_path, [MissionResult("completed", OPEN, [])])
-    _add(conn)
-    monkeypatch.setattr(
-        "agentic_fx.loops.trade_loop.signal_source_active", lambda *_a: True)
-    readings = []
-
-    class TickingClock:
-        def now(self):
-            value = NOW + timedelta(microseconds=len(readings) + 1)
-            readings.append(value)
-            return value
-
-    loop.clock = TickingClock()
-    at_signal_check = []
-    real_window = signals.freshness_window
-
-    def window(*args, **kwargs):
-        at_signal_check.append(readings[-1])
-        return real_window(*args, **kwargs)
-
-    monkeypatch.setattr(signals, "freshness_window", window)
-    snapshot_nows = []
-
-    def spy(snapshot, now, max_age):
-        snapshot_nows.append((now, at_signal_check[-1]))
-        return snapshot_age_exceeded(snapshot, now, max_age)
-
-    monkeypatch.setattr("agentic_fx.loops.trade_loop.snapshot_age_exceeded", spy)
-    loop.run_once("signal")
-
-    assert len(snapshot_nows) == 1
-    snapshot_now, signal_now = snapshot_nows[0]
-    assert snapshot_now == signal_now
+    assert _row(conn, signal_id)["status"] == "pending"
+    assert _row(conn, signal_id)["requeue_count"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
+    assert "signal_source_lock_requeue" in (tmp_path / "a.log").read_text()

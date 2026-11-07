@@ -60,6 +60,7 @@ from agentic_fx.plugin import sandbox as plugin_sandbox
 from agentic_fx.plugin.sandbox import REFERENCE_ERROR_CODES
 from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.plugin import switch
+from agentic_fx.plugin.strategy_adapter import normalize_strategy_payload
 from agentic_fx.plugin.deploy_ops import acquire_name_locks
 from agentic_fx.plugin.reference_frames import (
     FETCH_STATE_REASONS, RUNTIME_WINDOW_REASON,
@@ -448,10 +449,14 @@ class SignalProducer:
         if result.get("action") != "open":
             return 0
         def insert_strategy() -> int:
+            executable = normalize_strategy_payload(result, pair, provenance)
+            if executable is None:
+                raise ValueError("strategy open result normalized to no payload")
             row_id = signals.add(
                 conn, plugin=meta.name, content_hash=meta.content_hash,
                 pair=pair, timeframe=meta.timeframe, bar_ts=bar_ts,
-                kind="strategy", payload={**result, **provenance}, now=now)
+                kind="strategy", payload=executable,
+                contract_version="executable_v1", now=now)
             return 1 if row_id is not None else 0
         return self._insert_while_live(
             conn, meta, resolved, plugins_root, settings, insert_strategy)

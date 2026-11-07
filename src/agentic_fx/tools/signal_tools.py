@@ -72,6 +72,25 @@ _DEFAULT_SINCE_HOURS = 24
 # 混入しうる経路自体が無いことの回帰ピンを兼ねる。
 IMPROVE_FORBIDDEN = frozenset({"get_signals", "bless"})
 
+# signal の採否・shadow 成績・反応統計を返す tool の名前の接頭辞。改善ループの tool 一覧は
+# 名前がこれで始まるものを 1 つも含んではならない (これらは人間面と cron 取引だけの材料)。
+IMPROVE_FORBIDDEN_PREFIXES = (
+    "signal_", "get_signal", "shadow_", "get_shadow", "decision_",
+    "get_decision", "reaction_", "get_reaction", "get_econ_reaction")
+
+
+def improve_forbidden_hits(names) -> list[str]:
+    """改善ループの tool 名のうち、禁止集合か禁止の接頭辞に当たるもの。"""
+    return sorted(n for n in names
+                  if n in IMPROVE_FORBIDDEN or n.startswith(IMPROVE_FORBIDDEN_PREFIXES))
+
+
+def assert_improve_allowlist(names) -> None:
+    """改善ループに組み立てた tool 名が禁止集合と交わるなら組み立てを失敗させる。"""
+    hits = improve_forbidden_hits(names)
+    if hits:
+        raise ValueError(f"improve tool allowlist contains forbidden tools: {hits}")
+
 
 def _clamp_since_hours(value: object, max_hours: int) -> int:
     """int 検証 (bool 除外) → ``[1, max_hours]`` へのクランプ。

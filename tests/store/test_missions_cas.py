@@ -61,7 +61,7 @@ def test_recover_interrupted_requeues_claimed_signals_same_transaction(tmp_path)
     mid = missions.start(conn, "trade", "local", "m", NOW)
     signals.add(conn, plugin="p", content_hash="h", pair="USDJPY",
                timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
-               payload={}, now=NOW)
+               payload={}, now=NOW, contract_version="executable_v1")
     claimed = signals.claim_oldest(conn, mission_id=mid, now=NOW,
                                    freshness_bars=None)
     assert claimed is not None
@@ -81,7 +81,7 @@ def test_recover_interrupted_abandons_signal_over_requeue_limit(tmp_path):
     mid = missions.start(conn, "trade", "local", "m", NOW)
     signals.add(conn, plugin="p", content_hash="h", pair="USDJPY",
                timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
-               payload={}, now=NOW)
+               payload={}, now=NOW, contract_version="executable_v1")
     claimed = signals.claim_oldest(conn, mission_id=mid, now=NOW,
                                    freshness_bars=None)
     conn.execute("UPDATE signals SET requeue_count=2 WHERE id=?", (claimed["id"],))
@@ -113,7 +113,7 @@ def test_recover_interrupted_is_atomic_no_partial_state_on_failure(tmp_path):
     mid = missions.start(conn, "trade", "local", "m", NOW)
     signals.add(conn, plugin="p", content_hash="h", pair="USDJPY",
                timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
-               payload={}, now=NOW)
+               payload={}, now=NOW, contract_version="executable_v1")
     claimed = signals.claim_oldest(conn, mission_id=mid, now=NOW,
                                    freshness_bars=None)
     assert claimed is not None
@@ -151,7 +151,7 @@ def test_i2_conn_commit_required_in_recover_interrupted(tmp_path):
     mid = missions.start(conn, "trade", "local", "m", NOW)
     signals.add(conn, plugin="p", content_hash="h", pair="USDJPY",
                timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
-               payload={}, now=NOW)
+               payload={}, now=NOW, contract_version="executable_v1")
     claimed = signals.claim_oldest(conn, mission_id=mid, now=NOW,
                                    freshness_bars=None)
     assert claimed is not None
@@ -185,7 +185,7 @@ def test_i1_begin_immediate_locks_writes(tmp_path):
     mid = missions.start(conn1, "trade", "local", "m", NOW)
     signals.add(conn1, plugin="p", content_hash="h", pair="USDJPY",
                timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
-               payload={}, now=NOW)
+               payload={}, now=NOW, contract_version="executable_v1")
     claimed = signals.claim_oldest(conn1, mission_id=mid, now=NOW,
                                    freshness_bars=None)
     assert claimed is not None
@@ -250,7 +250,7 @@ def test_i4_atomicity_with_python_exception_on_signals_update(tmp_path):
     mid = missions.start(conn, "trade", "local", "m", NOW)
     signals.add(conn, plugin="p", content_hash="h", pair="USDJPY",
                timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
-               payload={}, now=NOW)
+               payload={}, now=NOW, contract_version="executable_v1")
     claimed = signals.claim_oldest(conn, mission_id=mid, now=NOW,
                                    freshness_bars=None)
     assert claimed is not None
@@ -283,7 +283,7 @@ def test_m1_abandon_branch_failure_injection(tmp_path):
     mid = missions.start(conn, "trade", "local", "m", NOW)
     signals.add(conn, plugin="p", content_hash="h", pair="USDJPY",
                timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
-               payload={}, now=NOW)
+               payload={}, now=NOW, contract_version="executable_v1")
     claimed = signals.claim_oldest(conn, mission_id=mid, now=NOW,
                                    freshness_bars=None)
     # abandon させるために requeue_count を max_requeue 以上にする
@@ -317,7 +317,7 @@ def test_m2_requeue_count_eq_max_requeue_becomes_abandoned(tmp_path):
     mid = missions.start(conn, "trade", "local", "m", NOW)
     signals.add(conn, plugin="p", content_hash="h", pair="USDJPY",
                timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
-               payload={}, now=NOW)
+               payload={}, now=NOW, contract_version="executable_v1")
     claimed = signals.claim_oldest(conn, mission_id=mid, now=NOW,
                                    freshness_bars=None)
     # requeue_count を 1 にセット
@@ -345,7 +345,7 @@ def test_m2_requeue_count_lt_max_requeue_becomes_requeued(tmp_path):
     mid = missions.start(conn, "trade", "local", "m", NOW)
     signals.add(conn, plugin="p", content_hash="h", pair="USDJPY",
                timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
-               payload={}, now=NOW)
+               payload={}, now=NOW, contract_version="executable_v1")
     claimed = signals.claim_oldest(conn, mission_id=mid, now=NOW,
                                    freshness_bars=None)
     # requeue_count は既定値 0

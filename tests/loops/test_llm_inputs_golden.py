@@ -20,6 +20,7 @@ from agentic_fx.config import load_settings
 from agentic_fx.core import transitions
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.core.contracts import OrderStatus as S
+from agentic_fx.core.econ_window import EventView, WindowView
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.loops.improve_context import _performance_report
 from agentic_fx.loops.reflection_cycle import ReflectionCycle
@@ -93,8 +94,11 @@ def _inputs(tmp_path: Path, *, observed: bool) -> dict[str, bytes]:
         report = json.dumps(_performance_report(conn, NOW), sort_keys=True,
                             ensure_ascii=False, separators=(",", ":"))
         econ = MagicMock()
-        econ.upcoming.return_value = [{"ts": "2026-07-22T19:30:00+00:00", "country": "USD",
-                                       "name": "CPI", "importance": 3}]
+        econ.pair_currencies = {"USDJPY": ("USD", "JPY")}
+        econ.window_view.return_value = WindowView(
+            pair="USDJPY", currencies=("JPY", "USD"), in_window=False, active=(),
+            next_event=EventView("USD", "CPI", 3, datetime(2026, 7, 22, 19, 30, tzinfo=timezone.utc)),
+            freshness="fresh")
         summary = build_state_summary(conn, PaperBroker(conn, SETTINGS, FixedClock(NOW)), econ,
                                       FixedClock(NOW), SETTINGS.paper.starting_balance)
         runner = FakeRunner([MissionResult("completed", {"content": "x"}, [])])
@@ -121,6 +125,12 @@ def test_ac18_llm_inputs_match_golden_bytes(tmp_path, name, observed):
         GOLDEN.mkdir(parents=True, exist_ok=True)
         (GOLDEN / name).write_bytes(got)
     assert got == (GOLDEN / name).read_bytes()
+
+
+def test_state_summary_golden_uses_pair_view_and_drops_the_24h_heading():
+    golden = (GOLDEN / "state_summary.txt").read_text(encoding="utf-8")
+    assert "24h 以内の経済指標" not in golden
+    assert "- 経済指標 (pair view):" in golden
 
 
 def test_ac18_observed_run_really_wrote_events(tmp_path):

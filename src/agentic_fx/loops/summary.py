@@ -2,14 +2,19 @@
 from __future__ import annotations
 
 import copy
+import logging
 import sqlite3
+from collections.abc import Mapping
 from datetime import datetime
 
+from agentic_fx._safe_error import safe_error_text
 from agentic_fx.core.contracts import Clock, OrderStatus
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.core.accounting import daily_start_equity
 from agentic_fx.datafeed.econ_calendar import EconCalendar
 from agentic_fx.store import orders
+
+_log = logging.getLogger(__name__)
 
 TRADE_INTENT_SCHEMA: dict = {
     "type": "object",
@@ -92,12 +97,32 @@ def build_state_summary(conn: sqlite3.Connection, broker: PaperBroker,
                 f"  - #{r['id']} {r['pair']} {r['direction']} "
                 f"pnl={pnl_str} ({r['close_reason']})")
 
-    events = econ.upcoming(hours=24)
-    if events:
-        lines.append("- 24h 以内の経済指標:")
-        for e in events[:8]:
-            stars = "★" * int(e["importance"] or 0)
-            lines.append(f"  - {e['ts']} {e['country']} {e['name']} {stars}")
+    pair_currencies = getattr(econ, "pair_currencies", None)
+    if isinstance(pair_currencies, Mapping):
+        lines.append("- 経済指標 (pair view):")
+        for pair in pair_currencies:
+            try:
+                view = econ.window_view(pair, now)
+            except Exception as e:  # noqa: BLE001 — 指標の表示で prompt 構築を止めない
+                _log.warning("econ window_view failed for %s: %s", pair,
+                             safe_error_text(e))
+                lines.append(f"  - {pair} freshness=unknown (取得できませんでした)")
+                continue
+            active = ", ".join(
+                f"{event.ts.isoformat()} {event.country} {event.name} "
+                f"{'★' * event.importance}"
+                for event in view.active) or "なし"
+            if view.next_event is None:
+                next_event = "なし"
+            else:
+                event = view.next_event
+                next_event = (
+                    f"{event.ts.isoformat()} {event.country} {event.name} "
+                    f"{'★' * event.importance}")
+            lines.append(
+                f"  - {view.pair} currencies={'/'.join(view.currencies)} "
+                f"in_window={'true' if view.in_window else 'false'} "
+                f"freshness={view.freshness} active={active} next={next_event}")
     return "\n".join(lines)
 
 

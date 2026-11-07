@@ -6,6 +6,7 @@ import jsonschema
 
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import FixedClock, OrderStatus
+from agentic_fx.core.econ_window import EventView, WindowView
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.loops.summary import (
     ANSWER_SCHEMA, TRADE_INTENT_SCHEMA, build_state_summary,
@@ -76,9 +77,11 @@ def test_summary_contains_positions_and_trades(tmp_path):
                         status=OrderStatus.CLOSED, now=NOW, quantity=0.1,
                         realized_pnl=-1200.0, close_reason="sl")
     econ = MagicMock()
-    econ.upcoming.return_value = [
-        {"ts": "2026-07-22T19:30:00+00:00", "country": "USD",
-         "name": "CPI", "importance": 3}]
+    econ.pair_currencies = {"USDJPY": ("USD", "JPY")}
+    econ.window_view.return_value = WindowView(
+        pair="USDJPY", currencies=("JPY", "USD"), in_window=False,
+        active=(), next_event=EventView("USD", "CPI", 3, NOW),
+        freshness="fresh")
     text = build_state_summary(conn, PaperBroker(conn, SETTINGS,
                                                  FixedClock(NOW)),
                                econ, FixedClock(NOW),

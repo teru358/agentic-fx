@@ -30,6 +30,7 @@ from agentic_fx.store import (approvals, backlog, candidate_archives,
 from agentic_fx.store.approvals import AlreadyDecidedError, ApprovalNotFoundError
 from agentic_fx.store.state import (
     GenerationMismatch, NotLatched, ResetNotApplied, StateStore, StateUncertain)
+from agentic_fx.loops import econ_signal_report
 from agentic_fx.ops.contracts import ErrorCode, OpsError, ShellCaller
 from agentic_fx.policy_projection import (
     POLICY_TEXT_LIMIT, MigrationRecordUnknown, ProjectionReconcileBlocked, insert_policy,
@@ -114,6 +115,11 @@ class Commands:
         # 操作 API と同じ ops / 決定レーンを共有するときに use_ops_service で
         # 注入する。未注入の間は従来の直接経路のまま動く。
         self.ops_service = None
+        self.econ_status_source = None
+
+    def use_econ_status_source(self, source) -> None:
+        """status 行に足す econ 集計の読み口 (共有 cache)。status 全体は走らせない。"""
+        self.econ_status_source = source
 
     def _tz(self) -> str:
         """表示 tz (設定の display_timezone。読めなければ UTC)。"""
@@ -611,7 +617,8 @@ class Commands:
         active = orders.list_by_status(self.conn, "open", "pending_fill",
                                        "protection_pending")
         recent = missions.recent(self.conn, 1)
-        last = (f"{recent[0]['loop']}:{recent[0]['status']} "
+        last = (f"{recent[0]['loop']}:"
+                f"{econ_signal_report.display_mission_status(recent[0]['status'])} "
                 f"({self._when(recent[0]['started_at'])})") if recent else "なし"
         ks = ("LATCHED" + (f" gen={s.kill_switch_generation}"
                            f" since={self._when(s.kill_switch_latched_at)}")
@@ -634,7 +641,20 @@ class Commands:
         note = region_name_warning(getattr(self.settings, "display_timezone", "UTC"))
         if note is not None:
             result += f"\nwarning: {note}"
+        result += self._econ_signal_lines()
         return result
+
+    def _econ_signal_lines(self) -> str:
+        """signal 採否・abandoned・slice 容量・worker の行。取れなければ何も足さない。"""
+        if self.econ_status_source is None:
+            return ""
+        try:
+            econ = self.econ_status_source()
+            lines = econ_signal_report.format_econ_lines(
+                econ if isinstance(econ, dict) else None, self._tz())
+        except Exception:  # noqa: BLE001 - 補助表示は status を止めない
+            return ""
+        return "".join("\n" + line for line in lines)
 
     def _data_state_line(self) -> str:
         """`status` 表示に足す 1 行: state / epoch / gap / 未処理建玉数 /

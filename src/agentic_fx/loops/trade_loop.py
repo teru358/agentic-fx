@@ -28,12 +28,16 @@ from agentic_fx.core.contracts import (
 )
 from agentic_fx.core.executor import (EXPOSURE_NOT_TRADABLE_REASON, Executor,
                                       ExposureNotTradableSymbol, NotTradableSymbol,
-                                      snapshot_age_exceeded)
+                                      intent_payload, snapshot_age_exceeded)
 from agentic_fx.core.notifier import Notifier
 from agentic_fx.datafeed.econ_calendar import EconCalendar
 from agentic_fx.datafeed.health import DataUnhealthy
 from agentic_fx.datafeed.price_provider import PriceProvider
 from agentic_fx.loops.mission_finalize import finalize_mission
+from agentic_fx.loops.signal_decision_contract import (
+    Accept, Invalid, Reject, DECISION_SCHEMA, SIGNAL_DECISION_TOOLS,
+    parse_decision, verify_opposite_position,
+)
 from agentic_fx.loops.mission_watch import MissionWatch
 from agentic_fx.loops.prompts_loader import load_prompt
 from agentic_fx.loops.summary import (
@@ -42,7 +46,13 @@ from agentic_fx.loops.summary import (
 from agentic_fx.policy import Policy
 from agentic_fx.runners.base import AgentRunner, Mission, MissionResult
 from agentic_fx.store import alert_state
+from agentic_fx.store import signal_decisions
+from agentic_fx.signal_admission import (
+    FRESHNESS_ABANDON_REASONS, TERMINAL_DECISION, TERMINAL_FRESHNESS_ABANDONED,
+)
+from agentic_fx.store.signal_shadow import spread_from_quote
 from agentic_fx.store import intents as intents_store
+from agentic_fx.store import orders as orders_store
 from agentic_fx.store import mission_decision_bars, missions, signals
 from agentic_fx.plugin import switch
 from agentic_fx.plugin.deploy_ops import acquire_name_locks
@@ -54,13 +64,13 @@ import logging
 
 _log = logging.getLogger("agentic_fx.trade_loop")
 
-_TRADE_TOOLS = ["get_ohlcv", "get_indicators", "search_news",
-                "get_econ_calendar", "get_positions", "get_account",
-                "get_recent_reflections", "search_reflections",
-                "get_signals"]
-
-# 最古の pending signal を 1 件 claim する trigger (判断足の cron と signal 起動)。
-_CLAIMING_TRIGGERS = frozenset({"cron", "signal"})
+_CRON_TOOLS = ["get_ohlcv", "get_indicators", "search_news",
+               "get_econ_calendar", "get_positions", "get_account",
+               "get_recent_reflections", "search_reflections"]
+_ASK_TOOLS = [*_CRON_TOOLS, "get_signals"]
+# Full registry-facing set retained for service validation; missions use the
+# explicit cron, ask, or signal list above.
+_TRADE_TOOLS = _ASK_TOOLS
 
 
 def signal_source_active(conn, plugins_root: Path, plugin: str, content_hash: str,
@@ -84,10 +94,12 @@ def gate_reject_streak(conn: sqlite3.Connection) -> tuple[int, int, str | None]:
         "WHERE action='open' AND gate_result='accepted'").fetchone()[0])
     count = int(conn.execute(
         "SELECT COUNT(*) FROM trade_intents WHERE action='open' "
-        "AND gate_result='rejected' AND id > ?", (streak_id,)).fetchone()[0])
+        "AND gate_result='rejected' AND reject_category IS NOT 'econ_window' "
+        "AND id > ?", (streak_id,)).fetchone()[0])
     row = conn.execute(
         "SELECT reject_category,COUNT(*) c FROM trade_intents "
-        "WHERE action='open' AND gate_result='rejected' AND id > ? "
+        "WHERE action='open' AND gate_result='rejected' "
+        "AND reject_category IS NOT 'econ_window' AND id > ? "
         "GROUP BY reject_category ORDER BY c DESC,reject_category ASC LIMIT 1",
         (streak_id,)).fetchone()
     return streak_id, count, row["reject_category"] if row else None
@@ -102,7 +114,8 @@ class TradeLoop:
                  conn_supervisor: sqlite3.Connection,
                  watch: MissionWatch | None = None,
                  plugins_root: Path | None = None,
-                 resolved_by_identity=None) -> None:
+                 resolved_by_identity=None,
+                 signal_terminal=None) -> None:
         self.conn = conn
         self.runner = runner
         self.settings = settings
@@ -117,6 +130,8 @@ class TradeLoop:
         self._conn_supervisor = conn_supervisor
         self._plugins_root = plugins_root
         self._resolved_by_identity = resolved_by_identity or {}
+        # commit 後に終端を渡す warning 評価境界 (core lock の外で呼ぶ)
+        self.signal_terminal = signal_terminal
         self.watch = watch if watch is not None else MissionWatch()
         self._market_tool_daily: dict = {}
 
@@ -184,19 +199,10 @@ class TradeLoop:
             self.notifier.send(f"[agentic-fx] データ不健全のため判断をスキップ: {e}")
             return None
 
-        # レビュー 1 周目 codex A2/A3: 以下の try/finally は
-        # `with self._core_lock:` (prepare) の**中**まで含めてメソッド全体を
-        # 覆う。以前は `try:` が prepare の外側 (with ブロックの後) にしか
-        # 無かったため、claim 成功後の set_trigger/build_prompt/build_mission
-        # で例外が出ると finally が一切実行されず、claimed signal も mid も
-        # 回収されないまま呼び出し元 (run_once のサービス境界) まで抜けて
-        # いた。`finalized` は「finalize_mission (または missions.finish) を
-        # 既に試みたか」を追跡し、finally での二重 finalize (CAS 上は無害だが
-        # 無用な mission_finalize_conflict ログを出す) を避ける。
-        claimed: dict | None = None
+        if trigger == "signal":
+            return self._run_signal_mission(signal_max_id)
+
         mid: int | None = None
-        consumed = False
-        stopped_by_data_state = False
         finalized = False
         try:
             # ---- prepare (core_lock 保持) ----
@@ -204,60 +210,11 @@ class TradeLoop:
                 if trigger == "cron" and decision_bars:
                     mid = self._start_cron_mission(now, decision_bars)
                 else:
-                    # signal 起動では trigger="signal" が暫定値。NULL 窓を作らず、
-                    # signals_rate_ok の LIKE 'signal%' がこの行も数える (§12 不変
-                    # 条件は維持したまま常に非 NULL trigger を持たせる)。
                     mid = missions.start(self.conn, "trade",
                                          self.settings.runner.trade.backend,
                                          self.settings.runner.trade.model, now,
                                          trigger=trigger)
-                if trigger in _CLAIMING_TRIGGERS:
-                    # claim_oldest は mission 行 (cron では mission_decision_bars
-                    # 行も) が commit された後に呼ぶ — claim_oldest は自身で
-                    # commit する別トランザクションなので、claim 済みなのに
-                    # mission が未確定という状態を作らない。1 mission が引き受ける
-                    # signal は最古の 1 件だけ (1 mission = 1 claim = 1 intent)。
-                    # signal 起動で claim できなければ LLM を起こさず skipped、
-                    # cron は signal なしで判断を続ける。
-                    try:
-                        claim_kwargs = {
-                            "mission_id": mid,
-                            "now": now,
-                            "freshness_bars": self.settings.plugin.signal_freshness_bars,
-                        }
-                        if signal_max_id is not None:
-                            claim_kwargs["max_id"] = signal_max_id
-                        claimed = signals.claim_oldest(self.conn, **claim_kwargs)
-                        if claimed is None and trigger == "signal":
-                            missions.finish(self.conn, mid, "skipped", None, [], now)
-                            finalized = True
-                            return None
-                    except Exception:
-                        # claim_oldest (または直後の "skipped" finish) が例外を
-                        # 出しても mission を running のまま残さず必ず終端させる。
-                        #
-                        # claim_oldest 内部で「DB は commit 済みだが呼び出し直後に
-                        # Python 例外」という曖昧窓は原理的に残る (claimed 行が
-                        # claimed のままリークし得る) — この窓を塞ぐのは
-                        # `signals.reclaim_expired` (lease 回収) の役目であり、
-                        # `signal_lease_min` が経過するまでは不可視になり得る。
-                        try:
-                            missions.finish(self.conn, mid, "failed", None, [], now)
-                        except Exception:  # noqa: BLE001 — 元の例外を握りつぶさない
-                            _log.exception(
-                                "failed to finalize mission %s after claim error", mid)
-                        else:
-                            finalized = True
-                        raise
-                if claimed is not None:
-                    # signal 起動では set_trigger で plugin 名を確定する。cron は
-                    # "cron" のまま (signal 起動の頻度制限に数えない)。
-                    if trigger == "signal":
-                        missions.set_trigger(self.conn, mid, f"signal:{claimed['plugin']}")
-                    prompt = (self._build_prompt(load_prompt("trade_mission"), now)
-                             + self._format_signal_injection(claimed, trigger))
-                else:
-                    prompt = self._build_prompt(load_prompt("trade_mission"), now)
+                prompt = self._build_prompt(load_prompt("trade_mission"), now)
                 mission = self._build_mission(prompt)
 
             # ---- run (core_lock 非保持) ----
@@ -343,128 +300,30 @@ class TradeLoop:
                     snapshot_error = e
 
             # ---- commit-core (core_lock 保持) ----
-            source_lock = contextlib.ExitStack()
-            source_lock_timeout = False
-            source_lock_error = False
-            if (claimed is not None and intent.action is Action.OPEN
-                    and self._plugins_root is not None):
-                resolved = self._resolved_by_identity.get(
-                    (claimed["plugin"], claimed["content_hash"]))
-                source_names = {claimed["plugin"]}
-                if resolved is not None:
-                    source_names.update(item.plugin_name for item in resolved.items)
-                try:
-                    source_lock.enter_context(acquire_name_locks(
-                        self._plugins_root, source_names,
-                        deadline=monotonic()
-                        + self.settings.worker.plugin_lock_timeout_sec))
-                except switch.PluginBusyError:
-                    source_lock.close()
-                    source_lock = contextlib.ExitStack()
-                    source_lock_timeout = True
-                except Exception:  # noqa: BLE001 — fail closed、intent は記録する
-                    _log.exception("signal source lock failed")
-                    source_lock.close()
-                    source_lock = contextlib.ExitStack()
-                    source_lock_error = True
             # **通知は commit-post まで遅延させる (Step 3.5)** — Notifier.send は
             # urlopen(timeout=10) の同期実行なので、ここで送ると core_lock を
             # 握ったまま最大 10 秒ブロックし SL/TP 監視が止まる。
-            with source_lock, self._core_lock, \
+            with self._core_lock, \
                     self.executor.defer_notifications() as deferred:
                 try:
+                    econ_window: tuple[bool, tuple[int, ...]] | None = None
+                    econ_window_error: Exception | None = None
+                    # signal trigger は上で専用 mission へ分岐済みなので、
+                    # ここに来る OPEN はすべて裁量判断として帯を判定する。
+                    if intent.action is Action.OPEN and snapshot_error is None:
+                        try:
+                            view = self.econ.window_view(
+                                intent.pair, self.clock.now())
+                            econ_window = (
+                                view.in_window,
+                                tuple(event.id for event in view.active))
+                        except Exception as e:  # noqa: BLE001 — OPEN は fail closed
+                            econ_window_error = e
                     # intent は執行前に必ず記録し、以降の拒否理由を iid に
                     # 結び付ける。record_and_validate_intent 自体は発注しない。
                     iid, early = self.executor.record_and_validate_intent(
                         intent, mid)
-                    consume_error = None
-                    source_rejected = False
-                    if (claimed is not None and intent.action is Action.OPEN
-                            and early is None):
-                        gate_now = self.clock.now()
-                        if source_lock_error:
-                            source_rejected = True
-                            reason = "signal_source_lock_error"
-                        elif source_lock_timeout:
-                            source_rejected = True
-                            reason = "signal_source_lock_timeout"
-                        else:
-                            _, fresh_until = signals.freshness_window(
-                                claimed["timeframe"], claimed["bar_ts"],
-                                self.settings.plugin.signal_freshness_bars)
-                            signal_stale = gate_now > datetime.fromisoformat(
-                                fresh_until)
-                            snapshot_reason = (
-                                snapshot_age_exceeded(
-                                    open_snapshot, gate_now,
-                                    self.settings.worker.snapshot_max_age_sec)
-                                if open_snapshot is not None else None)
-                            if signal_stale:
-                                source_rejected = True
-                                reason = "signal stale"
-                                signals.abandon_claimed(self.conn, claimed["id"])
-                                consumed = True
-                            elif snapshot_reason is not None:
-                                source_rejected = True
-                                reason = snapshot_reason
-                            elif self._plugins_root is not None:
-                                resolved = self._resolved_by_identity.get(
-                                    (claimed["plugin"], claimed["content_hash"]))
-                                if not signal_source_active(
-                                        self.conn, self._plugins_root,
-                                        claimed["plugin"], claimed["content_hash"],
-                                        resolved):
-                                    source_rejected = True
-                                    reason = "signal_source_inactive"
-                                    signals.abandon_claimed(self.conn, claimed["id"])
-                                    consumed = True
-                        if source_rejected:
-                            intents_store.set_gate_result(
-                                self.conn, iid, accepted=False, reject_reason=reason,
-                                reject_category=("execution" if reason.startswith("execution")
-                                                 else "signal"))
-                            self.activity.write(Category.TRADE, "gate_rejected", reason,
-                                                ref_id=str(iid))
-                    if (claimed is not None
-                            and intent.action is Action.OPEN
-                            and self.executor.state_fn() != "ready"):
-                        # consume せずに止める。finally の後始末で、鮮度が
-                        # 切れていれば pending に戻さず abandoned にする。
-                        stopped_by_data_state = True
-                    if (claimed is not None and not source_rejected and not (
-                            intent.action is Action.OPEN
-                            and self.executor.state_fn() != "ready")):
-                        # ⑥consume/requeue の確定規則: パース成功の時点で
-                        # consume する (プロンプトに実際に載せた Mission が
-                        # 確定できる)。executor 実行後の requeue は二重発注
-                        # ハザードになるため、ここで確定させる。
-                        #
-                        # `signals.consume` は fail-closed (CAS 不一致で
-                        # ValueError)。失敗時は consumed=False のままにして
-                        # finally の requeue に委ね、記録済み intent を signal
-                        # gate 拒否として確定する。
-                        try:
-                            signals.consume(
-                                self.conn, claimed["id"], mission_id=mid,
-                                now=self.clock.now())
-                        except ValueError as e:
-                            consume_error = e
-                        else:
-                            consumed = True
-                    if source_rejected:
-                        out = {"result": "rejected", "order_id": None,
-                               "reasons": [reason]}
-                    elif consume_error is not None:
-                        reason = ("signal not claimed by this mission: "
-                                  + safe_error_text(consume_error))
-                        intents_store.set_gate_result(
-                            self.conn, iid, accepted=False,
-                            reject_reason=reason, reject_category="signal")
-                        self.activity.write(Category.TRADE, "gate_rejected",
-                                            reason, ref_id=str(iid))
-                        out = {"result": "rejected", "order_id": None,
-                               "reasons": [reason]}
-                    elif isinstance(snapshot_error,
+                    if isinstance(snapshot_error,
                                     (NotTradableSymbol, ExposureNotTradableSymbol)):
                         reason = (EXPOSURE_NOT_TRADABLE_REASON
                                   if isinstance(snapshot_error, ExposureNotTradableSymbol)
@@ -501,12 +360,24 @@ class TradeLoop:
                                                 reasons[0], ref_id=str(iid))
                             out = {"result": "rejected", "order_id": None,
                                    "reasons": reasons}
+                    elif econ_window_error is not None and early is None:
+                        reasons = ["econ window check failed (fail closed): "
+                                   + safe_error_text(econ_window_error)]
+                        intents_store.set_gate_result(
+                            self.conn, iid, accepted=False,
+                            reject_reason=reasons[0],
+                            reject_category="execution")
+                        self.activity.write(Category.TRADE, "gate_rejected",
+                                            reasons[0], ref_id=str(iid))
+                        out = {"result": "rejected", "order_id": None,
+                               "reasons": reasons}
                     elif early is not None:
                         out = early
                     elif intent.action is Action.OPEN:
                         out = self.executor.open_from_snapshot(
                             intent, iid, open_snapshot,
-                            max_snapshot_age_sec=self.settings.worker.snapshot_max_age_sec)
+                            max_snapshot_age_sec=self.settings.worker.snapshot_max_age_sec,
+                            econ_window=econ_window)
                     elif intent.action is Action.CLOSE:
                         out = self.executor.close_from_snapshot(
                             intent, iid, close_snapshot,
@@ -554,25 +425,6 @@ class TradeLoop:
                                 ref_id=str(mid))
             return out
         finally:
-            # 例外時も claimed のまま残さない (lease 回収を待たず即 requeue)。
-            # consume 済みならここでは何もしない (二重発注ハザードを避ける)。
-            # 裁定書 F-6 (CR-5): _requeue_signal は signals.requeue 経由で
-            # conn_core を書き込むため、core_lock を保持中に呼ぶ (Global
-            # Constraints 違反の解消 — この finally はメソッド全体の
-            # try に対するものであり、commit-core の with ブロックは
-            # 例外伝播時点で既に解放済みなので RLock の再取得は安全)。
-            # レビュー 1 周目 codex A1: 通知の送信 (urlopen(timeout=10)) は
-            # lock 解放後に行う — _requeue_signal はもう送信しない
-            # (文面を返すだけ)。
-            if claimed is not None and not consumed:
-                with self._core_lock:
-                    _requeue_msg = self._requeue_signal(
-                            claimed, abandon_if_stale=stopped_by_data_state)
-                if _requeue_msg:
-                    try:
-                        self.notifier.send(_requeue_msg)
-                    except Exception:  # noqa: BLE001 — 通知失敗で本流を止めない
-                        _log.exception("requeue notification failed")
             # レビュー 1 周目 codex A3: run/commit-pre 相 (watch.begin/end・
             # TradeIntent 解析想定外例外・_read_exposure_pairs/
             # _read_close_row 等) で想定外の例外が出ても、mid が既に
@@ -584,6 +436,318 @@ class TradeLoop:
                 with self._core_lock:
                     finalize_mission(self.conn, self.activity, self.clock,
                                      mid, MissionResult("failed", None, []))
+
+    def _run_signal_mission(self, signal_max_id: int | None) -> dict | None:
+        """専用 signal 採否経路。採否 transaction が確定するまで発注しない。"""
+        now = self.clock.now()
+        mid: int | None = None
+        claimed: dict | None = None
+        finalized = False
+        consumed = False
+        terminal: str | None = None
+        deferred_notifications: list[str] = []
+        result = MissionResult("failed", None, [])
+        try:
+            with self._core_lock:
+                mid = missions.start(
+                    self.conn, "trade", self.settings.runner.trade.backend,
+                    self.settings.runner.trade.model, now, trigger="signal")
+                kwargs = {"mission_id": mid, "now": now,
+                          "freshness_bars": self.settings.plugin.signal_freshness_bars}
+                if signal_max_id is not None:
+                    kwargs["max_id"] = signal_max_id
+                claimed = signals.claim_oldest(self.conn, **kwargs)
+                if claimed is None:
+                    missions.finish(self.conn, mid, "skipped", None, [], now)
+                    finalized = True
+                    return None
+                missions.set_trigger(self.conn, mid, f"signal:{claimed['plugin']}")
+                # 帯内の signal は LLM を起動せず、commit 段で system reject にする
+                pre_filtered = self.econ.window_view(
+                    claimed["pair"], now).in_window
+                prompt = (self._build_prompt(
+                              load_prompt("signal_decision_mission"), now)
+                          + self._format_signal_injection(claimed))
+                mission = Mission(
+                    prompt=prompt, tools=list(SIGNAL_DECISION_TOOLS),
+                    output_schema=DECISION_SCHEMA,
+                    max_turns=self.settings.llama_swap.max_turns,
+                    timeout_sec=self.settings.llama_swap.timeout_sec)
+
+            parsed = None
+            if not pre_filtered:
+                self.watch.begin(mid, "trade", mission.timeout_sec)
+                try:
+                    run_result = self.runner.run(mission)
+                    result = (run_result if isinstance(run_result, MissionResult)
+                              else MissionResult("failed", None, []))
+                except Exception:  # noqa: BLE001
+                    _log.exception("signal decision runner raised")
+                finally:
+                    self.watch.end(mid)
+
+                if result.status != "completed":
+                    with self._core_lock:
+                        finalize_mission(self.conn, self.activity, self.clock, mid,
+                                         result)
+                    finalized = True
+                    self._record_signal_mission_failure(mid, result)
+                    return None
+
+                parsed = parse_decision(result.output
+                                        if isinstance(result.output, dict) else "")
+                if isinstance(parsed, Invalid):
+                    failed = MissionResult("failed", {"detail": parsed.detail},
+                                           result.transcript)
+                    with self._core_lock:
+                        finalize_mission(self.conn, self.activity, self.clock, mid,
+                                         failed)
+                        self.activity.write(
+                            Category.AGGREGATE, "signal_decision_invalid",
+                            parsed.detail, ref_id=str(claimed["id"]))
+                    finalized = True
+                    self._record_signal_mission_failure(mid, failed)
+                    return None
+
+            signal_id = int(claimed["id"])
+
+            payload = json.loads(claimed["payload_json"])
+            if not isinstance(payload, dict) or claimed.get("contract_version") != "executable_v1":
+                raise ValueError("claimed signal is not executable_v1")
+            executable = {**payload, "action": "open", "origin": Origin.SCHEDULER.value}
+            intent = TradeIntent.from_llm_dict(executable, origin=Origin.SCHEDULER)
+            if (intent.action is not Action.OPEN or intent.pair != claimed["pair"]
+                    or intent.origin is not Origin.SCHEDULER):
+                raise ValueError("signal intent failed origin/loop validation")
+
+            reject_code = parsed.code if isinstance(parsed, Reject) else None
+
+            try:
+                spec = self.executor.spec_fn(intent.pair)
+            except (NotTradableSymbol, ExposureNotTradableSymbol, DataUnhealthy) as exc:
+                # decision は書かず requeue する (上限で終わる)。理由は固定語で残す。
+                self.activity.write(
+                    Category.AGGREGATE, "signal_snapshot_requeue",
+                    type(exc).__name__, ref_id=str(mid))
+                raise
+            output = result.output if isinstance(result.output, dict) else None
+            snapshot = None
+            if isinstance(parsed, Accept):
+                exposure_pairs = self._read_exposure_pairs()
+                try:
+                    snapshot = self.executor.gather_open_snapshot(
+                        intent, exposure_pairs=exposure_pairs)
+                except (NotTradableSymbol, ExposureNotTradableSymbol, DataUnhealthy) as exc:
+                    # decision は書かず requeue する (上限で終わる)。理由は固定語で残す。
+                    self.activity.write(
+                        Category.AGGREGATE, "signal_snapshot_requeue",
+                        type(exc).__name__, ref_id=str(mid))
+                    raise
+                if self.executor.state_fn() != "ready":
+                    return None
+                quote = getattr(snapshot, "quote", None)
+            else:
+                quote = self._quote_for_spread(intent.pair)
+            spread = self._shadow_spread(intent.pair, spec.pip_size, quote)
+            payload_for_commit = intent_payload(intent)
+            with contextlib.ExitStack() as locks:
+                resolved = self._resolved_by_identity.get(
+                    (claimed["plugin"], claimed["content_hash"]))
+                if self._plugins_root is not None:
+                    source_names = {claimed["plugin"]}
+                    if resolved is not None:
+                        source_names.update(item.plugin_name
+                                            for item in resolved.items)
+                    try:
+                        locks.enter_context(acquire_name_locks(
+                            self._plugins_root, source_names,
+                            deadline=monotonic()
+                            + self.settings.worker.plugin_lock_timeout_sec))
+                    except switch.PluginBusyError:
+                        self.activity.write(
+                            Category.AGGREGATE, "signal_source_lock_requeue",
+                            "signal_source_lock_timeout", ref_id=str(mid))
+                        raise
+                    except Exception:
+                        self.activity.write(
+                            Category.AGGREGATE, "signal_source_lock_requeue",
+                            "signal_source_lock_error", ref_id=str(mid))
+                        raise
+                with self._core_lock, self.executor.defer_notifications() as deferred:
+                    deferred_notifications = deferred
+                    gate_now = self.clock.now()
+                    _, fresh_until = signals.freshness_window(
+                        claimed["timeframe"], claimed["bar_ts"],
+                        self.settings.plugin.signal_freshness_bars)
+                    signal_stale = gate_now > datetime.fromisoformat(fresh_until)
+                    snapshot_reason = (snapshot_age_exceeded(
+                        snapshot, gate_now,
+                        self.settings.worker.snapshot_max_age_sec)
+                        if snapshot is not None else None)
+                    if signal_stale:
+                        signals.abandon_claimed(
+                            self.conn, signal_id, now=gate_now,
+                            reason=signals.freshness_abandon_reason(claimed))
+                        missions.finish(self.conn, mid, "failed", None, [], gate_now)
+                        consumed = finalized = True
+                        terminal = TERMINAL_FRESHNESS_ABANDONED
+                        return None
+                    if snapshot_reason is not None:
+                        return None
+                    if self.executor.state_fn() != "ready":
+                        return None
+                    if (self._plugins_root is not None
+                            and not signal_source_active(
+                                self.conn, self._plugins_root, claimed["plugin"],
+                                claimed["content_hash"], resolved)):
+                        signals.abandon_claimed(
+                            self.conn, signal_id, now=gate_now,
+                            reason="source_inactive")
+                        missions.finish(self.conn, mid, "failed", None, [], gate_now)
+                        consumed = finalized = True
+                        return None
+                    if reject_code == "opposite_position":
+                        active_orders = orders_store.list_by_status(
+                            self._conn_supervisor, S.OPEN, S.PENDING_FILL,
+                            S.PROTECTION_PENDING)
+                        if not verify_opposite_position(
+                                parsed, active_orders, pair=intent.pair,
+                                direction=intent.direction):
+                            failed = MissionResult(
+                                "failed", {"detail": "invalid_reject_code"},
+                                result.transcript)
+                            finalize_mission(self.conn, self.activity, self.clock,
+                                             mid, failed)
+                            self.activity.write(
+                                Category.AGGREGATE, "signal_decision_invalid",
+                                "invalid_reject_code", ref_id=str(signal_id))
+                            finalized = True
+                            return None
+                    if pre_filtered or (
+                            isinstance(parsed, Accept)
+                            and self.econ.window_view(intent.pair, gate_now).in_window):
+                        signal_decisions.commit_reject(
+                            self.conn, mission_id=mid, signal_id=signal_id,
+                            actor=signal_decisions.ACTOR_SYSTEM,
+                            reject_code=signal_decisions.SYSTEM_REJECT_CODE,
+                            spread=spread, output=output,
+                            transcript=result.transcript, now=gate_now)
+                        consumed = finalized = True
+                        terminal = TERMINAL_DECISION
+                        self.activity.write(
+                            Category.AGGREGATE, "signal_filtered_econ_window",
+                            signal_decisions.SYSTEM_REJECT_CODE,
+                            ref_id=str(signal_id))
+                        return {"result": "rejected", "order_id": None,
+                                "reasons": ["econ_window"]}
+                    if isinstance(parsed, Accept):
+                        committed = signal_decisions.commit_accept(
+                            self.conn, mission_id=mid, signal_id=signal_id,
+                            intent_payload=payload_for_commit, spread=spread,
+                            output=output, transcript=result.transcript,
+                            now=gate_now)
+                        consumed = finalized = True
+                        terminal = TERMINAL_DECISION
+                        self.activity.write(
+                            Category.AGGREGATE, "signal_accepted", "accept",
+                            ref_id=str(signal_id))
+                        try:
+                            out = self.executor.open_from_snapshot(
+                                intent, committed.trade_intent_id, snapshot,
+                                max_snapshot_age_sec=(
+                                    self.settings.worker.snapshot_max_age_sec))
+                        except Exception as e:  # noqa: BLE001
+                            reason = safe_error_text(e)
+                            intents_store.set_gate_result(
+                                self.conn, committed.trade_intent_id,
+                                accepted=False, reject_reason=reason,
+                                reject_category="execution")
+                            self.activity.write(
+                                Category.AGGREGATE, "intent_execution_failed",
+                                reason, ref_id=str(mid))
+                            deferred_notifications.append(
+                                f"[agentic-fx] 注文処理失敗: {reason}")
+                            return None
+                        return out
+                    signal_decisions.commit_reject(
+                        self.conn, mission_id=mid, signal_id=signal_id,
+                        actor=signal_decisions.ACTOR_LLM, reject_code=reject_code,
+                        spread=spread, output=output, transcript=result.transcript,
+                        now=gate_now)
+                    consumed = finalized = True
+                    terminal = TERMINAL_DECISION
+                    self.activity.write(
+                        Category.AGGREGATE, "signal_rejected_by_llm",
+                        reject_code, ref_id=str(signal_id))
+                    return {"result": "rejected", "order_id": None,
+                            "reasons": [reject_code]}
+        except Exception:  # noqa: BLE001
+            _log.exception("signal decision flow failed")
+            return None
+        finally:
+            for message in deferred_notifications:
+                try:
+                    self.notifier.send(message)
+                except Exception:  # noqa: BLE001 — notification failure is non-fatal
+                    _log.exception("signal notification failed")
+            if claimed is not None and not consumed:
+                with self._core_lock:
+                    message, requeue_terminal = self._requeue_signal(
+                        claimed, abandon_if_stale=True)
+                if terminal is None and requeue_terminal is not None:
+                    terminal = requeue_terminal
+                if message:
+                    try:
+                        self.notifier.send(message)
+                    except Exception:  # noqa: BLE001
+                        _log.exception("signal requeue notification failed")
+            if mid is not None and not finalized:
+                with self._core_lock:
+                    finalize_mission(self.conn, self.activity, self.clock, mid,
+                                     MissionResult("failed", None, []))
+            if terminal is not None and claimed is not None:
+                self._report_signal_terminal(int(claimed["id"]), terminal)
+
+    def _quote_for_spread(self, pair: str):
+        """shadow の spread 用の quote。取れなければ None (assumed になる)。"""
+        try:
+            return self.executor.quote_fn(pair)
+        except Exception:  # noqa: BLE001 — spread の取得失敗で採否を止めない
+            return None
+
+    def _shadow_spread(self, pair: str, pip_size: float, quote):
+        pair_rule = self.settings.risk.pair_rules.get(pair)
+        assumed = pair_rule.assumed_spread_pips if pair_rule else 0.0
+        bid = getattr(quote, "bid", None)
+        ask = getattr(quote, "ask", None)
+        return spread_from_quote(bid, ask, pip_size=pip_size,
+                                 assumed_spread_pips=assumed)
+
+    def _report_signal_terminal(self, signal_id: int, kind: str) -> None:
+        """commit 後、core lock の外で warning 評価境界へ終端を渡す。"""
+        if self.signal_terminal is None:
+            return
+        try:
+            self.signal_terminal(signal_id, kind)
+        except Exception:  # noqa: BLE001 — 評価の失敗で採否を変えない
+            _log.exception("signal terminal evaluation failed")
+
+    def _record_signal_mission_failure(self, mission_id: int,
+                                       result: MissionResult) -> None:
+        status = result.status
+        reason = result.reason
+        if reason is None and isinstance(result.output, dict):
+            reason = result.output.get("detail")
+        self.activity.write(
+            Category.AGGREGATE, "mission_failed",
+            f"runner status={status}" + (f" — {reason}" if reason else ""),
+            ref_id=str(mission_id))
+        try:
+            self.notifier.send(
+                f"[agentic-fx] 判断 Mission 失敗: {status}"
+                + (f" — {reason}" if reason else ""))
+        except Exception:  # noqa: BLE001 — 通知失敗で再試行処理を妨げない
+            _log.exception("signal mission failure notification failed")
 
     def _start_cron_mission(self, now, decision_bars) -> int:
         """missions 行と mission_decision_bars 行を 1 transaction で確定する
@@ -651,12 +815,12 @@ class TradeLoop:
 
     def _build_mission(self, prompt: str) -> Mission:
         return Mission(
-            prompt=prompt, tools=_TRADE_TOOLS,
+            prompt=prompt, tools=_CRON_TOOLS,
             output_schema=trade_intent_schema(self.settings.pairs),
             max_turns=self.settings.llama_swap.max_turns,
             timeout_sec=self.settings.llama_swap.timeout_sec)
 
-    def _format_signal_injection(self, claimed: dict, trigger: str) -> str:
+    def _format_signal_injection(self, claimed: dict) -> str:
         """claim した signals 行を「この判断で扱う signal」節としてプロンプトに
         追記する。strategy_timeframe は signal を作った strategy の足 (判断足
         とは限らない)、bar_close は strategy 足の確定時刻、fresh_until は
@@ -676,14 +840,8 @@ class TradeLoop:
             # pending にしか効かず、claimed 中の同じ 1 tick は救えない)。
             # プロンプトへは「不明」で埋めて判断そのものは続行させる。
             bar_close = fresh_until = "不明"
-        if trigger == "signal":
-            lead = ("このMissionは以下の signal/strategy plugin の出力をトリガーに"
-                    "起動されました。判断の参考にしてください。\n")
-        else:
-            lead = ("この判断足の Mission は以下の signal を引き受けています。"
-                    "signal は strategy の足の確定に対する plugin の判定で、"
-                    "発注指示ではありません。判断が確定すると (hold を含む) "
-                    "この signal は consumed になり、他の Mission には渡りません。\n")
+        lead = ("このMissionは以下の signal/strategy plugin の出力をトリガーに"
+                "起動されました。判断の参考にしてください。\n")
         return (
             "\n\n## この判断で扱う signal\n"
             + lead
@@ -699,14 +857,15 @@ class TradeLoop:
             f"- payload: {json.dumps(payload, ensure_ascii=False)}\n")
 
     def _requeue_signal(self, claimed: dict, *,
-                        abandon_if_stale: bool = False) -> str | None:
+                        abandon_if_stale: bool = False
+                        ) -> tuple[str | None, str | None]:
         """claim した signal を pending へ戻す (**core_lock 保持中に呼ぶ** —
         signals.requeue は conn_core を書き込むため)。
 
         **通知はここで送らない** (レビュー 1 周目 codex A1)。Notifier.send は
         urlopen(timeout=10) の同期実行なので、lock 保持中に呼ぶと SL/TP
-        監視が最大 10 秒止まる。送るべき文面を返すだけにし、呼び出し元が
-        lock 解放後に送る。
+        監視が最大 10 秒止まる。通知文と freshness 系終端種別を返し、呼び出し元が
+        lock 解放後に通知・評価する。
 
         保守処理そのものの失敗で `_run_once_impl` の本流 (既に確定した
         結果/例外) を上書きしないよう、例外は握りつぶしログのみに残す。
@@ -715,21 +874,27 @@ class TradeLoop:
             if abandon_if_stale and self._claimed_signal_is_stale(claimed):
                 # 新規リスクが止まっている間に鮮度が切れた signal は、
                 # requeue 回数を使って pending に戻さず、その場で終端する。
-                signals.abandon_claimed(self.conn, claimed["id"])
-                return (f"[agentic-fx] signal #{claimed['id']} "
-                        f"({claimed['plugin']}) は鮮度切れのため "
-                        "abandoned になりました")
+                reason = signals.freshness_abandon_reason(claimed)
+                signals.abandon_claimed(
+                    self.conn, claimed["id"], now=self.clock.now(),
+                    reason=reason)
+                message = (f"[agentic-fx] signal #{claimed['id']} "
+                           f"({claimed['plugin']}) は鮮度切れのため "
+                           "abandoned になりました")
+                terminal = (TERMINAL_FRESHNESS_ABANDONED
+                            if reason in FRESHNESS_ABANDON_REASONS else None)
+                return message, terminal
             status = signals.requeue(
                 self.conn, claimed["id"], now=self.clock.now(),
                 max_requeue=self.settings.plugin.signal_requeue_max)
             if status == "abandoned":
                 return (f"[agentic-fx] signal #{claimed['id']} "
                         f"({claimed['plugin']}) は requeue 上限超過のため "
-                        "abandoned になりました")
+                        "abandoned になりました", None)
         except Exception:  # noqa: BLE001 — 保守処理の失敗で本流を止めない
             _log.exception("signal requeue failed for signal_id=%s",
                            claimed["id"])
-        return None
+        return None, None
 
     def _claimed_signal_is_stale(self, claimed: dict) -> bool:
         """鮮度の境界は `expire_stale` と同じ (`freshness_window` の
@@ -755,10 +920,11 @@ class TradeLoop:
         try:
             with self._core_lock:
                 now = self.clock.now()
-                prompt = self._build_prompt(load_prompt("ask_mission"), now) \
+                prompt = self._build_prompt(load_prompt("ask_mission"), now,
+                                            include_signals=True) \
                     + f"\n\n## ユーザーの質問\n{question}"
                 mission = Mission(
-                    prompt=prompt, tools=_TRADE_TOOLS,
+                    prompt=prompt, tools=_ASK_TOOLS,
                     output_schema=ANSWER_SCHEMA,
                     max_turns=self.settings.llama_swap.max_turns,
                     timeout_sec=self.settings.llama_swap.timeout_sec)
@@ -860,7 +1026,8 @@ class TradeLoop:
         total = calls.get("get_ohlcv", 0) + calls.get("get_indicators", 0)
         return f" market_tool_calls={total}"
 
-    def _build_prompt(self, system: str, now: datetime) -> str:
+    def _build_prompt(self, system: str, now: datetime, *,
+                      include_signals: bool = False) -> str:
         """システムプロンプト + policy + サマリを結合する。"""
         timeframe_section = (
             "## 判断足\n"
@@ -872,10 +1039,12 @@ class TradeLoop:
                 f"{', '.join(self.settings.datafeed.context_timeframes)} "
                 "(参考足。発注判断の足ではない。確定足だけ)\n"
             )
-        timeframe_section += (
-            "signal は strategy の足（例: 1h）でしか更新されず、get_signals は "
-            "status を問わず 24h 分を返す。consumed / abandoned の行は再提案しない。"
-        )
+        if include_signals:
+            timeframe_section += (
+                "signal は strategy の足（例: 1h）でしか更新されず、get_signals は "
+                "status を問わず 24h 分を返す。consumed / abandoned の行は再提案しない。"
+            )
+        timeframe_section = timeframe_section.rstrip()
         utc_now = as_utc(now)
         if not market_hours.is_market_open(utc_now):
             day_horizon = (

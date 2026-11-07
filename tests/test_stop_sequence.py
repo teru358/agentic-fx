@@ -182,11 +182,13 @@ def test_busy_resource_mapping_and_exit_code():
     # 残存スレッドが動いているのに flock を解放すると二重起動が可能になり、
     # 後発の recover_interrupted が旧 supervisor の running mission を
     # interrupted に書き換える。
-    held = {"conn_core", "conn_signal", "instance_lock",
+    held = {"conn_core", "conn_signal", "conn_admission", "instance_lock",
             "trade_event_observer", "trade_event_sink"}
     assert _busy_resources_after_join(True, False) == frozenset(held)
     assert _busy_resources_after_join(False, True) == frozenset(held | {"conn_supervisor"})
     assert _busy_resources_after_join(False, False) == frozenset()
+    # 日次 report の thread が残っている間も同じ集合を残す
+    assert _busy_resources_after_join(False, False, False, True) == frozenset(held)
     app = _minimal_app(); app.fatal_reason = "fatal"
     assert _exit_code(app, False, False) == 1
 
