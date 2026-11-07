@@ -7,7 +7,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 
-from afx_ops import display_time, reevaluation_text
+from afx_ops import base_text, display_time, reevaluation_text
 from afx_ops.display_zone import zone_of
 from afx_ops.notify.payload import encode_event
 
@@ -55,7 +55,7 @@ REASON_TEXT = {
     "detail_unavailable": "詳細を取得できません",
     "legacy_payload": "旧形式のため要約なし",
 }
-STATUS_LABELS = {"approved": "承認済み", "rejected": "却下", "expired": "失効"}
+STATUS_LABELS = {"approved": "承認済み", "rejected": "却下", "expired": "失効", "invalidated": "無効"}
 OMITTED_NOTE = "…(一部省略)"
 
 _REMOVED = frozenset({"Cc", "Cf", "Cs"})
@@ -316,6 +316,9 @@ def render_approval(record: ApprovalRecord, detail: object | None = None) -> str
     parts = [(_heading(record.approval_id, change, reeval), 0)]
     if reason is not None:
         parts.append((REASON_TEXT.get(reason, REASON_TEXT["unsafe_source"]), 0))
+    warning = base_text.warning_line(data.get("base_check"))
+    if warning is not None:
+        parts.append((escape_discord(warning), 1))
     parts += _reevaluation_parts(data, zone_of(data))
     parts += _summary_parts(change, performance=not reeval)
     parts.append((f"期限: {expires}" if expires is not None else "期限: なし", 1))
@@ -371,6 +374,8 @@ def render_terminal(record: ApprovalRecord, detail: object | None) -> str | None
     outcome = _reevaluation_outcome(data) if reeval else None
     if outcome is not None:
         parts.append((outcome, 0))
+    if state == "invalidated" and data.get("reason") == base_text.BASE_CHANGED:
+        parts.append((base_text.BASE_CHANGED_TEXT, 0))
     parts += _reevaluation_parts(data, zone_of(data))
     parts += _summary_parts(change, performance=not reeval)
     parts.append((_guide(record.approval_id), 0))

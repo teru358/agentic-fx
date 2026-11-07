@@ -192,3 +192,35 @@ def test_the_ctl_detail_shows_the_warning_and_stays_silent_for_a_match():
         "state": "match", "base": "a" * 12, "live": "a" * 12}})
     assert "土台" not in quiet
     assert "土台" not in client.format_approval_detail(base)
+
+
+def test_the_base_wording_in_afx_ops_matches_the_daemon_side():
+    import importlib.util
+    import sys
+    from pathlib import Path
+    from agentic_fx.plugin import base_identity
+    path = Path(__file__).resolve().parents[2] / "afx-ops" / "afx_ops" / "base_text.py"
+    spec = importlib.util.spec_from_file_location("afx_ops_base_text", path)
+    other = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = other
+    try:
+        spec.loader.exec_module(other)
+    finally:
+        del sys.modules[spec.name]
+    assert other.BASE_CHANGED == base_identity.BASE_CHANGED
+    assert other.BASE_CHANGED_TEXT == base_identity.BASE_CHANGED_TEXT
+    assert (other.STATE_MISMATCH, other.STATE_NONE_BUT_LIVE, other.STATE_UNREADABLE) == \
+        base_view.WARNING_STATES
+    h12, g12 = "a" * 12, "b" * 12
+    views = [{"state": "mismatch", "base": h12, "live": g12},
+             {"state": "mismatch", "base": h12, "live": "none"},
+             {"state": "mismatch", "base": h12, "live": "plain"},
+             {"state": "mismatch", "base": "plain", "live": "unreadable"},
+             {"state": "mismatch", "base": "unknown", "live": None},
+             {"state": "none_but_live", "base": "none", "live": g12},
+             {"state": "unreadable", "base": h12, "live": "unreadable"},
+             {"state": "match", "base": h12, "live": h12},
+             {"state": "legacy", "base": None, "live": None},
+             {"state": "unchecked", "base": None, "live": None}]
+    for view in views:
+        assert other.warning_line(view) == base_view.warning_line(view), view

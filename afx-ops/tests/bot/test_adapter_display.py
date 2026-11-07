@@ -526,7 +526,7 @@ def test_ac30_the_terminal_edit_keeps_the_summary_adds_the_state_and_removes_the
 @pytest.mark.parametrize("client", [
     _DecidedClient(Reply(404, None, "not_found")),
     _DecidedClient(Reply(200, _decided("pending"), None)),
-    _DecidedClient(Reply(200, _decided("invalidated"), None)),
+    _DecidedClient(Reply(200, _decided("bogus"), None)),
     _DecidedClient(Reply(200, _decided(["x"]), None)),
 ])
 def test_ac30_without_a_readable_result_the_view_is_still_removed_with_the_fixed_sentence(
@@ -536,6 +536,21 @@ def test_ac30_without_a_readable_result_the_view_is_still_removed_with_the_fixed
     asyncio.run(adapter._update_display(adapter.gate.state.record(7)))
     assert channel.edits == [(101, {"content": "Approval is no longer active.", "view": None,
              "allowed_mentions": _NO_MENTIONS})]
+    assert adapter.gate.state.record(7) is None
+
+
+@pytest.mark.parametrize("reason,fixed", [("base_changed", True), (None, False)])
+def test_an_invalidated_request_gets_a_terminal_card_and_only_base_changed_adds_the_sentence(
+        harness, reason, fixed):
+    adapter, channel, _ = harness(_record(state="done", edit_pending=True))
+    adapter.client = _DecidedClient(Reply(200, _decided("invalidated", reason=reason), None))
+    asyncio.run(adapter._update_display(adapter.gate.state.record(7)))
+    message_id, kwargs = channel.edits[0]
+    assert message_id == 101 and kwargs["view"] is None
+    content = kwargs["content"]
+    assert content != "Approval is no longer active."
+    assert "状態: 無効 (2026-10-19 14:16 +00:00)" in content
+    assert ("土台の版が配備中の版と違うため配備しませんでした" in content) is fixed
     assert adapter.gate.state.record(7) is None
 
 

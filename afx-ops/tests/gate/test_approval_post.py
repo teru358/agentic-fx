@@ -310,7 +310,7 @@ def test_ac30_a_terminal_post_keeps_the_summary_and_shows_status_and_time(status
 def test_ac30_a_terminal_post_without_a_readable_result_has_no_content():
     assert render_terminal(_record(state="done"), None) is None
     assert render_terminal(_record(state="done"), "x") is None
-    for status in ("pending", "invalidated", None, "APPROVED"):
+    for status in ("pending", None, "APPROVED", "bogus"):
         assert render_terminal(_record(state="done"), _terminal(status)) is None
 
 

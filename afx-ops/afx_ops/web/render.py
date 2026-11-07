@@ -6,7 +6,7 @@ import re
 import unicodedata
 from collections.abc import Mapping, Sequence
 
-from afx_ops import display_time, reevaluation_text
+from afx_ops import base_text, display_time, reevaluation_text
 from afx_ops.display_zone import zone_of
 from afx_ops.metric_words import metric_items
 from afx_ops.web.routes import ROUTE_TABLE, resolve_route
@@ -468,10 +468,16 @@ def _reevaluation_section(data: Mapping[str, object]) -> str:
     return "<section><h2>" + _text(described.heading) + "</h2>" + "".join(notes) + table + "</section>"
 
 
+def _base_section(data: Mapping[str, object]) -> str:
+    """土台の節。比較成績とは独立で、警告が要る状態 (不一致・土台なし・読めない) のときだけ出す。"""
+    line = base_text.warning_line(data.get("base_check"))
+    return "" if line is None else "<section><h2>土台</h2><p>" + _text(line) + "</p></section>"
+
+
 def _extra_sections(data: Mapping[str, object]) -> list[str]:
     """承認ページ末尾の節。重要でないものが先 (収まらないときは先頭から省く)。"""
     return [section for section in (_baseline_section(data), _gate_section(data),
-                                    _reevaluation_section(data)) if section]
+                                    _reevaluation_section(data), _base_section(data)) if section]
 
 
 def _unchanged_page(data: Mapping[str, object], message: str) -> bytes:
