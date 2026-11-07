@@ -89,8 +89,22 @@ class VerifyBackendResult:
     reason: object = None
     watch: object | None = None
     unreaped: object | None = None
+    cli_child_seen: bool | None = None
+    reaped: bool | None = None
     refusal: object = None
     blocking: object = None
+
+    @property
+    def tool_not_called(self) -> bool:
+        """隔離 gate を通った自己試験で、echo と MCP tools 列挙は観測したが呼出しが無い。"""
+        watch = self.watch
+        return (
+            self.gate == "incomplete" and self.status == "completed" and watch is not None
+            and callable(getattr(watch, "tool_not_called", None))
+            and watch.tool_not_called()
+            and self.cli_child_seen is True
+            and self.reaped is True
+        )
 
 
 _FAILURE_GATES = frozenset({
@@ -231,13 +245,15 @@ def selftest_detail_or_default(detail: object, *, gate: str = "incomplete",
 def _failure_result(*, backend: str, provider: Literal["chatgpt"] | None, gate: str,
                     status: object, reason: object = None, watch: object | None = None,
                     unreaped: object | None = None, refusal: object = None,
-                    blocking: object = None, operator_detail: str) -> VerifyBackendResult:
+                    blocking: object = None, cli_child_seen: bool | None = None,
+                    reaped: bool | None = None, operator_detail: str) -> VerifyBackendResult:
     return VerifyBackendResult(
         ok=False, backend=backend, provider=provider, fingerprint=None,
         detail=selftest_failure_detail(gate, status=status, reason=reason, watch=watch,
                                        unreaped=unreaped, refusal=refusal, blocking=blocking),
         operator_detail=operator_detail, gate=gate, status=status, reason=reason, watch=watch,
-        unreaped=unreaped, refusal=refusal, blocking=blocking)
+        unreaped=unreaped, refusal=refusal, blocking=blocking,
+        cli_child_seen=cli_child_seen, reaped=reaped)
 
 
 def _watch_progress(watch: object | None) -> str:
@@ -402,14 +418,30 @@ class _EchoWatch:
         self.calls = 0
 
     # tools/list は server 側の名前 (web_search 等) を返す。`afx_` 付きは CLI 側の呼び名
+    def _mcp_listed_locked(self) -> bool:
+        return (self.initialized and isinstance(self.listed, list) and bool(self.listed))
+
     @property
     def mcp_ok(self) -> bool:
-        return (self.initialized and self.listed is not None and len(self.listed) > 0
-                and self.calls >= 1)
+        with self._lock:
+            return self._mcp_ok_locked()
+
+    def _mcp_ok_locked(self) -> bool:
+        return self._mcp_listed_locked() and type(self.calls) is int and self.calls >= 1
+
+    def tool_not_called(self) -> bool:
+        """Return whether echo and a nonempty MCP listing were seen without a tool call."""
+        with self._lock:
+            return (self.seen and self._mcp_listed_locked() and type(self.calls) is int
+                    and self.calls == 0 and self.grace_expired is False)
 
     @property
     def ok(self) -> bool:
-        return self.seen and self.mcp_ok and not self.grace_expired
+        with self._lock:
+            return self._ok_locked()
+
+    def _ok_locked(self) -> bool:
+        return self.seen and self._mcp_ok_locked() and not self.grace_expired
 
     def observe(self, frame: dict) -> None:
         with self._lock:
@@ -418,7 +450,7 @@ class _EchoWatch:
             self._observe_locked(frame)
 
     def _expire_if_due(self) -> None:
-        if (self._echo_at is not None and not self.ok and not self.grace_expired
+        if (self._echo_at is not None and not self._ok_locked() and not self.grace_expired
                 and self._monotonic() - self._echo_at >= self._mcp_grace_sec):
             self.grace_expired = True
             self._stop.set()
@@ -455,7 +487,7 @@ class _EchoWatch:
                                  for t in _assistant_texts(self._backend, event)):
             self.seen = True
             self._echo_at = self._monotonic()
-        if self.ok:
+        if self._ok_locked():
             self._stop.set()
 
     def check_grace(self) -> bool:
@@ -659,10 +691,13 @@ def verify_backend(
         progress = _watch_progress(watch)
         echoed = watch is not None and watch.ok
         if watch is not None and not watch.ok:
+            cli_child_seen = backend == "local" or watcher.saw_any_descendant()
+            reaped = backend == "local" or not after_descendants
             # 自己試験は echo と MCP の両方が揃って初めて成功 (CLI の最終出力だけでは足りない)
             return _failure_result(
                 backend=backend, provider=effective_provider, gate="incomplete",
                 status=result.status, reason=result.reason, watch=watch,
+                cli_child_seen=cli_child_seen, reaped=reaped,
                 operator_detail=(f"mission did not complete: status={result.status} "
                                  f"reason={result.reason}{progress}"))
         if not echoed and (result.status != "completed" or not result.output):

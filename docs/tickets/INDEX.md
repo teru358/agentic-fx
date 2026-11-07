@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 163 件。完了分は closed/。
+未完了: 162 件。完了分は closed/。
 
 ## 実装中 (4)
 
@@ -71,9 +71,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (141)
+## 設計待ち (140)
 
-### 不具合 (77)
+### 不具合 (76)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -104,8 +104,8 @@
 | [news-cli-distinguish-permission-from-missing-db](open/news-cli-distinguish-permission-from-missing-db.md) | 中 | 2026-10-25 | afx news が root 未解決・権限不足も「DB がありません」と出す |
 | [safe-error-url-regex-misses-ipv6-host](open/safe-error-url-regex-misses-ipv6-host.md) | 中 | 2026-10-25 | _safe_error の URL 伏せが IPv6 host の URL を全く伏せない |
 | [sandbox-to-datetime-and-staging-precheck](open/sandbox-to-datetime-and-staging-precheck.md) | 中 | 2026-10-25 | 改善 sandbox: to_datetime 拒否と test_plugin.py の事前検査欠如 |
-| [improve-admission-selftest-flake-needs-restart](open/improve-admission-selftest-flake-needs-restart.md) | 中 | 2026-11-01 | 改善 admission の自己試験が 1 回落ちると再起動まで改善が止まる |
 | [ohlcv-cache-retention-cutoff-fixed-at-start](open/ohlcv-cache-retention-cutoff-fixed-at-start.md) | 中 | 2026-11-03 | cache の保持期間 cutoff が起動時刻で固定され再起動まで進まない |
+| [verify-backend-counts-preexisting-descendants](open/verify-backend-counts-preexisting-descendants.md) | 中 | 2026-11-06 | verify_backend が実行前から居た子孫プロセスも未回収と数えて失敗する |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
 | [tier-a-directive-ignored](open/tier-a-directive-ignored.md) | 中 |  | 自己テストの連続失敗の警告が無視され続け、止める仕組みが無い |
@@ -140,7 +140,6 @@
 | [datafeed-no-tick-minutes-counted-as-gap](open/datafeed-no-tick-minutes-counted-as-gap.md) | 低 | 2026-11-02 | 週明けの tick 無し時間を欠損と数え 15m 取得が約 1 日失敗 |
 | [first-run-acceptance-doc-quotes-drift](open/first-run-acceptance-doc-quotes-drift.md) | 低 | 2026-11-03 | 初回受入手順書の逐語引用 test 3 件が main で落ちる |
 | [mission-worker-improve-rpc-frame-test-fails](open/mission-worker-improve-rpc-frame-test-fails.md) | 低 | 2026-11-03 | mission_worker の improve RPC frame test が main で落ちる |
-| [verify-backend-counts-preexisting-descendants](open/verify-backend-counts-preexisting-descendants.md) | 低 | 2026-11-06 | verify_backend が実行前から居た子孫プロセスも未回収と数えて失敗する |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backtest-scheduler-log-leak](open/backtest-scheduler-log-leak.md) | 低 |  | backtest 内部 Scheduler の `maintain_reservations failed: no c… |
 | [graceful-stop-waits-mission](open/graceful-stop-waits-mission.md) | 低 |  | graceful stop が走行中 improve mission の timeout (最大 60 分) を待つ … |

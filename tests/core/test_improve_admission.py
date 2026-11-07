@@ -872,3 +872,90 @@ def test_running_event_is_released_when_the_cache_write_fails(tmp_path):
         adm.admit(backend="codex", artifact_path=path, host=Host())
     assert len(seen) == 1 and seen[0] is not None
     assert seen[0].is_set() and adm._running == {}
+
+
+def test_retryable_selftest_no_then_yes_logs_one_admitted_transition(tmp_path):
+    now = [0.0]
+    selftest = Probe(IA.ProbeOutcome(False, transient=True, detail="call=0"), OK)
+    emitted = []
+    adm = _admission(selftest=selftest, clock=lambda: now[0], technical_log=emitted.append)
+    path = str(_elf(tmp_path))
+
+    failed = adm.admit(backend="codex", artifact_path=path, host=Host())
+    assert not failed.admitted and failed.retryable
+    now[0] += IA.SELFTEST_RETRY_INTERVAL_SEC - 1
+    assert adm.admit(backend="codex", artifact_path=path, host=Host()) is failed
+    assert selftest.calls == 1 and len(emitted) == 1
+
+    now[0] += 1
+    admitted = adm.admit(backend="codex", artifact_path=path, host=Host())
+    assert admitted.admitted and selftest.calls == 2
+    expected = (f"improve isolation: enabled; backend=codex admitted=yes "
+                f"fingerprint={admitted.fingerprint.aggregate}")
+    assert emitted[1:] == [expected]
+
+
+def test_initial_admission_yes_does_not_log_transition(tmp_path):
+    emitted = []
+    adm = _admission(technical_log=emitted.append)
+    path = str(_elf(tmp_path))
+    decision = adm.admit(backend="codex", artifact_path=path, host=Host())
+    assert decision.admitted and emitted == []
+    assert adm.admit(backend="codex", artifact_path=path, host=Host()).admitted
+    assert emitted == []
+
+
+def test_permanent_no_then_different_fingerprint_yes_logs_transition(tmp_path):
+    emitted = []
+    canary = Probe(IA.ProbeOutcome(False, transient=False, detail="permanent"), OK)
+    adm = _admission(canary=canary, technical_log=emitted.append)
+    first_path = str(_elf(tmp_path, extra=b"first"))
+    second_path = str(_elf(tmp_path, name="cli-next", extra=b"second"))
+
+    first = adm.admit(backend="codex", artifact_path=first_path, host=Host())
+    assert not first.admitted and not first.retryable
+    second = adm.admit(backend="codex", artifact_path=second_path, host=Host())
+
+    assert second.admitted and second.fingerprint.aggregate != first.fingerprint.aggregate
+    expected = (f"improve isolation: enabled; backend=codex admitted=yes "
+                f"fingerprint={second.fingerprint.aggregate}")
+    assert emitted == [expected]
+
+
+def test_cached_yes_after_permanent_no_logs_transition(tmp_path):
+    emitted = []
+    canary = Probe(OK, IA.ProbeOutcome(False, transient=False, detail="permanent"))
+    adm = _admission(canary=canary, technical_log=emitted.append)
+    path_a = str(_elf(tmp_path, name="cli-a", extra=b"first"))
+    path_b = str(_elf(tmp_path, name="cli-b", extra=b"second"))
+
+    admitted_a = adm.admit(backend="codex", artifact_path=path_a, host=Host())
+    denied_b = adm.admit(backend="codex", artifact_path=path_b, host=Host())
+    cached_a = adm.admit(backend="codex", artifact_path=path_a, host=Host())
+
+    assert admitted_a.admitted and not denied_b.admitted
+    assert cached_a is admitted_a
+    expected = (f"improve isolation: enabled; backend=codex admitted=yes "
+                f"fingerprint={admitted_a.fingerprint.aggregate}")
+    assert emitted == [expected]
+
+
+def test_preflight_no_then_yes_logs_transition(tmp_path):
+    emitted = []
+    adm = _admission(technical_log=emitted.append)
+    path = str(_elf(tmp_path))
+
+    denied = adm.admit(backend="codex", artifact_path=path,
+                       host=Host(("cgroup_delegation_missing",)))
+    admitted = adm.admit(backend="codex", artifact_path=path, host=Host())
+
+    assert not denied.admitted and admitted.admitted
+    expected = (f"improve isolation: enabled; backend=codex admitted=yes "
+                f"fingerprint={admitted.fingerprint.aggregate}")
+    assert emitted == [expected]
+
+
+def test_denied_admission_status_requires_string_reason():
+    for reason in (None, ""):
+        with pytest.raises(ValueError):
+            IA._admission_status_line("codex", False, "fingerprint", reason)

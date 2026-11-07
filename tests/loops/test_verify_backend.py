@@ -13,6 +13,7 @@ import hashlib
 import logging
 import os
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1291,3 +1292,110 @@ def test_echo_watch_success_summary_has_no_grace_expired_after_ok():
     clock.t = 60.0
     assert watch.check_grace() is False
     assert watch.ok and "grace_expired" not in watch.summary()
+
+
+def test_call0_transcript_is_classified_by_watch_structure():
+    """実 transcript の echo は call=0 として retryable 分類の条件に使われる。"""
+    from types import SimpleNamespace
+    from agentic_fx.loops.verify_backend import _EchoWatch
+
+    fixture = (Path(__file__).resolve().parents[1] / "fixtures" / "selftest_call0"
+               / "selftest-call0-20261107.jsonl")
+    transcript = [json.loads(line) for line in fixture.read_text().splitlines()]
+    item = next(row["item"] for row in transcript
+                if row.get("item", {}).get("type") == "agent_message")
+    nonce = json.loads(item["text"])["echo"]
+
+    def make_watch(*, tools=tuple(f"tool-{n}" for n in range(13)), initialized=True, echo=True,
+                   grace=False, expected_nonce=nonce):
+        mono, stop = _FakeMono(), threading.Event()
+        watch = _EchoWatch(expected_nonce, stop, "codex", mcp_grace_sec=1, monotonic=mono)
+        if initialized:
+            watch.observe(_mcp("initialize", ()))
+        if tools is not None:
+            watch.observe(_mcp("tools/list", tuple(tools)))
+        sent_item = item if echo else {**item, "text": '{"echo":"wrong","count":0}'}
+        watch.observe(_event({"type": "item.completed", "item": sent_item}))
+        if grace:
+            mono.t = 1
+            watch.check_grace()
+        return watch
+
+    def classified(watch, *, gate="incomplete", status="completed"):
+        return VerifyBackendResult(False, "codex", None, None, "opaque", gate=gate,
+                                   status=status, watch=watch,
+                                   cli_child_seen=True, reaped=True).tool_not_called
+
+    valid = make_watch()
+    assert valid.seen and valid.initialized and valid.listed and valid.calls == 0
+    assert classified(valid) is True
+    valid.calls = 1
+    assert classified(valid) is False
+    valid.calls = 0
+    assert classified(make_watch(tools=())) is False
+    assert classified(make_watch(tools=None)) is False
+    assert classified(make_watch(initialized=False)) is False
+    assert classified(make_watch(echo=False)) is False
+    assert classified(make_watch(grace=True)) is False
+    assert classified(make_watch(expected_nonce="different")) is False
+    assert classified(None) is False
+    assert classified(valid, gate="nonce") is False
+    assert classified(valid, status="failed") is False
+    for listed, calls in (("invalid", 0), ([], 0), (["tool"], False), (["tool"], 0.0)):
+        malformed = SimpleNamespace(seen=True, initialized=True, listed=listed, calls=calls,
+                                     grace_expired=False)
+        assert classified(malformed) is False
+    missing = SimpleNamespace(seen=True, initialized=True, listed=["tool"], calls=0)
+    assert classified(missing) is False
+    assert VerifyBackendResult(False, "codex", None, None, "opaque", gate="incomplete",
+                               status="completed", watch=valid).tool_not_called is False
+
+
+def test_echo_watch_tool_not_called_waits_for_state_lock():
+    from agentic_fx.loops.verify_backend import _EchoWatch
+
+    stop = threading.Event()
+    watch = _EchoWatch("nonce", stop, "codex")
+    watch.seen = True
+    watch.initialized = True
+    watch.listed = ["list_staging"]
+    result = VerifyBackendResult(False, "codex", None, None, "opaque", gate="incomplete",
+                                 status="completed", watch=watch,
+                                 cli_child_seen=True, reaped=True)
+    checked = threading.Event()
+    watch._lock.acquire()
+    try:
+        thread = threading.Thread(target=lambda: (result.tool_not_called, checked.set()))
+        thread.start()
+        assert not checked.wait(0.05)
+    finally:
+        watch._lock.release()
+    thread.join(timeout=1)
+    assert checked.is_set()
+    assert result.tool_not_called is True
+
+
+@pytest.mark.parametrize(("seen_child", "remaining", "expected"), [
+    (False, False, False), (True, True, False), (True, False, True),
+])
+def test_call0_requires_child_observed_and_reaped_in_verify_branch(
+        tmp_path, monkeypatch, seen_child, remaining, expected):
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner", _StreamingRunner)
+    monkeypatch.setattr("agentic_fx.loops.verify_backend._DescendantWatcher",
+                        lambda pid: _FixedWatcher(saw=seen_child))
+    monkeypatch.setattr("agentic_fx.loops.verify_backend._descendant_pids",
+                        lambda pid: {999999} if remaining else set())
+
+    def events(nonce):
+        yield _mcp("initialize", ())
+        yield _mcp("tools/list", ("list_staging",))
+        yield _event({"type": "text", "part": {"text": json.dumps(
+            {"echo": nonce, "count": 0})}})
+
+    _BEHAVIOR["current"] = {"result": _echo_ok, "events": events,
+                            "final": MissionResult("completed", None, [])}
+    result = _run_stop_on_echo(tmp_path)
+    assert result.ok is False and result.gate == "incomplete"
+    assert result.cli_child_seen is seen_child
+    assert result.reaped is (not remaining)
+    assert result.tool_not_called is expected

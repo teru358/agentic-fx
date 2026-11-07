@@ -2,15 +2,15 @@
 id: verify-backend-counts-preexisting-descendants
 title: verify_backend が実行前から居た子孫プロセスも未回収と数えて失敗する
 status: 設計待ち
-priority: 低
+priority: 中
 kind: 不具合
 opened: 2026-11-06
 closed: null
-related: []
+related: [improve-admission-selftest-flake-needs-restart]
 ---
 # [verify-backend-counts-preexisting-descendants] verify_backend が実行前から居た子孫プロセスも未回収と数えて失敗する
 
-**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
+**状態**: 設計待ち / **優先**: 中 / **種別**: 不具合
 
 ## 現象
 
@@ -25,3 +25,4 @@ tests/loops/test_verify_backend.py::test_verify_backend_opencode_bypasses_llama_
 ## 経緯
 
 - 2026-11-06: 起票。
+- 2026-11-07: 優先: 中、関連: [improve-admission-selftest-flake-needs-restart] — 改善 admission の自己試験が improve 要求のたびに再評価されうるようになり (daemon 稼働中で他の子孫がいる)、誤った not_reaped は再評価できない失敗に倒れる。/code-review の指摘 (tmp/review-adm/cr/rulings.md #4) を受けて優先度を中に
