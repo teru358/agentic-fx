@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import zoneinfo
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,14 @@ def _guard_real_keys_data_and_env_are_untouched():
     after = {path: _signature(path) for path in _GUARDED}
     changed = [str(path) for path in _GUARDED if before[path] != after[path]]
     assert not changed, f"afx-ops tests touched real resources: {changed}"
+
+
+@pytest.fixture(autouse=True)
+def _keep_zoneinfo_search_path():
+    """startup.run は tz の探索 path を空にする。process 内で走らせた test の後に元へ戻す。"""
+    saved = list(zoneinfo.TZPATH)
+    yield
+    zoneinfo.reset_tzpath(to=saved)
 
 
 @pytest.fixture(autouse=True)

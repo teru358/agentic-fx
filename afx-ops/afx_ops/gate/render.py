@@ -5,8 +5,10 @@ import math
 import re
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 
+from afx_ops import display_time
+from afx_ops.display_zone import zone_of
 from afx_ops.notify.payload import encode_event
 
 from afx_ops.metric_words import metric_items
@@ -107,8 +109,11 @@ def _number(value: object) -> str | None:
     return None
 
 
-def _moment(value: object) -> str | None:
-    """ISO 8601 の時刻を分までの固定形にする。読めなければ None (出さない)。"""
+def _moment(value: object, tz: str = "UTC") -> str | None:
+    """ISO 8601 の時刻を、表示 tz に換算した分までの固定形 (`YYYY-MM-DD HH:MM ±HH:MM`) にする。
+
+    offset の無い時刻は換算せず分まで。読めなければ None (出さない)。
+    """
     if type(value) is not str or len(value) > 64:
         return None
     try:
@@ -117,10 +122,9 @@ def _moment(value: object) -> str | None:
         return None
     if parsed.tzinfo is None:
         return parsed.strftime("%Y-%m-%d %H:%M")
-    try:
-        return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    except (ValueError, OverflowError):
-        return None
+    shown = display_time.convert_or_raw(parsed, tz, display_time.PRECISION_MINUTE,
+                                        raw="", utc_fallback=True)
+    return shown or None
 
 
 def _hashable_str(value: object) -> bool:
@@ -289,7 +293,7 @@ def render_approval(record: ApprovalRecord, detail: object | None = None) -> str
     if any(type(change.get(key)) is not str for key in ("kind", "classification")
            if change.get(key) is not None):
         return _fallback(record.approval_id, "legacy_payload")
-    expires = _moment(data.get("expires_at"))
+    expires = _moment(data.get("expires_at"), zone_of(data))
     parts = [(_heading(record.approval_id, change), 0)]
     if reason is not None:
         parts.append((REASON_TEXT.get(reason, REASON_TEXT["unsafe_source"]), 0))
@@ -322,7 +326,7 @@ def render_terminal(record: ApprovalRecord, detail: object | None) -> str | None
     label = STATUS_LABELS.get(state) if type(state) is str else None
     if label is None:
         return None
-    decided = _moment(data.get("decided_at"))
+    decided = _moment(data.get("decided_at"), zone_of(data))
     status_line = f"状態: {label}" + (f" ({decided})" if decided is not None else "")
     if code is not None:
         return f"承認 #{record.approval_id}\n\n{status_line}\n\n{REASON_TEXT[code]}"
