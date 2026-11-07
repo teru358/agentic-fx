@@ -9,6 +9,7 @@ import ast
 import inspect
 import json
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -440,3 +441,54 @@ def test_selftest_cgroup_failure_includes_fixed_blocking_reasons(monkeypatch, tm
 
     assert outcome.detail == ("gate=cgroup_gate status=completed reason=- "
                               "blocking=cgroup_not_empty,worker_not_reaped")
+
+
+def test_selftest_call0_incomplete_is_retryable_but_other_incomplete_is_not(
+        monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from agentic_fx.config import load_settings
+    from agentic_fx.loops import verify_backend as VB
+
+    settings = load_settings(Path(__file__).resolve().parents[2] / "config"
+                             / "settings.yaml.example")
+    ctx = SimpleNamespace(host=SimpleNamespace(mission_allowed=lambda: True), backend="opencode",
+                          artifact=SimpleNamespace(as_dict=lambda: {}),
+                          fingerprint=SimpleNamespace(aggregate="a"))
+    watch = VB._EchoWatch("nonce", threading.Event(), "opencode")
+    watch.seen, watch.initialized, watch.listed = True, True, ["list_staging"]
+    monkeypatch.setattr(VB, "verify_backend", lambda *_args, **_kwargs: VB.VerifyBackendResult(
+        False, "opencode", None, None, "gate=incomplete status=completed reason=-",
+        gate="incomplete", status="completed", watch=watch,
+        cli_child_seen=True, reaped=True))
+    assert C.run_selftest(ctx, settings=settings, root=tmp_path).transient is True
+
+    watch.calls = 1
+    assert C.run_selftest(ctx, settings=settings, root=tmp_path).transient is False
+
+
+def test_selftest_call0_is_permanent_when_cgroup_gate_is_closed(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from agentic_fx.config import load_settings
+    from agentic_fx.loops import verify_backend as VB
+
+    settings = load_settings(Path(__file__).resolve().parents[2] / "config"
+                             / "settings.yaml.example")
+    watch = VB._EchoWatch("nonce", threading.Event(), "opencode")
+    watch.seen, watch.initialized, watch.listed = True, True, ["list_staging"]
+    monkeypatch.setattr(VB, "verify_backend", lambda *_args, **_kwargs: VB.VerifyBackendResult(
+        False, "opencode", None, None, "gate=incomplete status=completed reason=-",
+        gate="incomplete", status="completed", watch=watch,
+        cli_child_seen=True, reaped=True))
+    host = SimpleNamespace(mission_allowed=lambda: False,
+                           blocking_reasons=lambda: ("cgroup_not_empty",))
+    ctx = SimpleNamespace(host=host, backend="opencode",
+                          artifact=SimpleNamespace(as_dict=lambda: {}),
+                          fingerprint=SimpleNamespace(aggregate="a"))
+
+    outcome = C.run_selftest(ctx, settings=settings, root=tmp_path)
+
+    assert outcome.transient is False
+    assert outcome.detail == ("gate=cgroup_gate status=completed reason=- "
+                              "blocking=cgroup_not_empty")

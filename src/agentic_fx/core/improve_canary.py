@@ -556,7 +556,13 @@ def run_selftest(ctx, *, settings: Any, root: Path):
         return IA.ProbeOutcome(False, True,
                                selftest_failure_detail("spawn", status="failed"))
     if not res.ok:
-        return IA.ProbeOutcome(False, _transient(res.status, res.operator_detail),
+        if res.tool_not_called and not host.mission_allowed():
+            return IA.ProbeOutcome(False, False,
+                                   selftest_failure_detail(
+                                       "cgroup_gate", status="completed",
+                                       blocking=host.blocking_reasons()))
+        return IA.ProbeOutcome(False, _transient(res.status, res.operator_detail)
+                               or res.tool_not_called,
                                selftest_detail_or_default(res.detail))
     if not host.mission_allowed():
         return IA.ProbeOutcome(False, False,
