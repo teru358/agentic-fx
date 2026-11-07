@@ -3,7 +3,7 @@
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 未完了: 163 件。完了分は closed/。
 
-## 実装中 (4)
+## 実装中 (3)
 
 ### 不具合 (1)
 
@@ -17,12 +17,6 @@
 |---|---|---|---|
 | [improve-mission-indicator-creation-path](open/improve-mission-indicator-creation-path.md) | 中 | 2026-10-25 | 改善 mission に indicator 新設の経路を開く (規律 7 と方針の衝突) |
 | [multi-timeframe-indicator-deps](open/multi-timeframe-indicator-deps.md) | 低 | 2026-09-15 | 1 つの strategy が複数時間足の指標を同時に使えない |
-
-### 保守 (1)
-
-| id | 優先 | 起票 | 概要 |
-|---|---|---|---|
-| [redo-deployed-strategy-evaluation-after-time-repair](open/redo-deployed-strategy-evaluation-after-time-repair.md) | 中 | 2026-11-07 | 時刻修復後の履歴で配備中 strategy の in_sample / holdout をやり直し承認の根拠を差し替える |
 
 ## 実装待ち (13)
 
@@ -77,7 +71,7 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (140)
+## 設計待ち (141)
 
 ### 不具合 (77)
 
@@ -206,7 +200,7 @@
 | [legacy-e2e-model](open/legacy-e2e-model.md) | 低 |  | backend を切り替えるたびにモデル名の手編集が要る |
 | [legacy-oc-qwen3-8-toolcall](open/legacy-oc-qwen3-8-toolcall.md) | 低 |  | モデルが壊れた引数でツールを連打し予算を焼く |
 
-### 保守 (23)
+### 保守 (24)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -224,6 +218,7 @@
 | [improve-repeat-shutdown-test-flaky](open/improve-repeat-shutdown-test-flaky.md) | 低 | 2026-10-31 | improve_repeat の shutdown test が束でだけ落ちる (flaky) |
 | [time-repair-generalize-beyond-known-fingerprint](open/time-repair-generalize-beyond-known-fingerprint.md) | 低 | 2026-11-03 | repair と cache 誤り行検出を他の利用者の履歴へ一般化する |
 | [improve-e2e-floor-test-flakes-on-wallclock-seconds](open/improve-e2e-floor-test-flakes-on-wallclock-seconds.md) | 低 | 2026-11-07 | improve e2e の床 test が activity 行の時刻の秒に数字が当たると落ちる |
+| [reevaluation-approval-detail-display-polish](open/reevaluation-approval-detail-display-polish.md) | 低 | 2026-11-07 | 再評価の承認詳細の数値が丸められず、旧形式の注記と分類「不明」が出る |
 | [backend-descriptor](open/backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
 | [credentials-file-copied-unused](open/credentials-file-copied-unused.md) | 低 |  | `ClaudeRunner.__init__(credentials_file_copied)` が未使用 |
 | [db-rebuild-helper](open/db-rebuild-helper.md) | 低 |  | DB の table rebuild migration が 7 本重複している |
