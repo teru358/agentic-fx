@@ -1,7 +1,7 @@
 ---
 id: redo-deployed-strategy-evaluation-after-time-repair
 title: 時刻修復後の履歴で配備中 strategy の in_sample / holdout をやり直し承認の根拠を差し替える
-status: 設計待ち
+status: 実装中
 priority: 中
 kind: 保守
 opened: 2026-11-07
@@ -10,7 +10,7 @@ related: [market-hours-fixed-21utc-ignores-dst, mt5-bridge-applies-current-offse
 ---
 # [redo-deployed-strategy-evaluation-after-time-repair] 時刻修復後の履歴で配備中 strategy の in_sample / holdout をやり直し承認の根拠を差し替える
 
-**状態**: 設計待ち / **優先**: 中 / **種別**: 保守
+**状態**: 実装中 / **優先**: 中 / **種別**: 保守
 
 ## 現象
 
@@ -25,3 +25,4 @@ DST 設計 J2(c) の測定 (2026-11-07、tmp/review-dst/j2c-report.md): 配備�
 ## 経緯
 
 - 2026-11-07: 起票。
+- 2026-11-07: 状態: 実装中 — 設計 C2.1 を 2026-11-07 に利用者承認 (spec 2026-11-07-redo-deployed-strategy-evaluation-design.md)。T1 → T2 → T3 → T4
