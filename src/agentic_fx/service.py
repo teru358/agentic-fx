@@ -1923,7 +1923,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         capacity_reader = econ_signal_report.CapacityReader(
             capacity_monitor.plan, root / "data" / "agentic.db", clock=clock.now)
         econ_status_cache = econ_signal_report.EconStatusCache(
-            lambda: _compute_econ_signal(root, clock, capacity_reader, econ_health))
+            lambda: _compute_econ_signal(root, clock, capacity_reader, econ_health,
+                                         pair_currencies))
         ops_service = _build_ops_service(
             root, settings, clock, conn_ops=conn_ops, state=state, activity=activity,
             health_latch=health_latch, supervisor=supervisor,
@@ -1938,7 +1939,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             anchor=root,
             open_conn=lambda: connect_readonly(root / "data" / "agentic.db"),
             capacity=capacity_reader, worker=econ_health,
-            admission_status=admission.status))
+            admission_status=admission.status, pair_currencies=pair_currencies))
         # 取りこぼした改善通知の event を、listener を開く前・supervisor の開始前に出す。
         ops_service.emit_pending_improve_notices(
             enabled=settings.notify.improve_events)
@@ -2114,12 +2115,14 @@ def _reference_status_rows(conn, ingest, now: datetime, settings) -> list[dict] 
         return None
 
 
-def _compute_econ_signal(root: Path, clock, capacity_reader, econ_health) -> dict:
+def _compute_econ_signal(root: Path, clock, capacity_reader, econ_health,
+                         pair_currencies=None) -> dict:
     """status 用の econ 集計。専用の短命な読取接続で、他の lock を持たずに計算する。"""
     conn = connect_readonly(root / "data" / "agentic.db")
     try:
         return econ_signal_report.econ_signal_status(
-            conn, now=clock.now(), capacity=capacity_reader, worker=econ_health)
+            conn, now=clock.now(), capacity=capacity_reader, worker=econ_health,
+            pair_currencies=pair_currencies)
     finally:
         conn.close()
 

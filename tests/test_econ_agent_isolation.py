@@ -179,3 +179,101 @@ def test_agent_prompts_name_no_human_only_signal_facts(name):
     for word in ("shadow", "abandon", "slice", "wait_budget", "reaction",
                  "worst_case_guarantee", "signal_capacity"):
         assert word not in text
+
+
+_REACTION_CANARIES = ("ReactCanaryName", "BelowFloorCanary", "7777.25", "7777", "4242.5",
+                      "3131.75", "2121.5", "5555.75", "unique_ts_n", "unresolvable_n",
+                      "range_median", "close_change_median")
+
+
+def _seed_reaction_canaries(conn):
+    """床以上の束 (n=25) と床未満の束 (n=5) に、目印の付いた数値と名前を置く。"""
+    from agentic_fx.analytics.econ_reactions import WindowValue
+    from agentic_fx.store import econ_reaction_values as rv
+
+    def add(country, importance, name, count, values, day0):
+        for i in range(count):
+            ts = f"2026-{9 + (day0 + i) // 28:02d}-{(day0 + i) % 28 + 1:02d}T12:00:00+00:00"
+            event = conn.execute(
+                "INSERT INTO econ_events(ts,country,name,importance) VALUES(?,?,?,?)",
+                (ts, country, name, importance)).lastrowid
+            set_id = conn.execute(
+                "INSERT INTO ohlcv_slice_sets(event_id,pair,range_start,range_end,"
+                "expected_rows,state,created_at,completed_at,rule_version) "
+                "VALUES(?,?,?,?,?,'complete',?,?,1)",
+                (event, "USDJPY", ts, "2027-01-01T00:00:00+00:00", 255, ts, ts)).lastrowid
+            conn.commit()
+            assert rv.write_set_tx(conn, set_id=set_id, values=tuple(
+                WindowValue(w, "resolved", *values) for w in (15, 60, 240)),
+                keys=[(event, country)], now=NOW).committed
+
+    add("JPY", 3, "ReactCanaryName", 25, (7777.25, -2121.5, 4242.5, 3131.75), 0)
+    add("USD", 2, "BelowFloorCanary", 5, (5555.75, -2121.5, 4242.5, 3131.75), 40)
+    stats = rv.bundle_stats(conn)
+    assert any(s.n >= 20 and s.range_median == 7777.25 for s in stats)
+    assert any(s.n == 5 and s.range_median == 5555.75 for s in stats)
+
+
+def _canary_hits(text):
+    return [word for word in _REACTION_CANARIES if word in text]
+
+
+def test_reaction_values_reach_no_agent_surface(tmp_path):
+    """trade prompt・state summary・ask・reflection・RAG・improve・activity の全面を探す。
+    cron の get_econ_reactions の応答だけが対象外 (別の test が床と tool list を持つ)。"""
+    from unittest.mock import MagicMock
+    import threading
+    from agentic_fx.activity import ActivityLog
+    from agentic_fx.core.contracts import FixedClock, OrderStatus
+    from agentic_fx.loops.prompts_loader import load_prompt
+    from agentic_fx.loops.reflection_cycle import ReflectionCycle
+    from agentic_fx.loops.summary import build_state_summary
+    from agentic_fx.runners.base import MissionResult
+    from agentic_fx.runners.fake_runner import FakeRunner
+    from agentic_fx.store import orders
+    from tests.loops.test_trade_loop import _loop
+
+    conn = connect(tmp_path / "c.db")
+    init_db(conn)
+    _seed_reaction_canaries(conn)
+    _, loop, runner, _ = _loop(tmp_path, [
+        MissionResult("completed", {"action": "hold", "reasoning": "w"}, []),
+        MissionResult("completed", {"answer": "ok"}, [])], conn=conn)
+    loop.run_once()
+    loop.ask_once("今の相場は?")
+    assert len(runner.missions) == 2
+    surfaces = {
+        "trade_prompt": runner.missions[0].prompt,
+        "ask_prompt": runner.missions[1].prompt,
+        "state_summary": build_state_summary(
+            conn, loop.executor.broker, loop.econ, loop.clock,
+            SETTINGS.paper.starting_balance),
+        "activity": "\n".join(loop.activity.tail(10_000)),
+    }
+
+    rag = MagicMock()
+    reflect_runner = FakeRunner([MissionResult("completed", {"content": "学び"}, [])])
+    cycle = ReflectionCycle(conn=conn, runner=reflect_runner, rag=rag, settings=SETTINGS,
+                            activity=ActivityLog(tmp_path / "r.log"), clock=FixedClock(NOW),
+                            core_lock=threading.RLock())
+    orders.insert(conn, pair="USDJPY", direction="long", entry_type="market",
+                  horizon="day", status=OrderStatus.CLOSED, now=NOW, quantity=0.1,
+                  realized_pnl=-1500.0, close_reason="sl", avg_fill_price=148.5,
+                  close_price=148.0)
+    assert cycle.run_pending() == 1
+    assert len(reflect_runner.missions) == 1
+    surfaces["reflection_prompt"] = reflect_runner.missions[0].prompt
+    surfaces["rag_writes"] = repr(rag.mock_calls)
+
+    ctx = build_improve_context(conn, settings=SETTINGS, now=NOW, root=tmp_path,
+                                allowed_backlog_ids=None)
+    surfaces["improve_context"] = json.dumps(ctx, default=str, ensure_ascii=False)
+    surfaces["improve_prompt"] = load_prompt("improve_mission")
+
+    for name, text in surfaces.items():
+        assert text, f"{name} was not exercised"
+        assert _canary_hits(text) == [], name
+
+
+def test_the_canary_detector_sees_a_planted_value():
+    assert _canary_hits("x range_median=7777.25") == ["7777.25", "7777", "range_median"]

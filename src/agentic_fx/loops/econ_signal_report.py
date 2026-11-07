@@ -16,11 +16,12 @@ import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.core import display_time, market_hours
-from agentic_fx.store import ohlcv_slices, signals
+from agentic_fx.analytics import econ_reactions
+from agentic_fx.store import econ_reaction_values, ohlcv_slices, signals
 
 _log = logging.getLogger("agentic_fx.loops.econ_signal_report")
 
@@ -332,10 +333,40 @@ def shadow_status(conn: sqlite3.Connection) -> list[dict]:
                       "n", "avg_pnl_pips"), tuple(row))) for row in rows]
 
 
+_REACTION_COUNTS = ("n", "unique_ts_n", "unresolvable_n")
+_REACTION_NUMBERS = ("range_median", "range_p75", "abs_median", "abs_p75",
+                     "net_median", "net_p75", "close_change_median")
+_REACTION_KIND_ORDER = {"importance": 0, "name": 1}
+
+
+def reaction_status(conn: sqlite3.Connection, *,
+                    pair_currencies: Mapping[str, tuple[str, str]]) -> dict:
+    """人間面の反応統計。床未満の束も n と数値を出す (agent 面の床は適用しない)。
+
+    importance の束を先、name の束を後に、通貨・key・窓の順に並べる。"""
+    bundles = []
+    for stat_row in econ_reaction_values.bundle_stats(conn):
+        row = {"currency": stat_row.currency, "kind": stat_row.kind,
+               "key": stat_row.key, "window_min": stat_row.window_min}
+        for field in _REACTION_COUNTS:
+            row[field] = getattr(stat_row, field)
+        for field in _REACTION_NUMBERS:
+            value = getattr(stat_row, field)
+            row[field] = None if value is None else round(float(value), 2)
+        bundles.append(row)
+    bundles.sort(key=lambda r: (_REACTION_KIND_ORDER.get(r["kind"], 2), r["currency"],
+                                r["key"], r["window_min"]))
+    return {"floor": econ_reactions.AGENT_FLOOR, "bundles": bundles,
+            "backlog": econ_reaction_values.backlog_counts(
+                conn, pair_currencies=pair_currencies)}
+
+
 def econ_signal_status(conn: sqlite3.Connection, *, now: datetime,
                        capacity: CapacityReader | None,
-                       worker: WorkerHealth | None) -> dict:
-    """`afx ctl status` に足す項目。節ごとに失敗を隔離し、取れない節は None にする。"""
+                       worker: WorkerHealth | None,
+                       pair_currencies: Mapping[str, tuple[str, str]] | None = None) -> dict:
+    """`afx ctl status` に足す項目。節ごとに失敗を隔離し、取れない節は None にする。
+    反応統計の節は、通貨の対応表 (`pair_currencies`) を渡されたときだけ足す。"""
     out: dict = {}
 
     def section(name: str, fn):
@@ -366,6 +397,8 @@ def econ_signal_status(conn: sqlite3.Connection, *, now: datetime,
     section("shadow", lambda: shadow_status(conn))
     section("slice_capacity",
             lambda: None if capacity is None else capacity.status(conn))
+    if pair_currencies is not None:
+        section("reaction", lambda: reaction_status(conn, pair_currencies=pair_currencies))
     out["slice_worker"] = "unknown" if worker is None else worker.state()
     return out
 
@@ -414,6 +447,8 @@ def format_econ_lines(econ: dict | None, tz: str = "UTC") -> list[str]:
         omitted = econ.get("shadow_omitted")
         if type(omitted) is int and omitted > 0:
             lines.append(f"  shadow: 省略 {omitted} 組")
+    if "reaction" in econ:
+        lines.append(_reaction_line(econ["reaction"]))
     cap = econ.get("slice_capacity")
     if "slice_capacity" not in econ:
         pass
@@ -445,6 +480,22 @@ def format_econ_lines(econ: dict | None, tz: str = "UTC") -> list[str]:
         if cap.get("level") in ("warn", "full"):
             lines.append(f"  warning: slice capacity {cap['level']}")
     return lines
+
+
+def _reaction_line(reaction: dict | None) -> str:
+    if not isinstance(reaction, dict):
+        return "  reaction: unavailable"
+    bundles = reaction.get("bundles") or []
+    floor = reaction.get("floor")
+    floor = floor if type(floor) is int else econ_reactions.AGENT_FLOOR
+    above = sum(1 for row in bundles if type(row.get("n")) is int and row["n"] >= floor)
+    backlog = reaction.get("backlog") or {}
+    line = (f"  reaction: 束 {len(bundles)} (床 {floor} 以上 {above})、"
+            f"未算定 {_fmt(backlog.get('sets_without_values'))}")
+    keyless = backlog.get("events_without_currency_key")
+    if type(keyless) is int and keyless > 0:
+        line += f"、通貨 key 無し {keyless}"
+    return line
 
 
 class EconStatusCache:
@@ -534,6 +585,9 @@ def render_report(facts: dict, *, label: date, close_at: datetime) -> str:
                 f"- {row['decision']}/{row['actor']}/{_fmt(row['reject_code'])} "
                 f"{row['state']}/{_fmt(row['result_code'])}: n={row['n']} "
                 f"avg_pnl_pips={_fmt(row['avg_pnl_pips'])}")
+    if "reaction" in facts:
+        lines += ["", "## reaction (pips、窓は分、床未満も数値を出す)"]
+        lines += _reaction_report_lines(facts["reaction"])
     lines += ["", "## slice capacity"]
     cap = facts.get("slice_capacity")
     if cap is None:
@@ -554,12 +608,34 @@ def render_report(facts: dict, *, label: date, close_at: datetime) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _reaction_report_lines(reaction: dict | None) -> list[str]:
+    if reaction is None:
+        return ["unavailable"]
+    lines = []
+    for row in reaction.get("bundles") or []:
+        lines.append(
+            f"- {row['currency']} {row['kind']}={row['key']} {row['window_min']}m: "
+            f"n={row['n']} unique_ts_n={row['unique_ts_n']} "
+            f"unresolvable_n={row['unresolvable_n']} "
+            f"range={_fmt(row['range_median'])}/{_fmt(row['range_p75'])} "
+            f"abs={_fmt(row['abs_median'])}/{_fmt(row['abs_p75'])} "
+            f"net={_fmt(row['net_median'])}/{_fmt(row['net_p75'])} "
+            f"close_change={_fmt(row['close_change_median'])}")
+    backlog = reaction.get("backlog") or {}
+    lines.append(f"- backlog: sets_without_values={_fmt(backlog.get('sets_without_values'))} "
+                 f"events_without_currency_key={_fmt(backlog.get('events_without_currency_key'))}")
+    return lines
+
+
 def collect_report_facts(conn: sqlite3.Connection, *, now: datetime,
                          capacity: CapacityReader | None,
                          worker: WorkerHealth | None,
                          admission_status: Callable[[sqlite3.Connection, datetime], dict]
-                         | None = None) -> dict:
-    facts = econ_signal_status(conn, now=now, capacity=capacity, worker=worker)
+                         | None = None,
+                         pair_currencies: Mapping[str, tuple[str, str]] | None = None
+                         ) -> dict:
+    facts = econ_signal_status(conn, now=now, capacity=capacity, worker=worker,
+                               pair_currencies=pair_currencies)
     if admission_status is not None:
         try:
             snap = admission_status(conn, now)
@@ -745,7 +821,8 @@ def make_daily_report_callback(*, reports_dir: Path,
                                capacity: CapacityReader | None,
                                worker: WorkerHealth | None,
                                admission_status: Callable | None = None,
-                               anchor: Path | None = None
+                               anchor: Path | None = None,
+                               pair_currencies: Mapping[str, tuple[str, str]] | None = None
                                ) -> Callable[[datetime], None]:
     """scheduler の日次 hook (`register_daily_report`) に渡す callback。
 
@@ -762,7 +839,7 @@ def make_daily_report_callback(*, reports_dir: Path,
         try:
             facts = collect_report_facts(
                 conn, now=close_at - timedelta(minutes=1), capacity=capacity, worker=worker,
-                admission_status=admission_status)
+                admission_status=admission_status, pair_currencies=pair_currencies)
         finally:
             conn.close()
         write_report_once(reports_dir, label=label, anchor=anchor,

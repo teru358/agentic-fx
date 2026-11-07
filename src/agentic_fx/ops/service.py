@@ -377,6 +377,61 @@ def _econ_shadow(raw: object) -> list | None:
     return rows
 
 
+_ECON_REACTION_MAX = 600
+_ECON_REACTION_WINDOWS = (15, 60, 240)
+_ECON_REACTION_KINDS = ("importance", "name")
+_ECON_REACTION_COUNTS = ("n", "unique_ts_n", "unresolvable_n")
+_ECON_REACTION_NUMBERS = ("range_median", "range_p75", "abs_median", "abs_p75",
+                          "net_median", "net_p75", "close_change_median")
+_ECON_REACTION_KEY_MAX = 80
+
+
+def _econ_number(value: object) -> float | int | None:
+    if type(value) in (int, float) and math.isfinite(value):
+        return value
+    return None
+
+
+def _econ_reaction_row(row: object) -> dict | None:
+    if type(row) is not dict:
+        return None
+    currency, kind, key = row.get("currency"), row.get("kind"), row.get("key")
+    if (type(currency) is not str or len(currency) != 3 or not currency.isascii()
+            or not currency.isupper() or not currency.isalpha()):
+        return None
+    if kind not in _ECON_REACTION_KINDS or row.get("window_min") not in _ECON_REACTION_WINDOWS:
+        return None
+    if (type(key) is not str or not 0 < len(key) <= _ECON_REACTION_KEY_MAX
+            or not key.isprintable()):
+        return None
+    out = {"currency": currency, "kind": kind, "key": key,
+           "window_min": row["window_min"]}
+    for field in _ECON_REACTION_COUNTS:
+        count = _econ_int(row.get(field))
+        if count is None:
+            return None
+        out[field] = count
+    for field in _ECON_REACTION_NUMBERS:
+        out[field] = _econ_number(row.get(field))
+    return out
+
+
+def _econ_reaction(raw: object) -> dict | None:
+    """反応統計の許可投影。件数と数値と短い束の名前だけを通し、行数に上限を置く。"""
+    if type(raw) is not dict or type(raw.get("bundles")) is not list:
+        return None
+    rows = []
+    for item in raw["bundles"]:
+        row = _econ_reaction_row(item)
+        if row is not None:
+            rows.append(row)
+    shown = rows[:_ECON_REACTION_MAX]
+    return {"floor": _econ_int(raw.get("floor")), "bundles": shown,
+            "bundles_omitted": len(raw["bundles"]) - len(shown),
+            "backlog": _econ_counts(raw.get("backlog"),
+                                    ("sets_without_values", "events_without_currency_key"))}
+
+
 def _econ_capacity(raw: object) -> dict | None:
     if type(raw) is not dict:
         return None
@@ -420,7 +475,8 @@ def econ_signal_view(raw: object) -> dict | None:
         "shadow": _econ_section(lambda: _econ_shadow(raw.get("shadow"))),
         "shadow_omitted": _econ_section(lambda: _econ_shadow_omitted(raw.get("shadow"))),
         "slice_capacity": _econ_section(lambda: _econ_capacity(raw.get("slice_capacity"))),
-    }
+    } | ({"reaction": _econ_section(lambda: _econ_reaction(raw.get("reaction")))}
+         if "reaction" in raw else {})
 
 
 def _parse_time(value: object) -> datetime | None:
