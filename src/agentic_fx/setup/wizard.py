@@ -444,6 +444,9 @@ def _url_problem(url: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+_SAFE_ZONE_NAME = re.compile(r"[A-Za-z0-9_+\-/]{1,64}")
+
+
 @dataclass
 class Answers:
     display_timezone: str
@@ -478,6 +481,7 @@ class Answers:
     news_sources: list[tuple[str, str]] = field(default_factory=list)
     watch_symbols: list[str] | None = None
     watch_notes: list[str] = field(default_factory=list)
+    zone_note: str | None = None
 
 
 _SOURCE_KEYS = ("yfinance", "mt5", "twelvedata")
@@ -792,18 +796,26 @@ def _initial_answers(sess: _Session, st: _Start) -> Answers:
     s = st.base_settings
     balance = s.paper.starting_balance
     zone = s.display_timezone
+    zone_note = None
     if st.mode == "fresh":
-        guess = sess.deps.local_timezone() or "UTC"
+        found = sess.deps.local_timezone()
+        guess = found or "UTC"
         try:
             ZoneInfo(guess)
             zone = guess if is_region_name(guess) else "UTC"
         except (ZoneInfoNotFoundError, ValueError, OSError):
             zone = "UTC"
+        if found is None:
+            zone_note = "この機械の tz を判別できないため、初期値を UTC にしました。"
+        elif zone != guess:
+            shown = f" `{found}`" if _SAFE_ZONE_NAME.fullmatch(found) else ""
+            zone_note = f"この機械の tz{shown} は地域名として読めないため、初期値を UTC にしました。"
     unit_dir = sess.deps.unit_dir or unit_module.default_unit_dir(sess.deps.environ)
     daemon = True if st.mode == "fresh" else (s.api.enabled or (unit_dir / "afx.service").is_file())
     return Answers(
         display_timezone=zone, account_currency=s.account_currency,
         pairs=list(s.pairs), starting_balance=balance, timeframe=s.datafeed.decision_timeframe,
+        zone_note=zone_note,
         api_enabled=s.api.enabled, daemon=daemon, landlock=dict(st.landlock_record))
 
 
@@ -835,6 +847,8 @@ def _stage2(sess: _Session, st: _Start, a: Answers) -> None:
     sess.say("")
     sess.say("[段 2 基本] 表示・口座・対象ペア・初期残高 (まだ何も書きません)")
     help_text = _HELP_STAGE[2]
+    if a.zone_note:
+        sess.say(a.zone_note)
     while True:
         zone = sess.text("表示タイムゾーン (例 Asia/Tokyo)", a.display_timezone, help_text=help_text)
         try:

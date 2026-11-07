@@ -19,7 +19,7 @@ from pathlib import Path
 
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.config import load_env_file, load_settings
-from agentic_fx.core.display_time import PRECISION_MINUTE, convert_time
+from agentic_fx.core.display_time import PRECISION_MINUTE, convert_or_raw
 from agentic_fx.datafeed import news_probe
 from agentic_fx.display_tz import read_display_timezone
 from agentic_fx.datafeed.news_url import NewsInputError, fold_url, normalize_url, validate_name, validate_url
@@ -77,11 +77,7 @@ def _pad(text: str, width: int) -> str:
 
 def _when_text(moment: datetime, tz: str) -> str:
     """表示 tz の分精度。換算できなければ UTC で出す。"""
-    for zone in (tz, "UTC"):
-        converted = convert_time(moment, zone, PRECISION_MINUTE)
-        if converted.ok:
-            return converted.text
-    return "?"
+    return convert_or_raw(moment, tz, PRECISION_MINUTE, raw="?", utc_fallback=True)
 
 
 def _check_existing_name(name: str) -> None:

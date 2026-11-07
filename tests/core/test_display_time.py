@@ -28,6 +28,7 @@ from agentic_fx.core.display_time import (
     clear_zone_cache,
     convert_activity_line,
     convert_log_line,
+    convert_or_raw,
     convert_time,
     convert_tokens,
     display_header,
@@ -244,6 +245,52 @@ def test_effective_tz_name():
     assert effective_tz_name("Asia/Tokyo") == "Asia/Tokyo"
     assert effective_tz_name("Nowhere/City") == "UTC"
     assert effective_tz_name(None) == "UTC"
+
+
+def test_convert_or_raw_converts_when_it_can():
+    assert convert_or_raw("2026-11-06T10:00:00+00:00", "Asia/Tokyo") == "2026-11-06 19:00:00 +09:00"
+    assert convert_or_raw("2026-11-06T10:00:00+00:00", "Asia/Tokyo",
+                          PRECISION_MINUTE) == "2026-11-06 19:00 +09:00"
+
+
+@pytest.mark.parametrize("value", ["not a time", "2026-11-06T10:00:00", None, 5])
+def test_convert_or_raw_returns_the_original_text_when_it_cannot(value):
+    assert convert_or_raw(value, "Asia/Tokyo") == str(value)
+
+
+def test_convert_or_raw_prefers_the_given_raw_text():
+    assert convert_or_raw("junk", "Asia/Tokyo", raw="shown") == "shown"
+
+
+def test_convert_or_raw_with_a_bad_zone_keeps_the_original_unless_utc_is_allowed():
+    value = "2026-11-06T10:00:00+09:00"
+    assert convert_or_raw(value, "Nowhere/City") == value
+    assert convert_or_raw(value, "Nowhere/City", utc_fallback=True) == "2026-11-06 01:00:00 +00:00"
+    assert convert_or_raw("junk", "Nowhere/City", utc_fallback=True, raw="?") == "?"
+
+
+def test_convert_or_raw_never_raises_on_a_value_whose_str_fails():
+    class Hostile:
+        def __str__(self):
+            raise RuntimeError("boom")
+
+    assert convert_or_raw(Hostile(), "Asia/Tokyo") == "?"
+
+
+def test_time_rule_cutover_body_is_the_stored_capture_serialisation():
+    from agentic_fx.core import time_cutover
+    capture = {"t_c": "2026-11-06T10:00:00+00:00", "captured_at": "2026-11-06T10:00:00+00:00",
+               "orders": [{"id": 1, "pair": "EURUSD", "day_deadline": None, "note": "日本語"}],
+               "daily_base": {"legacy": None, "new": {"equity": 1000.5, "snapshot_ts": "x"},
+                              "applied": 3},
+               "activity_logged": False}
+    stored = {k: v for k, v in capture.items() if k != "activity_logged"}
+    assert dt_mod.time_rule_cutover(capture)[2] == time_cutover._dump(stored)
+
+
+def test_time_rule_cutover_body_does_not_stringify_what_cannot_be_serialised():
+    body = dt_mod.time_rule_cutover({"t_c": datetime(2026, 11, 6, tzinfo=UTC)})[2]
+    assert body == "(本文を組み立てられない)"
 
 
 @pytest.fixture

@@ -13,7 +13,7 @@ from agentic_fx import metric_words
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core import display_time
 from agentic_fx.core.display_time import (
-    convert_activity_line, convert_log_line, convert_time, display_header,
+    convert_activity_line, convert_log_line, convert_or_raw, display_header,
     effective_tz_name)
 from agentic_fx.core.contracts import Clock
 from agentic_fx.display_tz import region_name_warning
@@ -127,8 +127,7 @@ class Commands:
 
     def _when(self, value) -> str:
         """時刻の値を表示 tz に換算する。換算できないものは元の表記のまま。"""
-        converted = convert_time(value, self._tz())
-        return converted.text if converted.ok else str(value)
+        return convert_or_raw(value, self._tz())
 
     def use_ops_service(self, ops_service) -> None:
         """操作 API と同じレーンを使うよう切り替える。

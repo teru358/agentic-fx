@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 from agentic_fx.config import load_settings_text
 from agentic_fx.core.contracts import SystemClock
-from agentic_fx.core.display_time import convert_time, display_header
+from agentic_fx.core.display_time import convert_or_raw, display_header
 from agentic_fx.display_tz import read_display_timezone, region_name_warning
 from agentic_fx.ops.contracts import Principal
 from agentic_fx.ops.keys import key_dir, key_file_name
@@ -256,8 +256,7 @@ def _observer_db_path(root: Path) -> tuple[Path, str]:
 
 def _shown_time(value: object, tz: str) -> str:
     """A stored UTC instant in the display zone; unconvertible values stay as written."""
-    converted = convert_time(value, tz)
-    return converted.text if converted.ok else str(value)
+    return convert_or_raw(value, tz)
 
 
 def _database(db_path: Path, kind: str, conn: sqlite3.Connection | None,

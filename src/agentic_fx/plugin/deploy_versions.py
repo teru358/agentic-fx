@@ -6,7 +6,7 @@ import re
 import sqlite3
 from pathlib import Path
 
-from agentic_fx.core.display_time import convert_time
+from agentic_fx.core.display_time import convert_or_raw
 from agentic_fx.plugin import deploy_ops, loader
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import plugin_deploy_ops as deploy_store
@@ -127,8 +127,7 @@ def _short(value: str | None, others: list[str]) -> str:
 
 def _when(value: object, tz: str) -> str:
     """A stored UTC instant in the display zone; anything unconvertible stays as written."""
-    converted = convert_time(value, tz)
-    return converted.text if converted.ok else str(value)
+    return convert_or_raw(value, tz)
 
 
 def render_versions(data: dict, tz: str = "UTC") -> list[str]:

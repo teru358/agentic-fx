@@ -35,7 +35,7 @@ import httpx
 from agentic_fx.core import improve_repeat as ir
 from agentic_fx.core.display_time import (
     PRECISION_MINUTE, PRECISION_SECOND, TIME_FIELDS, convert_activity_line,
-    convert_log_line, convert_time, display_header, effective_tz_name)
+    convert_log_line, convert_or_raw, display_header, effective_tz_name)
 from agentic_fx.display_tz import region_name_warning
 from agentic_fx.core.econ_window import FRESHNESS_UNKNOWN, FRESHNESS_VALUES
 from agentic_fx.datafeed.reference_status import REFERENCE_STATES
@@ -602,8 +602,7 @@ def _when(value, tz: str, precision: str = PRECISION_SECOND, *,
     if not isinstance(value, str):
         return "-"
     text = display_text(redactor.redact_value(value) if redact else value, 1 << 20)
-    converted = convert_time(text, tz, precision)
-    shown = converted.text if converted.ok else text
+    shown = convert_or_raw(text, tz, precision, raw=text)
     if limit is None:
         return display_text(shown)
     return shown if len(shown) <= limit else shown[:limit] + "…"
@@ -1827,11 +1826,8 @@ def _format_deadline(value, tz: str = "UTC") -> str:
             return display_text(value)
         if moment.tzinfo is None:
             moment = moment.replace(tzinfo=timezone.utc)
-        for zone in (tz, "UTC"):
-            converted = convert_time(moment, zone, PRECISION_MINUTE)
-            if converted.ok:
-                return converted.text
-        return display_text(value)
+        return convert_or_raw(moment, tz, PRECISION_MINUTE, raw=display_text(value),
+                              utc_fallback=True)
     return display_text(value)
 
 

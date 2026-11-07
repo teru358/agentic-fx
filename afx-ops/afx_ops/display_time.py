@@ -142,6 +142,20 @@ def convert_time(value: object, tz_name: object,
         return UNCONVERTIBLE
 
 
+def convert_or_raw(value: object, tz_name: object, precision: str = PRECISION_SECOND,
+                   *, raw: str | None = None, utc_fallback: bool = False) -> str:
+    """表示 tz に換算した文字列。換算できなければ原文 (`raw` があればそれ)。
+
+    `utc_fallback` が真なら、tz で換算できないとき UTC でもう一度試す。送出しない。
+    """
+    zones = (tz_name, "UTC") if utc_fallback else (tz_name,)
+    for zone in zones:
+        converted = convert_time(value, zone, precision)
+        if converted.ok:
+            return converted.text
+    return raw if raw is not None else _text_of(value)
+
+
 # ---- 自由文の時刻 token ----------------------------------------------------
 
 _TOKEN = re.compile(
@@ -357,7 +371,7 @@ def time_rule_cutover(capture: dict) -> Built:
     return _build(
         "SYSTEM", "time_rule_cutover",
         lambda: json.dumps({k: v for k, v in capture.items() if k != "activity_logged"},
-                           sort_keys=True, ensure_ascii=False, default=str))
+                           sort_keys=True, ensure_ascii=False))
 
 
 def kill_switch_reset(generation: object, latched_at: object) -> Built:

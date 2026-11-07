@@ -490,8 +490,7 @@ def _fmt(value) -> str:
 def _shown_time(value, tz: str) -> str:
     if value is None:
         return "-"
-    converted = display_time.convert_time(value, tz)
-    return converted.text if converted.ok else str(value)
+    return display_time.convert_or_raw(value, tz)
 
 
 def report_label(close_at: datetime) -> date:

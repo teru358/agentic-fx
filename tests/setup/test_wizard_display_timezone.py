@@ -6,7 +6,7 @@ import pytest
 from agentic_fx.setup.wizard import run_wizard
 
 from tests.setup.test_wizard_rerun import installed_root
-from tests.setup.wizard_support import ScriptedWizardIO, fresh_responder, make_deps
+from tests.setup.wizard_support import ScriptedWizardIO, fresh_responder, make_deps, make_root
 
 _ASK = "表示タイムゾーン (例"
 
@@ -53,3 +53,43 @@ def test_the_bridge_clock_is_shown_in_the_zone_just_answered(tmp_path, zone, sho
     io = ScriptedWizardIO(responder=fresh_responder((_ASK, zone)))
     assert run_wizard(root, io, deps) == 0, io.text
     assert f"(bridge の時刻 {shown})" in io.text
+
+
+@pytest.mark.parametrize(("guess", "shown"), [
+    ("Etc/UTC", "`Etc/UTC`"),
+    ("Japan", "`Japan`"),
+    ("Nowhere/City", "`Nowhere/City`"),
+])
+def test_a_discarded_machine_zone_guess_is_explained_before_the_question(tmp_path, guess, shown):
+    root = make_root(tmp_path)
+    deps, *_ = make_deps(tmp_path, local_timezone=lambda: guess)
+    inner = fresh_responder((_ASK, "UTC"))
+    said_before_ask: list[str] = []
+
+    def responder(prompt):
+        if _ASK in prompt and not said_before_ask:
+            said_before_ask.append("\n".join(io.out))
+        return inner(prompt)
+
+    io = ScriptedWizardIO(responder=responder)
+    assert run_wizard(root, io, deps) == 0, io.text
+    reason = f"この機械の tz {shown} は地域名として読めないため、初期値を UTC にしました"
+    assert reason in said_before_ask[0]
+
+
+def test_an_unsafe_machine_zone_name_is_not_echoed(tmp_path):
+    root = make_root(tmp_path)
+    deps, *_ = make_deps(tmp_path, local_timezone=lambda: "Bad\x1b[31m/Name")
+    io = ScriptedWizardIO(responder=fresh_responder((_ASK, "UTC")))
+    assert run_wizard(root, io, deps) == 0, io.text
+    assert "\x1b" not in io.text
+    assert "この機械の tz は地域名として読めないため、初期値を UTC にしました" in io.text
+
+
+@pytest.mark.parametrize("guess", ["Asia/Tokyo", "UTC"])
+def test_a_usable_machine_zone_guess_needs_no_explanation(tmp_path, guess):
+    root = make_root(tmp_path)
+    deps, *_ = make_deps(tmp_path, local_timezone=lambda: guess)
+    io = ScriptedWizardIO(responder=fresh_responder((_ASK, guess)))
+    assert run_wizard(root, io, deps) == 0, io.text
+    assert "初期値を UTC にしました" not in io.text
