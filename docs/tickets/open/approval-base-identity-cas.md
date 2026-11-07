@@ -1,7 +1,7 @@
 ---
 id: approval-base-identity-cas
 title: 承認時に候補の土台版を照合し、同名候補の上書き (lost update) を防ぐ
-status: 設計待ち
+status: 実装中
 priority: 高
 kind: 不具合
 opened: 2026-10-27
@@ -10,7 +10,7 @@ related: [ctl-improve-repeat-duration-and-oneoff-comment, same-name-candidate-mu
 ---
 # [approval-base-identity-cas] 承認時に候補の土台版を照合し、同名候補の上書き (lost update) を防ぐ
 
-**状態**: 設計待ち / **優先**: 高 / **種別**: 不具合
+**状態**: 実装中 / **優先**: 高 / **種別**: 不具合
 
 ## 現象
 
@@ -26,3 +26,4 @@ related: [ctl-improve-repeat-duration-and-oneoff-comment, same-name-candidate-mu
 
 - 2026-10-27: 起票。
 - 2026-10-29: 優先: 高、関連: [ctl-improve-repeat-duration-and-oneoff-comment, same-name-candidate-must-beat-deployed-baseline] — 2026-10-29 棚卸し: 承認の中身の正しさ: 同名候補 A→B 承認で B が A を黙って消す。同名更新が増える (plugin-naming 方針・比較 gate) 前に塞ぐ
+- 2026-11-07: 状態: 実装中 — 設計 C1 (docs/superpowers/specs/2026-11-07-approval-base-identity-cas-design.md) を 2026-11-07 に利用者承認、§7 の裁定 3 点は推奨どおり。T1 (土台の保存と照合) → T2 (承認画面の土台の項目)
