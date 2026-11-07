@@ -1,16 +1,15 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 163 件。完了分は closed/。
+未完了: 162 件。完了分は closed/。
 
-## 実装中 (5)
+## 実装中 (4)
 
-### 不具合 (2)
+### 不具合 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [executor-pair-membership-guard](open/executor-pair-membership-guard.md) | 高 | 2026-10-25 | 発注経路に Order.pair ∈ settings.pairs の決定論的検査が無い |
-| [improve-admission-selftest-flake-needs-restart](open/improve-admission-selftest-flake-needs-restart.md) | 高 | 2026-11-01 | 改善 admission の自己試験が 1 回落ちると再起動まで改善が止まる |
 
 ### 機能 (3)
 

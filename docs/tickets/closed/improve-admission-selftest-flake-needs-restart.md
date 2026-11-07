@@ -1,16 +1,16 @@
 ---
 id: improve-admission-selftest-flake-needs-restart
 title: 改善 admission の自己試験が 1 回落ちると再起動まで改善が止まる
-status: 実装中
+status: 是正済
 priority: 高
 kind: 不具合
 opened: 2026-11-01
-closed: null
+closed: 2026-11-07
 related: [graceful-stop-waits-mission, verify-backend-counts-preexisting-descendants]
 ---
 # [improve-admission-selftest-flake-needs-restart] 改善 admission の自己試験が 1 回落ちると再起動まで改善が止まる
 
-**状態**: 実装中 / **優先**: 高 / **種別**: 不具合
+**状態**: 是正済 / **優先**: 高 / **種別**: 不具合
 
 ## 現象
 
@@ -30,6 +30,14 @@ related: [graceful-stop-waits-mission, verify-backend-counts-preexisting-descend
 
 ## 修正内容
 
+main a69c0857 (branch adm-retry: 680ebd43 → r1 是正 8ea5464f → /code-review 是正 323f7f15)。
+- `VerifyBackendResult.tool_not_called` (verify_backend.py): gate=incomplete・status=completed・CLI 子の観測と回収・echo 監視側の `tool_not_called()` (echo 到達・MCP initialized・tools 列挙が非空 list・calls が int の 0・grace_expired でない、lock の下)。
+- 自己試験 (improve_canary.py): 上が真で cgroup gate (`host.mission_allowed()`) も通るときだけ transient (= 60 秒後の次の admit で再評価)。
+- admission (improve_admission.py): backend ごとの直前の判定 (早期拒否・cache 命中も含む) と比べ、no → yes の遷移を起動行と同じ書式で 1 回 technical log に出す。不合格の行は理由を必須に。
+- 実 transcript fixture `tests/fixtures/selftest_call0/`。レビュー: sol r1 (3 件全採用) → /code-review high (6 件、採用 4 / 却下 2) → sol 閉鎖確認 (全閉)。
+- 2026-11-07 17:54 JST に配備 (afx 再起動、新 fingerprint f795bc60… は canary + 自己試験に合格し admitted=yes、登録を更新)。
+- 2026-11-07: main a69c0857 を 11-07 に配備、tool 未呼出しの自己試験失敗は再評価される
+
 ## 経緯
 
 - 2026-11-01: 起票。
@@ -37,3 +45,4 @@ related: [graceful-stop-waits-mission, verify-backend-counts-preexisting-descend
 - 2026-11-07: 優先: 高 — 利用者が優先タスクに指定 (11-07 の 3 回目の再発を受けて)。設計に着手
 - 2026-11-07: 状態: 実装中、関連: [graceful-stop-waits-mission] — 設計 v0.2 を利用者が承認、実装着手
 - 2026-11-07: 関連: [graceful-stop-waits-mission, verify-backend-counts-preexisting-descendants] — /code-review の指摘 #4 (他の子孫で reaped が偽) は verify-backend-counts-preexisting-descendants と同根として関連付け
+- 2026-11-07: 是正内容 — main a69c0857 を 11-07 に配備、tool 未呼出しの自己試験失敗は再評価される
