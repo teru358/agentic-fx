@@ -52,9 +52,9 @@ from pathlib import Path
 #: canary と自己試験をやり直す (登録は次の集合外 → 合格の後に更新する)。
 #: 2026-10-11 登録 (最終 E2E: 3 backend の実 improve mission が隔離下で完走):
 SUPPORTED_FINGERPRINTS: frozenset[str] = frozenset({
-    # codex (vendor native ELF 0.164.0、path_fd。npm の再インストールや隔離 source の変更で
-    # 集合外になる。2026-10-29 の本番起動行から再登録)
-    "c1254134e09e0964301e8141882b2969b3fbf59073c648c9b27507ae86d096d9",
+    # codex (vendor native ELF 0.166.0、path_fd。npm の再インストールや隔離 source の変更で
+    # 集合外になる。2026-11-07 の本番起動行から再登録)
+    "15bd94e5922a7c2d285edccf146726ade5c0aff2b4e83f8a003b4c1043d7175a",
     # claude (2.1.296、native_elf)
     "28fb9fa7d8626fd012374cb8920d7dd120cc774ce6ccca4d25d7ade61ceec23a",
     # opencode (native_elf)

@@ -25,3 +25,4 @@ related: []
 ## 経緯
 
 - 2026-11-01: 起票。
+- 2026-11-07: 再発 (3 回目)。07:05Z の再起動で同じ gate=incomplete (call=0) → admitted=no、16:27 / 16:33 JST の improve #3254・#3255 が sandbox_unavailable で 0 秒終了。fingerprint 15bd94e5… (codex 0.166.0) が未登録で毎起動に自己試験が走っていた → 登録を更新 (起動時の自己試験を減らす当面の策、本件の是正ではない)
