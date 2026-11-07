@@ -27,6 +27,17 @@ def tokyo_api(ops_env):
     lock.close()
 
 
+@pytest.fixture
+def est_api(ops_env):
+    api_env = make_api(ops_env, service_pid=0, display_timezone="EST")
+    lock = acquire_instance_lock(ops_env.root / "data")
+    yield api_env
+    for http in api_env.clients:
+        http.close()
+    api_env.server.stop(5.0)
+    lock.close()
+
+
 def _old_daemon(monkeypatch):
     """応答の data から display_timezone を落とす (古い daemon の応答)。"""
     real = client.ApiClient.request
@@ -143,6 +154,35 @@ def test_ctl_status_starts_with_the_zone_and_offset(tokyo_api):
     lines = out.splitlines()
     assert lines[0] == "表示 tz: Asia/Tokyo (+09:00)"
     assert lines[1] == "mode: learning / autopilot: off / kill switch: ok"
+
+
+def test_ctl_status_warns_when_the_zone_is_an_abbreviation_and_keeps_its_fixed_offset(est_api):
+    env = est_api.env
+    approval_id = env.make_plugin_approval()
+    rc, status, err = run_ctl(env.root, ["status"])
+    assert rc == 0, err
+    lines = status.splitlines()
+    assert lines[0] == "表示 tz: EST (-05:00)"
+    assert lines[1].startswith("警告: display_timezone 'EST' は地域名ではありません。")
+    assert "America/New_York" in lines[1]
+    assert lines[2] == "mode: learning / autopilot: off / kill switch: ok"
+    # 2026-10-05 は夏時間の期間だが、略称の EST は固定の -05:00 で換算される
+    _, listing, _ = run_ctl(env.root, ["approval", "list"])
+    assert f"#{approval_id} kind=plugin name=sma created_at=2026-10-04 19:00:00 -05:00 " in listing
+
+
+def test_a_region_name_or_a_missing_field_gives_no_zone_warning(tokyo_api, monkeypatch):
+    _, status, _ = run_ctl(tokyo_api.env.root, ["status"])
+    assert "警告" not in status
+    _old_daemon(monkeypatch)
+    _, old, _ = run_ctl(tokyo_api.env.root, ["status"])
+    assert "警告" not in old
+
+
+def test_the_zone_warning_is_sanitised():
+    text = client._region_warning({"display_timezone": "E\x1b[31mST\nspoof"})
+    assert "\x1b" not in text and "\n" not in text
+    assert text.startswith("警告: ")
 
 
 def test_ctl_approval_list_shows_the_creation_time_in_the_display_zone(tokyo_api):
@@ -270,32 +310,62 @@ def test_format_deadline_keeps_the_utc_default_and_non_strings():
 
 # ---- 時刻表示の網羅 -------------------------------------------------------------
 
-def test_no_raw_utc_iso_survives_in_any_ctl_renderer_for_a_non_utc_zone():
-    import re
-    raw = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?(\+00:00|Z)")
-    stamp = "2026-11-06T10:04:05+00:00"
-    outputs = [
-        client.format_status({
-            "display_timezone": TOKYO,
-            "kill_switch": {"latched": True, "generation": 1, "latched_at": stamp,
-                            "started_at": stamp},
-            "mission": {"loop": "trade", "status": "ok", "started_at": stamp},
-            "gaps": [{"pair": "USDJPY", "since": stamp}],
-            "setup": {"pending_steps": [{"code": "x", "observed_at": stamp}]}}),
-        client.format_approval_list({"display_timezone": TOKYO, "approvals": [
-            {"id": 1, "kind": "plugin", "name": "n", "created_at": stamp}]}),
-        client.format_approval_detail({
-            "display_timezone": TOKYO, "id": 1, "kind": "plugin", "status": "approved",
-            "decided_at": stamp, "expires_at": stamp,
-            "change": {"classification": "new", "computed_at": stamp}}),
-        client.format_event({"id": 1, "ts": stamp, "code": "c", "ref": "-", "fields": {
-            "first_failed_at": stamp, "last_failed_at": stamp, "until": stamp,
-            "since": stamp, "deadline": stamp}}, TOKYO),
-        client.Runner._job_line({"id": "j", "kind": "x", "state": "done",
-                                 "display_timezone": TOKYO,
-                                 "result": {"deadline_at": stamp, "started_at": stamp,
-                                            "expires_at": stamp}}),
-    ]
-    for text in outputs:
-        assert raw.search(text) is None, text
-        assert "+09:00" in text, text
+def _stamp(minute: int) -> str:
+    return f"2026-11-06T10:{minute:02d}:00+00:00"
+
+
+def _local(minute: int) -> str:
+    return f"2026-11-06 19:{minute:02d}:00 +09:00"
+
+
+def test_every_displayed_time_field_shows_its_own_label_and_converted_value():
+    # 欄ごとに別の分を使うので、取り違えや欄の消失は値の不一致になる。
+    status = client.format_status({
+        "display_timezone": TOKYO,
+        "kill_switch": {"latched": True, "generation": 1, "latched_at": _stamp(1)},
+        "mission": {"loop": "trade", "status": "ok", "started_at": _stamp(2)}})
+    assert f"since={_local(1)}" in status
+    assert f"trade:ok ({_local(2)})" in status
+
+    approvals = client.format_approval_list({"display_timezone": TOKYO, "approvals": [
+        {"id": 1, "kind": "plugin", "name": "n", "created_at": _stamp(3)}]})
+    assert f"created_at={_local(3)}" in approvals
+
+    detail = client.format_approval_detail({
+        "display_timezone": TOKYO, "id": 1, "kind": "plugin", "status": "approved",
+        "decided_at": _stamp(4),
+        "change": {"classification": "new", "computed_at": _stamp(5)}})
+    assert f"decided_at={_local(4)}" in detail
+    assert f"計算時刻: {_local(5)}" in detail
+
+    event = client.format_event({"id": 1, "ts": _stamp(6), "code": "c", "ref": "-", "fields": {
+        "first_failed_at": _stamp(7), "last_failed_at": _stamp(8), "until": _stamp(9),
+        "since": _stamp(10), "deadline": _stamp(11)}}, TOKYO)
+    assert f"#1 {_local(6)} c -" in event
+    for label, minute in (("first_failed_at", 7), ("last_failed_at", 8), ("until", 9),
+                          ("since", 10), ("deadline", 11)):
+        assert f"{label}={_local(minute)}" in event
+
+    job = client.Runner._job_line({"id": "j", "kind": "x", "state": "done",
+                                   "display_timezone": TOKYO,
+                                   "result": {"deadline_at": _stamp(12), "started_at": _stamp(13),
+                                              "expires_at": _stamp(14)}})
+    for label, minute in (("deadline_at", 12), ("started_at", 13), ("expires_at", 14)):
+        assert f"{label}={_local(minute)}" in job
+
+
+def test_dto_times_that_no_renderer_shows_are_not_shown_in_any_form():
+    # 表示の網羅の証拠ではなく、「表示されない」ことの確認。
+    status = client.format_status({
+        "display_timezone": TOKYO,
+        "kill_switch": {"latched": True, "generation": 1, "latched_at": _stamp(1),
+                        "started_at": _stamp(20)},
+        "gaps": [{"pair": "USDJPY", "since": _stamp(21)}],
+        "setup": {"record_state": "ok",
+                  "pending_steps": [{"code": "x", "observed_at": _stamp(22)}]}})
+    detail = client.format_approval_detail({
+        "display_timezone": TOKYO, "id": 1, "kind": "plugin", "status": "approved",
+        "expires_at": _stamp(23)})
+    for minute in (20, 21, 22, 23):
+        for text in (status, detail):
+            assert f":{minute:02d}:00" not in text, text

@@ -254,18 +254,39 @@ TIME_FIELDS = frozenset({
 
 # ---- 識別子と本文 builder --------------------------------------------------
 
-def utc_token(dt: object) -> str:
-    """時点を `YYYY-MM-DDTHH:MM:SSZ` にする。naive は `naive:` を前に付けた ISO。"""
-    if not isinstance(dt, datetime):
-        return _non_datetime_text(dt)
-    if dt.tzinfo is None or dt.utcoffset() is None:
-        return f"naive:{dt.isoformat()}"
+_INVALID = "invalid:"
+
+
+def _text_of(value: object) -> str:
+    """最後の手段の文字列化。これも失敗したら固定の表記。"""
     try:
+        return str(value)
+    except Exception:  # noqa: BLE001
+        return "?"
+
+
+def _fallback(dt: object, timespec: str) -> str:
+    try:
+        return f"{_INVALID}{dt.isoformat(timespec=timespec)}"  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001
+        return _INVALID
+
+
+def utc_token(dt: object) -> str:
+    """時点を `YYYY-MM-DDTHH:MM:SSZ` にする。naive は `naive:` を前に付けた ISO。
+
+    送出しない。読めないものは `invalid:` を前に付けた表記 (ISO にできなければ `invalid:` だけ)。
+    """
+    try:
+        if not isinstance(dt, datetime):
+            return _non_datetime_text(dt)
+        if dt.tzinfo is None or dt.utcoffset() is None:
+            return f"naive:{dt.isoformat()}"
         u = dt.astimezone(timezone.utc)
         return (f"{u.year:04d}-{u.month:02d}-{u.day:02d}T"
                 f"{u.hour:02d}:{u.minute:02d}:{u.second:02d}Z")
-    except Exception:  # noqa: BLE001 — 範囲外
-        return f"invalid:{dt.isoformat()}"
+    except Exception:  # noqa: BLE001 — 範囲外・tzinfo の故障
+        return _fallback(dt, "auto")
 
 
 def _non_datetime_text(value: object) -> str:
@@ -274,21 +295,21 @@ def _non_datetime_text(value: object) -> str:
             return utc_token(datetime.fromisoformat(value))
         except ValueError:
             return value
-    return str(value)
+    return _text_of(value)
 
 
 def bar_label(dt: object) -> str:
-    """足のラベル `YYYY-MM-DDTHH:MM UTC` (識別子。換算しない)。"""
-    if not isinstance(dt, datetime):
-        return _non_datetime_text(dt)
-    if dt.tzinfo is None or dt.utcoffset() is None:
-        return f"naive:{dt.isoformat(timespec='minutes')}"
+    """足のラベル `YYYY-MM-DDTHH:MM UTC` (識別子。換算しない)。送出しない。"""
     try:
+        if not isinstance(dt, datetime):
+            return _non_datetime_text(dt)
+        if dt.tzinfo is None or dt.utcoffset() is None:
+            return f"naive:{dt.isoformat(timespec='minutes')}"
         u = dt.astimezone(timezone.utc)
         return (f"{u.year:04d}-{u.month:02d}-{u.day:02d}T"
                 f"{u.hour:02d}:{u.minute:02d} UTC")
     except Exception:  # noqa: BLE001
-        return f"invalid:{dt.isoformat(timespec='minutes')}"
+        return _fallback(dt, "minutes")
 
 
 _BODY_UNAVAILABLE = "(本文を組み立てられない)"

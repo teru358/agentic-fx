@@ -40,7 +40,7 @@ from agentic_fx.commands import (
 from agentic_fx.config import MAX_STORED_DECISION_INTERVAL_MIN, Settings, load_settings_text
 from agentic_fx.core import improve_admission, landlock
 from agentic_fx.core.contracts import Mode
-from agentic_fx.core.display_time import convert_time
+from agentic_fx.core.display_time import PRECISION_MINUTE, convert_time
 from agentic_fx.core.idea_check import idea_looks_unintended, normalize_idea_display
 from agentic_fx.core.mission_ceiling import worker_ceiling
 from agentic_fx.core.scheduler import (
@@ -584,9 +584,14 @@ def next_improve_occurrence(settings: Settings, now: datetime) -> datetime:
     raise ValueError("next improve occurrence not found")
 
 
-def _format_occurrence(occurrence: datetime) -> str:
-    weekday = "月火水木金土日"[occurrence.weekday()]
-    return f"{occurrence:%Y-%m-%d} ({weekday}) {occurrence:%H:%M} {occurrence.tzname()}"
+def _format_occurrence(occurrence: datetime, tz_name: str) -> str:
+    """予定時刻を `2026-11-07 (土) 03:00 +09:00` で返す (曜日は表示 tz の暦)。"""
+    converted = convert_time(occurrence, tz_name, PRECISION_MINUTE)
+    if not converted.ok:
+        return occurrence.isoformat(timespec="minutes")
+    date, clock = converted.text.split(" ", 1)
+    weekday = "月火水木金土日"[datetime.fromisoformat(date).weekday()]
+    return f"{date} ({weekday}) {clock}"
 
 
 def _cross_quote_pairs(pairs: Sequence[str], currency: str) -> list[str]:
@@ -1744,7 +1749,7 @@ def _stage6(sess: _Session, st: _Start, a: Answers) -> None:
 
 def _next_schedule_text(settings: Settings, now: datetime) -> str:
     occurrence = next_improve_occurrence(settings, now)
-    return _format_occurrence(occurrence)
+    return _format_occurrence(occurrence, settings.display_timezone)
 
 
 def _stage7(sess: _Session, st: _Start, a: Answers) -> None:
@@ -1773,7 +1778,7 @@ def _stage7(sess: _Session, st: _Start, a: Answers) -> None:
         "schedule": schedule.model_copy(update={"improve": a.cadence, "improve_at": a.improve_at})})
     now = sess.now()
     current = scheduled_period(candidate, now)
-    sess.say(f"直近の予定は {_format_occurrence(current.occurrence)} (期 {current.period_key})、"
+    sess.say(f"直近の予定は {_format_occurrence(current.occurrence, candidate.display_timezone)} (期 {current.period_key})、"
              f"次回は {_next_schedule_text(candidate, now)} です。")
     sess.say("  1. 次の予定まで待つ (既定) — 起動直後には走らない。その間に方針文と最初の課題を入れられる")
     sess.say("  2. サービス起動の直後に 1 本走らせる")

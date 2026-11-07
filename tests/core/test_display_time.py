@@ -9,7 +9,7 @@ import ast
 import json
 import re
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 
 import pytest
@@ -366,6 +366,33 @@ def test_naive_token_is_not_converted_afterwards():
 def test_utc_token_out_of_range_does_not_raise():
     far = datetime.min.replace(tzinfo=timezone(timedelta(hours=9)))
     assert utc_token(far).startswith("invalid:")
+
+
+class _BrokenZone(tzinfo):
+    def utcoffset(self, dt):
+        raise OSError("zone data unavailable")
+
+    def dst(self, dt):
+        raise OSError("zone data unavailable")
+
+    def tzname(self, dt):
+        raise OSError("zone data unavailable")
+
+
+def test_utc_token_and_bar_label_do_not_raise_when_the_tzinfo_fails():
+    broken = datetime(2026, 11, 6, 10, 0, tzinfo=_BrokenZone())
+    assert utc_token(broken) == "invalid:"
+    assert bar_label(broken) == "invalid:"
+
+
+class _Unprintable:
+    def __str__(self):
+        raise RuntimeError("no text")
+
+
+def test_utc_token_and_bar_label_do_not_raise_for_an_unprintable_value():
+    assert utc_token(_Unprintable()) == "?"
+    assert bar_label(_Unprintable()) == "?"
 
 
 def test_bar_label_has_minutes_and_utc():

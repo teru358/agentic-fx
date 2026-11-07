@@ -36,6 +36,7 @@ from agentic_fx.core import improve_repeat as ir
 from agentic_fx.core.display_time import (
     PRECISION_MINUTE, PRECISION_SECOND, TIME_FIELDS, convert_activity_line,
     convert_log_line, convert_time, display_header, effective_tz_name)
+from agentic_fx.display_tz import region_name_warning
 from agentic_fx.datafeed.reference_status import REFERENCE_STATES
 from agentic_fx.loops import approval_facts
 from agentic_fx.loops.approval_facts import display_text
@@ -582,6 +583,15 @@ def _tz_of(data) -> str:
     if isinstance(data, dict):
         return effective_tz_name(data.get("display_timezone"))
     return "UTC"
+
+
+def _region_warning(data) -> str | None:
+    """応答の `display_timezone` が地域名でないときの警告 (無害化済み)。無い・文字列でないときは None。"""
+    name = data.get("display_timezone") if isinstance(data, dict) else None
+    if not isinstance(name, str):
+        return None
+    text = region_name_warning(name)
+    return None if text is None else "警告: " + display_text(text, _TEXT_LIMIT)
 
 
 def _when(value, tz: str, precision: str = PRECISION_SECOND, *,
@@ -1203,7 +1213,11 @@ class Runner:
     # ---- 読取
     def _op_status(self, *, terminal) -> int:
         data = self._get("/v1/status")
-        self.say(display_header(_tz_of(data)) + "\n" + format_status(data))
+        head = display_header(_tz_of(data))
+        warning = _region_warning(data)
+        if warning is not None:
+            head += "\n" + warning
+        self.say(head + "\n" + format_status(data))
         return RC_OK
 
     def _op_whoami(self, *, terminal) -> int:

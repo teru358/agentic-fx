@@ -2,7 +2,8 @@
 
 時刻を含む本文は `core/display_time.py` の builder だけが作る。daemon の
 `ActivityLog` に書く module (`backtest/` と部品の module を除く) で、本文に
-日時を埋める書き方を検出する。検出するのは次の 6 つ。
+日時を埋める書き方を検出する。検出するのは次の 6 つと、登録 builder 以外の展開引数
+(`write(*args)`) 。
 
 - 日時の format spec を持つ f-string (`{x:%H:%M}`)
 - `.format(` の日時指定 (`"{:%H:%M}".format(x)`)
@@ -23,6 +24,8 @@ from pathlib import Path
 
 import pytest
 
+from agentic_fx.core.display_time import BUILDERS
+
 SRC = Path(__file__).resolve().parents[1] / "src" / "agentic_fx"
 EXCLUDED_DIRS = ("backtest",)
 EXCLUDED_FILES = ("core/display_time.py",)
@@ -30,6 +33,7 @@ EXCLUDED_FILES = ("core/display_time.py",)
 _FORMAT_SPEC_DATETIME = re.compile(r"%[A-Za-z]")
 _FORMAT_CALL_DATETIME = re.compile(r"\{[^{}]*:[^{}]*%[A-Za-z][^{}]*\}")
 _DEPTH = 4
+BUILDER_NAMES = frozenset(builder.__name__ for builder in BUILDERS.values())
 
 
 @dataclass(frozen=True)
@@ -126,6 +130,26 @@ def _reasons(expr: ast.AST, module: _Module, scope: ast.AST | None,
     return reasons
 
 
+def _builder_ref(expr: ast.AST, module: _Module, scope: ast.AST | None, depth: int = 2) -> bool:
+    """登録 builder を指す式 (名前・属性、その選択 `a if c else b`、代入元がそれらだけの変数)。"""
+    if isinstance(expr, ast.Name):
+        if expr.id in BUILDER_NAMES:
+            return True
+        values = module.assignments(scope, expr.id)
+        return depth > 0 and bool(values) and all(
+            _builder_ref(v, module, scope, depth - 1) for v in values)
+    if isinstance(expr, ast.Attribute):
+        return expr.attr in BUILDER_NAMES
+    if isinstance(expr, ast.IfExp):
+        return (_builder_ref(expr.body, module, scope, depth)
+                and _builder_ref(expr.orelse, module, scope, depth))
+    return False
+
+
+def _is_builder_call(expr: ast.AST, module: _Module, scope: ast.AST | None) -> bool:
+    return isinstance(expr, ast.Call) and _builder_ref(expr.func, module, scope)
+
+
 def find_violations(source: str, path: str) -> list[Violation]:
     tree = ast.parse(source)
     module = _Module(tree)
@@ -137,7 +161,17 @@ def find_violations(source: str, path: str) -> list[Violation]:
         if isinstance(node, ast.Call):
             exprs: list[ast.expr] = []
             if _is_activity_write(node):
-                exprs = [a for a in node.args[1:] if not isinstance(a, ast.Starred)]
+                for arg in node.args:
+                    if isinstance(arg, ast.Starred):
+                        # 登録 builder の呼出しだけ免除。それ以外の展開は中身を追い、
+                        # 追えない形そのものも違反にする。
+                        if not _is_builder_call(arg.value, module, function):
+                            exprs.append(arg.value)
+                            violations.append(Violation(
+                                path, getattr(function, "name", "<module>"), node.lineno,
+                                "starred arguments from a non-builder"))
+                    elif arg is not node.args[0]:
+                        exprs.append(arg)
                 exprs += [k.value for k in node.keywords if k.arg != "ref_id"]
             elif _is_activity_append(node):
                 exprs = list(node.args[0].elts[1:])  # type: ignore[attr-defined]
@@ -243,6 +277,17 @@ class A:
     def go(self, dt):
         self.activity.write(Category.SYSTEM, "e", f"at {_stamp(dt)}")
 ''',
+    "starred_tuple": '''
+class A:
+    def go(self, dt):
+        args = (Category.SYSTEM, "e", dt.isoformat())
+        self.activity.write(*args)
+''',
+    "starred_unknown_callable": '''
+class A:
+    def go(self, dt, make):
+        self.activity.write(*make(dt))
+''',
     "utc_token_outside_the_module": '''
 from agentic_fx.core.display_time import utc_token
 
@@ -263,10 +308,32 @@ def test_each_mutation_is_detected(name, tmp_path):
     assert {v.function for v in found} == {"go"}
 
 
-def test_mutation_set_is_the_six_documented_ones():
+def test_mutation_set_is_the_documented_ones():
     assert set(MUTATIONS) == {"direct_isoformat", "format_spec", "format_call",
-                              "prior_assignment", "other_helper",
+                              "prior_assignment", "other_helper", "starred_tuple",
+                              "starred_unknown_callable",
                               "utc_token_outside_the_module"}
+
+
+def test_a_starred_tuple_is_followed_into_its_source():
+    source = _HEAD + MUTATIONS["starred_tuple"]
+    reasons = {v.reason for v in find_violations(source, "m.py")}
+    assert "isoformat" in reasons
+
+
+def test_registered_builder_calls_are_exempt_in_every_spelling():
+    source = _HEAD + '''
+from agentic_fx.core import display_time
+
+
+class A:
+    def go(self, due, kind):
+        self.activity.write(*display_time.kill_switch_reset(1, due))
+        builder = (display_time.news_fetch_skipped if kind == "news"
+                   else display_time.econ_fetch_skipped)
+        self.activity.write(*builder(due))
+'''
+    assert find_violations(source, "m.py") == []
 
 
 def test_fmt_bar_in_a_body_is_detected():

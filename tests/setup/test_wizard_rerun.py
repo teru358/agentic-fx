@@ -223,9 +223,9 @@ def _waves(root):
 
 
 @pytest.mark.parametrize("now,period,next_text", [
-    (datetime(2026, 10, 2, 6, 0, tzinfo=timezone.utc), "2026-W39", "2026-10-03 (土) 03:00 JST"),
-    (datetime(2026, 10, 2, 18, 0, tzinfo=timezone.utc), "2026-W40", "2026-10-10 (土) 03:00 JST"),
-    (datetime(2026, 10, 3, 1, 0, tzinfo=timezone.utc), "2026-W40", "2026-10-10 (土) 03:00 JST"),
+    (datetime(2026, 10, 2, 6, 0, tzinfo=timezone.utc), "2026-W39", "2026-10-03 (土) 03:00 +09:00"),
+    (datetime(2026, 10, 2, 18, 0, tzinfo=timezone.utc), "2026-W40", "2026-10-10 (土) 03:00 +09:00"),
+    (datetime(2026, 10, 3, 1, 0, tzinfo=timezone.utc), "2026-W40", "2026-10-10 (土) 03:00 +09:00"),
 ])
 def test_waiting_for_the_first_run_marks_exactly_the_period_the_scheduler_would_start(
         tmp_path, now, period, next_text):
@@ -345,3 +345,13 @@ def test_a_cache_retention_problem_stops_before_anything_is_written(tmp_path, mo
     assert "cache retention too short" in io.text and "何も書いていません" in io.text
     after = snapshot(root)
     assert set(after) - set(before) <= LOCK_FILES
+
+
+@pytest.mark.parametrize("when,zone,expected", [
+    (datetime(2026, 11, 6, 18, 0, tzinfo=timezone.utc), "Asia/Tokyo", "2026-11-07 (土) 03:00 +09:00"),
+    (datetime(2026, 7, 11, 7, 0, tzinfo=timezone.utc), "America/New_York", "2026-07-11 (土) 03:00 -04:00"),
+    (datetime(2026, 12, 12, 8, 0, tzinfo=timezone.utc), "America/New_York", "2026-12-12 (土) 03:00 -05:00"),
+])
+def test_the_scheduled_time_is_shown_with_an_offset_not_an_abbreviation(when, zone, expected):
+    from agentic_fx.setup.wizard import _format_occurrence
+    assert _format_occurrence(when, zone) == expected
