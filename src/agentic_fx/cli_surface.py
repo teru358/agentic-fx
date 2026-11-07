@@ -292,6 +292,10 @@ _BASE_COMMANDS: tuple[CommandRecord, ...] = (
             "plugin を戻す", "backtest/cli.py", confirm=True, condition="再起動後反映", exposed=True),
     _record(Group.PLUGIN, Lane.LOCAL, "plugin revoke", "afx plugin revoke <name> --version HASH …",
             Label.CHANGE, "plugin の版を失効させる", "backtest/cli.py", confirm=True, exposed=True),
+    _record(Group.PLUGIN, Lane.LOCAL, "plugin reevaluate",
+            "afx plugin reevaluate [--all-deployed | <name>]", Label.CHANGE,
+            "配備中の strategy を再評価する", "backtest/cli.py", confirm=True,
+            exposed=True),
     _record(Group.PLUGIN, Lane.LOCAL, "plugin versions", "afx plugin versions <name>", Label.READ,
             "plugin の版を表示する", "backtest/cli.py", exposed=True),
     _record(Group.PLUGIN, Lane.LOCAL, "plugin list", "afx plugin list [--kind indicator|strategy]",
@@ -529,6 +533,16 @@ class HelpFormatter(argparse.RawDescriptionHelpFormatter):
     def __init__(self, prog: str, **kwargs) -> None:
         kwargs["width"] = 100
         super().__init__(prog, **kwargs)
+
+    def _format_usage(self, usage, actions, groups, prefix):
+        text = super()._format_usage(usage, actions, groups, prefix)
+        lines = text.rstrip("\n").split("\n")
+        if len(lines) < 2 or all(_display_width(line) <= 100 for line in lines):
+            return text
+        # 子コマンドの選択肢が長いと、prog に揃えた折り返しが幅を超える。
+        # 継続行を 4 桁の字下げに寄せて固定幅に収める。
+        rest = ["    " + line.strip() for line in lines[1:] if line.strip()]
+        return "\n".join([lines[0], *rest]) + "\n\n"
 
 
 class SurfaceRenderer:

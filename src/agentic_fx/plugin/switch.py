@@ -2780,3 +2780,389 @@ def bless_candidate(
                 f"(expected content_hash={content_hash} "
                 f"artifact_hash={artifact_hash})")
         return approval_id
+
+
+# ============================================================
+# 配備中 strategy の再評価 (candidate_origin="reevaluation" の依頼を作る)
+# ============================================================
+
+REEVALUATION_REASON = "history_time_repaired"
+REEVALUATION_MISSION_OUTCOME = "reevaluation"
+REEVALUATION_LOCK_WAIT_SEC = 30.0
+_RESULT_STATUSES = frozenset({
+    "created", "existing", "unevaluable", "failed", "changed_during_evaluation", "skipped"})
+
+
+@dataclass(frozen=True)
+class ReevaluationResult:
+    """1 本ぶんの結果。`status` は `_RESULT_STATUSES` のどれか。
+    `skipped` の `reason` は対象にしなかった理由 (`not_strategy` は indicator)。"""
+    name: str
+    status: str
+    approval_id: int | None = None
+    reason: str = ""
+
+
+class _Skip(Exception):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+@dataclass(frozen=True)
+class _Snapshot:
+    meta: "loader.PluginMeta"
+    resolved: object
+    inventory: object
+    target: str
+    pins: dict
+    decision_id: int
+    previous_id: int
+    deploy_generation: list
+    history_epoch: str
+    lock_names: tuple
+
+    def key(self) -> tuple:
+        """依頼の一意性の鍵。同じ名前の pending 再評価は高々 1 件。"""
+        return (self.meta.name, self.meta.content_hash, self.meta.artifact_hash,
+                self.history_epoch, self.decision_id, tuple(self.deploy_generation))
+
+    def identity(self) -> tuple:
+        """評価中に変わってはならない項目の全部 (保存の前に取り直して比べる)。"""
+        return (self.meta.content_hash, self.meta.artifact_hash, self.target,
+                json.dumps(self.pins, sort_keys=True), self.decision_id, self.previous_id,
+                tuple(self.deploy_generation), self.history_epoch, self.lock_names)
+
+
+def reevaluation_candidate_names(plugins_root: Path) -> list[str]:
+    """`--all-deployed` の走査対象: plugins 直下の正規名の entry を名前順に。"""
+    if not plugins_root.is_dir():
+        return []
+    return sorted(
+        entry.name for entry in plugins_root.iterdir()
+        if not entry.name.startswith(("_", "."))
+        and loader.is_canonical_plugin_name(entry.name)
+        and (entry.is_symlink() or entry.is_dir()))
+
+
+def _reevaluation_key(payload: dict) -> tuple:
+    generation = payload.get("deploy_generation")
+    return (payload.get("name"), payload.get("content_hash"), payload.get("artifact_hash"),
+            payload.get("history_epoch"), payload.get("basis_decision_id"),
+            tuple(generation) if isinstance(generation, (list, tuple)) else generation)
+
+
+def _pending_reevaluations(conn: sqlite3.Connection, name: str) -> list[tuple[int, dict]]:
+    rows = conn.execute(
+        "SELECT id, payload_json FROM approval_requests WHERE kind='plugin' "
+        "AND status='pending' AND json_extract(payload_json,'$.candidate_origin')=? "
+        "AND json_extract(payload_json,'$.name')=? ORDER BY id",
+        (REEVALUATION_ORIGIN, name)).fetchall()
+    out = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict):
+            out.append((row["id"], payload))
+    return out
+
+
+def _live_lock_names(plugins_root: Path, name: str) -> tuple:
+    """live の版 dir の config から、lock を取る名前 (自分と依存 indicator) を読む。"""
+    live = plugins_root / name
+    target = os.readlink(live)
+    if not loader.is_canonical_symlink_target(name, target):
+        raise _Skip("non_canonical_symlink")
+    return tuple(sorted(set(_dependency_names(plugins_root / target, name))))
+
+
+def _take_reevaluation_snapshot(conn, plugins_root: Path, name: str, settings,
+                                lock_names: tuple) -> _Snapshot:
+    """lock を持った状態で、評価の入力と基準を固定して返す。対象外なら `_Skip`。"""
+    live = plugins_root / name
+    if not live.is_symlink():
+        raise _Skip("plain_plugin" if live.is_dir() else "not_deployed")
+    target = os.readlink(live)
+    if not loader.is_canonical_symlink_target(name, target):
+        raise _Skip("non_canonical_symlink")
+    inventory = tools_plugin_loader.approved_plugins(conn, plugins_root, settings=settings)
+    meta = next((m for m in inventory.inventory.metas if m.name == name), None)
+    if meta is None:
+        raise _Skip("not_approved")
+    if meta.kind != "strategy":
+        raise _Skip("not_strategy")
+    artifact = meta.artifact_hash
+    if artifact is None or target != f".versions/{name}/{artifact}":
+        raise _Skip("not_canonical_version")
+    if not _version_dir_hashes_ok(plugins_root / ".versions" / name / artifact,
+                                  content_hash=meta.content_hash, artifact_hash=artifact):
+        raise _Skip("version_mismatch")
+    resolved = inventory.resolved.get((name, meta.content_hash))
+    if resolved is None:
+        raise _Skip("not_approved")
+    pins = resolved.pin_object()
+    if not _reevaluation_pins_are_live(conn, plugins_root, {"indicator_deps": pins}):
+        raise _Skip("indicator_not_live")
+    decision = approvals_store.latest_decision_for_identity(conn, name, meta.content_hash)
+    if decision is None or decision["status"] != "approved":
+        raise _Skip("not_approved")
+    latest_approved = approvals_store.latest_approved_for_identity(
+        conn, name, meta.content_hash)
+    if latest_approved is None:
+        raise _Skip("not_approved")
+    deps = tuple(sorted(set(_dependency_names(plugins_root / target, name))))
+    if not set(deps) <= set(lock_names):
+        raise ValueError("candidate_changed")
+    return _Snapshot(
+        meta=meta, resolved=resolved, inventory=inventory, target=target, pins=pins,
+        decision_id=decision["id"], previous_id=latest_approved["id"],
+        deploy_generation=deploy_generation(conn, name), history_epoch=history_epoch(conn),
+        lock_names=tuple(lock_names))
+
+
+def _payload_pair_metrics(value, pair: str, pairs: list[str]) -> dict | None:
+    """承認 payload の成績 (pair ごと、または 1 pair だけ平らな dict) から 1 pair 分を取る。"""
+    if not isinstance(value, dict) or not value:
+        return None
+    if "trades" in value:
+        return dict(value) if len(pairs) == 1 else None
+    entry = value.get(pair)
+    return dict(entry) if isinstance(entry, dict) else None
+
+
+def _unknown_value() -> dict:
+    return {"metrics": None, "source": "unknown", "run_id": None}
+
+
+def _reevaluation_previous(conn, previous_row: dict, *, pairs: list[str],
+                           eval_source: str, base_interval: str) -> dict:
+    """前回の承認の in_sample / holdout を、出所つきで pair ごとに返す。
+    holdout が payload に無いときは、前回の承認より前に書かれた承認時の gate の行が
+    pair ごとにちょうど 1 行のときだけ採る。それ以外は不明。"""
+    try:
+        payload = json.loads(previous_row["payload_json"])
+    except (TypeError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    in_sample_source = payload.get("in_sample")
+    if not isinstance(in_sample_source, dict) or not in_sample_source:
+        in_sample_source = payload.get("metrics")
+    source = payload.get("eval_source") or eval_source
+    interval = payload.get("base_interval") or base_interval
+    approved_at = datetime.fromisoformat(previous_row["created_at"])
+    previous = {"approval_id": previous_row["id"], "in_sample": {}, "holdout": {}}
+    for pair in pairs:
+        metrics = _payload_pair_metrics(in_sample_source, pair, pairs)
+        previous["in_sample"][pair] = (
+            {"metrics": metrics, "source": "payload", "run_id": None}
+            if metrics is not None else _unknown_value())
+        metrics = _payload_pair_metrics(payload.get("holdout"), pair, pairs)
+        if metrics is not None:
+            previous["holdout"][pair] = {"metrics": metrics, "source": "payload",
+                                         "run_id": None}
+            continue
+        rows = conn.execute(
+            "SELECT id, metrics_json, created_at FROM backtest_runs WHERE "
+            "scope='holdout_gate' AND variant='candidate' AND mission_outcome='approval' "
+            "AND issued_by='harness' AND content_hash=? AND pair=? AND source=? "
+            "AND base_interval=?",
+            (payload.get("content_hash"), pair, source, interval)).fetchall()
+        matches = [row for row in rows
+                   if datetime.fromisoformat(row["created_at"]) <= approved_at]
+        if len(matches) == 1:
+            try:
+                found = json.loads(matches[0]["metrics_json"])
+            except (TypeError, ValueError):
+                found = None
+            if isinstance(found, dict):
+                previous["holdout"][pair] = {"metrics": found, "source": "run",
+                                             "run_id": matches[0]["id"]}
+                continue
+        previous["holdout"][pair] = _unknown_value()
+    return previous
+
+
+def _write_reevaluation_rows(conn, rows) -> dict:
+    """gate の行を書き、scope と pair ごとの id を返す (tx は呼び出し元)。"""
+    run_ids: dict = {"in_sample": {}, "holdout": {}}
+    for row in rows:
+        scope = "holdout" if row["scope"] == "holdout_gate" else "in_sample"
+        run_id = backtest_runs_store.save_harness_run(
+            conn, commit=False, mission_id=None,
+            mission_outcome=REEVALUATION_MISSION_OUTCOME, **row)
+        if row.get("variant", "candidate") == "candidate":
+            run_ids[scope][row["pair"]] = run_id
+    return run_ids
+
+
+def _evaluate_deployed(conn, snapshot: _Snapshot, *, settings, now, rows: list):
+    return strategy_gate.evaluate_strategy_adoption_gate(
+        conn, meta=snapshot.meta, settings=settings, now=now, resolved=snapshot.resolved,
+        inventory=snapshot.inventory, floor_mode="warn", compare_mode="off",
+        record_fn=rows.append)
+
+
+def reevaluate_deployed(
+    conn: sqlite3.Connection, *, name: str, plugins_root: Path, settings, now: datetime,
+    activity: "ActivityLog | None" = None, gate_fn=None,
+    lock_wait_sec: float = REEVALUATION_LOCK_WAIT_SEC,
+) -> ReevaluationResult:
+    """配備中の strategy 1 本を、今の履歴で評価し直して承認の依頼にする。
+
+    1. lock の中で入力と基準を固定する (同じ鍵の pending があれば評価しない)。
+    2. lock の外で評価する。daemon の signal 投入を止めない。`now` と `settings` は
+       呼び出し側が 1 回だけ読んだものを全 strategy で共通に使う。
+    3. lock を取り直して固定した項目を全部比べ直し、同じなら 1 tx で gate の行と
+       pending を書く。違えば何も書かない。
+
+    評価不能では依頼を作らず、評価不能の理由を activity に残す。失敗 (例外・lock
+    timeout) では何も書かない。配備はどの場合も変えない。"""
+    gate = gate_fn or _evaluate_deployed
+
+    def deadline() -> float:
+        return time.monotonic() + lock_wait_sec
+
+    try:
+        live = plugins_root / name
+        if not loader.is_canonical_plugin_name(name) or not (
+                live.is_symlink() or live.is_dir()):
+            return ReevaluationResult(name, "skipped", reason="not_deployed")
+        if not live.is_symlink():
+            return ReevaluationResult(name, "skipped", reason="plain_plugin")
+        try:
+            lock_names = _live_lock_names(plugins_root, name)
+        except _Skip as skip:
+            return ReevaluationResult(name, "skipped", reason=skip.reason)
+        except OSError:
+            return ReevaluationResult(name, "skipped", reason="not_deployed")
+        with _plugin_locks(plugins_root, lock_names, deadline=deadline(), stop_event=None):
+            try:
+                snapshot = _take_reevaluation_snapshot(
+                    conn, plugins_root, name, settings, lock_names)
+            except _Skip as skip:
+                return ReevaluationResult(name, "skipped", reason=skip.reason)
+            for approval_id, payload in _pending_reevaluations(conn, name):
+                if _reevaluation_key(payload) == snapshot.key():
+                    return ReevaluationResult(name, "existing", approval_id)
+
+        rows: list[dict] = []
+        verdict = gate(conn, snapshot, settings=settings, now=now, rows=rows)
+
+        with _plugin_locks(plugins_root, lock_names, deadline=deadline(), stop_event=None):
+            try:
+                current = _take_reevaluation_snapshot(
+                    conn, plugins_root, name, settings, lock_names)
+            except (_Skip, ValueError):
+                current = None
+            if current is None or current.identity() != snapshot.identity():
+                _reevaluation_activity(
+                    activity, "reevaluation_changed_during_evaluation", f"name={name}")
+                return ReevaluationResult(name, "changed_during_evaluation")
+            if not verdict.evaluable:
+                reason = verdict.observation_reason or verdict.unevaluable_kind
+                if rows and not _store_unevaluable_rows(conn, snapshot, rows):
+                    _reevaluation_activity(
+                        activity, "reevaluation_changed_during_evaluation", f"name={name}")
+                    return ReevaluationResult(name, "changed_during_evaluation")
+                _reevaluation_activity(
+                    activity, "reevaluation_unevaluable", f"name={name} reason={reason}")
+                return ReevaluationResult(name, "unevaluable", reason=reason)
+            return _store_reevaluation(
+                conn, snapshot, verdict, rows, settings=settings, now=now,
+                activity=activity)
+    except Exception as exc:  # noqa: BLE001 - one strategy's failure must not stop the others
+        _reevaluation_activity(
+            activity, "reevaluation_failed",
+            f"name={name} error={type(exc).__name__}: {safe_error_text(exc)}")
+        return ReevaluationResult(name, "failed", reason=type(exc).__name__)
+
+
+def _store_unevaluable_rows(conn, snapshot: _Snapshot, rows: list) -> bool:
+    """評価不能でも生成済みの gate の行は残す。tx の中で履歴の epoch を確かめ、
+    変わっていれば何も書かず False を返す。"""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if history_epoch(conn) != snapshot.history_epoch:
+            conn.rollback()
+            return False
+        _write_reevaluation_rows(conn, rows)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return True
+
+
+def _store_reevaluation(conn, snapshot: _Snapshot, verdict, rows: list, *, settings,
+                        now: datetime, activity) -> ReevaluationResult:
+    """lock の中。gate の行と pending を 1 つの tx に書く。"""
+    from agentic_fx.backtest import holdout
+
+    meta = snapshot.meta
+    name = meta.name
+    dataset = settings.backtest.dataset()
+    pairs = list(meta.pairs)
+    g = settings.improve.gate
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if history_epoch(conn) != snapshot.history_epoch:
+            conn.rollback()
+            _reevaluation_activity(
+                activity, "reevaluation_changed_during_evaluation", f"name={name}")
+            return ReevaluationResult(name, "changed_during_evaluation")
+        stale = []
+        for approval_id, payload in _pending_reevaluations(conn, name):
+            if _reevaluation_key(payload) == snapshot.key():
+                conn.rollback()
+                return ReevaluationResult(name, "existing", approval_id)
+            stale.append(approval_id)
+        for approval_id in stale:
+            approvals_store.apply_decision(
+                conn, approval_id, "invalidated", decided_by="system", now=now,
+                reason="reevaluation_superseded", commit=False)
+        previous_row = dict(conn.execute(
+            "SELECT * FROM approval_requests WHERE id=?",
+            (snapshot.previous_id,)).fetchone())
+        previous = _reevaluation_previous(
+            conn, previous_row, pairs=pairs, eval_source=dataset.source,
+            base_interval=dataset.base_interval)
+        run_ids = _write_reevaluation_rows(conn, rows)
+        payload = {
+            "name": name, "kind": "strategy",
+            "content_hash": meta.content_hash, "artifact_hash": meta.artifact_hash,
+            "candidate_origin": REEVALUATION_ORIGIN,
+            "candidate_path": f"plugins/.versions/{name}/{meta.artifact_hash}",
+            "pairs": pairs,
+            "in_sample": verdict.candidate_metrics or {},
+            "holdout": verdict.holdout_metrics or {},
+            "run_ids": run_ids,
+            "history_epoch": snapshot.history_epoch,
+            "eval_now": holdout._normalize_now(now, dataset.base_interval).isoformat(),
+            "reevaluates_approval_id": snapshot.previous_id,
+            "basis_decision_id": snapshot.decision_id,
+            "deploy_generation": list(snapshot.deploy_generation),
+            "previous": previous,
+            "reason": REEVALUATION_REASON,
+            "floor_warning": verdict.floor_reason,
+            "floor_detail": verdict.floor_detail,
+            "profitability_floor": g.snapshot(),
+            "indicator_deps": snapshot.pins,
+            "eval_source": dataset.source,
+            "base_interval": dataset.base_interval,
+            "eval_timeframe": strategy_gate._eval_timeframe(meta.timeframe),
+            "live_source": settings.datafeed.primary,
+        }
+        approval_id = approvals_store.create(
+            conn, kind="plugin", payload=payload, now=now, commit=False)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    _reevaluation_activity(
+        activity, "reevaluation_created",
+        f"approval_id={approval_id} name={name} content_hash={meta.content_hash} "
+        f"reevaluates_approval_id={snapshot.previous_id}")
+    return ReevaluationResult(name, "created", approval_id)

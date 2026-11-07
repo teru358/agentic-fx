@@ -183,7 +183,8 @@ def in_sample_view(conn: sqlite3.Connection, *,
                     pair: str | None = None) -> list[dict]:
     """改善ループが読む唯一の成績面。period_start/period_end は含めない。"""
     query = (f"SELECT {_VIEW_COLUMNS} FROM backtest_runs "
-             "WHERE scope='in_sample' AND issued_by='harness'")
+             "WHERE scope='in_sample' AND issued_by='harness' "
+             "AND (mission_outcome IS NULL OR mission_outcome <> 'reevaluation')")
     params: list[Any] = []
     if pair is not None:
         query += " AND pair=?"
@@ -205,9 +206,45 @@ def in_sample_view(conn: sqlite3.Connection, *,
     return result
 
 
+def _reevaluated_in_sample_metrics(conn: sqlite3.Connection, name: str, content_hash: str,
+                                   *, pair: str, variant: str, source: str,
+                                   base_interval: str) -> dict | None:
+    """(name, content_hash) の最新の承認が再評価の依頼なら、その依頼が指す
+    in_sample の行の metrics を返す。再評価でなければ、行が無ければ None。"""
+    from agentic_fx.store import approvals as approvals_store
+
+    latest = approvals_store.latest_approved_for_identity(conn, name, content_hash)
+    if latest is None:
+        return None
+    try:
+        payload = json.loads(latest["payload_json"])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("candidate_origin") != "reevaluation":
+        return None
+    run_ids = payload.get("run_ids")
+    in_sample_ids = run_ids.get("in_sample") if isinstance(run_ids, dict) else None
+    run_id = in_sample_ids.get(pair) if isinstance(in_sample_ids, dict) else None
+    if not isinstance(run_id, int) or isinstance(run_id, bool):
+        return None
+    row = conn.execute(
+        "SELECT metrics_json FROM backtest_runs WHERE id=? AND scope='in_sample' "
+        "AND issued_by='harness' AND mission_outcome='reevaluation' AND content_hash=? "
+        "AND pair=? AND variant=? AND source=? AND base_interval=?",
+        (run_id, content_hash, pair, variant, source, base_interval)).fetchone()
+    if row is None:
+        return None
+    try:
+        return _filter_metrics(json.loads(row["metrics_json"]))
+    except (TypeError, ValueError):
+        _log.warning("latest_in_sample_metrics: reevaluation metrics_json decode failed "
+                     "content_hash=%s pair=%s", content_hash, pair)
+        return None
+
+
 def latest_in_sample_metrics(conn: sqlite3.Connection, content_hash: str, *,
                               pair: str, variant: str, source: str,
-                              base_interval: str) -> dict | None:
+                              base_interval: str, name: str | None = None) -> dict | None:
     """指定 content_hash・pair の in_sample 成績のうち最新 1 件の metrics
     を返す。
 
@@ -236,6 +273,12 @@ def latest_in_sample_metrics(conn: sqlite3.Connection, content_hash: str, *,
     (get_signals 側) と同じ fail-open 流儀で、decode 失敗は warning ログ +
     None 返却にする。
     """
+    if name is not None:
+        reevaluated = _reevaluated_in_sample_metrics(
+            conn, name, content_hash, pair=pair, variant=variant, source=source,
+            base_interval=base_interval)
+        if reevaluated is not None:
+            return reevaluated
     row = conn.execute(
         "SELECT metrics_json FROM backtest_runs WHERE scope='in_sample' "
         "AND issued_by='harness' AND content_hash=? AND pair=? "
@@ -297,7 +340,7 @@ def find_matching_approved_metrics(conn: sqlite3.Connection, *, pair: str,
         rows = conn.execute(
             "SELECT content_hash, metrics_json FROM backtest_runs WHERE "
             "scope='in_sample' AND issued_by='harness' AND variant=? "
-            "AND mission_outcome='approval' AND pair=? AND source=? "
+            "AND mission_outcome IN ('approval','reevaluation') AND pair=? AND source=? "
             "AND base_interval=? AND content_hash IN ("
             "SELECT json_extract(payload_json, '$.content_hash') "
             "FROM approval_requests) ORDER BY id",
@@ -306,7 +349,7 @@ def find_matching_approved_metrics(conn: sqlite3.Connection, *, pair: str,
         rows = conn.execute(
             "SELECT content_hash, metrics_json FROM backtest_runs WHERE "
             "scope='in_sample' AND issued_by='harness' AND variant=? "
-            "AND mission_outcome='approval' AND pair=? AND source=? "
+            "AND mission_outcome IN ('approval','reevaluation') AND pair=? AND source=? "
             "AND base_interval=? AND content_hash IN ("
             "SELECT json_extract(payload_json, '$.content_hash') "
             "FROM approval_requests "

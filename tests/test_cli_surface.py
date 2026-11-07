@@ -112,6 +112,7 @@ EXPECTED = (
     ('plugin disable', G.PLUGIN, "LOCAL", 'afx plugin disable <name> …', None, "CHANGE", True, False, None, None, False, '再起動後反映'),
     ('plugin rollback', G.PLUGIN, "LOCAL", 'afx plugin rollback <name> …', None, "CHANGE", True, False, None, None, False, '再起動後反映'),
     ('plugin revoke', G.PLUGIN, "LOCAL", 'afx plugin revoke <name> --version HASH …', None, "CHANGE", True, False, None, None, False, None),
+    ('plugin reevaluate', G.PLUGIN, "LOCAL", 'afx plugin reevaluate [--all-deployed | <name>]', None, "CHANGE", True, False, None, None, False, None),
     ('plugin versions', G.PLUGIN, "LOCAL", 'afx plugin versions <name>', None, "READ", False, False, None, None, False, None),
     ('plugin list', G.PLUGIN, "LOCAL", 'afx plugin list [--kind indicator|strategy]', None, "READ", False, False, None, None, False, None),
     ('ctl approval list', G.PLUGIN, "CTL", 'afx ctl approval list [n]', 'approval list [n]', "READ", False, False, 'approvals.list', 'approval_list', True, None),

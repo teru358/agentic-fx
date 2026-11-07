@@ -166,7 +166,7 @@ def build(conn: sqlite3.Connection, settings: Settings,
                     else backtest_runs.latest_in_sample_metrics(
                         conn, row["content_hash"], pair=row["pair"],
                         variant="candidate", source=dataset.source,
-                        base_interval=dataset.base_interval))
+                        base_interval=dataset.base_interval, name=row["plugin"]))
                 if item["in_sample_metrics"] is not None:
                     item["in_sample_metrics"].pop("eval_bars", None)
                 item["note"] = _ANNOTATION

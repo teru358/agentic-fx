@@ -614,3 +614,49 @@ def test_a_request_based_on_a_revocation_row_is_stale_even_though_the_ids_match(
     outcome = case.approve()
     assert (outcome.outcome, outcome.reason) == ("invalidated", "reevaluation_stale")
     assert case.decision() == (revoked, "rejected")
+
+
+def _stage_candidate(case: Case, tag: str) -> None:
+    staging = case.root / "_staging" / "1" / NAME
+    staging.mkdir(parents=True)
+    (staging / "plugin.py").write_text(
+        f"# {tag}\ndef evaluate(df, indicators, signals, params):\n"
+        "    return {'action': 'hold'}\n")
+    (staging / "config.yaml").write_text(
+        "kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\nexit_mode: levels\n")
+    (staging / "test_plugin.py").write_text("def test_plugin():\n    pass\n")
+
+
+def test_an_ordinary_candidate_submitted_before_the_approval_deploys_after_it(
+        case, monkeypatch):
+    from tests.fixtures.wiring_envs import install_gate_double
+
+    install_gate_double(monkeypatch)
+    _stage_candidate(case, "b")
+    candidate_id = switch.submit_candidate(
+        case.conn, name=NAME, staging_dir=case.root / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None, settings=SETTINGS,
+        now=at(20))
+    deployed_before = case.live_target()
+
+    confirmed = case.approve()
+
+    assert confirmed.outcome == "reevaluation_confirmed"
+    assert case.live_target() == deployed_before
+    assert case.conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                             (candidate_id,)).fetchone()[0] == "pending"
+
+    outcome = switch.approve_candidate(
+        case.conn, candidate_id, decided_by="human", now=at(60), plugins_root=case.root,
+        settings=SETTINGS, activity=case.activity)
+
+    assert outcome.outcome == "deployed"
+    assert case.live_target() != deployed_before
+    assert case.live_target().startswith(f".versions/{NAME}/")
+    journal = case.conn.execute(
+        "SELECT phase FROM plugin_switch_journal WHERE approval_id=?",
+        (candidate_id,)).fetchone()
+    assert journal["phase"] == "decided"
+    assert case.conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                             (candidate_id,)).fetchone()[0] == "approved"
+    assert not (case.root / "_staging" / "1" / NAME).exists()
