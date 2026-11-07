@@ -1,9 +1,9 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 162 件。完了分は closed/。
+未完了: 163 件。完了分は closed/。
 
-## 実装中 (4)
+## 実装中 (3)
 
 ### 不具合 (1)
 
@@ -11,12 +11,11 @@
 |---|---|---|---|
 | [executor-pair-membership-guard](open/executor-pair-membership-guard.md) | 高 | 2026-10-25 | 発注経路に Order.pair ∈ settings.pairs の決定論的検査が無い |
 
-### 機能 (3)
+### 機能 (2)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [improve-mission-indicator-creation-path](open/improve-mission-indicator-creation-path.md) | 中 | 2026-10-25 | 改善 mission に indicator 新設の経路を開く (規律 7 と方針の衝突) |
-| [econ-event-actuals-and-reaction-stats](open/econ-event-actuals-and-reaction-stats.md) | 中 | 2026-10-30 | 指標の発表実績を取得し、種別ごとの価格反応を決定論的に集計する |
 | [multi-timeframe-indicator-deps](open/multi-timeframe-indicator-deps.md) | 低 | 2026-09-15 | 1 つの strategy が複数時間足の指標を同時に使えない |
 
 ## 実装待ち (12)
@@ -71,9 +70,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (140)
+## 設計待ち (142)
 
-### 不具合 (76)
+### 不具合 (77)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -106,6 +105,7 @@
 | [sandbox-to-datetime-and-staging-precheck](open/sandbox-to-datetime-and-staging-precheck.md) | 中 | 2026-10-25 | 改善 sandbox: to_datetime 拒否と test_plugin.py の事前検査欠如 |
 | [ohlcv-cache-retention-cutoff-fixed-at-start](open/ohlcv-cache-retention-cutoff-fixed-at-start.md) | 中 | 2026-11-03 | cache の保持期間 cutoff が起動時刻で固定され再起動まで進まない |
 | [verify-backend-counts-preexisting-descendants](open/verify-backend-counts-preexisting-descendants.md) | 中 | 2026-11-06 | verify_backend が実行前から居た子孫プロセスも未回収と数えて失敗する |
+| [plugin-inherited-filter-test-hits-fingerprint-selftest-first](open/plugin-inherited-filter-test-hits-fingerprint-selftest-first.md) | 中 | 2026-11-07 | 継承 seccomp filter の拒否 test が fingerprint 自己試験の失敗を先に返す |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
 | [tier-a-directive-ignored](open/tier-a-directive-ignored.md) | 中 |  | 自己テストの連続失敗の警告が無視され続け、止める仕組みが無い |
@@ -199,7 +199,7 @@
 | [legacy-e2e-model](open/legacy-e2e-model.md) | 低 |  | backend を切り替えるたびにモデル名の手編集が要る |
 | [legacy-oc-qwen3-8-toolcall](open/legacy-oc-qwen3-8-toolcall.md) | 低 |  | モデルが壊れた引数でツールを連打し予算を焼く |
 
-### 保守 (24)
+### 保守 (25)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -216,6 +216,7 @@
 | [e2e-phase1-full-cycle-flaky](open/e2e-phase1-full-cycle-flaky.md) | 低 | 2026-10-30 | e2e phase1 full_cycle が sleep 0.5 の競合で時々落ちる |
 | [improve-repeat-shutdown-test-flaky](open/improve-repeat-shutdown-test-flaky.md) | 低 | 2026-10-31 | improve_repeat の shutdown test が束でだけ落ちる (flaky) |
 | [time-repair-generalize-beyond-known-fingerprint](open/time-repair-generalize-beyond-known-fingerprint.md) | 低 | 2026-11-03 | repair と cache 誤り行検出を他の利用者の履歴へ一般化する |
+| [first-run-acceptance-doc-lacks-reference-symbols-stage](open/first-run-acceptance-doc-lacks-reference-symbols-stage.md) | 低 | 2026-11-07 | 初回設定の受入手順書がウィザードの参照銘柄の段を引用していない |
 | [improve-e2e-floor-test-flakes-on-wallclock-seconds](open/improve-e2e-floor-test-flakes-on-wallclock-seconds.md) | 低 | 2026-11-07 | improve e2e の床 test が activity 行の時刻の秒に数字が当たると落ちる |
 | [reevaluation-approval-detail-display-polish](open/reevaluation-approval-detail-display-polish.md) | 低 | 2026-11-07 | 再評価の承認詳細の数値が丸められず、旧形式の注記と分類「不明」が出る |
 | [backend-descriptor](open/backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |

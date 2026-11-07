@@ -1,16 +1,16 @@
 ---
 id: econ-event-actuals-and-reaction-stats
 title: 指標の発表実績を取得し、種別ごとの価格反応を決定論的に集計する
-status: 実装中
+status: 是正済
 priority: 中
 kind: 機能
 opened: 2026-10-30
-closed: null
+closed: 2026-11-07
 related: [econ-event-hold-window-deterministic, llm-vs-strategy-signal-authority]
 ---
 # [econ-event-actuals-and-reaction-stats] 指標の発表実績を取得し、種別ごとの価格反応を決定論的に集計する
 
-**状態**: 実装中 / **優先**: 中 / **種別**: 機能
+**状態**: 是正済 / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -22,6 +22,8 @@ econ_events は forecast / previous だけで actual が 1026 件中 0 件 (econ
 
 ## 修正内容
 
+- 2026-11-07: 反応統計 (T1〜T4) を main 8106f486 で配備 (2026-11-07)。econ slice worker の cycle 後処理が終端の event set を DB 再走査して反応値を 1 回だけ保存し、(通貨, 重要度) と (通貨, 名前) の束で median / p75 / n を集計する。値の無い event set は purge しない。trade の cron mission に get_econ_reactions (n 20 未満は insufficient のみ)、ctl status / web に反応統計の欄。反応統計を呼んだ非 signal mission の判断理由は振り返りに渡さない (intent の reasoning_source)。全範囲の判定は既知の失敗と main でも落ちるもの以外は緑。配備後の ctl status で未算定は起動直後の 32 から 0 に、束 99 (床 20 以上 3)。actual の取得は源に無く対象外
+
 ## 経緯
 
 - 2026-10-30: 起票。
@@ -29,3 +31,4 @@ econ_events は forecast / previous だけで actual が 1026 件中 0 件 (econ
 - 2026-11-01: 状態: 実装待ち — 設計 C0 v0.9 (docs/superpowers/specs/2026-11-01-econ-window-signal-authority-shadow-design.md) を 8 周のレビューで清書、J1〜J3 をユーザーが推奨どおり承認。3 件は束 1 (回避帯・採否契約・shadow、T1a〜T5) と束 2 (反応統計、T1〜T4) で実装。actual 取得は対象外 (源に無い)
 - 2026-11-07: 状態: 実装待ち — 束 1 (slice の退避と 1m 規則、反応統計の後処理差込口) は 2026-11-07 に配備 (main c0aa9bb0)。反応統計の集計・tool・人間面は束 2 (T1〜T4)
 - 2026-11-07: 状態: 実装中 — 束 2 着手。前提確認 (sol) で設計 v0.10.5 (反応値は DB 再走査の cycle 後処理、unrecoverable も 3 窓 unresolvable、値の無い event set は purge しない)。利用者が進め方を承認
+- 2026-11-07: 是正内容 — 反応統計 (T1〜T4) を main 8106f486 で配備 (2026-11-07)。econ slice worker の cycle 後処理が終端の event set を DB 再走査して反応値を 1 回だけ保存し、(通貨, 重要度) と (通貨, 名前) の束で median / p75 / n を集計する。値の無い event set は purge しない。trade の cron mission に get_econ_reactions (n 20 未満は insufficient のみ)、ctl status / web に反応統計の欄。反応統計を呼んだ非 signal mission の判断理由は振り返りに渡さない (intent の reasoning_source)。全範囲の判定は既知の失敗と main でも落ちるもの以外は緑。配備後の ctl status で未算定は起動直後の 32 から 0 に、束 99 (床 20 以上 3)。actual の取得は源に無く対象外
