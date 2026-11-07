@@ -6,6 +6,8 @@ import re
 import unicodedata
 from collections.abc import Mapping, Sequence
 
+from afx_ops import display_time
+from afx_ops.display_zone import zone_of
 from afx_ops.metric_words import metric_items
 from afx_ops.web.routes import ROUTE_TABLE, resolve_route
 
@@ -92,14 +94,20 @@ def _is_on(value: object) -> bool:
     return type(value) is dict and (value.get("latched") is True or value.get("active") is True)
 
 
+def _time_text(value: object, tz: str) -> str:
+    """時刻 field の文字列を表示 tz に換算して escape する。換算できなければ原文 (UTC で再試行)。"""
+    return _text(display_time.convert_or_raw(value, tz, display_time.PRECISION_SECOND,
+                                             raw=value, utc_fallback=True))
+
+
 def _pairs(data: object, allowed: frozenset[str], *, nested_allowed: frozenset[str] = frozenset(),
-           emphasis: Mapping[str, str] | None = None) -> str:
+           emphasis: Mapping[str, str] | None = None, tz: str = "UTC") -> str:
     if type(data) is not dict:
         return ""
     rows = []
     for key in sorted(set(data) & allowed):
         value = data[key]
-        shown = _value(value, nested_allowed)
+        shown = _value(value, nested_allowed, tz, key)
         if shown:
             mark = (emphasis or {}).get(key) if _is_on(value) else None
             attr = f' class="{mark}"' if mark else ""
@@ -107,36 +115,48 @@ def _pairs(data: object, allowed: frozenset[str], *, nested_allowed: frozenset[s
     return "<dl>" + "".join(rows) + "</dl>" if rows else ""
 
 
-def _value(value: object, nested_allowed: frozenset[str]) -> str:
-    scalar = _text(value)
+def _value(value: object, nested_allowed: frozenset[str], tz: str = "UTC",
+           key: str | None = None) -> str:
+    if key in display_time.TIME_FIELDS and type(value) is str:
+        scalar = _time_text(value, tz)
+    else:
+        scalar = _text(value)
     if scalar:
         return scalar
     if type(value) is dict and nested_allowed:
-        return _pairs(value, nested_allowed)
+        return _pairs(value, nested_allowed, tz=tz)
     if isinstance(value, list):
-        values = [_value(item, nested_allowed) for item in value[:MAX_ITEMS]]
+        values = [_value(item, nested_allowed, tz, key) for item in value[:MAX_ITEMS]]
         return "<ul>" + "".join(f"<li>{item}</li>" for item in values if item) + "</ul>"
     return ""
 
 
-def _document(title: str, body: str) -> bytes:
+def _zone_line(tz: str | None) -> str:
+    """全ページの上部に出す、換算に使った tz。tz を持たない面 (error) は出さない。"""
+    if tz is None:
+        return ""
+    return "<p>" + html.escape(display_time.display_header(tz), quote=True) + "</p>"
+
+
+def _document(title: str, body: str, tz: str | None = None) -> bytes:
     return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
             + f'<meta http-equiv="refresh" content="{REFRESH_SECONDS}"><title>'
             + html.escape(title, quote=True) + "</title><style>" + STYLE + "</style></head><body>"
-            + _NAV + "<h1>" + html.escape(title, quote=True) + "</h1>" + body
+            + _NAV + "<h1>" + html.escape(title, quote=True) + "</h1>" + _zone_line(tz) + body
             + "</body></html>").encode("utf-8")
 
 
-def _page(title: str, body: str) -> bytes:
-    document = _document(title, body)
+def _page(title: str, body: str, tz: str | None = None) -> bytes:
+    document = _document(title, body, tz)
     if len(document) <= MAX_RESPONSE_BYTES:
         return document
-    return _page(title, "<p>Output clipped</p>")
+    return _page(title, "<p>Output clipped</p>", tz)
 
 
 def render_status(data: Mapping[str, object]) -> bytes:
-    body = _pairs(data, STATUS_FIELDS, nested_allowed=NESTED_FIELDS, emphasis=_EMPHASIS)
-    return _page("Status", body + _calendar_section(data) + _econ_section(data))
+    tz = zone_of(data)
+    body = _pairs(data, STATUS_FIELDS, nested_allowed=NESTED_FIELDS, emphasis=_EMPHASIS, tz=tz)
+    return _page("Status", body + _calendar_section(data) + _econ_section(data, tz), tz)
 
 
 # daemon 側 (agentic_fx.loops.econ_signal_report) の定義の写し。test が突き合わせる。
@@ -180,7 +200,7 @@ def _count_text(value: object) -> str:
     return _num(value) if type(value) is int else "-"
 
 
-def _econ_section(data: Mapping[str, object]) -> str:
+def _econ_section(data: Mapping[str, object], tz: str = "UTC") -> str:
     econ = data.get("econ_signal")
     if type(econ) is not dict:
         return ""
@@ -236,7 +256,7 @@ def _econ_section(data: Mapping[str, object]) -> str:
             if key.endswith("_level") or key == "level":
                 shown = _word(value, _LEVELS)
             elif key == "slice_bytes_measured_at":
-                shown = _text(value) or "-"
+                shown = (_time_text(value, tz) if type(value) is str else _text(value)) or "-"
             elif key == "slice_bytes_stale":
                 shown = "古い" if value is True else ("-" if value is None else "新しい")
             elif key == "measure_outcome":
@@ -271,13 +291,14 @@ def _detail_link(item: dict) -> str:
 def render_approvals(data: Mapping[str, object]) -> bytes:
     approvals = data.get("approvals")
     entries = approvals if isinstance(approvals, list) else []
-    body = "".join("<section>" + _detail_link(item) + _pairs(item, APPROVAL_FIELDS) + "</section>"
+    tz = zone_of(data)
+    body = "".join("<section>" + _detail_link(item) + _pairs(item, APPROVAL_FIELDS, tz=tz) + "</section>"
                    for item in entries[:MAX_ITEMS] if type(item) is dict)
     journals = data.get("open_journals")
     if isinstance(journals, list):
-        body += "".join("<section>" + _pairs(item, JOURNAL_FIELDS) + "</section>"
+        body += "".join("<section>" + _pairs(item, JOURNAL_FIELDS, tz=tz) + "</section>"
                         for item in journals[:MAX_ITEMS] if type(item) is dict)
-    return _page("Pending approvals", body)
+    return _page("Pending approvals", body, tz)
 
 
 def _change_is_well_formed(change: Mapping[str, object]) -> bool:
@@ -364,11 +385,12 @@ def _extra_sections(data: Mapping[str, object]) -> list[str]:
 
 
 def _unchanged_page(data: Mapping[str, object], message: str) -> bytes:
-    body = (_pairs(data, DETAIL_FIELDS, nested_allowed=NESTED_FIELDS)
+    tz = zone_of(data)
+    body = (_pairs(data, DETAIL_FIELDS, nested_allowed=NESTED_FIELDS, tz=tz)
             + "<section><h2>変更内容</h2><p>" + message + "</p></section>")
-    extra = _fit_extra_sections(len(_document("Approval", "")) + _bytes(body), _extra_sections(data))
-    page = _document("Approval", body + "".join(extra))
-    return page if len(page) < PAGE_LIMIT_BYTES else _page("Approval", "<p>Output clipped</p>")
+    extra = _fit_extra_sections(len(_document("Approval", "", tz)) + _bytes(body), _extra_sections(data))
+    page = _document("Approval", body + "".join(extra), tz)
+    return page if len(page) < PAGE_LIMIT_BYTES else _page("Approval", "<p>Output clipped</p>", tz)
 
 
 def render_approval(data: Mapping[str, object], change_data: Mapping[str, object] | None = None) -> bytes:
@@ -459,7 +481,16 @@ def _rows(pairs: list[tuple[str, str]]) -> str:
     return "<dl>" + "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in pairs) + "</dl>"
 
 
-def _overview_section(data: Mapping[str, object], change: Mapping[str, object], parent: bool) -> str:
+def _computed_at(value: object, tz: str) -> str:
+    """計算時刻の手書きの行。表示 tz に換算し、換算できなければ従来どおりの原文 (40 文字まで)。"""
+    if type(value) is not str:
+        return _cut(value, 40)
+    return _cut(display_time.convert_or_raw(value, tz, display_time.PRECISION_SECOND,
+                                            raw=value, utc_fallback=True), 40)
+
+
+def _overview_section(data: Mapping[str, object], change: Mapping[str, object], parent: bool,
+                      tz: str = "UTC") -> str:
     name = change.get("name")
     name = name if type(name) is str and _NAME.match(name) else "-"
     kind = change.get("kind") if change.get("kind") in ("strategy", "indicator", "signal") else "-"
@@ -467,9 +498,9 @@ def _overview_section(data: Mapping[str, object], change: Mapping[str, object], 
     pairs = [("plugin", html.escape(name)), ("kind", kind), ("分類", label),
              ("候補", _hash12(change.get("candidate_hash"))),
              ("比較対象", _hash12(change.get("baseline_hash"))),
-             ("計算時刻", _cut(change.get("computed_at"), 40))]
+             ("計算時刻", _computed_at(change.get("computed_at"), tz))]
     fields = OVERVIEW_FIELDS if parent else OVERVIEW_FIELDS - {"parent_facts"}
-    body = _pairs(data, fields, nested_allowed=NESTED_FIELDS) + _rows(pairs)
+    body = _pairs(data, fields, nested_allowed=NESTED_FIELDS, tz=tz) + _rows(pairs)
     if change.get("classification") == "new":
         body += "<p>前版なし</p>"
     reason = change.get("reason")
@@ -703,12 +734,13 @@ def compose_approval_page(data: Mapping[str, object], change: Mapping[str, objec
         diff_bytes, plans = _bytes(diff_body), []
     diff_html = "<section><h2>変更 diff</h2>" + diff_body + "</section>"
     frame = _bytes(diff_html) - diff_bytes
-    skeleton = len(_document("Approval", ""))
+    tz = zone_of(data)
+    skeleton = len(_document("Approval", "", tz))
     params_total = len(_params_rows(change)[0])
 
     def build(show_params: int | None, claim_limit: int, parent: bool) -> str:
         params_html, _ = _params_section(change, show_params)
-        return (_overview_section(data, change, parent) + params_html
+        return (_overview_section(data, change, parent, tz) + params_html
                 + _performance_section(change) + _claims_section(summary, rationale, claim_limit))
 
     candidates = [(None, CLAIM_CHARS, True)]
@@ -724,10 +756,10 @@ def compose_approval_page(data: Mapping[str, object], change: Mapping[str, objec
     kept = _fit_extra_sections(fixed + _bytes(others), extra_sections)
     extra_html = "".join(kept)
     body = others + (diff_html if diff_body else "")
-    page = _document("Approval", body + extra_html)
+    page = _document("Approval", body + extra_html, tz)
     other_bytes = len(page) - diff_bytes
     if len(page) >= PAGE_LIMIT_BYTES:
-        page = _page("Approval", "<p>Output clipped</p>")
+        page = _page("Approval", "<p>Output clipped</p>", tz)
     return ApprovalPage(page, diff_bytes, other_bytes, plans)
 
 
@@ -735,15 +767,19 @@ def render_log(data: Mapping[str, object]) -> bytes:
     lines = data.get("lines")
     if not isinstance(lines, list):
         lines = data.get("log")
-    values = [_text(line) for line in lines[-MAX_ITEMS:]] if isinstance(lines, list) else []
-    return _page("Log", "<pre>" + "\n".join(item for item in values if item) + "</pre>")
+    tz = zone_of(data)
+    values = ([_text(display_time.convert_log_line(line, tz)) for line in lines[-MAX_ITEMS:]]
+              if isinstance(lines, list) else [])
+    return _page("Log", "<pre>" + "\n".join(item for item in values if item) + "</pre>", tz)
 
 
 def render_activity(data: Mapping[str, object]) -> bytes:
     lines = data.get("lines")
-    values = [_text(line) for line in lines[-MAX_ITEMS:]] if isinstance(lines, list) else []
+    tz = zone_of(data)
+    values = ([_text(display_time.convert_activity_line(line, tz)) for line in lines[-MAX_ITEMS:]]
+              if isinstance(lines, list) else [])
     body = "<pre>" + "\n".join(item for item in values if item) + "</pre>"
-    return _page("Activity", body)
+    return _page("Activity", body, tz)
 
 
 def render_error(status: int) -> bytes:

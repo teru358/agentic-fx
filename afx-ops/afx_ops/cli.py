@@ -38,7 +38,15 @@ RUNTIMES: Mapping[str, Callable[[startup.Isolated], int]] = MappingProxyType({
 })
 
 
+def _preload_zone() -> None:
+    """tz の規則を読む標準の経路と pip の tzdata を、隔離前に import しておく。"""
+    import importlib.resources  # noqa: F401
+
+    import tzdata  # noqa: F401
+
+
 def _preload_bot() -> None:
+    _preload_zone()
     import discord  # noqa: F401
 
     # 業務処理の module も隔離前に読む (隔離後に新しい module を読み込まない)
@@ -46,10 +54,12 @@ def _preload_bot() -> None:
 
 
 def _preload_web() -> None:
+    _preload_zone()
     import aiohttp.web  # noqa: F401
 
 
 def _preload_notify() -> None:
+    _preload_zone()
     import aiohttp  # noqa: F401
 
 

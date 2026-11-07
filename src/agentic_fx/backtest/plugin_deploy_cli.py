@@ -22,6 +22,7 @@ from pathlib import Path
 
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog
+from agentic_fx.core.display_time import effective_tz_name
 from agentic_fx.plugin import deploy_disable, deploy_ops, deploy_retire, deploy_rollback
 from agentic_fx.plugin import deploy_versions
 from agentic_fx.plugin import switch as plugin_switch
@@ -734,6 +735,7 @@ def plugin_versions(settings, args, root: Path) -> int:
         return _emit(_failure(str(exc), "invalid_request"))
     finally:
         conn.close()
-    for line in deploy_versions.render_versions(data):
+    tz = effective_tz_name(getattr(settings, "display_timezone", None))
+    for line in deploy_versions.render_versions(data, tz):
         print(line)
     return RC_OK

@@ -227,7 +227,8 @@ def test_ac14_http_endpoint_returns_json_with_raw_ampersand(api):
     assert response.status_code == 200
     assert "a = b & c < d" in response.text and "&amp;" not in response.text
     data = response.json()["data"]
-    assert data["id"] == approval_id and set(data) == {"id", "change", "claims", "diff"}
+    assert data["id"] == approval_id and set(data) == {
+        "id", "change", "claims", "diff", "display_timezone"}
     missing = api.client(Principal.OPERATOR).get("/v1/approvals/99999/change")
     assert missing.status_code == 404
     assert api.client(Principal.OPERATOR).get(

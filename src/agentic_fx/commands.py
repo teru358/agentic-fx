@@ -11,7 +11,12 @@ from pathlib import Path
 from agentic_fx._safe_error import one_line_error, safe_error_text
 from agentic_fx import metric_words
 from agentic_fx.activity import ActivityLog, Category
+from agentic_fx.core import display_time
+from agentic_fx.core.display_time import (
+    convert_activity_line, convert_log_line, convert_or_raw, display_header,
+    effective_tz_name)
 from agentic_fx.core.contracts import Clock
+from agentic_fx.display_tz import region_name_warning
 from agentic_fx.core.idea_check import idea_looks_unintended, normalize_idea_display
 from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.paper_broker import PaperBroker
@@ -116,6 +121,14 @@ class Commands:
         """status 行に足す econ 集計の読み口 (共有 cache)。status 全体は走らせない。"""
         self.econ_status_source = source
 
+    def _tz(self) -> str:
+        """表示 tz (設定の display_timezone。読めなければ UTC)。"""
+        return effective_tz_name(getattr(self.settings, "display_timezone", None))
+
+    def _when(self, value) -> str:
+        """時刻の値を表示 tz に換算する。換算できないものは元の表記のまま。"""
+        return convert_or_raw(value, self._tz())
+
     def use_ops_service(self, ops_service) -> None:
         """操作 API と同じレーンを使うよう切り替える。
 
@@ -138,7 +151,9 @@ class Commands:
             if cmd == "activity":
                 n = int(args[0]) if args else 20
                 cat = Category(args[1].upper()) if len(args) > 1 else None
-                return "\n".join(self.activity.tail(n, cat)) or "(なし)"
+                tz = self._tz()
+                return "\n".join(convert_activity_line(line, tz)
+                                 for line in self.activity.tail(n, cat)) or "(なし)"
             if cmd == "ask":
                 if not args:
                     return "usage: ask <質問>"
@@ -258,7 +273,7 @@ class Commands:
                         return "kill switch はラッチされていません"
                     return (f"kill switch は LATCHED です "
                             f"(gen={shown.kill_switch_generation} "
-                            f"since={shown.kill_switch_latched_at})。"
+                            f"since={self._when(shown.kill_switch_latched_at)})。"
                             f"解除するには `killswitch reset "
                             f"{shown.kill_switch_generation}` を実行してください")
                 generation = None
@@ -296,10 +311,8 @@ class Commands:
                     self.activity.write(Category.SYSTEM,
                                         "kill_switch_state_uncertain", msg)
                     return msg
-                self.activity.write(
-                    Category.SYSTEM, "kill_switch_reset",
-                    f"human explicit reset via shell gen={generation} "
-                    f"latched_at={before.kill_switch_latched_at}")
+                self.activity.write(*display_time.kill_switch_reset(
+                    generation, before.kill_switch_latched_at))
                 return "kill switch ラッチを解除しました"
             if cmd == "reflect" and len(args) == 2 and args[0] == "retry":
                 order_id = int(args[1])
@@ -588,10 +601,10 @@ class Commands:
             "解除の途中で止まった印があります。新規の取引は止めています。\n"
             f"状態ファイルの値: {file_line} "
             f"(gen={raw.kill_switch_generation} "
-            f"since={raw.kill_switch_latched_at})\n"
+            f"since={self._when(raw.kill_switch_latched_at)})\n"
             f"印の内容: requested_generation="
             f"{marker.get('requested_generation')} "
-            f"started_at={marker.get('started_at')}"
+            f"started_at={self._when(marker.get('started_at'))}"
             + (f" unreadable={marker['unreadable']}"
                if "unreadable" in marker else "") + "\n"
             "ラッチ中として確定するには `killswitch reconcile confirm` を実行して"
@@ -605,11 +618,12 @@ class Commands:
         recent = missions.recent(self.conn, 1)
         last = (f"{recent[0]['loop']}:"
                 f"{econ_signal_report.display_mission_status(recent[0]['status'])} "
-                f"({recent[0]['started_at']})") if recent else "なし"
+                f"({self._when(recent[0]['started_at'])})") if recent else "なし"
         ks = ("LATCHED" + (f" gen={s.kill_switch_generation}"
-                           f" since={s.kill_switch_latched_at}")
+                           f" since={self._when(s.kill_switch_latched_at)}")
               if s.kill_switch_latched else "ok")
-        result = (f"mode: {s.mode.value} / autopilot: "
+        result = (f"{display_header(self._tz())}\n"
+                f"mode: {s.mode.value} / autopilot: "
                 f"{'on' if s.autopilot else 'off'} / kill switch: "
                 f"{ks}\n"
                 f"残高: {balance:,.0f} / エクイティ: {equity:,.0f}\n"
@@ -623,6 +637,9 @@ class Commands:
             result += f"\nhealth: LATCHED ({reasons})"
         if self.outage is not None:
             result += "\n" + self._data_state_line()
+        note = region_name_warning(getattr(self.settings, "display_timezone", "UTC"))
+        if note is not None:
+            result += f"\nwarning: {note}"
         result += self._econ_signal_lines()
         return result
 
@@ -633,7 +650,7 @@ class Commands:
         try:
             econ = self.econ_status_source()
             lines = econ_signal_report.format_econ_lines(
-                econ if isinstance(econ, dict) else None)
+                econ if isinstance(econ, dict) else None, self._tz())
         except Exception:  # noqa: BLE001 - 補助表示は status を止めない
             return ""
         return "".join("\n" + line for line in lines)
@@ -650,7 +667,7 @@ class Commands:
                        if info.get("observe_failed") else "")
         if state == "ready" and info["resume_requested_at"] is None:
             return f"data: ready (epoch {info['epoch']}){failed_note}"
-        gap_texts = [f"{pair}/{interval} since {gs}"
+        gap_texts = [f"{pair}/{interval} since {self._when(gs)}"
                     for (pair, interval), gs in sorted(info["gap_starts"].items())]
         gap_text = "; ".join(gap_texts) if gap_texts else "-"
         resume_text = (f" — resume 要求あり (acknowledge="
@@ -661,12 +678,12 @@ class Commands:
         if detail:
             unprocessed_text += f" ({detail})"
         if state == "restricted":
-            since_text = (f"since {info['restricted_since']}, "
-                          f"deadline {info['restricted_deadline_at']}")
+            since_text = (f"since {self._when(info['restricted_since'])}, "
+                          f"deadline {self._when(info['restricted_deadline_at'])}")
         else:
-            since_text = f"since {info['entered_degraded_at']}"
+            since_text = f"since {self._when(info['entered_degraded_at'])}"
             if info["restricted_since"] is not None:
-                since_text += f", restricted from {info['restricted_since']}"
+                since_text += f", restricted from {self._when(info['restricted_since'])}"
         return (f"data: {state.upper()} (epoch {info['epoch']}, "
                 f"{since_text}, gap: {gap_text}) — "
                 f"{unprocessed_text}{resume_text}{failed_note}")
@@ -853,7 +870,7 @@ class Commands:
             lines.append(
                 f"#{row['id']} kind={row['kind']} "
                 f"name={payload.get('name', '-')} "
-                f"created_at={row['created_at']} "
+                f"created_at={self._when(row['created_at'])} "
                 f"content_hash={content_hash[:8] or '-'}")
         if not lines:
             lines.append("承認待ちはありません")
@@ -899,7 +916,7 @@ class Commands:
         decision_line = (
             f"reason={display_text(row['reason'], approval_facts.CLAIM_DISPLAY_LIMIT)} "
             f"decided_by={display_text(row['decided_by'])} "
-            f"decided_at={display_text(row['decided_at'])}")
+            f"decided_at={self._when(display_text(row['decided_at']))}")
         try:
             payload = (json.loads(row["payload_json"])
                       if row["payload_json"] else {})
@@ -1066,5 +1083,7 @@ class Commands:
         path = self.log_dir / "agentic.log"
         if not path.exists():
             return "(ログなし)"
+        tz = self._tz()
         return "\n".join(
-            path.read_text(encoding="utf-8").splitlines()[-n:])
+            convert_log_line(line, tz)
+            for line in path.read_text(encoding="utf-8").splitlines()[-n:])

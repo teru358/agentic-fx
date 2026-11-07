@@ -72,7 +72,7 @@ def test_status_page_shows_every_econ_item_with_its_value():
                        ("byte_level", "ok"), ("base_bytes", "348160"),
                        ("bytes_per_row", "177"), ("db_bytes", "11"), ("wal_bytes", "12"),
                        ("free_bytes", "13"), ("level", "warn"),
-                       ("slice_bytes_measured_at", "2026-11-06T01:02:03+00:00"),
+                       ("slice_bytes_measured_at", "2026-11-06 01:02:03 +00:00"),
                        ("capacity_override_below_producer", "True")):
         assert cells[f"slice {key}"] == value, key
     assert cells["slice capacity warning"] == "warn"

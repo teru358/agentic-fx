@@ -72,7 +72,11 @@ def test_setup_and_settings_vocabulary_do_not_disturb_other_sources(tmp_path, ca
     assert values["recent mission"].startswith("#1 ")
     assert values["pending approvals"] == "2"
     assert values["plugin deploy ops"] == "none"
-    assert values["recent activity"] == "2026-10-25T00:00:00Z mission started"
+    tokyo = settings == "ok"
+    assert values["recent activity"] == (
+        "2026-10-25 09:00:00 +09:00 mission started" if tokyo
+        else "2026-10-25 00:00:00 +00:00 mission started")
+    assert values["表示 tz"] == ("Asia/Tokyo (+09:00)" if tokyo else "UTC (+00:00)")
     assert values["ops"] == "bot=missing web=missing notify=missing marker=none"
     steps = [line for line in out.splitlines() if line.startswith("  - ")]
     assert values["pending steps"] == str(len(steps))
@@ -132,7 +136,7 @@ def test_database_ok_reports_mission_approvals_and_deploy_ops(tmp_path, capsys):
     root = full_root(tmp_path)
     values = fields(run_status(root, capsys)[1])
     assert values["database"] == "ok"
-    assert values["recent mission"] == "#1 running at 2026-10-25T00:00:00+00:00"
+    assert values["recent mission"] == "#1 running at 2026-10-25 09:00:00 +09:00"
     assert values["pending approvals"] == "2"
     assert values["plugin deploy ops"] == "none"
 
@@ -172,7 +176,7 @@ def test_corrupt_database_is_unavailable_and_the_other_sections_survive(tmp_path
     assert values["pending approvals"] == "unavailable"
     assert values["plugin deploy ops"] == "unavailable"
     assert values["setup"] == "ok" and values["settings"] == "ok"
-    assert values["recent activity"] == "2026-10-25T00:00:00Z mission started"
+    assert values["recent activity"] == "2026-10-25 09:00:00 +09:00 mission started"
     assert values["state"] == "mode=learning kill_switch=clear"
     assert values["unit"].startswith("afx.service=")
     assert manifest(root) == before
@@ -198,7 +202,7 @@ def test_a_missing_table_only_makes_its_own_line_unavailable(tmp_path, capsys, d
         if line != affected:
             assert values[line] != "unavailable", line
     assert values["setup"] == "ok"
-    assert values["recent activity"] == "2026-10-25T00:00:00Z mission started"
+    assert values["recent activity"] == "2026-10-25 09:00:00 +09:00 mission started"
     assert _db_bytes(root) == bytes_before
     assert _user_version(root) == version_before
     assert manifest(root) == tree_before
@@ -291,7 +295,7 @@ def test_enroll_marker_none_feature_invalid(tmp_path, capsys, text, word):
 @pytest.mark.parametrize("case,lines,expected,rc", [
     ("none", None, "none", 0),
     ("empty", [], "none", 0),
-    ("one", ["2026-10-25T01:02:03Z\tpolicy\tpolicy_added\tfree text"], "2026-10-25T01:02:03Z policy policy_added", 0),
+    ("one", ["2026-10-25T01:02:03Z\tpolicy\tpolicy_added\tfree text"], "2026-10-25 10:02:03 +09:00 policy policy_added", 0),
     ("broken", ["no tabs here"], "unavailable", 1),
 ])
 def test_activity_line(tmp_path, capsys, case, lines, expected, rc):
@@ -313,7 +317,7 @@ def test_activity_longer_than_two_hundred_characters_is_cut(tmp_path, capsys):
     write_activity(root, "2026-10-25T01:02:03Z\tpolicy\t" + "word " * 120 + "\tsummary")
     value = fields(run_status(root, capsys)[1])["recent activity"]
     assert 0 < len(value) <= 200
-    assert value.startswith("2026-10-25T01:02:03Z policy word word")
+    assert value.startswith("2026-10-25 10:02:03 +09:00 policy word word")
 
 
 def test_activity_secrets_are_redacted_and_the_summary_field_is_not_shown(tmp_path, capsys):
@@ -328,7 +332,7 @@ def test_activity_secrets_are_redacted_and_the_summary_field_is_not_shown(tmp_pa
 def test_only_the_last_activity_line_is_shown(tmp_path, capsys):
     root = full_root(tmp_path)
     write_activity(root, "2026-10-25T00:00:00Z\tpolicy\told\tx", "2026-10-25T00:00:05Z\tpolicy\tnew\ty")
-    assert fields(run_status(root, capsys)[1])["recent activity"] == "2026-10-25T00:00:05Z policy new"
+    assert fields(run_status(root, capsys)[1])["recent activity"] == "2026-10-25 09:00:05 +09:00 policy new"
 
 
 # pending facts ---------------------------------------------------------------
@@ -519,9 +523,13 @@ def test_an_unreadable_settings_file_degrades_only_the_settings_line(tmp_path, c
 
     assert rc == 0
     assert values["settings"] == "invalid"
-    for other in ("setup", "unit", "ops", "state", "database", "recent mission", "pending approvals",
-                  "plugin deploy ops", "recent activity"):
+    for other in ("setup", "unit", "ops", "state", "database", "pending approvals",
+                  "plugin deploy ops"):
         assert values[other] == healthy[other]
+    # 設定が読めないので表示 tz は UTC に戻り、時刻の欄だけが換算されずに UTC で出る
+    assert values["表示 tz"] == "UTC (+00:00)"
+    assert values["recent mission"] == "#1 running at 2026-10-25 00:00:00 +00:00"
+    assert values["recent activity"] == "2026-10-25 00:00:00 +00:00 mission started"
 
 
 def test_a_failing_pending_collector_keeps_the_pending_steps_line_present(tmp_path, monkeypatch, capsys):
@@ -858,14 +866,14 @@ def test_a_percent_encoded_non_ascii_field_is_redacted_alone(tmp_path, capsys):
     root = full_root(tmp_path)
     write_activity(root, "2026-10-25T01:02:03Z\tpolicy\ttoken=%E3%81%82\tsummary")
     rc, out = run_status(root, capsys)
-    assert fields(out)["recent activity"] == "2026-10-25T01:02:03Z policy [redacted]"
+    assert fields(out)["recent activity"] == "2026-10-25 10:02:03 +09:00 policy [redacted]"
     assert rc == 0
 
 
 def test_a_redacted_category_does_not_hide_the_other_fields(tmp_path, capsys):
     root = full_root(tmp_path)
     write_activity(root, "2026-10-25T01:02:03Z\ttoken=%E3%81%82\tevent\tsummary")
-    assert fields(run_status(root, capsys)[1])["recent activity"] == "2026-10-25T01:02:03Z [redacted] event"
+    assert fields(run_status(root, capsys)[1])["recent activity"] == "2026-10-25 10:02:03 +09:00 [redacted] event"
 
 
 @pytest.mark.parametrize("stdout,rc_code,word", [
@@ -978,6 +986,38 @@ def test_the_state_reader_and_the_state_store_validate_alike(tmp_path):
         assert (status.read_state(root)[0] != "unavailable") is store_ok
 
 
+# 表示 tz ---------------------------------------------------------------------
+
+def test_the_heading_names_the_zone_of_the_settings_and_the_times_follow_it(tmp_path, capsys):
+    root = full_root(tmp_path)
+    path = root / "config" / "settings.yaml"
+    path.write_text(path.read_text().replace("display_timezone: Asia/Tokyo",
+                                             "display_timezone: America/New_York"))
+    out = run_status(root, capsys)[1]
+    assert out.splitlines()[2].startswith("表示 tz: America/New_York (-0")
+    assert fields(out)["recent activity"] == "2026-10-24 20:00:00 -04:00 mission started"
+    assert fields(out)["recent mission"] == "#1 running at 2026-10-24 20:00:00 -04:00"
+    assert "warning" not in out
+
+
+def test_a_non_region_zone_name_adds_a_warning_but_still_converts(tmp_path, capsys):
+    root = full_root(tmp_path)
+    path = root / "config" / "settings.yaml"
+    path.write_text(path.read_text().replace("display_timezone: Asia/Tokyo", "display_timezone: EST"))
+    rc, out = run_status(root, capsys)
+    assert rc == 0
+    assert fields(out)["表示 tz"] == "EST (-05:00)"
+    assert "warning: display_timezone 'EST' は地域名ではありません" in out
+    assert fields(out)["recent activity"] == "2026-10-24 19:00:00 -05:00 mission started"
+
+
+def test_the_offline_status_does_not_load_the_env_file_for_the_zone(tmp_path, capsys, monkeypatch):
+    from agentic_fx import config
+    root = full_root(tmp_path)
+    monkeypatch.setattr(config, "load_env_file", lambda *a: pytest.fail("env loaded"))
+    assert fields(run_status(root, capsys)[1])["表示 tz"] == "Asia/Tokyo (+09:00)"
+
+
 def test_offline_status_counts_econ_signal_abandonment_and_filtered_missions(tmp_path, capsys):
     root = full_root(tmp_path)
     import sqlite3 as _sqlite3
@@ -991,7 +1031,7 @@ def test_offline_status_counts_econ_signal_abandonment_and_filtered_missions(tmp
 
     assert rc == 0
     assert values["recent mission"] == (
-        "#2 system_filtered (filtered, not failed) at 2026-10-25T00:00:00+00:00")
+        "#2 system_filtered (filtered, not failed) at 2026-10-25 09:00:00 +09:00")
     assert "econ signal:" in out.splitlines()
     assert "  missions (latest day): system_filtered=0 failed=0 running=0" in out
     assert "  abandoned (latest day/total): none" in out

@@ -19,6 +19,8 @@ from agentic_fx._safe_error import safe_error_text, safe_text
 from agentic_fx.config import Settings
 from agentic_fx.core import (
     accounting, band_notice, market_hours, time_cutover, transitions)
+from agentic_fx.core import display_time
+from agentic_fx.core.display_time import bar_label
 from agentic_fx.core.contracts import Bar, ConversionRate, Mode, OrderStatus as S
 from agentic_fx.core.executor import Executor, open_risk_and_notional
 from agentic_fx.core.econ_window import WindowSettings
@@ -694,7 +696,7 @@ class Scheduler:
             self._cron_deferred_logged.add(marker)
             self.activity.write(
                 Category.SYSTEM, "cron_mission_deferred",
-                f"{pair} {interval} bar={_fmt_bar(bar_time)} "
+                f"{pair} {interval} bar={bar_label(bar_time)} "
                 f"busy ({_busy_text(result)})")
 
     def _record_cron_coalesced(self, previous: dict) -> None:
@@ -715,9 +717,9 @@ class Scheduler:
             if skipped:
                 self.activity.write(
                     Category.SYSTEM, "cron_mission_coalesced",
-                    f"{pair} {interval} accepted={_fmt_bar(bar_time)} "
+                    f"{pair} {interval} accepted={bar_label(bar_time)} "
                     f"skipped={len(skipped)} "
-                    f"({', '.join(_fmt_bar(t) for t in skipped)})")
+                    f"({', '.join(bar_label(t) for t in skipped)})")
 
     def _drop_previous_session_bars(self, due: dict, now: datetime) -> dict:
         """`W + 足幅 <= session_start(now)` の足 (前セッションの足) では
@@ -731,8 +733,8 @@ class Scheduler:
             for (pair, interval), bar_time in sorted(previous.items()):
                 self.activity.write(
                     Category.SYSTEM, "cron_previous_session_bar_skipped",
-                    f"{pair} {interval} bar={_fmt_bar(bar_time)} "
-                    f"session_start={_fmt_bar(session)}")
+                    f"{pair} {interval} bar={bar_label(bar_time)} "
+                    f"session_start={bar_label(session)}")
         return current
 
     def _restore_cron_cursor(self) -> None:
@@ -799,7 +801,7 @@ class Scheduler:
         self._cron_cursor_failure_logged_this_tick.add(key)
         self.activity.write(
             Category.SYSTEM, "cron_cursor_write_failed",
-            f"{key[0]} {key[1]} bar={_fmt_bar(bar_time)} "
+            f"{key[0]} {key[1]} bar={bar_label(bar_time)} "
             f"dirty={len(self._dirty_cron_cursor)}: {text} — 次 tick で再試行 "
             "(成功までの間に再起動すると同じ足を再判断し得る)")
 
@@ -812,7 +814,7 @@ class Scheduler:
                      key[0], key[1], watermark.isoformat(), cursor.isoformat())
         self.activity.write(
             Category.SYSTEM, "cron_cursor_future_watermark",
-            f"{key[0]} {key[1]} L={_fmt_bar(cursor)} W={_fmt_bar(watermark)} "
+            f"{key[0]} {key[1]} L={bar_label(cursor)} W={bar_label(watermark)} "
             "(この pair の cron 判定を保留、W が L に追いつくと自動で再開)")
 
     def _release_future_cursor(self, key, cursor: datetime,
@@ -820,7 +822,7 @@ class Scheduler:
         self._cron_hold.discard(key)
         self.activity.write(
             Category.SYSTEM, "cron_cursor_future_watermark_resolved",
-            f"{key[0]} {key[1]} L={_fmt_bar(cursor)} W={_fmt_bar(watermark)} "
+            f"{key[0]} {key[1]} L={bar_label(cursor)} W={bar_label(watermark)} "
             "(cron 判定を再開)")
 
     def _load_fetch_anchors(self, now: datetime) -> None:
@@ -852,10 +854,9 @@ class Scheduler:
                 self._last_econ = anchor
             due = anchor + interval
             if due > now:
-                self.activity.write(
-                    Category.NEWS, f"{kind}_fetch_skipped",
-                    f"前回の取得から間もないので次回は "
-                    f"{due.astimezone(timezone.utc):%H:%M} UTC")
+                builder = (display_time.news_fetch_skipped if kind == "news"
+                           else display_time.econ_fetch_skipped)
+                self.activity.write(*builder(due))
 
     def _record_fetch_attempt(self, key: str, now: datetime) -> None:
         # 取得の前に残す: 取得中にプロセスが落ちても「試みた」ことは残る
@@ -1636,7 +1637,7 @@ class Scheduler:
             self.activity.write(
                 Category.TRADE, "limit_fill_suppressed_econ_window",
                 f"#{row['id']} {row['pair']}: 指標回避帯 (成分 {component.id}) "
-                f"と足 {bar.ts.isoformat()} が交差 — 約定を見送り (注文は維持)",
+                f"と足 {bar_label(bar.ts)} が交差 — 約定を見送り (注文は維持)",
                 ref_id=str(row["id"]))
         return True
 
@@ -1839,10 +1840,6 @@ def scheduled_period(settings: Settings, now: datetime) -> ScheduledPeriod:
     return ScheduledPeriod(
         occurrence=occurrence,
         period_key=period_key_of(occurrence, cadence=s.improve))
-
-
-def _fmt_bar(bar_time: datetime) -> str:
-    return bar_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M")
 
 
 def _busy_text(result: SubmitResult) -> str:

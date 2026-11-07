@@ -441,6 +441,20 @@ def op_import_runtime(p, iso):
     return [len(p["modules"]), 0]
 
 
+def op_zone(p, iso):
+    """隔離後に、まだ使っていない zone と互換名を pip の tzdata から作って換算する。"""
+    import zoneinfo
+
+    from afx_ops import display_time
+    return {"tzpath": list(zoneinfo.TZPATH),
+            "new_york_summer": display_time.convert_time(
+                "2026-07-01T00:00:00Z", "America/New_York").text,
+            "new_york_winter": display_time.convert_time(
+                "2026-12-01T00:00:00Z", "America/New_York").text,
+            "japan": display_time.convert_time("2026-07-01T00:00:00Z", "Japan").text,
+            "tokyo": display_time.convert_time("2026-07-01T00:00:00Z", "Asia/Tokyo").text}
+
+
 def op_snapshot_rounds(p, iso):
     """隔離後の state dir で snapshot の書込み・読戻しを繰り返し、thread からも書く。"""
     from afx_ops.snapshot import read_snapshot, write_snapshot

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from logging.handlers import RotatingFileHandler
@@ -38,7 +39,7 @@ import sys
 
 _LOG_DIR = Path(__file__).parent / "logs"
 _LOG_DIR.mkdir(exist_ok=True)
-_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+_LOG_FORMAT = "%(asctime)s UTC [%(levelname)s] %(name)s: %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 # levelname 専用 ANSI 色 (cmd.exe / Windows Terminal / Linux 共通)
@@ -81,6 +82,7 @@ class _ColoredLevelFormatter(logging.Formatter):
         use_colors: bool | None = None,
     ) -> None:
         super().__init__(fmt=fmt, datefmt=datefmt)
+        self.converter = time.gmtime
         if use_colors is None:
             use_colors = sys.stderr.isatty()
         self._use_colors = bool(use_colors)
@@ -107,6 +109,7 @@ def _make_colored_access_formatter(*args, **kwargs):
     class _ColoredAccessFormatter(AccessFormatter):
         def __init__(self, *a, **kw) -> None:
             super().__init__(*a, **kw)
+            self.converter = time.gmtime
             if self.use_colors is None:
                 self.use_colors = sys.stderr.isatty()
 
@@ -128,7 +131,9 @@ _file_handler = RotatingFileHandler(
     backupCount=5,         # bridge.log + bridge.log.1 .. .5 を保持
     encoding="utf-8",
 )
-_file_handler.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt=_DATE_FORMAT))
+_file_formatter = logging.Formatter(_LOG_FORMAT, datefmt=_DATE_FORMAT)
+_file_formatter.converter = time.gmtime
+_file_handler.setFormatter(_file_formatter)
 
 # ターミナル出力 (色付き、tty 検出で自動切替)
 _stream_handler = logging.StreamHandler()
@@ -633,7 +638,7 @@ def _build_log_config() -> dict:
                 # AccessFormatter を継承して levelname も色付け
                 # status_code/request_line の色付けは AccessFormatter 標準のまま
                 "()": _make_colored_access_formatter,
-                "format": "%(asctime)s [%(levelname)s] uvicorn.access: %(client_addr)s - \"%(request_line)s\" %(status_code)s",
+                "format": "%(asctime)s UTC [%(levelname)s] uvicorn.access: %(client_addr)s - \"%(request_line)s\" %(status_code)s",
                 "datefmt": _DATE_FORMAT,
             },
         },

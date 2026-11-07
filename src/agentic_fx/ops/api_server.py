@@ -474,7 +474,8 @@ class ApiServer:
                  monotonic: Callable[[], float] = time.monotonic,
                  wall_clock: Callable[[], datetime] | None = None,
                  notifier=None, service_pid: int | None = None,
-                 pidfd_supported: bool = True) -> None:
+                 pidfd_supported: bool = True,
+                 display_timezone: str = "UTC") -> None:
         _validate_authorization(PRINCIPAL_SCOPES)
         self._ops = ops
         self._keyset = keyset
@@ -483,6 +484,7 @@ class ApiServer:
         self._monotonic = monotonic
         self._service_pid = service_pid if service_pid is not None else os.getpid()
         self._pidfd_supported = pidfd_supported
+        self._display_timezone = display_timezone
         self._notify = _RejectionNotifier(
             notifier, wall_clock or (lambda: datetime.now(timezone.utc)))
         self._listener: socket.socket | None = None
@@ -636,6 +638,8 @@ class ApiServer:
             data = _call(self._ops, route, params, request, principal, deadline, actor)
             if route.method == "GET":
                 _log.debug("api read %s", route.handler)
+            if isinstance(data, dict):
+                data = {**data, "display_timezone": self._display_timezone}
             return route.accepted, {"ok": True, "data": data}
         except _Reject as reject:
             if reject.code == UNAUTHENTICATED:

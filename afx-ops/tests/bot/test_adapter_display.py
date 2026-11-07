@@ -516,7 +516,7 @@ def test_ac30_the_terminal_edit_keeps_the_summary_adds_the_state_and_removes_the
     message_id, kwargs = channel.edits[0]
     assert message_id == 101 and kwargs["view"] is None
     content = kwargs["content"]
-    assert f"状態: {label} (2026-10-19 14:16 UTC)" in content
+    assert f"状態: {label} (2026-10-19 14:16 +00:00)" in content
     assert "承認 #7 / 戦略 sma\\_cross (更新)" in content and "params.period: 14 → 10" in content
     assert "USDJPY" in content and "短い申告です" in content
     assert "ops-bot" not in content and "api:" not in content
@@ -800,7 +800,7 @@ def test_a_pending_post_deleted_before_a_restart_is_reposted_with_summary_perfor
     asyncio.run(adapter.reconcile_startup())
     content = channel.sent[0]["content"]
     assert "params.period: 14 → 10" in content and "USDJPY" in content
-    assert "短い申告です" in content and "期限: 2026-10-26 00:00 UTC" in content
+    assert "短い申告です" in content and "期限: 2026-10-26 00:00 +00:00" in content
 
 
 def test_the_repost_summary_comes_from_the_fetched_detail_not_from_the_record(harness, monkeypatch):

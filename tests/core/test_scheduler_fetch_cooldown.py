@@ -57,8 +57,8 @@ def test_restart_skip_is_reported_once_with_next_time(tmp_path):
     log = _activity(env)
     assert log.count("econ_fetch_skipped") == 1
     assert log.count("news_fetch_skipped") == 1
-    assert "次回は 16:38 UTC" in log          # econ: 10:38 + 6h
-    assert "次回は 11:08 UTC" in log          # news: 10:38 + 30m
+    assert "次回は 2026-07-22T16:38:00Z" in log         # econ: 10:38 + 6h
+    assert "次回は 2026-07-22T11:08:00Z" in log         # news: 10:38 + 30m
 
 
 def test_restart_fetches_news_when_interval_has_just_elapsed(tmp_path):

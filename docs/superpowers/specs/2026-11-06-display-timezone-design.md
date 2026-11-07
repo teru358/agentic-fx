@@ -1,4 +1,4 @@
-# 人に見せる時刻を表示 tz で出せるようにする — 設計 v0.5
+# 人に見せる時刻を表示 tz で出せるようにする — 設計 v0.5.1
 
 チケット: `display-timestamps-in-local-timezone` (機能 / 中)。
 
@@ -85,7 +85,7 @@ afx-ops は独立 package で `agentic_fx` に依存しない (`afx-ops/pyprojec
 2. **換算の部品 (1 module、2 package へ byte 一致で写す)。**
    - stdlib だけで書いた 1 module (`agentic_fx/core/display_time.py`) に、時刻の換算・自由文 token の換算・ログ行頭の換算・時刻 field の集合・本文 builder の表・`bar_label` を置く。**正本は main package 側** (この module と `tests/fixtures/display_time_vectors.json`)。afx-ops 側の `afx_ops/display_time.py` と `afx-ops/tests/fixtures/display_time_vectors.json` は写しで、直接編集しない。変更の手順は「正本を編集 → 写しを更新 → byte 比較 → 両 suite」を同じ変更の中で行う。両 package の test が file 全体の byte 一致を検査する。
    - 時刻の換算: 入力は aware datetime か ISO 文字列、tz 名、精度 (分 / 秒 / ミリ秒)。並びは `YYYY-MM-DD HH:MM[:SS[,mmm]] ±HH:MM` (J1)、精度は面ごとに今と同じ (承認カードの期限・判定時刻と ctl の期限は分、activity と status は秒、agentic.log はミリ秒)。offset は zone に移した後の値の `utcoffset()` から作る (DST 境界で正しい値になる)。
-   - **部品は送出しない**: naive、読めない文字列、`OverflowError`、tz 名の型違い・不正 (`KeyError` / `ValueError` / `TypeError` / `OSError`、`ZoneInfoNotFoundError` を含む) はすべて「換算できない」を返す。
+   - **部品は送出しない**: offset が分で割り切れない zone の時刻 (19 世紀の地方平均時など) は「換算できない」。naive、読めない文字列、`OverflowError`、tz 名の型違い・不正 (`KeyError` / `ValueError` / `TypeError` / `OSError`、`ZoneInfoNotFoundError` を含む) はすべて「換算できない」を返す。
    - 換算できないときの扱いは各面が決める。今の契約を保つ: ctl の期限は naive を UTC とみなす (`ops/client.py:1716-1717`)、承認カードは naive を分まで・不正は出さない、ctl の `_safe_cell` の伏字。
    - 処理の順は「無害化 (伏字) → 換算 → 長さ制限」。
    - 正しさは共通の入出力表 (test vector) で pin する。vector の id は一意で、両 suite が消化した id の集合が vector の id の集合と一致することを確かめる。
@@ -100,12 +100,12 @@ afx-ops は独立 package で `agentic_fx` に依存しない (`afx-ops/pyprojec
 4. **時刻 field の宣言。** 時刻を持つ field の名前を 1 つの集合で宣言し、両 package に置く (byte 一致の module に含める)。初期の集合: `ts`, `created_at`, `updated_at`, `started_at`, `latched_at`, `decided_at`, `computed_at`, `observed_at`, `effective_at`, `deadline_at`, `expires_at`, `first_failed_at`, `last_failed_at`, `last_attempt_at`, `expected_last_attempt_at`, `restricted_since`, `since`, `deadline`, `until`。T1a は DTO を作る箇所 (`ops/service.py`、`ops/events.py`、`ops/api_server.py`、`src/agentic_fx/service.py` の status provider) を grep して名前と代表 path (`status.kill_switch.latched_at`、`approvals[].created_at`、`events[].ts`、`events[].fields.first_failed_at`、`status.gaps[].since`、job の result の cell など) を表にし、集合に足りないものを足す。web は `_value` の全階層で、ctl は `format_event` / `_job_line` など汎用の k=v 描画で、この集合に入る field を一律に換算する。新しいページ・項目は集合に足せば換算される (§0 の要望の本体)。手書きの行 (web の承認詳細の「計算時刻」など) は部品を明示的に呼ぶ。
 5. **ログ行頭の換算 (ctl と web の log / activity、shell の log / activity)。** activity の行は tab 区切り 5 field で、第 1 field が UTC ISO、第 2 field が既知の category のときだけ第 1 field を換算する。agentic.log の行は `YYYY-MM-DD HH:MM:SS,mmm UTC <LEVEL> <logger>:` の形が揃うときだけ時刻を換算する。形が合わない行 (traceback の続き、途中で切れた行、tab を含む疑似行) はそのまま。
 6. **自由文の時刻 token。**
-   - 形: 候補は `(?<![\w.:+-])\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d{1,6})?(Z|[+-]\d\d:\d\d)(?![\w:+-]|\.\d)` で拾い、候補全体を `fromisoformat` で読み、offset がちょうど 0 のもの (`Z`、`+00:00`、`-00:00`) だけを換算する (`+00:00.5`、`Z+09:00`、offset 秒、7 桁以上の小数秒は換算しない。token の直後の `.` や `:` + 空白は句読点として許す)。
+   - 形: 候補は `(?<![\w.:+-])\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d{1,6})?(Z|[+-]\d\d:\d\d)(?![\w+-]|:\S|\.\d)` で拾い、候補全体を `fromisoformat` で読み、offset がちょうど 0 のもの (`Z`、`+00:00`、`-00:00`) だけを換算する (`+00:00.5`、`Z+09:00`、offset 秒、7 桁以上の小数秒は換算しない。token の直後の `.` や `:` + 空白は句読点として許す。`:` の直後が空白でないもの (`+00:00:30` など) は拒否)。
    - 換算するのは「形の正しい activity 行の本文 field (第 4 field) で、`(category, event)` が builder の表の key に入るもの」だけ。LLM の書く本文、agentic.log の本文、形の崩れた行は換算しない。
    - 規則 5 (行頭) と規則 6 (本文) は同じ行に両方適用する。
 7. **時刻を含む本文は builder だけが作る。**
    - 部品の module に builder の表を置く。各 builder は特定の `(category, event)` に束ねられ、`(category, event, body)` を返す (呼出側は `activity.write(*builder(...))` と書く)。表の key の集合が、規則 6 の換算対象の event の集合そのもの (1 つの表)。
-   - builder は時刻を `utc_token(dt)` (秒まで、`Z` 終わり) で埋める。builder は送出しない (`activity.write` は資金保護の経路と `BEGIN IMMEDIATE` の中から呼ばれる、`activity.py:33-48`、`outage.py:220-222,270,292-377`): naive な datetime を受けたら token にせず `naive:` を前に付けた ISO で書く (換算されず、読む人に分かる)。
+   - builder は時刻を `utc_token(dt)` (秒まで、`Z` 終わり) で埋める。builder は送出しない (`activity.write` は資金保護の経路と `BEGIN IMMEDIATE` の中から呼ばれる、`activity.py:33-48`、`outage.py:220-222,270,292-377`): naive な datetime を受けたら token にせず `naive:` を前に付けた ISO で、範囲外の値は `invalid:` を前に付けて書く (換算されず、読む人に分かる)。builder の返す category は文字列 (部品は stdlib だけで `Category` を import しない) で、`ActivityLog.write` は文字列の category を `Category` に正規化して受ける (T1b)。
    - `utc_token(` は部品の module の中 (builder) でだけ使う。足のラベルは `bar_label(dt)` (`YYYY-MM-DDTHH:MM UTC`) で書く。
    - **検査**: (a) 表の各 event について「builder で書く → activity 行 → ctl / shell / web の表示」で換算後の時刻が出る。(b) 補助の AST 検査: daemon の `ActivityLog` に書く module (`src/agentic_fx/` の `backtest/` を除く) で、日時の format spec を持つ f-string (`{x:%H…}` など)、`.format(` の日時指定、`strftime(`、`isoformat()`、部品の module の外での `utc_token(`、`_fmt_bar(` が activity の本文に入る書き方を検出する (直接の引数と、同じ関数内で事前に代入した変数)。変異 (直接・format spec・`.format`・事前代入・別 helper・module 外の `utc_token`) を 1 つずつ足すと落ちる。属性を埋め込むだけの書き方 (`f"latched_at={state.latched_at}"`) は AST で取れないので、§1.2 の一覧を builder へ載せ替えて守る。
 8. **bridge のログを UTC に。** `mt5_bridge/server.py` の file formatter、通常 stream の `_ColoredLevelFormatter`、uvicorn の default formatter、uvicorn の access formatter (動的に派生させるもの) のすべてで `converter = time.gmtime` を使い、各書式に `UTC` を入れる (端末に出る uvicorn の行も UTC になる)。server time の換算は触らない。
@@ -183,4 +183,5 @@ T1a → T1b → T2 の順。T3 は独立。判定は指揮者が回す。
 | 2026-11-06 | v0.2 | 目的を「換算できる仕組み」に、DST、afx-ops の独立 package と隔離、表示面の追加、tz の経路、news、換算不能の扱い、行頭判定、bridge、対象外、J1 / J2 | 利用者の要望、sol r1 (I6 / M3) | — |
 | 2026-11-06 | v0.3 | tz を成功応答 1 か所で付け cache を廃止、部品は送出しない、自由文 token の範囲、書き込み一覧と AST、表示面の追加、web の全階層、byte 一致の写し、小さな読み手、J1 = A、CLI 日時入力は非目標 | 利用者の裁定、opus r2 (I8 / M11) | — |
 | 2026-11-06 | v0.4 | tz の dir を固定、登録 builder + 補助 AST、時刻 field の初期一覧と網羅の pin、正本と更新手順、全 GET / POST、token は候補全体を読む、J1-b の選択肢 | sol r3 (I3 / M5) | — |
+| 2026-11-06 | v0.5.1 | token の lookahead を `(?![\w+-]|:\S|\.\d)` に (`…Z: next` を正例に通す)、範囲外は `invalid:`、分で割り切れない offset は換算できない、builder の category は文字列で `ActivityLog.write` が正規化 | T1a の実装で判明 | — |
 | 2026-11-06 | v0.5 | tz は offset 表記 (J1-b)、UTC も `+00:00`、zone の名前は見出しだけ。afx-ops は pip の tzdata だけを読み Landlock の規則を足さない (`reset_tzpath(to=[])`、preload)。builder は event に束ね送出しない (naive は `naive:` 付き)、`utc_token` は builder の中だけ、`bar_label` で `_fmt_bar` を廃止、AST は daemon の ActivityLog に限る。書き込み一覧に `kill_switch_reset` と `_fmt_bar` の全箇所、時刻 field に `last_attempt_at` / `since`、status provider を grep 対象に、lint の allowlist を名指し、token の lookahead と `-00:00`、§5-4 の引用 test を訂正、最初の写しを T1a に、tz の名前の検査 (規則 10) | 利用者の裁定 (J1-b、略称の設定は却下)、opus r4 (I1 / M9) | — |

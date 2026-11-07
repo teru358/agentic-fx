@@ -60,7 +60,7 @@ def test_ac7_the_post_has_heading_params_performance_claim_deadline_and_guide_in
         "変更:\nparams.period: 14 → 10",
         "成績 (in-sample):\nUSDJPY / trades 120 / PF 1.25 / avg R 0.05",
         "agent の申告 (未検証):\n> 短い申告です",
-        "期限: 2026-10-26 00:00 UTC",
+        "期限: 2026-10-26 00:00 +00:00",
         "詳細: web の承認 #7 / `afx ctl approval 7`",
     ]
     assert "://" not in content and "http" not in content
@@ -266,7 +266,7 @@ def test_ac11_facts_sections_never_contain_the_claim():
             assert section == f"agent の申告 (未検証):\n> {canary}"
         else:
             assert section.split("\n")[0] in {
-                "承認 #7 / 戦略 sma\\_cross (更新)", "期限: 2026-10-26 00:00 UTC", "変更:",
+                "承認 #7 / 戦略 sma\\_cross (更新)", "期限: 2026-10-26 00:00 +00:00", "変更:",
                 "成績 (in-sample):", "詳細: web の承認 #7 / `afx ctl approval 7`"}
     assert "RATIONALE_CANARY" not in content
 
@@ -298,7 +298,7 @@ def test_ac30_a_terminal_post_keeps_the_summary_and_shows_status_and_time(status
         status, decided_by="api:ops-bot", reason="REJECT_REASON"))
     sections = _sections(content)
     assert sections[0] == "承認 #7 / 戦略 sma\\_cross (更新)"
-    assert f"状態: {label} (2026-10-19 14:16 UTC)" in sections
+    assert f"状態: {label} (2026-10-19 14:16 +00:00)" in sections
     assert "変更:\nparams.period: 14 → 10" in sections
     assert any(s.startswith("成績 (in-sample):") for s in sections)
     assert any(s == "agent の申告 (未検証):\n> 短い申告です" for s in sections)
@@ -319,7 +319,7 @@ def test_ac30_a_terminal_post_omits_an_unreadable_time_and_handles_a_legacy_payl
     assert "状態: 承認済み\n\n" in content and "(" not in content.split("状態: 承認済み")[1][:3]
     legacy = render_terminal(_record(state="done"), {"status": "rejected", "change": None,
                                                      "decided_at": "2026-10-19T14:16:00+00:00"})
-    assert legacy == "承認 #7\n\n状態: 却下 (2026-10-19 14:16 UTC)\n\n旧形式のため要約なし"
+    assert legacy == "承認 #7\n\n状態: 却下 (2026-10-19 14:16 +00:00)\n\n旧形式のため要約なし"
 
 
 def test_ac30_the_terminal_post_applies_the_same_escape_and_limit():
@@ -438,12 +438,12 @@ def test_ac7_a_performance_number_is_shown_only_when_it_is_a_finite_number(value
 
 
 @pytest.mark.parametrize("raw,shown", [
-    ("2026-10-26T09:00:00+09:00", "期限: 2026-10-26 00:00 UTC"),
-    ("2026-10-26T00:00:00Z", "期限: 2026-10-26 00:00 UTC"),
+    ("2026-10-26T09:00:00+09:00", "期限: 2026-10-26 00:00 +00:00"),
+    ("2026-10-26T00:00:00Z", "期限: 2026-10-26 00:00 +00:00"),
     ("2026-10-26T00:00:00", "期限: 2026-10-26 00:00"),
     ("2026-10-26T00:00:00." + "1" * 60 + "+00:00", "期限: なし"),
     ("", "期限: なし"), (5, "期限: なし"), (None, "期限: なし")])
-def test_ac7_the_deadline_is_a_utc_minute_when_it_has_a_zone_and_unreadable_values_are_none(
+def test_the_deadline_is_a_minute_in_the_display_zone_when_it_has_a_zone_and_unreadable_values_are_none(
         raw, shown):
     content = render_approval(_record(), _detail(expires_at=raw))
     assert shown in _sections(content)

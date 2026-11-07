@@ -65,7 +65,7 @@ def test_fourteen_answers_change_exactly_twelve_lines_without_reformatting():
     assert len(changed) == 12
     assert len(before) == len(after)
     assert {number: after[number - 1] for number in changed} == {
-        3: "display_timezone: UTC          # [init] ログ・status 表示に使う (保存は常に UTC、市場境界は NY 固定で変更不可)",
+        3: "display_timezone: UTC          # [init] 画面に出す時刻と週次改善の時刻 (improve_at) に効く。変えると次回の改善が数時間前後する。Asia/Tokyo のような地域名で書く (JST・EST・Etc/GMT-9 は不可)。保存は常に UTC、市場境界は NY 固定で変更不可",
         4: "account_currency: USD          # [init] 利用者の基準通貨。損益・リスクの表現と換算に使う。取引可能ペアを制限するものではない (設計書 §5)。実取引では MT5 口座通貨が真で、起動時に照合する",
         23: "    USDJPY: {sl_distance_min_pips: 6, sl_distance_max_pips: 200, assumed_spread_pips: 1.2}",
         27: "  trade: {backend: claude, model: claude-sonnet}          # [init] 取引判断は local または claude",
@@ -187,7 +187,7 @@ def test_missing_block_tab_and_semantic_failure_do_not_edit(monkeypatch):
 
 def test_folded_scalar_is_rejected_without_editing():
     text = EXAMPLE.read_text(encoding="utf-8").replace(
-        "display_timezone: Asia/Tokyo  # [init] ログ・status 表示に使う (保存は常に UTC、市場境界は NY 固定で変更不可)",
+        "display_timezone: Asia/Tokyo  # [init] 画面に出す時刻と週次改善の時刻 (improve_at) に効く。変えると次回の改善が数時間前後する。Asia/Tokyo のような地域名で書く (JST・EST・Etc/GMT-9 は不可)。保存は常に UTC、市場境界は NY 固定で変更不可",
         "display_timezone: >\n  Asia/Tokyo",
     )
 

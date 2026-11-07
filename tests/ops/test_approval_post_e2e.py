@@ -94,7 +94,7 @@ def test_the_terminal_post_of_a_real_decided_approval_keeps_the_summary(ops_env)
     ops_env.conn.commit()
     detail = json.loads(json.dumps(ops_env.service().approval_detail(OPERATOR, approval_id)))
     content = render_terminal(RECORD, detail)
-    assert "状態: 却下 (2026-10-19 14:16 UTC)" in content and "実装の申告" in content
+    assert "状態: 却下 (2026-10-19 14:16 +00:00)" in content and "実装の申告" in content
     assert "api:x" not in content and "REJECT_CANARY" not in content
 
 
@@ -106,4 +106,4 @@ def test_ac7_the_real_detail_carries_the_request_deadline_and_the_post_shows_it(
     ops_env.conn.commit()
     detail = json.loads(json.dumps(ops_env.service().approval_detail(OPERATOR, approval_id)))
     assert detail["expires_at"] == "2026-10-26T09:30:00+00:00"
-    assert "期限: 2026-10-26 09:30 UTC" in render_approval(RECORD, detail)
+    assert "期限: 2026-10-26 09:30 +00:00" in render_approval(RECORD, detail)

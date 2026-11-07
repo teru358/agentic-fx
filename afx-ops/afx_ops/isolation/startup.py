@@ -42,6 +42,7 @@ import socket
 import stat
 import sys
 import sysconfig
+import zoneinfo
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1070,6 +1071,8 @@ def run(plan: StartupPlan, config: OpsConfig, body: Callable[[Isolated], int], *
         with contextlib.ExitStack() as cleanup:
             cleanup.callback(owner.close)
             try:
+                # tz の規則は pip の tzdata だけから読む (system の zoneinfo と PYTHONTZPATH は探さない)
+                zoneinfo.reset_tzpath(to=[])
                 preload()
             except Exception:
                 raise StartupError("runtime_import_failed") from None

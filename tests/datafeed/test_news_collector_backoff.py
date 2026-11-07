@@ -82,7 +82,7 @@ def test_waiting_cycles_do_not_fetch_and_report_skip_once(tmp_path, monkeypatch)
         col.collect()
         col.collect()
     assert len(fetch.calls) == 1
-    assert activity_details(tmp_path, "news_source_skipped") == ["src: 連続 3 回失敗のため 13:00 UTC まで待つ"]
+    assert activity_details(tmp_path, "news_source_skipped") == ["src: 連続 3 回失敗のため 2026-10-25T13:00:00Z まで待つ"]
 
 
 def test_first_cycle_one_second_after_the_deadline_fetches(tmp_path, monkeypatch):
@@ -136,9 +136,9 @@ def test_skip_message_names_each_cause(tmp_path, monkeypatch):
         patch.setattr("agentic_fx.datafeed.news_collector.fetch_feed", Scripted([[]], clock))
         col.collect()
     assert sorted(activity_details(tmp_path, "news_source_skipped")) == [
-        "a: 連続 3 回失敗のため 14:00 UTC まで待つ",
-        "b: 先方の拒否が 4 回続いたため 14:00 UTC まで待つ",
-        "c: 先方の指示により 14:00 UTC まで待つ"]
+        "a: 連続 3 回失敗のため 2026-10-25T14:00:00Z まで待つ",
+        "b: 先方の拒否が 4 回続いたため 2026-10-25T14:00:00Z まで待つ",
+        "c: 先方の指示により 2026-10-25T14:00:00Z まで待つ"]
 
 
 def test_new_collector_instance_keeps_waiting(tmp_path, monkeypatch):
@@ -399,7 +399,7 @@ def test_rewound_clock_retry_after_wait_is_capped_at_a_day_from_now(tmp_path, mo
         patch.setattr("agentic_fx.datafeed.news_collector.fetch_feed", fetch)
         col.collect()
     assert fetch.calls == []
-    assert activity_details(tmp_path, "news_source_skipped") == ["src: 先方の指示により 12:00 UTC まで待つ"]
+    assert activity_details(tmp_path, "news_source_skipped") == ["src: 先方の指示により 2026-10-26T12:00:00Z まで待つ"]
 
 
 def test_corrupt_fetch_attempt_value_means_no_wait(tmp_path, monkeypatch):
