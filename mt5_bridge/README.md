@@ -57,10 +57,12 @@ afx の価格取得だけが目的なら、API キーなしでも動く (発注�
 
 1. Wine 上の bridge 実行 Python に `tzdata==2026.6` を入れる。同じ interpreter で `ZoneInfo("America/New_York")` を引き、夏の日付 (例 7 月) で `-04:00`、冬の日付 (例 1 月) で `-05:00` になることを確認する。
 2. 新しいコードと lock を配備する。
-3. bridge だけを再起動する (ターミナルは触らない)。
-4. 開場中に、認証付きで `/server-time` を呼ぶ。`offset_source` が `"rule"`、`time_rule_state` が `"ok"`、`measured_age_sec` が 300 以下であること。閉場中や tick が動かない間は `unverified` のままになるので、開場中にもう一度呼ぶ。
+3. bridge だけを再起動する (MT5 ターミナルは触らない)。
+4. 開場中に、認証付きで `/server-time` を呼ぶ。`time_rule_state` が `"ok"`、`offset_source` が `"rule"`、`measured_age_sec` が 300 以下であること。閉場中や tick が動かない間は `unverified` のままになるので、開場中にもう一度呼ぶ。
 5. `/health` で `mt5_connected` が `true` であることを確認する。
 6. ここまで通ってから afx を再起動する。`time_rule_state` が `ok` になる前は history import を実行しない。
+
+`bridge.log` に既に記録された行は書き換えない。更新後に記録される行から UTC 表記になり、切替の前後で表記が変わる。
 
 ## セットアップ
 
