@@ -11,7 +11,7 @@ import pytest
 from afx_ops.api_client import ApiError, Reply
 from afx_ops.bot.adapter import BotAdapter, BotFailure, BotSettings, _event_content, _post_effect
 from afx_ops.bot.views import GateView
-from afx_ops.gate.render import primary_view
+from afx_ops.gate.render import confirm_view, primary_view
 from afx_ops.gate.service import GateService
 from afx_ops.gate.state import ApprovalRecord, BotState, load, observe_high
 from afx_ops.gate.types import GateResult
@@ -308,16 +308,34 @@ def test_an_unreadable_event_is_a_payload_failure_and_never_a_silent_skip(tmp_pa
         os.close(fd)
 
 
-def test_reject_is_drawn_as_a_danger_button_and_the_others_as_secondary():
+def _styles(model) -> dict:
     async def build() -> GateView:
         async def noop(interaction) -> None:
             return None
-        return GateView(primary_view(_record()), noop)
+        return GateView(model, noop)
 
     view = asyncio.run(build())
-    styles = {item.label: item.style for item in view.children}
-    assert styles["Reject"] is discord.ButtonStyle.danger
-    assert styles["Approve"] is discord.ButtonStyle.secondary
+    return {item.label: item.style for item in view.children}
+
+
+def test_approve_is_green_reject_is_red_and_retry_is_grey():
+    styles = _styles(primary_view(_record()))
+    assert styles == {"Approve": discord.ButtonStyle.success,
+                      "Reject": discord.ButtonStyle.danger,
+                      "Retry": discord.ButtonStyle.secondary}
+
+
+@pytest.mark.parametrize("action, confirm_style", [
+    ("approve", discord.ButtonStyle.success),
+    ("retry", discord.ButtonStyle.success),
+    ("reject", discord.ButtonStyle.danger),
+])
+def test_confirm_takes_the_colour_of_the_action_it_confirms_and_cancel_is_grey(
+        action, confirm_style):
+    record = _record(state="claimed", actor="discord:" + "1" * 18, action=action,
+                     nonce="n" * 32, expiry=1)
+    styles = _styles(confirm_view(record))
+    assert styles == {"Confirm": confirm_style, "Cancel": discord.ButtonStyle.secondary}
 
 
 def test_an_interaction_ends_by_retiring_the_views_of_terminal_records():

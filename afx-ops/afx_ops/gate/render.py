@@ -379,15 +379,16 @@ def render_terminal(record: ApprovalRecord, detail: object | None) -> str | None
 
 def primary_view(record: ApprovalRecord) -> ViewModel:
     return ViewModel((
-        ViewComponent(encode_custom_id("approve", record.approval_id), "Approve"),
-        ViewComponent(encode_custom_id("reject", record.approval_id), "Reject", True),
+        ViewComponent(encode_custom_id("approve", record.approval_id), "Approve", "positive"),
+        ViewComponent(encode_custom_id("reject", record.approval_id), "Reject", "destructive"),
         ViewComponent(encode_custom_id("retry", record.approval_id), "Retry"),
     ))
 
 
 def confirm_view(record: ApprovalRecord) -> ViewModel:
     return ViewModel((
-        ViewComponent(encode_custom_id("confirm", record.approval_id), "Confirm", True),
+        ViewComponent(encode_custom_id("confirm", record.approval_id), "Confirm",
+                      "destructive" if record.action == "reject" else "positive"),
         ViewComponent(encode_custom_id("cancel", record.approval_id), "Cancel"),
     ), ephemeral=True)
 
