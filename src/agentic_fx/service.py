@@ -98,6 +98,7 @@ from agentic_fx.ops_setup.setup_lease import SetupLeaseBusy, acquire_setup_lease
 from agentic_fx.setup.settings_migrate import CURRENT_SCHEMA_VERSION, _schema_version
 from agentic_fx.store.state import StateStore
 from agentic_fx.setup.pending_facts import collect_pending_facts
+from agentic_fx.display_tz import region_name_warning
 from agentic_fx.setup.pending_steps import pending_steps
 from agentic_fx.setup.pending_text import STEP_PARAMS, render_pending_step, sanitize_param
 from agentic_fx.tools import (
@@ -1061,6 +1062,9 @@ class StartupContext:
 
 def _startup_settings_valid(settings, ctx: StartupContext):
     _validate_startup(settings)
+    note = region_name_warning(settings.display_timezone)
+    if note is not None:
+        _log.warning("%s", note)
     return settings
 
 
@@ -2277,7 +2281,8 @@ def start_ops_api(app: App, root: Path) -> None:
         keyset = ops_keys.load_keyset(directory)
         server = ApiServer(app.ops, keyset, Path(root) / settings.api.socket_path,
                            limits=_api_limits(settings), wall_clock=app.clock.now,
-                           notifier=app.notifier)
+                           notifier=app.notifier,
+                           display_timezone=settings.display_timezone)
         server.start()
     except (ops_keys.KeySetError, ApiStartError) as exc:
         _api_start_failed(app, exc.code)

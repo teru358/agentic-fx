@@ -247,7 +247,7 @@ def test_repeat_accepted_prints_the_first_launch_and_returns_zero(tmp_path):
     assert [m for m, *_ in api.sent].count("POST") == 1
     assert out.splitlines() == [
         f"job {JOB} を受理しました",
-        "improve を繰り返します: 期限 2026-10-26 14:30 UTC (1h30m)、最大 3 回、一時指示あり",
+        "improve を繰り返します: 期限 2026-10-26 14:30 +00:00 (1h30m)、最大 3 回、一時指示あり",
         "1 回目 mission #41 を起動しました",
         f"各 mission の開始・終了は通知に出ます。止める: afx ctl jobs cancel {JOB} "
         "(実行中の mission は完走し、次を始めません)",

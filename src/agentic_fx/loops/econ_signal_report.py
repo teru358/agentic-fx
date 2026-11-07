@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Callable
 
 from agentic_fx._safe_error import safe_error_text
-from agentic_fx.core import market_hours
+from agentic_fx.core import display_time, market_hours
 from agentic_fx.store import ohlcv_slices, signals
 
 _log = logging.getLogger("agentic_fx.loops.econ_signal_report")
@@ -378,8 +378,9 @@ def display_mission_status(status: object) -> str:
     return str(status)
 
 
-def format_econ_lines(econ: dict | None) -> list[str]:
-    """`econ_signal_status` の値を人が読む行にする。取れない節は unavailable。"""
+def format_econ_lines(econ: dict | None, tz: str = "UTC") -> list[str]:
+    """`econ_signal_status` の値を人が読む行にする。取れない節は unavailable。
+    時刻は表示 tz (`tz`) の offset 付きに換算する。換算できなければ元の表記。"""
     if not isinstance(econ, dict):
         return []
     lines = ["econ signal:" + (f" worker={econ['slice_worker']}"
@@ -435,7 +436,7 @@ def format_econ_lines(econ: dict | None) -> list[str]:
             f"free={_fmt(cap.get('free_bytes'))}")
         if not unmeasured:
             lines.append(f"  slice bytes: {_fmt(cap.get('slice_bytes'))} "
-                         f"(measured_at={_fmt(cap.get('slice_bytes_measured_at'))})")
+                         f"(measured_at={_shown_time(cap.get('slice_bytes_measured_at'), tz)})")
         if cap.get("measure_outcome") is not None or cap.get("measure_elapsed_sec") is not None:
             lines.append(f"  slice measure: last={_fmt(cap.get('measure_outcome'))} "
                          f"elapsed={_fmt(cap.get('measure_elapsed_sec'))}s")
@@ -484,6 +485,12 @@ def _shadow_label(row: dict) -> str:
 
 def _fmt(value) -> str:
     return "-" if value is None else str(value)
+
+
+def _shown_time(value, tz: str) -> str:
+    if value is None:
+        return "-"
+    return display_time.convert_or_raw(value, tz)
 
 
 def report_label(close_at: datetime) -> date:

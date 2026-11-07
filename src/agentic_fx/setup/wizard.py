@@ -40,6 +40,7 @@ from agentic_fx.commands import (
 from agentic_fx.config import MAX_STORED_DECISION_INTERVAL_MIN, Settings, load_settings_text
 from agentic_fx.core import improve_admission, landlock
 from agentic_fx.core.contracts import Mode
+from agentic_fx.core.display_time import PRECISION_MINUTE, convert_time
 from agentic_fx.core.idea_check import idea_looks_unintended, normalize_idea_display
 from agentic_fx.core.mission_ceiling import worker_ceiling
 from agentic_fx.core.scheduler import (
@@ -47,6 +48,7 @@ from agentic_fx.core.scheduler import (
 )
 from agentic_fx.datafeed import sources
 from agentic_fx.datafeed import news_probe
+from agentic_fx.display_tz import is_region_name
 from agentic_fx.store import news_sources
 from agentic_fx.logging_setup import setup_technical_logging
 from agentic_fx.ops_setup.interactive import EnableResult, interactive_enable
@@ -442,6 +444,9 @@ def _url_problem(url: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+_SAFE_ZONE_NAME = re.compile(r"[A-Za-z0-9_+\-/]{1,64}")
+
+
 @dataclass
 class Answers:
     display_timezone: str
@@ -476,6 +481,7 @@ class Answers:
     news_sources: list[tuple[str, str]] = field(default_factory=list)
     watch_symbols: list[str] | None = None
     watch_notes: list[str] = field(default_factory=list)
+    zone_note: str | None = None
 
 
 _SOURCE_KEYS = ("yfinance", "mt5", "twelvedata")
@@ -582,9 +588,14 @@ def next_improve_occurrence(settings: Settings, now: datetime) -> datetime:
     raise ValueError("next improve occurrence not found")
 
 
-def _format_occurrence(occurrence: datetime) -> str:
-    weekday = "月火水木金土日"[occurrence.weekday()]
-    return f"{occurrence:%Y-%m-%d} ({weekday}) {occurrence:%H:%M} {occurrence.tzname()}"
+def _format_occurrence(occurrence: datetime, tz_name: str) -> str:
+    """予定時刻を `2026-11-07 (土) 03:00 +09:00` で返す (曜日は表示 tz の暦)。"""
+    converted = convert_time(occurrence, tz_name, PRECISION_MINUTE)
+    if not converted.ok:
+        return occurrence.isoformat(timespec="minutes")
+    date, clock = converted.text.split(" ", 1)
+    weekday = "月火水木金土日"[datetime.fromisoformat(date).weekday()]
+    return f"{date} ({weekday}) {clock}"
 
 
 def _cross_quote_pairs(pairs: Sequence[str], currency: str) -> list[str]:
@@ -772,7 +783,7 @@ def _safe_int(fn: Callable[[], int]) -> int:
 # ---------------------------------------------------------------------------
 
 _HELP_STAGE = {
-    2: "表示タイムゾーンは改善の時刻 (improve_at) の解釈にも使われます。口座通貨と初期残高は後から変えると過去の損益と混ざります。",
+    2: "表示タイムゾーンは画面に出す時刻と改善の時刻 (improve_at) に効きます。変えると次回の改善が数時間前後します。地域名 (Asia/Tokyo など) で書いてください。口座通貨と初期残高は後から変えると過去の損益と混ざります。",
     3: "取引判断と約定判定に使う価格の取得元です。どれを選んでも後の振る舞いが大きく違うので、既定は置いていません。",
     4: "取引判断と改善にそれぞれ LLM を割り当てます。claude / codex はサブスクの枠を使います (従量課金 API ではありません)。",
     5: "1 回の判断が判断足の幅より短い時間で終わらないと、1 足に 1 回の判断が成立しません。",
@@ -785,18 +796,26 @@ def _initial_answers(sess: _Session, st: _Start) -> Answers:
     s = st.base_settings
     balance = s.paper.starting_balance
     zone = s.display_timezone
+    zone_note = None
     if st.mode == "fresh":
-        guess = sess.deps.local_timezone() or "UTC"
+        found = sess.deps.local_timezone()
+        guess = found or "UTC"
         try:
             ZoneInfo(guess)
-            zone = guess
+            zone = guess if is_region_name(guess) else "UTC"
         except (ZoneInfoNotFoundError, ValueError, OSError):
             zone = "UTC"
+        if found is None:
+            zone_note = "この機械の tz を判別できないため、初期値を UTC にしました。"
+        elif zone != guess:
+            shown = f" `{found}`" if _SAFE_ZONE_NAME.fullmatch(found) else ""
+            zone_note = f"この機械の tz{shown} は地域名として読めないため、初期値を UTC にしました。"
     unit_dir = sess.deps.unit_dir or unit_module.default_unit_dir(sess.deps.environ)
     daemon = True if st.mode == "fresh" else (s.api.enabled or (unit_dir / "afx.service").is_file())
     return Answers(
         display_timezone=zone, account_currency=s.account_currency,
         pairs=list(s.pairs), starting_balance=balance, timeframe=s.datafeed.decision_timeframe,
+        zone_note=zone_note,
         api_enabled=s.api.enabled, daemon=daemon, landlock=dict(st.landlock_record))
 
 
@@ -828,12 +847,19 @@ def _stage2(sess: _Session, st: _Start, a: Answers) -> None:
     sess.say("")
     sess.say("[段 2 基本] 表示・口座・対象ペア・初期残高 (まだ何も書きません)")
     help_text = _HELP_STAGE[2]
+    if a.zone_note:
+        sess.say(a.zone_note)
+        a.zone_note = None
     while True:
         zone = sess.text("表示タイムゾーン (例 Asia/Tokyo)", a.display_timezone, help_text=help_text)
         try:
             ZoneInfo(zone)
+            valid = is_region_name(zone)
         except (ZoneInfoNotFoundError, ValueError, OSError):
-            sess.say("'JST' のような略称は使えません。'Asia/Tokyo' のような地域名で入力してください。")
+            valid = False
+        if not valid:
+            sess.say("'JST' や 'EST' のような略称、'Etc/GMT-9' や 'Japan' のような名前は使えません。"
+                     "'America/New_York' のような地域名で入力してください。")
             continue
         a.display_timezone = zone
         break
@@ -982,7 +1008,9 @@ def _stage3_price_choose(sess: _Session, st: _Start, a: Answers) -> None:
         result = _bridge_check(sess, a, url)
         if result.result == "ok":
             server_time = result.params.get("server_time", "")
-            sess.say(f"MT5 bridge OK: {a.pairs[0]} (bridge の時刻 {server_time})")
+            shown = convert_time(server_time, a.display_timezone)
+            sess.say(f"MT5 bridge OK: {a.pairs[0]} (bridge の時刻 "
+                     f"{shown.text if shown.ok else server_time})")
             a.price = _check_record(result)
             a.bridge_plan = "connected"
             _stage3_watch_symbols(sess, st, a, url)
@@ -1736,7 +1764,7 @@ def _stage6(sess: _Session, st: _Start, a: Answers) -> None:
 
 def _next_schedule_text(settings: Settings, now: datetime) -> str:
     occurrence = next_improve_occurrence(settings, now)
-    return _format_occurrence(occurrence)
+    return _format_occurrence(occurrence, settings.display_timezone)
 
 
 def _stage7(sess: _Session, st: _Start, a: Answers) -> None:
@@ -1765,7 +1793,7 @@ def _stage7(sess: _Session, st: _Start, a: Answers) -> None:
         "schedule": schedule.model_copy(update={"improve": a.cadence, "improve_at": a.improve_at})})
     now = sess.now()
     current = scheduled_period(candidate, now)
-    sess.say(f"直近の予定は {_format_occurrence(current.occurrence)} (期 {current.period_key})、"
+    sess.say(f"直近の予定は {_format_occurrence(current.occurrence, candidate.display_timezone)} (期 {current.period_key})、"
              f"次回は {_next_schedule_text(candidate, now)} です。")
     sess.say("  1. 次の予定まで待つ (既定) — 起動直後には走らない。その間に方針文と最初の課題を入れられる")
     sess.say("  2. サービス起動の直後に 1 本走らせる")

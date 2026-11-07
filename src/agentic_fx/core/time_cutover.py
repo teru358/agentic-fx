@@ -19,7 +19,7 @@ from collections.abc import Callable
 from datetime import date, datetime, time, timedelta
 
 from agentic_fx.activity import Category
-from agentic_fx.core import market_hours
+from agentic_fx.core import display_time, market_hours
 from agentic_fx.core.contracts import OrderStatus as S
 from agentic_fx.core.timeutil import as_utc
 
@@ -310,9 +310,7 @@ def _log_activity_once(conn: sqlite3.Connection, activity, t_c: datetime,
         present = activity.contains(ACTIVITY_EVENT, ref)
         if not present:
             activity.end_partial_line()
-            body = {k: v for k, v in capture.items() if k != "activity_logged"}
-            activity.write(Category.SYSTEM, ACTIVITY_EVENT, _dump(body),
-                           ref_id=ref)
+            activity.write(*display_time.time_rule_cutover(capture), ref_id=ref)
             present = activity.contains(ACTIVITY_EVENT, ref)
     except OSError as exc:
         _log.warning("time rule activity check failed: %s", exc)

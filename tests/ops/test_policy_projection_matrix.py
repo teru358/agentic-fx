@@ -115,7 +115,7 @@ def test_policy_endpoints_admit_only_operator_and_approver_over_uds(api5, princi
     if allowed:
         assert show.status_code == 200
         assert show.json()["data"]["managed"][0]["directive"] == "secret directive alpha"
-        assert remove.status_code == 200 and remove.json()["data"] == {"id": 1}
+        assert remove.status_code == 200 and remove.json()["data"] == {"id": 1, "display_timezone": "UTC"}
         assert reconcile.status_code == 200
         assert reconcile.json()["data"]["projection"] == {"status": "ok", "reasons": []}
         assert [row[0] for row in _table(env, "SELECT id FROM ops_policies ORDER BY id")] == [2]

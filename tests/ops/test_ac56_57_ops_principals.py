@@ -135,7 +135,8 @@ def test_ac56_bot_cannot_operate_or_guard_and_web_notify_cannot_change(api5):
     assert web.get(f"/v1/approvals/{approval}").status_code == 200
     who = web.get("/v1/whoami").json()["data"]
     assert who == {"authenticated_principal": "ops-web", "asserted_actor": None,
-                   "scopes": sorted(SPEC_SCOPES["ops-web"])}
+                   "scopes": sorted(SPEC_SCOPES["ops-web"]),
+                   "display_timezone": "UTC"}
 
 
 @pytest.mark.parametrize("principal,allowed", [

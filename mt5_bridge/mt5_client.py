@@ -53,10 +53,10 @@ def _new_york_wall_to_utc(wall: datetime) -> datetime:
     first_round_trip = first_utc.astimezone(NY).replace(tzinfo=None) == wall
     second_round_trip = second_utc.astimezone(NY).replace(tzinfo=None) == wall
     if first_round_trip and second_round_trip and first_utc != second_utc:
-        logger.warning("ambiguous New York server wall time: %s", wall.isoformat())
+        logger.warning("ambiguous New York MT5 server wall time (naive): %s", wall.isoformat())
         return first_utc
     if not first_round_trip or not second_round_trip:
-        logger.warning("nonexistent New York server wall time: %s", wall.isoformat())
+        logger.warning("nonexistent New York MT5 server wall time (naive): %s", wall.isoformat())
         return first_utc
     return first_utc
 

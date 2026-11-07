@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core.contracts import Clock
+from agentic_fx.core.display_time import news_source_skipped
 from agentic_fx.datafeed.fetchers import fetch_feed, fetch_web
 from agentic_fx.datafeed.news_probe import classify_failure
 from agentic_fx.store import fetch_attempts, news_health, news_sources
@@ -139,8 +140,7 @@ class NewsCollector:
             prefix = f"{name}: 先方の拒否が {current.retry_after_streak if current else 0} 回続いたため "
         else:
             prefix = f"{name}: 先方の指示により "
-        self.activity.write(Category.NEWS, "news_source_skipped",
-                            prefix + f"{until.astimezone(timezone.utc):%H:%M} UTC まで待つ")
+        self.activity.write(*news_source_skipped(prefix, until))
 
     def _update_health(self, name: str, raw: str | None,
                        current: news_health.Health | None, outcome: str,

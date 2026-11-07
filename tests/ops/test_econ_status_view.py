@@ -154,7 +154,7 @@ def test_ctl_status_shows_capacity_abandoned_decisions_and_worker(ops_env):
     assert "shadow: accept/system/-:resolved/tp=3" in text
     assert ("slice capacity: rows 80/100 (warn) bytes 400000/10000000 (ok) S=96 "
             "(producer=96 override=120) B0=348160 beta=177 db=11 wal=12 free=13") in text
-    assert "slice bytes: 7000 (measured_at=2026-11-06T01:02:03+00:00)" in text
+    assert "slice bytes: 7000 (measured_at=2026-11-06 01:02:03 +00:00)" in text
     assert "warning: capacity_override_below_producer" in text
     assert "warning: slice capacity warn" in text
 
@@ -336,3 +336,12 @@ def test_the_client_has_no_second_copy_of_the_calendar_words():
     for word in econ_window.FRESHNESS_VALUES:
         assert client._calendar_word({"freshness": word}) == word
     assert client._calendar_word({"freshness": "bogus"}) == "unknown"
+
+
+def test_slice_bytes_measured_at_follows_the_display_zone():
+    from agentic_fx.loops.econ_signal_report import format_econ_lines
+    econ = {"slice_capacity": {"slice_bytes": 7000,
+                               "slice_bytes_measured_at": "2026-11-06T01:02:03+00:00"}}
+    assert "  slice bytes: 7000 (measured_at=2026-11-06 10:02:03 +09:00)" in format_econ_lines(
+        econ, "Asia/Tokyo")
+    assert "(measured_at=-)" not in "".join(format_econ_lines(econ, "Asia/Tokyo"))

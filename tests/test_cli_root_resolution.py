@@ -162,7 +162,8 @@ def test_status_prints_the_resolved_root_right_after_the_title(tmp_path, monkeyp
     assert entry.main(["status"]) in (0, 1)
     lines = capsys.readouterr().out.splitlines()
     assert lines[:2] == ["agentic-fx offline status", f"root: {root}"]
-    assert lines[2].startswith("instance: ")
+    assert lines[2].startswith("表示 tz: ")
+    assert lines[3].startswith("instance: ")
     assert manifest(tmp_path) == before
 
 

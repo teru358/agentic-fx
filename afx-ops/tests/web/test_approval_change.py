@@ -321,7 +321,7 @@ def test_ac25_page_shows_twelve_hash_digits_and_the_computed_time():
     assert f"<dt>候補</dt><dd>{H_CAND[:12]}</dd>" in text
     assert f"<dt>比較対象</dt><dd>{H_BASE[:12]}</dd>" in text
     assert H_CAND[:13] not in text
-    assert "<dt>計算時刻</dt><dd>2026-10-19T01:02:03+00:00</dd>" in text
+    assert "<dt>計算時刻</dt><dd>2026-10-19 01:02:03 +00:00</dd>" in text
 
 
 @pytest.mark.parametrize("cls,label", [("new", "新規"), ("updated", "更新"), ("same", "同一版"),
