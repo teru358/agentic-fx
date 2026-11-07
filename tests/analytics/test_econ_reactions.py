@@ -55,11 +55,16 @@ def test_window_values_uses_baseline_terminal_range_and_full_spread():
     ts = datetime(2026, 11, 9, 12, 0, tzinfo=UTC)
     got = reactions.window_values(_rows(ts, 240), event_ts=ts, pip_size=PIP,
                                   spread_pips=300.0, set_state="complete")
-    assert got == (
-        reactions.WindowValue(15, "resolved", 30.0, 15.0, 15.0, -285.0),
-        reactions.WindowValue(60, "resolved", 120.0, 60.0, 60.0, -240.0),
-        reactions.WindowValue(240, "resolved", 480.0, 240.0, 240.0, -60.0),
+    expected = (
+        (15, "resolved", 30.0, 15.0, 15.0, -285.0),
+        (60, "resolved", 120.0, 60.0, 60.0, -240.0),
+        (240, "resolved", 480.0, 240.0, 240.0, -60.0),
     )
+    # pip への割り算は 2 進の浮動小数で端数が出るので、数値は近似で比べる
+    assert [(v.window_min, v.status) for v in got] == [e[:2] for e in expected]
+    assert [(v.range_pips, v.close_change_pips, v.abs_close_change_pips,
+             v.net_abs_close_change_pips) for v in got] == [
+        pytest.approx(e[2:], abs=1e-9) for e in expected]
 
 
 def test_window_status_is_independent_and_baseline_marker_invalidates_each_window():

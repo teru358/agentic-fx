@@ -839,6 +839,8 @@ def purgeable_sets(conn: sqlite3.Connection, *, now: datetime, limit: int,
     return [r[0] for r in conn.execute(
         "SELECT id FROM ohlcv_slice_sets WHERE state IN (?,?) "
         "AND purged_at IS NULL AND created_at < ? AND id > ? "
+        "AND (event_id IS NULL OR (SELECT COUNT(*) FROM econ_reaction_values rv "
+        "WHERE rv.set_id=ohlcv_slice_sets.id)=3) "
         "ORDER BY id LIMIT ?",
         (STATE_COMPLETE, STATE_UNRECOVERABLE,
          _purge_cutoff(now, retention_days),
@@ -857,7 +859,9 @@ def purge_step(conn: sqlite3.Connection, *, set_id: int, now: datetime,
     def body():
         if conn.execute(
                 "SELECT 1 FROM ohlcv_slice_sets WHERE id=? AND state IN (?,?) "
-                "AND purged_at IS NULL AND created_at < ?",
+                "AND purged_at IS NULL AND created_at < ? "
+                "AND (event_id IS NULL OR (SELECT COUNT(*) FROM econ_reaction_values rv "
+                "WHERE rv.set_id=ohlcv_slice_sets.id)=3)",
                 (set_id, STATE_COMPLETE, STATE_UNRECOVERABLE,
                  cutoff)).fetchone() is None:
             raise Conflict

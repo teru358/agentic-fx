@@ -38,6 +38,7 @@ from agentic_fx.core import transitions
 from agentic_fx.core.contracts import Clock, Mode, SystemClock
 from agentic_fx.core.econ_slice_worker import CapacityMeasurer, EconSliceWorker
 from agentic_fx.core.econ_window import WindowSettings, currencies_by_pair
+from agentic_fx.analytics.econ_reaction_pass import run_pass as run_econ_reaction_pass
 from agentic_fx.core.executor import Executor
 from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.notifier import Notifier
@@ -1949,7 +1950,12 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             quote_fn=lambda pair: executor.quote_fn(pair),
             pip_size_fn=lambda pair: executor.spec_fn(pair).pip_size,
             assumed_spread_pips_fn=lambda pair: _assumed_spread_pips(settings, pair),
-            now_fn=clock.now)
+            now_fn=clock.now,
+            after_cycle=lambda context: run_econ_reaction_pass(
+                read=context.read, write=context.write, stopped=context.stopped,
+                pair_currencies=currencies_by_pair(settings.pairs, executor.spec_fn),
+                pip_size_fn=lambda pair: executor.spec_fn(pair).pip_size,
+                now=context.now))
         econ_measurer = CapacityMeasurer(
             open_conn=lambda: connect_readonly(root / "data" / "agentic.db"),
             measure_fn=econ_signal_report.slice_related_bytes, now_fn=clock.now)

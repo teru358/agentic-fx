@@ -164,6 +164,14 @@ def _classify(staged: Sequence[SliceRow], want: Sequence[SliceRow]) -> str:
     return "match" if len(staged) == len(want) else "partial"
 
 
+@dataclass(frozen=True, slots=True)
+class CycleContext:
+    read: Callable[[Callable[[sqlite3.Connection], object]], object]
+    write: Callable[[Callable[[sqlite3.Connection, object, object], object]], object]
+    stopped: Callable[[], bool]
+    now: datetime
+
+
 class EconSliceWorker:
     def __init__(self, *, read_conn: sqlite3.Connection,
                  write_conn: sqlite3.Connection, core_lock: threading.RLock,
@@ -175,6 +183,7 @@ class EconSliceWorker:
                  monotonic: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep,
                  on_complete: Callable[[dict], None] | None = None,
+                 after_cycle: Callable[["CycleContext"], None] | None = None,
                  interval_sec: float = CYCLE_INTERVAL_SEC) -> None:
         self._read = read_conn
         self._write_conn = write_conn
@@ -187,6 +196,7 @@ class EconSliceWorker:
         self._monotonic = monotonic
         self._sleep = sleep
         self._on_complete = on_complete
+        self._after_cycle = after_cycle
         self._interval = interval_sec
         self._generation: int | None = None
         self._commit_seconds: deque[float] = deque(maxlen=256)
@@ -286,6 +296,17 @@ class EconSliceWorker:
         self._sweep_cancelled()
         self._purge_once(now)
         self._resolve_owners(now)
+        if self._after_cycle is not None:
+            context = CycleContext(
+                read=self._reading,
+                write=lambda op: self._write(
+                    lambda begin, checkpoint: op(self._write_conn, begin, checkpoint),
+                    locked=True),
+                stopped=self._stopped, now=now)
+            try:
+                self._after_cycle(context)
+            except Exception:
+                _log.exception("econ slice after_cycle failed")
         self._purge(now)
         self._report.yielded = self._abort and not self._exhausted()
         self._report.budget_exhausted = self._exhausted()
