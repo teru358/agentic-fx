@@ -6,7 +6,8 @@ from datetime import datetime
 from typing import Mapping, Sequence
 
 from agentic_fx.analytics.econ_reactions import (RULE_VERSION, ReactionSample, WindowValue,
-                                                  BundleStats, aggregate)
+                                                  BundleStats, aggregate,
+                                                  canonical_pair, event_currencies)
 from agentic_fx.store.ohlcv_slices import (STATE_COMPLETE, STATE_UNRECOVERABLE,
                                             Begin, Checkpoint, Conflict, TxResult,
                                             begin_immediate, short_tx)
@@ -29,8 +30,8 @@ def pending_sets(conn: sqlite3.Connection, *, pair_currencies: Mapping[str, tupl
         if n not in (0, 3):
             continue
         if n == 3:
-            currencies = _currencies(row['country'], pair_currencies)
-            todo = [c for c in currencies if _canonical(c, pair_currencies) == row['pair'] and
+            currencies = event_currencies(row['country'], pair_currencies)
+            todo = [c for c in currencies if canonical_pair(c, pair_currencies) == row['pair'] and
                     conn.execute("SELECT 1 FROM econ_reaction_keys WHERE event_id=? AND currency=?",
                                  (row['event_id'], c)).fetchone() is None]
             if not todo: continue
@@ -38,15 +39,6 @@ def pending_sets(conn: sqlite3.Connection, *, pair_currencies: Mapping[str, tupl
         out.append(row)
         if len(out) >= limit: break
     return out
-
-
-def _currencies(country, pairs):
-    if country == 'All': return tuple(dict.fromkeys(c for pair in pairs.values() for c in pair))
-    return (country,) if any(country in cs for cs in pairs.values()) else ()
-
-
-def _canonical(currency, pairs):
-    return next((p for p, cs in pairs.items() if currency in cs), None)
 
 
 def write_set_tx(conn: sqlite3.Connection, *, set_id: int, values: Sequence[WindowValue],
@@ -69,7 +61,6 @@ def write_set_tx(conn: sqlite3.Connection, *, set_id: int, values: Sequence[Wind
 
 def load_samples(conn: sqlite3.Connection) -> tuple[ReactionSample, ...]:
     rows = conn.execute("SELECT k.event_id,k.currency,e.importance,e.name,e.ts,v.window_min,v.status,v.range_pips,v.close_change_pips,v.abs_close_change_pips,v.net_abs_close_change_pips FROM econ_reaction_keys k JOIN econ_events e ON e.id=k.event_id JOIN econ_reaction_values v ON v.set_id=k.set_id JOIN ohlcv_slice_sets ss ON ss.id=k.set_id WHERE e.superseded_by IS NULL ORDER BY k.event_id,k.currency,v.window_min").fetchall()
-    from datetime import datetime
     return tuple(ReactionSample(r[0], r[1], r[2], r[3], datetime.fromisoformat(r[4]),
         WindowValue(r[5], r[6], r[7], r[8], r[9], r[10])) for r in rows)
 
@@ -86,6 +77,6 @@ def backlog_counts(conn: sqlite3.Connection, *, pair_currencies: Mapping[str, tu
     for row in sets:
         count = conn.execute("SELECT COUNT(*) FROM econ_reaction_values WHERE set_id=?", (row[0],)).fetchone()[0]
         if count != 3: no_values += 1
-        currencies = _currencies(row[2], pair_currencies)
+        currencies = event_currencies(row[2], pair_currencies)
         if not currencies: keyless_events.add(row[1])
     return {"sets_without_values": no_values, "events_without_currency_key": len(keyless_events)}

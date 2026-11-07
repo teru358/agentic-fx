@@ -57,6 +57,32 @@ def test_build_app_builds_the_worker_with_its_own_connections(tmp_path):
         app.close()
 
 
+def test_the_worker_runs_the_reaction_pass_with_settings_pairs_and_pip_sizes(tmp_path):
+    from agentic_fx.core.econ_slice_worker import CycleContext
+    from agentic_fx.core.econ_window import currencies_by_pair
+    _init(tmp_path)
+    seen = []
+    with patch("agentic_fx.service.run_econ_reaction_pass",
+               lambda **kwargs: seen.append(kwargs)):
+        app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                        embedding_fn=FakeEmbedding())
+        try:
+            assert app.econ_worker._after_cycle is not None
+            context = CycleContext(read=lambda fn: None, write=lambda op: None,
+                                   stopped=lambda: False, now=NOW)
+            app.econ_worker._after_cycle(context)
+            [kwargs] = seen
+            assert kwargs["pair_currencies"] == currencies_by_pair(
+                app.settings.pairs, app.executor.spec_fn)
+            assert kwargs["pair_currencies"]
+            pair = app.settings.pairs[0]
+            assert kwargs["pip_size_fn"](pair) == app.executor.spec_fn(pair).pip_size
+            assert (kwargs["read"], kwargs["write"], kwargs["stopped"], kwargs["now"]) == (
+                context.read, context.write, context.stopped, NOW)
+        finally:
+            app.close()
+
+
 def test_the_worker_reads_quote_pip_and_assumed_spread_like_the_trade_loop(tmp_path):
     app = _build(tmp_path)
     try:

@@ -768,7 +768,16 @@ def test_unrecoverable_event_and_shadow_owners(tmp_path):
 
 # --- purge ---------------------------------------------------------------
 
-def _complete_event_set(conn, eid, *, created_at):
+def _give_reaction_values(conn, set_id):
+    conn.executemany(
+        "INSERT INTO econ_reaction_values (set_id,window_min,status,range_pips,"
+        "close_change_pips,abs_close_change_pips,net_abs_close_change_pips,"
+        "rule_version,computed_at) VALUES (?,?,'resolved',1,1,1,0,1,?)",
+        [(set_id, w, NOW.isoformat()) for w in (15, 60, 240)])
+    conn.commit()
+
+
+def _complete_event_set(conn, eid, *, created_at, values=True):
     set_id = _event_set(conn, eid)
     gen = os_.new_generation(conn, now=NOW)
     _stage_all(conn, set_id, gen, _bars(TS - timedelta(minutes=15), 255))
@@ -777,24 +786,22 @@ def _complete_event_set(conn, eid, *, created_at):
     conn.execute("UPDATE ohlcv_slice_sets SET created_at=? WHERE id=?",
                  (created_at.isoformat(), set_id))
     conn.commit()
+    if values:
+        _give_reaction_values(conn, set_id)
     return set_id
 
 
 def test_purge_removes_rows_only_after_the_retention_days(tmp_path):
     conn = _conn(tmp_path)
     cutoff = NOW - timedelta(days=os_.RETENTION_DAYS)
-    old = _complete_event_set(conn, _event(conn),
+    old = _complete_event_set(conn, _event(conn), values=False,
                               created_at=cutoff - timedelta(microseconds=1))
     edge = _complete_event_set(conn, _event(conn, name="PPI"),
                                created_at=cutoff)
     awaiting = _event_set(conn, _event(conn, name="GDP"))
     conn.execute("UPDATE ohlcv_slice_sets SET created_at=? WHERE id=?",
                  ((cutoff - timedelta(days=1)).isoformat(), awaiting))
-    conn.execute(
-        "INSERT INTO econ_reaction_values (set_id,window_min,status,range_pips,"
-        "close_change_pips,abs_close_change_pips,net_abs_close_change_pips,"
-        "rule_version,computed_at) VALUES (?,15,'resolved',1,1,1,0,1,?)",
-        (old, NOW.isoformat()))
+    _give_reaction_values(conn, old)
     conn.execute("INSERT INTO econ_reaction_keys (event_id,currency,set_id,"
                  "decided_at) SELECT event_id,'USD',id,? FROM ohlcv_slice_sets "
                  "WHERE id=?", (NOW.isoformat(), old))
@@ -823,6 +830,34 @@ def test_purge_removes_rows_only_after_the_retention_days(tmp_path):
     conn.rollback()
     with pytest.raises(ValueError, match="at least"):
         os_.purgeable_sets(conn, now=NOW, limit=10, retention_days=399)
+
+
+def test_an_event_set_without_three_reaction_values_is_not_purged(tmp_path):
+    conn = _conn(tmp_path)
+    old = NOW - timedelta(days=os_.RETENTION_DAYS + 1)
+    bare = _complete_event_set(conn, _event(conn, name="A"), created_at=old,
+                               values=False)
+    partial = _complete_event_set(conn, _event(conn, name="B"), created_at=old,
+                                  values=False)
+    conn.execute(
+        "INSERT INTO econ_reaction_values (set_id,window_min,status,rule_version,"
+        "computed_at) VALUES (?,15,'unresolvable',1,?)", (partial, NOW.isoformat()))
+    full = _complete_event_set(conn, _event(conn, name="C"), created_at=old)
+    conn.commit()
+    assert os_.purgeable_sets(conn, now=NOW, limit=10) == [full]
+    for set_id in (bare, partial):
+        assert os_.purge_step(conn, set_id=set_id, now=NOW).status == "conflict"
+        assert _rows_of(conn, set_id) == 255
+        assert os_.get_set(conn, set_id)["purged_at"] is None
+    assert os_.purge_step(conn, set_id=full, now=NOW).rows == 240
+    for window in (15, 60, 240):
+        conn.execute(
+            "INSERT OR IGNORE INTO econ_reaction_values (set_id,window_min,status,"
+            "rule_version,computed_at) VALUES (?,?,'unresolvable',1,?)",
+            (partial, window, NOW.isoformat()))
+    conn.commit()
+    assert partial in os_.purgeable_sets(conn, now=NOW, limit=10)
+    assert os_.purge_step(conn, set_id=partial, now=NOW).rows == 240
 
 
 def test_purgeable_sets_after_returns_only_later_ids_in_order(tmp_path):
