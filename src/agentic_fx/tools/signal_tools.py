@@ -128,6 +128,7 @@ def build(conn: sqlite3.Connection, settings: Settings,
         rows = signals.recent(conn, pair, since=since,
                               exclude_deploy_linked=True)
         result: list[dict] = []
+        reevaluation_cache: dict = {}
         for row in rows:
             try:
                 payload = json.loads(row["payload_json"])
@@ -166,7 +167,8 @@ def build(conn: sqlite3.Connection, settings: Settings,
                     else backtest_runs.latest_in_sample_metrics(
                         conn, row["content_hash"], pair=row["pair"],
                         variant="candidate", source=dataset.source,
-                        base_interval=dataset.base_interval, name=row["plugin"]))
+                        base_interval=dataset.base_interval, name=row["plugin"],
+                        reevaluation_cache=reevaluation_cache))
                 if item["in_sample_metrics"] is not None:
                     item["in_sample_metrics"].pop("eval_bars", None)
                 item["note"] = _ANNOTATION

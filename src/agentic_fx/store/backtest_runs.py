@@ -206,21 +206,39 @@ def in_sample_view(conn: sqlite3.Connection, *,
     return result
 
 
-def _reevaluated_in_sample_metrics(conn: sqlite3.Connection, name: str, content_hash: str,
-                                   *, pair: str, variant: str, source: str,
-                                   base_interval: str) -> dict | None:
-    """(name, content_hash) の最新の承認が再評価の依頼なら、その依頼が指す
-    in_sample の行の metrics を返す。再評価でなければ、行が無ければ None。"""
+def _reevaluation_payload(conn: sqlite3.Connection, name: str, content_hash: str,
+                          cache: dict | None) -> dict | None:
+    """(name, content_hash) の最新の承認が再評価の依頼ならその payload を返す。
+    承認の走査が失敗したときは再評価前の値に戻すため None (警告ログ 1 回)。
+    cache があれば同じ (name, content_hash) の結果を使い回す。"""
     from agentic_fx.store import approvals as approvals_store
 
-    latest = approvals_store.latest_approved_for_identity(conn, name, content_hash)
-    if latest is None:
-        return None
+    key = (name, content_hash)
+    if cache is not None and key in cache:
+        return cache[key]
+    payload = None
     try:
-        payload = json.loads(latest["payload_json"])
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(payload, dict) or payload.get("candidate_origin") != "reevaluation":
+        latest = approvals_store.latest_approved_for_identity(conn, name, content_hash)
+        if latest is not None:
+            loaded = json.loads(latest["payload_json"])
+            if isinstance(loaded, dict) and loaded.get("candidate_origin") == "reevaluation":
+                payload = loaded
+    except Exception:
+        _log.warning("latest_in_sample_metrics: reevaluation lookup failed "
+                     "content_hash=%s — using the earlier numbers", content_hash)
+        payload = None
+    if cache is not None:
+        cache[key] = payload
+    return payload
+
+
+def _reevaluated_in_sample_metrics(conn: sqlite3.Connection, name: str, content_hash: str,
+                                   *, pair: str, variant: str, source: str,
+                                   base_interval: str, cache: dict | None = None) -> dict | None:
+    """(name, content_hash) の最新の承認が再評価の依頼なら、その依頼が指す
+    in_sample の行の metrics を返す。再評価でなければ、行が無ければ None。"""
+    payload = _reevaluation_payload(conn, name, content_hash, cache)
+    if payload is None:
         return None
     run_ids = payload.get("run_ids")
     in_sample_ids = run_ids.get("in_sample") if isinstance(run_ids, dict) else None
@@ -244,7 +262,8 @@ def _reevaluated_in_sample_metrics(conn: sqlite3.Connection, name: str, content_
 
 def latest_in_sample_metrics(conn: sqlite3.Connection, content_hash: str, *,
                               pair: str, variant: str, source: str,
-                              base_interval: str, name: str | None = None) -> dict | None:
+                              base_interval: str, name: str | None = None,
+                              reevaluation_cache: dict | None = None) -> dict | None:
     """指定 content_hash・pair の in_sample 成績のうち最新 1 件の metrics
     を返す。
 
@@ -276,7 +295,7 @@ def latest_in_sample_metrics(conn: sqlite3.Connection, content_hash: str, *,
     if name is not None:
         reevaluated = _reevaluated_in_sample_metrics(
             conn, name, content_hash, pair=pair, variant=variant, source=source,
-            base_interval=base_interval)
+            base_interval=base_interval, cache=reevaluation_cache)
         if reevaluated is not None:
             return reevaluated
     row = conn.execute(

@@ -538,21 +538,30 @@ class BotAdapter:
 
     def _with_reject_warning(self, request: Interaction, result: GateResult) -> GateResult:
         """再評価の依頼の Reject の確認文に、配備を停止することを明記する。
-        daemon の詳細が読めない・再評価でないときは、gate の確認文のまま。"""
+        daemon への問合せは承認ごとの先送り (429 / 503) に従い、読めない・先送り中は
+        「配備を止める可能性がある」固定の警告を出す。再評価でないと分かれば gate の確認文のまま。"""
         try:
             action, approval_id = decode_custom_id(request.custom_id)
         except CustomIdError:
             return result
         if action != "reject" or result.confirm_view is None:
             return result
+        unknown = GateResult(reevaluation_text.UNKNOWN_REJECT_WARNING, result.effects,
+                             result.confirm_view, result.decision)
+        if not self._poll_due(approval_id):
+            return unknown
         try:
             reply = self.client.approval(approval_id)
-        except Exception:  # noqa: BLE001 — 確認文の補足なので、読めなくても gate の文を返す
-            return result
+        except Exception:  # noqa: BLE001 — 確認文の補足が取れないときは固定の警告にする
+            return unknown
+        self._observe(approval_id, reply)
         data = getattr(reply, "data", None)
         status = getattr(reply, "status", 0)
-        if not (200 <= status < 300 and reevaluation_text.is_reevaluation(data)):
+        if status == 404 or (200 <= status < 300 and type(data) is dict
+                             and not reevaluation_text.is_reevaluation(data)):
             return result
+        if not (200 <= status < 300 and reevaluation_text.is_reevaluation(data)):
+            return unknown
         view = data.get("reevaluation") if type(data.get("reevaluation")) is dict else {}
         change = data.get("change") if type(data.get("change")) is dict else {}
         name = (reevaluation_text.safe_name(view.get("name"))

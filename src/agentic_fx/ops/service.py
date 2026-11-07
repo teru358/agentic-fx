@@ -1000,7 +1000,7 @@ class OpsService:
         gate = approval_facts.gate_fields(payload)
         if gate:
             gate["gate_lines"] = approval_facts.gate_lines(payload)
-        reevaluation = self._reevaluation_detail(payload, row["status"])
+        reevaluation = self._reevaluation_detail(payload, row["status"], row["decided_at"])
         return {**gate, **reevaluation,
                 "id": approval_id, "kind": display_text(row["kind"]),
                 "status": row["status"], "change": change,
@@ -1018,34 +1018,38 @@ class OpsService:
                 "expires_at": row["expires_at"],
                 "asserted_actor": None}
 
-    def _reevaluation_detail(self, payload: dict, status: str) -> dict:
+    def _reevaluation_detail(self, payload: dict, status: str,
+                             decided_at: str | None = None) -> dict:
         """再評価の依頼だけに足す field。bot と web が通常の承認と見分け、前回との比較を出す。
         却下済みなら配備停止の段階 (`deploy_phase`) も持つ。"""
         from . import reevaluation_view
+        if payload.get("candidate_origin") != reevaluation_view.ORIGIN:
+            return {}
         try:
             view = reevaluation_view.build_view(self._conn, payload)
         except Exception:  # noqa: BLE001 — 表示の材料は読めなくても詳細全体は返す
             _log.error("reevaluation view failed")
             view = None
-        if payload.get("candidate_origin") != reevaluation_view.ORIGIN:
-            return {}
         detail = {"candidate_origin": reevaluation_view.ORIGIN, "reevaluation": view,
                   "deploy_phase": None}
         if status == "rejected":
             try:
-                detail["deploy_phase"] = self._reevaluation_deploy_phase(payload)
+                detail["deploy_phase"] = self._reevaluation_deploy_phase(payload, decided_at)
             except Exception:  # noqa: BLE001
                 _log.error("reevaluation deploy phase failed")
         return detail
 
-    def _reevaluation_deploy_phase(self, payload: dict) -> str | None:
-        """却下が作った配備停止の op の今の段階 (done / needs_retry / foreign)。"""
+    def _reevaluation_deploy_phase(self, payload: dict, decided_at: str | None) -> str | None:
+        """却下が作った配備停止の op の今の段階 (done / needs_retry / foreign)。
+        op は却下と同じ tx・同じ時刻で作られるので、決定時刻と作成時刻の一致で結ぶ。"""
+        if decided_at is None:
+            return None
         row = self._conn.execute(
             "SELECT phase FROM plugin_deploy_ops WHERE op_kind='disable_symlink' AND name=? "
             "AND subject_content_hash=? AND subject_artifact_hash=? AND approval_id IS ? "
-            "ORDER BY op_id DESC LIMIT 1",
+            "AND created_at=? ORDER BY op_id DESC LIMIT 1",
             (payload.get("name"), payload.get("content_hash"), payload.get("artifact_hash"),
-             payload.get("reevaluates_approval_id"))).fetchone()
+             payload.get("reevaluates_approval_id"), decided_at)).fetchone()
         return row["phase"] if row is not None and row["phase"] in (
             "done", "needs_retry", "foreign") else None
 

@@ -116,7 +116,7 @@ def test_the_terminal_card_of_a_rejection_follows_the_deploy_phase(phase, expect
 
 def test_the_terminal_card_of_a_confirmed_request_says_the_deployment_is_unchanged():
     content = render_terminal(RECORD, _detail(status="approved"))
-    assert "根拠を差し替えました (配備は変わりません)" in content
+    assert "再評価の結果で承認の根拠を差し替えました (配備は変わりません)" in content
     assert "配備されました" not in content
 
 
@@ -130,7 +130,7 @@ def _text(payload):
 
 @pytest.mark.parametrize("state,fields,expected", [
     ("approved", {"candidate_origin": "reevaluation"},
-     "承認 #7 (plugin sma_cross): 根拠を差し替えました (配備は変わりません)。"),
+     "承認 #7 (plugin sma_cross): 再評価の結果で承認の根拠を差し替えました (配備は変わりません)。"),
     ("rejected", {"candidate_origin": "reevaluation", "deploy_phase": "done"},
      "却下し、配備を停止しました。"),
     ("rejected", {"candidate_origin": "reevaluation", "deploy_phase": "needs_retry"},
@@ -173,6 +173,8 @@ class _Client:
 def _adapter(client):
     adapter = BotAdapter.__new__(BotAdapter)
     adapter.client = client
+    adapter._next_poll_at = {}
+    adapter._now = lambda: 100.0
     return adapter
 
 
@@ -201,6 +203,25 @@ def test_only_a_reject_gets_the_stop_warning(action):
 @pytest.mark.parametrize("reply", [
     Reply(200, _detail(candidate_origin=None), None),
     Reply(200, {"status": "pending", "change": CHANGE}, None),
-    Reply(500, None, None), Reply(404, None, None), RuntimeError("down")])
-def test_an_ordinary_or_unreadable_approval_keeps_the_gate_text(reply):
+    Reply(404, None, None)])
+def test_an_ordinary_approval_keeps_the_gate_text(reply):
     assert _adapter(_Client(reply))._with_reject_warning(_request("reject"), CONFIRM) is CONFIRM
+
+
+@pytest.mark.parametrize("reply", [
+    Reply(500, None, None), Reply(429, None, 30), Reply(503, None, None),
+    RuntimeError("down")])
+def test_an_unreadable_approval_gets_the_fixed_possible_stop_warning(reply):
+    result = _adapter(_Client(reply))._with_reject_warning(_request("reject"), CONFIRM)
+    assert result.text == "Reject で配備を止める可能性があります"
+    assert result.confirm_view is CONFIRM.confirm_view
+
+
+def test_a_throttled_reply_defers_the_next_question_for_that_approval():
+    client = _Client(Reply(429, None, 30))
+    adapter = _adapter(client)
+    adapter._with_reject_warning(_request("reject"), CONFIRM)
+    second = adapter._with_reject_warning(_request("reject"), CONFIRM)
+    assert client.asked == [7]
+    assert second.text == "Reject で配備を止める可能性があります"
+    assert adapter._next_poll_at[7] > 100.0

@@ -19,11 +19,12 @@ _NAME = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 
 HEADING = "再評価"
 NO_CODE_CHANGE = "コード変更なし。承認すると承認の根拠だけを差し替え、配備は変わりません"
+UNKNOWN_REJECT_WARNING = "Reject で配備を止める可能性があります"
 STOP_HINT = "配備を止めるなら `afx plugin disable {name}`"
 PERIOD_NOTE = "(期間が違う比較です)"
 STALE_TEXT = ("依頼が古いため無効にしました。配備は変えていません。"
               "再評価をやり直してください")
-CONFIRMED_TEXT = "根拠を差し替えました (配備は変わりません)"
+CONFIRMED_TEXT = "再評価の結果で承認の根拠を差し替えました (配備は変わりません)"
 REJECT_TEXT = {
     "done": "却下し、配備を停止しました",
     "needs_retry": ("却下しました。取引は止まりましたが symlink を外せていません。"

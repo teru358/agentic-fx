@@ -71,6 +71,17 @@ def test_an_ordinary_approval_detail_has_no_reevaluation_field(ops_env):
     assert not {"candidate_origin", "reevaluation", "deploy_phase"} & set(detail)
 
 
+def test_an_ordinary_approval_detail_does_not_build_a_reevaluation_view(ops_env, monkeypatch):
+    approval_id = ops_env.make_plugin_approval()
+    calls = []
+    monkeypatch.setattr(reevaluation_view, "build_view",
+                        lambda *args: calls.append(args))
+
+    ops_env.service().approval_detail(OPERATOR, approval_id)
+
+    assert calls == []
+
+
 def test_a_view_keeps_only_finite_numbers_and_known_sources(fx, ops_env):
     payload = _with_comparison(fx, ops_env)
     payload["in_sample"]["USDJPY"] = {"pf": "x", "trades": True, "avg_r": float("inf"),
@@ -95,6 +106,27 @@ def test_a_rejected_request_reports_how_far_the_stop_went(fx, ops_env, deploy_ph
     detail = ops_env.service().approval_detail(OPERATOR, fx.approval_id)
 
     assert detail["status"] == "rejected" and detail["deploy_phase"] == deploy_phase
+
+
+def test_a_later_disable_of_the_same_version_does_not_change_the_rejected_requests_phase(
+        fx, ops_env):
+    from agentic_fx.store import plugin_deploy_ops
+    _run(ops_env, ops_env.service(), "reject", fx.approval_id)
+    plugin_deploy_ops.insert_intent(
+        ops_env.conn, op_kind="disable_symlink", name=NAME, from_kind="symlink",
+        to_kind="absent", from_target=fx.target, to_target=None, retired_path=None,
+        subject_content_hash=fx.content, subject_artifact_hash=fx.artifact,
+        target_content_hash=None, target_artifact_hash=None, approval_id=fx.basis,
+        revoke=False, revoke_row_id=None, force=False, actor="human_cli",
+        now=datetime(2030, 1, 1, tzinfo=timezone.utc))
+    ops_env.conn.execute("UPDATE plugin_deploy_ops SET phase='needs_retry', "
+                         "fail_reason='syscall_failed' WHERE op_id=("
+                         "SELECT MAX(op_id) FROM plugin_deploy_ops)")
+    ops_env.conn.commit()
+
+    detail = ops_env.service().approval_detail(OPERATOR, fx.approval_id)
+
+    assert detail["deploy_phase"] == "done"
 
 
 # ---------------------------------------------------------------- shell の承認詳細
@@ -345,7 +377,14 @@ def test_the_wording_in_afx_ops_matches_the_daemon_side():
     assert other.REJECT_TEXT == reevaluation_view.REJECT_TEXT
     assert other.STALE_TEXT == reevaluation_view.STALE_TEXT
     assert other.STOP_HINT == reevaluation_view.STOP_HINT
+    assert other.CONFIRMED_TEXT == reevaluation_view.CONFIRMED_TEXT
     assert other.reject_warning("x", "却下") == reevaluation_view.reject_warning("x")
     assert other.NO_CODE_CHANGE in "\n".join(reevaluation_view.lines(
         {"reevaluates_approval_id": 1}, lambda v: v))
     assert other.METRIC_KEYS == reevaluation_view.METRIC_KEYS
+    assert other.SCOPES == reevaluation_view.SCOPES
+    assert other._SOURCE_TEXT == reevaluation_view._SOURCE_TEXT
+    daemon_lines = "\n".join(reevaluation_view.lines(
+        {"reevaluates_approval_id": 1}, lambda v: v))
+    assert daemon_lines.startswith(other.HEADING)
+    assert other.PERIOD_NOTE.strip("()") in daemon_lines
