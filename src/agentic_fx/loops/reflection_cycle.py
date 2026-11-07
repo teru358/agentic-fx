@@ -48,6 +48,26 @@ _SCHEMA = {"type": "object",
            "required": ["content"]}
 
 
+_REASONING_WITHHELD = (
+    "この取引の判断理由は反応統計を参照したため振り返りに渡さない")
+_REASONING_SOURCE_UNKNOWN = (
+    "この取引の判断理由の出所が記録されていないため振り返りに渡さない")
+
+
+def _entry_reasoning(intent: dict | None) -> str | None:
+    """振り返りへ渡す entry reasoning。intent が無ければ None。出所が
+    strategy / llm のものだけ reasoning を渡し、反応統計を参照した判断と
+    出所不明 (配備前の intent) は固定文にする。"""
+    if intent is None:
+        return None
+    source = intent.get("reasoning_source")
+    if source in ("strategy", "llm"):
+        return intent.get("reasoning")
+    if source == "llm_with_reactions":
+        return _REASONING_WITHHELD
+    return _REASONING_SOURCE_UNKNOWN
+
+
 class ReflectionCycle:
     def __init__(self, *, conn: sqlite3.Connection, runner: AgentRunner,
                  rag: Rag, settings: Settings, activity: ActivityLog,
@@ -150,7 +170,7 @@ class ReflectionCycle:
                               "id", "pair", "direction", "horizon", "quantity",
                               "avg_fill_price", "close_price", "realized_pnl",
                               "close_reason")},
-                              "entry_reasoning": (intent or {}).get("reasoning")},
+                              "entry_reasoning": _entry_reasoning(intent)},
                               ensure_ascii=False, indent=1))
 
                 mission = Mission(

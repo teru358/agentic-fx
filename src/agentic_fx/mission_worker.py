@@ -118,6 +118,24 @@ def _build_clock() -> "Clock":
     return SystemClock()
 
 
+_COUNTED_TRADE_TOOLS = ("get_ohlcv", "get_indicators", "get_econ_reactions")
+
+
+def new_market_tool_counter() -> tuple[
+        Callable[[str, bool, str | None], None], dict[str, int]]:
+    """trade mission の tool 呼出し回数の hook と、その回数 dict を返す。
+
+    registry の実行ごとに 1 回数える (引数不正・例外・error 応答も含む)。
+    `get_econ_reactions` の回数は、反応統計を見た判断かどうかの判定に使う。"""
+    calls = {name: 0 for name in _COUNTED_TRADE_TOOLS}
+
+    def count(name: str, _ok: bool, _error: str | None) -> None:
+        if name in calls:
+            calls[name] += 1
+
+    return count, calls
+
+
 def _build_trade_indicator_metas(conn, plugins_dir, settings) -> list:
     """[indicator-consumption-wiring] §2.3: **これは producer とは別の
     composition root** — 子が handshake の `plugins_dir` から
@@ -1146,12 +1164,7 @@ def main(*, build_runner: Callable[..., Any] | None = None) -> None:
                        if handshake.get("plugins_dir") else None)
         approved = _build_trade_indicator_metas(conn, plugins_dir, settings)
 
-        market_tool_calls = {"get_ohlcv": 0, "get_indicators": 0}
-
-        def count_market_tool_result(
-                name: str, _ok: bool, _error: str | None) -> None:
-            if name in market_tool_calls:
-                market_tool_calls[name] += 1
+        count_market_tool_result, market_tool_calls = new_market_tool_counter()
 
         # CR-3 対応: `main()` 冒頭で構築した out_seq を、_RagRpcProxy と
         # on_message (event フレーム送出) の両方に**同一インスタンス**で

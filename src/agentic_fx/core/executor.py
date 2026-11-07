@@ -454,8 +454,9 @@ class Executor:
 
     # ---- public ---------------------------------------------------------
 
-    def record_and_validate_intent(self, intent: TradeIntent,
-                                   mission_id: int) -> tuple[int, dict | None]:
+    def record_and_validate_intent(
+            self, intent: TradeIntent, mission_id: int, *,
+            reasoning_source: str | None = None) -> tuple[int, dict | None]:
         """intent の DB 記録 (常に行う) + HOLD 短絡 + origin/loop 検証
         (プラン8 五相再構成 — `handle_intent` から分割。判定ロジックは
         1 文字も変えていない)。
@@ -467,8 +468,9 @@ class Executor:
         """
         now = self.clock.now()
         iid = intents_store.insert(self.conn, mission_id,
-                                   intent_payload(intent), now,
-                                   action=intent.action.value)
+                                   intent_payload(
+                                       intent, reasoning_source=reasoning_source),
+                                   now, action=intent.action.value)
         if intent.action is Action.HOLD:
             self.activity.write(Category.AGGREGATE, "hold",
                                 intent.reasoning[:120], ref_id=str(iid))
@@ -1195,8 +1197,12 @@ class Executor:
         return {"result": result, "order_id": row["id"], "reasons": []}
 
 
-def intent_payload(intent: TradeIntent) -> dict:
-    return {
+def intent_payload(intent: TradeIntent, *,
+                   reasoning_source: str | None = None) -> dict:
+    """`reasoning_source` は reasoning の出所 (strategy / llm /
+    llm_with_reactions)。振り返りへ reasoning を渡してよいかの判定に使う。
+    None のときはキーを持たない。"""
+    payload = {
         "action": intent.action.value, "origin": intent.origin.value,
         "pair": intent.pair,
         "direction": intent.direction.value if intent.direction else None,
@@ -1207,3 +1213,6 @@ def intent_payload(intent: TradeIntent) -> dict:
         "take_profit": intent.take_profit, "confidence": intent.confidence,
         "reasoning": intent.reasoning, "ref_price": intent.ref_price,
     }
+    if reasoning_source is not None:
+        payload["reasoning_source"] = reasoning_source
+    return payload

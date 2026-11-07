@@ -256,10 +256,23 @@ def test_reaction_values_reach_no_agent_surface(tmp_path):
     cycle = ReflectionCycle(conn=conn, runner=reflect_runner, rag=rag, settings=SETTINGS,
                             activity=ActivityLog(tmp_path / "r.log"), clock=FixedClock(NOW),
                             core_lock=threading.RLock())
+    quoting = ("反応統計の range_median は 7777.25、close_change_median は 4242.5 "
+               "(ReactCanaryName, n=unique_ts_n)")
+    mission_id = conn.execute(
+        "INSERT INTO missions (loop, runner, model, status, started_at) "
+        "VALUES ('trade', 'fake', 'fake', 'completed', ?) RETURNING id",
+        (NOW.isoformat(),)).fetchone()[0]
+    intent_id = conn.execute(
+        "INSERT INTO trade_intents (mission_id, payload_json, created_at) "
+        "VALUES (?, ?, ?) RETURNING id",
+        (mission_id, json.dumps({"reasoning": quoting,
+                                 "reasoning_source": "llm_with_reactions"}),
+         NOW.isoformat())).fetchone()[0]
+    conn.commit()
     orders.insert(conn, pair="USDJPY", direction="long", entry_type="market",
                   horizon="day", status=OrderStatus.CLOSED, now=NOW, quantity=0.1,
                   realized_pnl=-1500.0, close_reason="sl", avg_fill_price=148.5,
-                  close_price=148.0)
+                  close_price=148.0, intent_id=intent_id)
     assert cycle.run_pending() == 1
     assert len(reflect_runner.missions) == 1
     surfaces["reflection_prompt"] = reflect_runner.missions[0].prompt
