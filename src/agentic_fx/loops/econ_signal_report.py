@@ -576,21 +576,39 @@ def _report_name(label: date) -> str:
     return f"econ-signal-{label.isoformat()}.md"
 
 
-def _open_reports_dir(reports_dir: Path, *, create: bool) -> int:
-    """保存 dir を symlink を辿らずに開く。作るときも末尾を辿らない。"""
+def _open_reports_dir(reports_dir: Path, *, create: bool,
+                      anchor: Path | None = None) -> int:
+    """保存 dir を symlink を辿らずに開く。
+
+    `anchor` (信頼する dir、本番は instance root) から下の各段を `O_NOFOLLOW` で 1 段ずつ
+    開くので、祖先の symlink も辿らない。`create` なら無い段を 0700 で作る。`anchor` を
+    渡さなければ親 dir を起点にする (末尾の 1 段だけを守る)。
+    """
     reports_dir = Path(reports_dir)
-    if create:
-        reports_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        parent_fd = os.open(reports_dir.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            try:
-                os.mkdir(reports_dir.name, 0o700, dir_fd=parent_fd)
-            except FileExistsError:
-                pass
-            return _open_nofollow(reports_dir.name, parent_fd)
-        finally:
-            os.close(parent_fd)
-    return _open_nofollow(str(reports_dir), None)
+    base = Path(anchor) if anchor is not None else reports_dir.parent
+    try:
+        parts = reports_dir.relative_to(base).parts
+    except ValueError as exc:
+        raise ReportStoreError("report directory is outside its anchor") from exc
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        raise ReportStoreError("report directory path is not a plain relative path")
+    if create and anchor is None:
+        base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts:
+            if create:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            next_fd = _open_nofollow(part, fd)
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def _open_nofollow(name: str, dir_fd: int | None) -> int:
@@ -614,10 +632,11 @@ def _final_is_generated(dir_fd: int, name: str) -> bool:
     return True
 
 
-def report_exists(reports_dir: Path, *, label: date) -> bool:
+def report_exists(reports_dir: Path, *, label: date,
+                  anchor: Path | None = None) -> bool:
     """その取引日の report が生成済みか。保存 dir が無ければ False、形が不正なら例外。"""
     try:
-        dir_fd = _open_reports_dir(reports_dir, create=False)
+        dir_fd = _open_reports_dir(reports_dir, create=False, anchor=anchor)
     except FileNotFoundError:
         return False
     try:
@@ -655,10 +674,11 @@ def sweep_dir_stale_parts(dir_fd: int, *, now: float | None = None) -> int:
     return removed
 
 
-def sweep_stale_parts(reports_dir: Path, *, now: float | None = None) -> int:
+def sweep_stale_parts(reports_dir: Path, *, now: float | None = None,
+                      anchor: Path | None = None) -> int:
     """`sweep_dir_stale_parts` を保存 dir の path から行う。dir が無ければ 0。"""
     try:
-        dir_fd = _open_reports_dir(Path(reports_dir), create=False)
+        dir_fd = _open_reports_dir(Path(reports_dir), create=False, anchor=anchor)
     except OSError:
         return 0
     try:
@@ -667,7 +687,8 @@ def sweep_stale_parts(reports_dir: Path, *, now: float | None = None) -> int:
         os.close(dir_fd)
 
 
-def write_report_once(reports_dir: Path, *, label: date, body: str) -> Path | None:
+def write_report_once(reports_dir: Path, *, label: date, body: str,
+                      anchor: Path | None = None) -> Path | None:
     """取引日ごとに 1 file。既にあれば何もせず None。親専有 (dir 0700 / file 0600)。
 
     保存 dir は symlink を辿らずに開き、以降は dir fd 相対で作る。part file に書き切って
@@ -679,7 +700,7 @@ def write_report_once(reports_dir: Path, *, label: date, body: str) -> Path | No
     最終名への `os.link` が使えない filesystem (hard link 非対応) は対象外で、
     本番の保存先は local fs である。"""
     reports_dir = Path(reports_dir)
-    dir_fd = _open_reports_dir(reports_dir, create=True)
+    dir_fd = _open_reports_dir(reports_dir, create=True, anchor=anchor)
     try:
         os.fchmod(dir_fd, 0o700)
         name = _report_name(label)
@@ -716,18 +737,19 @@ def make_daily_report_callback(*, reports_dir: Path,
                                open_conn: Callable[[], sqlite3.Connection],
                                capacity: CapacityReader | None,
                                worker: WorkerHealth | None,
-                               admission_status: Callable | None = None
+                               admission_status: Callable | None = None,
+                               anchor: Path | None = None
                                ) -> Callable[[datetime], None]:
     """scheduler の日次 hook (`register_daily_report`) に渡す callback。
 
     取引日 (`report_label`) で一意なので、at-least-once で呼ばれても 2 つ目は作らない。
     読み取り接続を callback の中で開いて閉じる。例外は呼び出し側 (scheduler) が数える。
     作った時点 (起動時) に、保存 dir の古い part file を掃除する。"""
-    sweep_stale_parts(reports_dir)
+    sweep_stale_parts(reports_dir, anchor=anchor)
 
     def callback(close_at: datetime) -> None:
         label = report_label(close_at)
-        if report_exists(reports_dir, label=label):
+        if report_exists(reports_dir, label=label, anchor=anchor):
             return
         conn = open_conn()
         try:
@@ -736,6 +758,6 @@ def make_daily_report_callback(*, reports_dir: Path,
                 admission_status=admission_status)
         finally:
             conn.close()
-        write_report_once(reports_dir, label=label,
+        write_report_once(reports_dir, label=label, anchor=anchor,
                           body=render_report(facts, label=label, close_at=close_at))
     return callback

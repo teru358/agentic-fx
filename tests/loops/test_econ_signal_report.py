@@ -381,6 +381,43 @@ def test_report_directory_that_is_a_symlink_is_refused(tmp_path):
         esr.report_exists(reports, label=date(2026, 10, 30))
 
 
+def test_an_ancestor_that_is_a_symlink_is_refused_below_the_anchor(tmp_path):
+    root = tmp_path / "root"
+    (root / "data").mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "econ_signal").mkdir(parents=True)
+    old_part = elsewhere / "econ_signal" / ".econ-signal-2026-10-29.1.ab.part"
+    old_part.write_text("old")
+    os.utime(old_part, (1, 1))
+    (root / "data" / "improve_reports").symlink_to(elsewhere)
+    reports = root / "data" / "improve_reports" / "econ_signal"
+    with pytest.raises(esr.ReportStoreError):
+        esr.write_report_once(reports, label=date(2026, 10, 30), body="a\n",
+                              anchor=root)
+    with pytest.raises(esr.ReportStoreError):
+        esr.report_exists(reports, label=date(2026, 10, 30), anchor=root)
+    assert esr.sweep_stale_parts(reports, anchor=root) == 0
+    assert sorted(p.name for p in (elsewhere / "econ_signal").iterdir()) == [
+        old_part.name]
+
+
+def test_the_anchor_walk_creates_missing_levels_owner_only(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    reports = root / "data" / "improve_reports" / "econ_signal"
+    path = esr.write_report_once(reports, label=date(2026, 10, 30), body="a\n",
+                                 anchor=root)
+    assert path == reports / "econ-signal-2026-10-30.md"
+    assert stat.S_IMODE(reports.stat().st_mode) == 0o700
+    assert esr.report_exists(reports, label=date(2026, 10, 30), anchor=root)
+
+
+def test_a_report_dir_outside_its_anchor_is_refused(tmp_path):
+    with pytest.raises(esr.ReportStoreError):
+        esr.write_report_once(tmp_path / "x" / "econ_signal", label=date(2026, 10, 30),
+                              body="a\n", anchor=tmp_path / "root")
+
+
 def _prepared_dir(tmp_path):
     reports = tmp_path / "econ_signal"
     reports.mkdir(mode=0o700)

@@ -1929,6 +1929,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         # (scheduler が呼ぶ。生成側が取引日で一意にする)。
         scheduler.register_daily_report(econ_signal_report.make_daily_report_callback(
             reports_dir=root / "data" / "improve_reports" / econ_signal_report.REPORT_DIR_NAME,
+            anchor=root,
             open_conn=lambda: connect_readonly(root / "data" / "agentic.db"),
             capacity=capacity_reader, worker=econ_health,
             admission_status=admission.status))
