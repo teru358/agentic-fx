@@ -45,7 +45,7 @@ def pending_sets(conn: sqlite3.Connection, *, pair_currencies: Mapping[str, tupl
         "FROM ohlcv_slice_sets ss JOIN econ_events e ON e.id=ss.event_id "
         "LEFT JOIN value_counts vc ON vc.set_id=ss.id "
         "WHERE ss.event_id IS NOT NULL AND ss.state IN (?,?) AND ss.id>? "
-        "AND (COALESCE(vc.n,0)=0 OR (vc.n=3 AND EXISTS ("
+        "AND (COALESCE(vc.n,0)=0 OR (vc.n=3 AND e.superseded_by IS NULL AND EXISTS ("
         " SELECT 1 FROM canonical_keys ck WHERE ck.pair=ss.pair "
         " AND (e.country='All' OR e.country=ck.currency) "
         " AND NOT EXISTS (SELECT 1 FROM econ_reaction_keys k "

@@ -189,6 +189,10 @@ def test_a_superseded_event_set_gets_its_three_windows_but_no_key_or_sample(tmp_
     assert len(_values(conn, old_set)) == 3
     assert _keys(conn) == []
     assert rv.load_samples(conn) == ()
+    # 値が揃った後の巡回でも key を後付けしない
+    _run(conn)
+    _run(conn)
+    assert _keys(conn) == []
     from agentic_fx.store import ohlcv_slices
     conn.execute("UPDATE ohlcv_slice_sets SET created_at=? WHERE id=?",
                  ((TS - timedelta(days=ohlcv_slices.RETENTION_DAYS + 1)).isoformat(), old_set))
