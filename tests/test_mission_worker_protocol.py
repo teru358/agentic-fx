@@ -1661,7 +1661,7 @@ def test_trade_result_frame_counts_market_tool_starts(monkeypatch, tmp_path):
         market_registry=True)
     assert callable(registry_calls[0][1]["on_tool_result"])
     assert frames[-1]["market_tool_calls"] == {
-        "get_ohlcv": 2, "get_indicators": 2,
+        "get_ohlcv": 2, "get_indicators": 2, "get_econ_reactions": 0,
     }
 
 
@@ -1670,7 +1670,7 @@ def test_trade_result_frame_counts_only_market_tools(monkeypatch, tmp_path, capl
         monkeypatch, tmp_path, runner_cls=_FakeMixedToolRunner,
         market_registry=True)
     assert frames[-1]["market_tool_calls"] == {
-        "get_ohlcv": 1, "get_indicators": 0,
+        "get_ohlcv": 1, "get_indicators": 0, "get_econ_reactions": 0,
     }
     assert "on_result hook raised" not in caplog.text
 
@@ -1682,7 +1682,7 @@ def test_trade_exception_result_frame_keeps_market_tool_counts(
         market_registry=True)
     assert frames[-1]["status"] == "failed"
     assert frames[-1]["market_tool_calls"] == {
-        "get_ohlcv": 2, "get_indicators": 2,
+        "get_ohlcv": 2, "get_indicators": 2, "get_econ_reactions": 0,
     }
 
 
