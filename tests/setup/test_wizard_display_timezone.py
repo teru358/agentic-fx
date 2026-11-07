@@ -93,3 +93,24 @@ def test_a_usable_machine_zone_guess_needs_no_explanation(tmp_path, guess):
     io = ScriptedWizardIO(responder=fresh_responder((_ASK, guess)))
     assert run_wizard(root, io, deps) == 0, io.text
     assert "初期値を UTC にしました" not in io.text
+
+
+def test_the_discarded_guess_is_explained_once_even_when_stage_two_is_asked_again(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from agentic_fx.setup import wizard
+
+    real_ceiling = wizard.worker_ceiling
+    calls = {"n": 0}
+
+    def ceiling(settings):
+        calls["n"] += 1
+        return SimpleNamespace(total=3601) if calls["n"] == 1 else real_ceiling(settings)
+
+    monkeypatch.setattr(wizard, "worker_ceiling", ceiling)
+    root = make_root(tmp_path)
+    deps, *_ = make_deps(tmp_path, local_timezone=lambda: "Etc/UTC")
+    io = ScriptedWizardIO(responder=fresh_responder(("[r] 段 2 へ", "r"), (_ASK, "UTC")))
+    assert run_wizard(root, io, deps) == 0, io.text
+    assert io.text.count("[段 2 基本]") == 2
+    assert io.text.count("初期値を UTC にしました") == 1

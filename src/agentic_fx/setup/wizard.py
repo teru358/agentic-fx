@@ -849,6 +849,7 @@ def _stage2(sess: _Session, st: _Start, a: Answers) -> None:
     help_text = _HELP_STAGE[2]
     if a.zone_note:
         sess.say(a.zone_note)
+        a.zone_note = None
     while True:
         zone = sess.text("表示タイムゾーン (例 Asia/Tokyo)", a.display_timezone, help_text=help_text)
         try:

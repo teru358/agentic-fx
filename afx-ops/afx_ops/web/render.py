@@ -296,7 +296,7 @@ def render_approvals(data: Mapping[str, object]) -> bytes:
                    for item in entries[:MAX_ITEMS] if type(item) is dict)
     journals = data.get("open_journals")
     if isinstance(journals, list):
-        body += "".join("<section>" + _pairs(item, JOURNAL_FIELDS) + "</section>"
+        body += "".join("<section>" + _pairs(item, JOURNAL_FIELDS, tz=tz) + "</section>"
                         for item in journals[:MAX_ITEMS] if type(item) is dict)
     return _page("Pending approvals", body, tz)
 
