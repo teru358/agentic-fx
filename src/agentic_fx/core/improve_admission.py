@@ -244,6 +244,7 @@ class ImproveAdmission:
                 if self._stopping():
                     return self._stopping_decision(backend, fp, artifact)
         decision = None
+        admitted_transition = None
         try:
             decision = self._decide(AdmissionContext(backend, artifact_path, artifact, fp, host,
                                                      settings))
@@ -256,11 +257,23 @@ class ImproveAdmission:
                             decision = self._stopping_decision(backend, fp, artifact)
                         else:
                             # 再試行の間隔は判定が終わった時刻から数える (長い試験で即失効させない)
+                            previous = self._cache.get(key)
+                            if (decision.admitted and previous is not None
+                                    and not previous[0].admitted):
+                                admitted_transition = _admission_status_line(
+                                    backend, True, fp.aggregate)
                             self._cache[key] = (decision, self._clock())
                 finally:
                     self._running.pop(key, None)
                     done.set()
         self._emit_new_selftest_failure(decision)
+        if admitted_transition is not None:
+            with self._lock:
+                technical_log = self._technical_log
+            try:
+                technical_log(admitted_transition)
+            except Exception:  # noqa: BLE001
+                _log.exception("improve isolation admission transition logging failed")
         return decision
 
     def _emit_new_selftest_failure(self, decision: AdmissionDecision | None) -> None:
@@ -305,6 +318,15 @@ class ImproveAdmission:
         return AdmissionDecision(True, None, ctx.backend, fp, art,
                                  detail="fingerprint is outside the supported set; "
                                         "canary and selftest passed in this process")
+
+
+def _admission_status_line(backend: str, admitted: bool, fingerprint: str,
+                           reason: str | None = None) -> str:
+    if admitted:
+        return (f"improve isolation: enabled; backend={backend} admitted=yes "
+                f"fingerprint={fingerprint}")
+    return (f"improve isolation: enabled; backend={backend} admitted=no "
+            f"reason={reason} fingerprint={fingerprint}")
 
 
 # --- afx 本体側の配線 -------------------------------------------------------------
@@ -467,9 +489,8 @@ def startup(settings: Any, root: Path, *, deadline: float, enabled: bool | None 
                    if choice.decision is not None and choice.decision.fingerprint is not None
                    else "none")
     if choice.refusal is None:
-        return f"improve isolation: enabled; backend={backend} admitted=yes fingerprint={fingerprint}"
-    return (f"improve isolation: enabled; backend={backend} admitted=no "
-            f"reason={choice.refusal} fingerprint={fingerprint}")
+        return _admission_status_line(backend, True, fingerprint)
+    return _admission_status_line(backend, False, fingerprint, choice.refusal)
 
 
 __all__ = [

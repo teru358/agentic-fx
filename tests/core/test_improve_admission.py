@@ -872,3 +872,31 @@ def test_running_event_is_released_when_the_cache_write_fails(tmp_path):
         adm.admit(backend="codex", artifact_path=path, host=Host())
     assert len(seen) == 1 and seen[0] is not None
     assert seen[0].is_set() and adm._running == {}
+
+
+def test_retryable_selftest_no_then_yes_logs_one_admitted_transition(tmp_path):
+    now = [0.0]
+    selftest = Probe(IA.ProbeOutcome(False, transient=True, detail="call=0"), OK)
+    emitted = []
+    adm = _admission(selftest=selftest, clock=lambda: now[0], technical_log=emitted.append)
+    path = str(_elf(tmp_path))
+
+    failed = adm.admit(backend="codex", artifact_path=path, host=Host())
+    assert not failed.admitted and failed.retryable
+    now[0] += IA.SELFTEST_RETRY_INTERVAL_SEC - 1
+    assert adm.admit(backend="codex", artifact_path=path, host=Host()) is failed
+    assert selftest.calls == 1 and len(emitted) == 1
+
+    now[0] += 1
+    admitted = adm.admit(backend="codex", artifact_path=path, host=Host())
+    assert admitted.admitted and selftest.calls == 2
+    expected = (f"improve isolation: enabled; backend=codex admitted=yes "
+                f"fingerprint={admitted.fingerprint.aggregate}")
+    assert emitted[1:] == [expected]
+
+
+def test_initial_admission_yes_does_not_log_transition(tmp_path):
+    emitted = []
+    adm = _admission(technical_log=emitted.append)
+    decision = adm.admit(backend="codex", artifact_path=str(_elf(tmp_path)), host=Host())
+    assert decision.admitted and emitted == []

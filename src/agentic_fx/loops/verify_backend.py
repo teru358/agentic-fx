@@ -92,6 +92,19 @@ class VerifyBackendResult:
     refusal: object = None
     blocking: object = None
 
+    @property
+    def tool_not_called(self) -> bool:
+        """隔離 gate を通った自己試験で、echo と MCP tools 列挙は観測したが呼出しが無い。"""
+        watch = self.watch
+        return (
+            self.gate == "incomplete" and self.status == "completed" and watch is not None
+            and getattr(watch, "seen", False) is True
+            and getattr(watch, "initialized", False) is True
+            and bool(getattr(watch, "listed", None))
+            and getattr(watch, "calls", None) == 0
+            and getattr(watch, "grace_expired", True) is False
+        )
+
 
 _FAILURE_GATES = frozenset({
     "handshake", "incomplete", "nonce", "no_cli_child", "not_reaped", "spawn", "cgroup_gate",
