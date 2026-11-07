@@ -210,9 +210,9 @@ OHLC の一致は既存の許容誤差 (`store/db.py` の `FLOAT_TOL`)、volume 
   - (a) 反応統計・shadow の 1m は cache の live 行 (正) を読む。履歴の 5m 冬は使わないので、repair を待たずに誤りは入らない。
   - (b) **第三分類「既知閉場」を足す。** 今の §3.5-3 は outage に無い欠落 minute をすべて「tick 無し」として flat を作るので、冬の日曜 21:00-22:00 のような真の閉場 minute にも flat を作りうる。`is_market_open` が偽の minute は、期待格子・flat の生成・障害欠損のどれにも入れない。fixture は週末、12/25、1/1、両方の DST 切替を通す。
   - (c) shadow の day close は `next_rollover` を共有しており、T2a-2 の期待値で冬の日付を使うものは 22:00 基準に改める。
-  - (d) C1 の偽の足は 1m cache に 900 本あり、`ohlcv_slices` を作る T4a は (b) により閉場の行を読まない。
+  - (d) C1 の偽の足は 1m cache に 900 本あったが、R1 の再起動で保持期間の cutoff が進み 0 本になった (2026-11-03、§3.4 の `absent_before_cache_window`)。残る閉場行は C2 の 4 行で、`ohlcv_slices` を作る T4a は (b) により閉場の行を読まない。
   - (e) `Scheduler.latest_trading_close` (econ-b1 `core/scheduler.py:453-464`) は 24h ずつ遡るので、`session_start` と同じく NY 日付で遡る形に改める。
-  - (f) **日次のラベルを `market_hours.trading_date` に統一する。** 日次 report の marker (`:473-497`、閉じた境界の ISO 文字列を文字列比較) は「閉じた境界の 1 分前の `trading_date`」で比べる。旧版が書いた ISO 値は同じ式で読み替える (旧 21:00Z と新 22:00Z の close が同じ取引日になる)。wait-budget の運用日 key (`signal_admission.py:250-252`) は `trading_date(now)` にし、旧版の key (取引日の開始 ISO) は「開始 + 24h − 1 分の `trading_date`」で読み替える。§3.7 の過渡期間は旧新のラベルの遅い方。
+  - (f) **日次のラベルを `market_hours.trading_date` に統一する。** 日次 report の marker (`:473-497`、閉じた境界の ISO 文字列を文字列比較) は「閉じた境界の 1 分前の `trading_date`」で比べる。旧版が書いた ISO 値は同じ式で読み替える (旧 21:00Z と新 22:00Z の close が同じ取引日になる)。wait-budget の運用日 key (`signal_admission.py:250-252`) は `trading_date(now)` にし、旧版の key (取引日の開始 ISO) は「開始 + 24h − 1 分の `trading_date`」で読み替える。§3.7 の過渡期間は旧新のラベルの遅い方。**実装との差 (2026-11-07 追記):** `time_cutover.daily_label` は wait-budget の運用日 key にだけ使う。日次 report は `now` が過渡期間かで旧新の遅い方の取引日を読む (`daily_label` を report に使うと翌日の report を落とすため、econ 設計 §7 の DST 引渡し表 (f) と同じ)。
   - (g) **merge の順。** econ-b1 が先に main に入れば R1 が (e)(f) を直す。R1 が先なら econ-b1 の rebase が直す。後に入る側は (e)(f) の実装と AC 22 が通るまで merge しない。**R1 の期限 (2026-11-05 merge、11-06 20:30Z 切替) はこれで止めない。** econ-b1 が期限までに main に入らなければ R1 は (e)(f) を持たずに入り、AC 22 は econ-b1 の merge 条件になる。
 
 ### 3.7 稼働中の切替 (cutover)
