@@ -189,3 +189,10 @@ alert:                         # 運用アラート (プラン9 Task17)。省略
 notify:                        # 取引 event の発行。省略可 (省略時は発行する)
   trade_events: true            # false にすると daemon は order_state_changed / position_closed を一切出さない (rollback 用。bot / notify 側の表示設定ではない)
   improve_events: true          # false にすると daemon は改善 mission の開始・終了通知 (improve_run_changed) を生成しない (rollback 用。変更後は daemon の再起動が必要)
+
+econ:                          # 経済指標の回避帯。省略可 (省略時は下の既定値)
+  window:
+    importance_min: 3           # この重要度 (1〜3) 以上の event だけを回避帯の対象にする
+    before_min: 30              # 発表前の回避分数 (帯は発表時刻の前後を含む)
+    after_min: 15               # 発表後の回避分数
+  # signal_capacity_daily_max:  # 未設定 = 承認済み strategy から導く signal 保存容量の日次上限を使う。明示するなら 1 以上の整数

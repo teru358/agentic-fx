@@ -235,9 +235,9 @@ def test_append_revocation_is_ordered_idempotent_and_has_only_audit_payload(tmp_
 
 def test_linked_signals_are_excluded_and_pending_requires_freshness(tmp_path):
     conn = _conn(tmp_path)
-    pending = signals.add(conn, plugin="alpha", content_hash="a", pair="USDJPY", timeframe="1h", bar_ts=NOW.isoformat(), kind="signal", payload={}, now=NOW)
-    claimed = signals.add(conn, plugin="alpha", content_hash="b", pair="USDJPY", timeframe="1h", bar_ts=(NOW + timedelta(minutes=1)).isoformat(), kind="signal", payload={}, now=NOW)
-    stale = signals.add(conn, plugin="alpha", content_hash="c", pair="USDJPY", timeframe="1h", bar_ts=(NOW - timedelta(hours=3)).isoformat(), kind="signal", payload={}, now=NOW)
+    pending = signals.add(conn, plugin="alpha", content_hash="a", pair="USDJPY", timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy", payload={}, now=NOW, contract_version="executable_v1")
+    claimed = signals.add(conn, plugin="alpha", content_hash="b", pair="USDJPY", timeframe="1h", bar_ts=(NOW + timedelta(minutes=1)).isoformat(), kind="strategy", payload={}, now=NOW, contract_version="executable_v1")
+    stale = signals.add(conn, plugin="alpha", content_hash="c", pair="USDJPY", timeframe="1h", bar_ts=(NOW - timedelta(hours=3)).isoformat(), kind="strategy", payload={}, now=NOW, contract_version="executable_v1")
     mission_id = missions.start(conn, "trade", "local", "model", NOW)
     second_mission_id = missions.start(conn, "trade", "local", "model", NOW)
     claim = signals.claim_oldest(conn, mission_id=mission_id, now=NOW, freshness_bars=1)
@@ -671,6 +671,46 @@ def test_lease_recovery_linked_signal_cannot_be_claimed_again(tmp_path):
     next_mission = missions.start(conn, "trade", "local", "model", NOW)
     assert signals.claim_oldest(
         conn, mission_id=next_mission, now=NOW, freshness_bars=2) is None
+
+
+def test_lease_boundary_keeps_linked_claims_terminal_and_reclaims_only_unlinked(
+        tmp_path):
+    conn = _conn(tmp_path)
+    mission_id = missions.start(conn, "trade", "local", "model", NOW)
+    linked_before = _linked_claimed(conn, mission_id, link=True)
+    conn.execute("UPDATE signals SET content_hash='linked-before' WHERE id=?",
+                 (linked_before,))
+    linked_equal = _linked_claimed(conn, mission_id, link=True)
+    conn.execute("UPDATE signals SET content_hash='linked-equal' WHERE id=?",
+                 (linked_equal,))
+    unlinked_expired = _linked_claimed(conn, mission_id, link=False)
+    lease_min = 15
+    boundary = NOW - timedelta(minutes=lease_min)
+    conn.execute(
+        "UPDATE signals SET claimed_by_mission_id=NULL, claimed_at=? WHERE id=?",
+        ((boundary + timedelta(seconds=1)).isoformat(), linked_before))
+    conn.execute(
+        "UPDATE signals SET claimed_by_mission_id=NULL, claimed_at=? WHERE id=?",
+        (boundary.isoformat(), linked_equal))
+    conn.execute(
+        "UPDATE signals SET claimed_at=?, bar_ts=?, kind='strategy', "
+        "contract_version='executable_v1' WHERE id=?",
+        ((boundary - timedelta(hours=1)).isoformat(),
+         (NOW - timedelta(hours=1)).isoformat(), unlinked_expired))
+    conn.commit()
+
+    statuses = signals.reclaim_expired(
+        conn, now=NOW, lease_min=lease_min, max_requeue=3)
+
+    assert statuses == ["abandoned", "pending"]
+    assert _status(conn, linked_before) == "claimed"
+    assert _status(conn, linked_equal) == "abandoned"
+    assert _status(conn, unlinked_expired) == "pending"
+    next_mission = missions.start(conn, "trade", "local", "model", NOW)
+    claimed = signals.claim_oldest(
+        conn, mission_id=next_mission, now=NOW, freshness_bars=2)
+    assert claimed is not None
+    assert claimed["id"] == unlinked_expired
 
 
 def test_expire_stale_abandons_linked_pending_signal(tmp_path):

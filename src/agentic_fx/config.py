@@ -12,8 +12,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import yaml
 from dotenv import load_dotenv
 from pydantic import (
-    BaseModel, ConfigDict, Field, StrictBool, ValidationError, field_validator,
-    model_validator,
+    BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError,
+    field_validator, model_validator,
 )
 
 from agentic_fx.core.fx_time import FRIDAY_SWING_CUTOFF_LIMIT_NY
@@ -324,6 +324,22 @@ class NewsSettings(_Strict):
     cleanup_hours: int = Field(gt=0)
 
 
+class EconWindowSettings(_Strict):
+    """経済指標の回避帯。event `ts` の帯は inclusive な
+    `[ts - before_min, ts + after_min]`。"""
+    importance_min: StrictInt = Field(ge=1, le=3, default=3)
+    before_min: StrictInt = Field(ge=0, default=30)
+    after_min: StrictInt = Field(ge=0, default=15)
+
+
+class EconSettings(_Strict):
+    """省略時は回避帯を既定値で使う。`signal_capacity_daily_max` は signal /
+    shadow の保存容量の日次上限の上書きで、省略時は承認済み strategy から
+    導く値を使う (ここでは 1 以上の整数であることだけを検査する)。"""
+    window: EconWindowSettings = Field(default_factory=EconWindowSettings)
+    signal_capacity_daily_max: StrictInt | None = Field(default=None, ge=1)
+
+
 class ResearchSettings(_Strict):
     max_searches: int = Field(ge=1, default=20)
     max_fetches: int = Field(ge=1, default=30)
@@ -617,6 +633,7 @@ class Settings(_Strict):
     reflection: ReflectionSettings = Field(default_factory=ReflectionSettings)
     alert: AlertSettings = Field(default_factory=AlertSettings)
     notify: NotifySettings = Field(default_factory=NotifySettings)
+    econ: EconSettings = Field(default_factory=EconSettings)
 
     @model_validator(mode="before")
     @classmethod

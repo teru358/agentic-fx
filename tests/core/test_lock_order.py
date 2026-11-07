@@ -12,6 +12,7 @@ from agentic_fx.plugin import switch
 from agentic_fx.runners.base import MissionResult
 from agentic_fx.service import _scheduler_tick_once
 from agentic_fx.store import signals
+from agentic_fx.store import signal_decisions
 
 from tests.loops.test_trade_loop import NOW, _loop
 from tests.core._lock_helpers import TrackedRLock
@@ -74,18 +75,16 @@ def test_deferred_name_lock_is_not_acquired_while_scheduler_owns_core_lock(tmp_p
     assert violations == [False]
 
 
-def test_open_takes_name_lock_before_core_lock(tmp_path, monkeypatch):
-    """OPEN の name lock を core lock の後ろへ移す変異を guard で検出する。"""
-    intent = {
-        "action": "open", "pair": "USDJPY", "direction": "long",
-        "entry_type": "market", "horizon": "day", "stop_loss": 147.0,
-        "take_profit": 149.0, "reasoning": "test",
-    }
-    conn, loop, _, _ = _loop(tmp_path, [MissionResult("completed", intent, [])])
+def test_signal_mission_takes_name_lock_before_core_lock(tmp_path, monkeypatch):
+    """専用採否 mission の name lock は commit core より先に取る。"""
+    accept = {"decision": "accept", "reject_code": None}
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult("completed", accept, [])])
     signals.add(
         conn, plugin="strategy", content_hash="a" * 64, pair="USDJPY",
         timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
-        payload={"direction": "long"}, now=NOW)
+        payload={"action": "open", "pair": "USDJPY", "direction": "long",
+                 "entry_type": "market", "horizon": "day", "stop_loss": 147.0,
+                 "take_profit": 149.0}, now=NOW, contract_version="executable_v1")
     loop._plugins_root = tmp_path / "plugins"
     tracked = TrackedRLock()
     loop._core_lock = tracked
@@ -117,33 +116,33 @@ def test_open_takes_name_lock_before_core_lock(tmp_path, monkeypatch):
     assert hold_seconds[0] < 1.0
 
 
-def test_scheduler_protection_precedes_open_core_and_deferred_name_lock(tmp_path, monkeypatch):
-    """OPEN waits behind protection, then the deferred hook waits behind OPEN."""
+def test_scheduler_protection_precedes_signal_commit_and_deferred_name_lock(tmp_path, monkeypatch):
+    """Signal commit waits behind protection and the deferred hook follows it."""
     scheduler_root = tmp_path / "scheduler"
     loop_root = tmp_path / "loop"
     scheduler_root.mkdir()
     loop_root.mkdir()
     env = Env(scheduler_root)
-    conn, loop, _, _ = _loop(loop_root, [MissionResult("completed", {
-        "action": "open", "pair": "USDJPY", "direction": "long",
-        "entry_type": "market", "horizon": "day", "stop_loss": 147.0,
-        "take_profit": 149.0, "reasoning": "test",
-    }, [])])
+    conn, loop, _, _ = _loop(loop_root, [MissionResult(
+        "completed", {"decision": "accept", "reject_code": None}, [])])
     signals.add(
         conn, plugin="strategy", content_hash="a" * 64, pair="USDJPY",
         timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
-        payload={"direction": "long"}, now=NOW)
+        payload={"action": "open", "pair": "USDJPY", "direction": "long",
+                 "entry_type": "market", "horizon": "day", "stop_loss": 147.0,
+                 "take_profit": 149.0}, now=NOW, contract_version="executable_v1")
     loop._plugins_root = loop_root / "plugins"
     loop._plugins_root.mkdir()
+    loop.econ.window_view.return_value.in_window = False
     monkeypatch.setattr(
         "agentic_fx.loops.trade_loop.signal_source_active", lambda *_args: True)
 
     events = []
-    open_name_entered = threading.Event()
+    signal_name_entered = threading.Event()
     scheduler_entered = threading.Event()
     sltp_entered = threading.Event()
     allow_scheduler_release = threading.Event()
-    open_core_entered = threading.Event()
+    signal_commit_entered = threading.Event()
 
     class RecordingRLock(TrackedRLock):
         def __enter__(self):
@@ -157,6 +156,7 @@ def test_scheduler_protection_precedes_open_core_and_deferred_name_lock(tmp_path
 
     core_lock = RecordingRLock()
     loop._core_lock = core_lock
+    loop.executor.state_fn = lambda: "ready"
     real_locks = switch._plugin_locks
 
     @contextlib.contextmanager
@@ -164,11 +164,10 @@ def test_scheduler_protection_precedes_open_core_and_deferred_name_lock(tmp_path
         names = set(names)
         with real_locks(root, names, **kwargs):
             if names == {"strategy"}:
-                events.append("open-name")
-                open_name_entered.set()
+                events.append("signal-name")
+                signal_name_entered.set()
                 assert scheduler_entered.wait(5)
             else:
-                assert open_core_entered.wait(5)
                 events.append("hook-name")
             yield
 
@@ -194,17 +193,17 @@ def test_scheduler_protection_precedes_open_core_and_deferred_name_lock(tmp_path
         executor=env.executor, scheduler=env.sched,
     )
 
-    original_record = loop.executor.record_and_validate_intent
+    original_commit = signal_decisions.commit_accept
 
     def record(*args, **kwargs):
-        events.append("open-core")
-        open_core_entered.set()
-        return original_record(*args, **kwargs)
+        events.append("signal-commit")
+        signal_commit_entered.set()
+        return original_commit(*args, **kwargs)
 
-    loop.executor.record_and_validate_intent = record
-    open_thread = threading.Thread(target=lambda: loop.run_once("signal"))
-    open_thread.start()
-    assert open_name_entered.wait(5)
+    monkeypatch.setattr(signal_decisions, "commit_accept", record)
+    signal_thread = threading.Thread(target=lambda: loop.run_once("signal"))
+    signal_thread.start()
+    assert signal_name_entered.wait(5)
 
     scheduler_thread = threading.Thread(target=lambda: _scheduler_tick_once(app))
     try:
@@ -213,11 +212,11 @@ def test_scheduler_protection_precedes_open_core_and_deferred_name_lock(tmp_path
         scheduler_entered.set()
         allow_scheduler_release.set()
         scheduler_thread.join(5)
-        open_thread.join(5)
+        signal_thread.join(5)
     finally:
         switch.set_plugin_lock_owner_guard(None)
     assert not scheduler_thread.is_alive()
-    assert not open_thread.is_alive()
-    assert events.index("open-name") < events.index("sltp")
-    assert events.index("sltp") < events.index("open-core") < events.index("hook-name")
+    assert not signal_thread.is_alive()
+    assert events.index("signal-name") < events.index("sltp")
+    assert events.index("sltp") < events.index("signal-commit") < events.index("hook-name")
     assert lock_owners == [False, False]

@@ -2107,10 +2107,10 @@ def test_relock_creates_a_new_hash_that_never_collides_with_the_old_rows(
     assert hashes_in_approvals.count(old_hash) == 2  # submit 1 + seed 1
     assert signals_store.add(conn, plugin="rsi_pullback", content_hash=old_hash,
                              pair="USDJPY", timeframe="1h", bar_ts=BAR_TS,
-                             kind="strategy", payload={}, now=fx.NOW) is not None
+                             kind="strategy", payload={}, now=fx.NOW, contract_version="executable_v1") is not None
     assert signals_store.add(conn, plugin="rsi_pullback", content_hash=new_hash,
                              pair="USDJPY", timeframe="1h", bar_ts=BAR_TS,
-                             kind="strategy", payload={}, now=fx.NOW) is not None
+                             kind="strategy", payload={}, now=fx.NOW, contract_version="executable_v1") is not None
     assert br_store.latest_in_sample_metrics(
         conn, new_hash, pair="USDJPY", variant="candidate",
         source="dukascopy", base_interval="5m") is None

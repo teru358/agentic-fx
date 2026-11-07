@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 from datetime import datetime, timedelta, timezone
@@ -30,17 +31,20 @@ from agentic_fx.commands import Commands
 from agentic_fx.config import (
     load_env_file, load_settings, load_settings_text, warn_surplus_pair_rules,
 )
-from agentic_fx.core import mission_ceiling
 from agentic_fx.core import landlock
+from agentic_fx.core import mission_ceiling
 from agentic_fx.core import time_cutover
 from agentic_fx.core import transitions
 from agentic_fx.core.contracts import Clock, Mode, SystemClock
+from agentic_fx.core.econ_slice_worker import CapacityMeasurer, EconSliceWorker
+from agentic_fx.core.econ_window import WindowSettings, currencies_by_pair
 from agentic_fx.core.executor import Executor
 from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.notifier import Notifier
 from agentic_fx.core.paper_broker import PaperBroker
-from agentic_fx.core.scheduler import Scheduler
+from agentic_fx.core.scheduler import TICK_INTERVAL_SEC, Scheduler
 from agentic_fx.core.supervisor import MissionSupervisor, SubmitResult
+from agentic_fx.core.writer_admission import WriterAdmission
 from agentic_fx.datafeed import cache_window, sources
 from agentic_fx.datafeed.ingest import Ingest
 from agentic_fx.datafeed.outage import IngestTickReport, OutageStateMachine
@@ -56,7 +60,7 @@ from agentic_fx.ops import keys as ops_keys
 from agentic_fx.ops.api_server import ApiLimits, ApiServer, ApiStartError
 from agentic_fx.ops.service import OpsLimits, OpsService
 from agentic_fx.ops.trade_event_sink import BUSY_RETRY_SEC, TradeEventEmitter, TradeEventSink
-from agentic_fx.loops import reflection_cycle
+from agentic_fx.loops import econ_signal_report, reflection_cycle
 from agentic_fx.loops.mission_watch import MissionWatch
 from agentic_fx.loops.reflection_cycle import ReflectionCycle
 from agentic_fx.loops.summary import ANSWER_SCHEMA, trade_intent_schema
@@ -68,11 +72,16 @@ from agentic_fx.policy import Policy, directives_path
 from agentic_fx.runners.base import AgentRunner
 from agentic_fx.runners.local_runner import LocalRunner
 from agentic_fx.runners.worker_runner import WorkerRunner
+from agentic_fx.signal_admission import (
+    CalendarFreshnessNotice, CapacityMonitor, DeployedStrategies, SignalAdmission,
+    WaitBudgetEvaluator,
+    FRESHNESS_ABANDON_REASONS, TERMINAL_FRESHNESS_ABANDONED, signal_due,
+)
 from agentic_fx.setup.checks import (CheckReason, CheckResult, check_cli_backend,
                                      check_llama_swap, cli_candidate, is_executable_file)
 from agentic_fx.setup.preflight import Finding, PreflightFailure, is_warning
 from agentic_fx.setup.settings_edit import atomic_write_settings
-from agentic_fx.store import approvals, missions, orders, signals, ohlcv
+from agentic_fx.store import approvals, missions, orders, signals, ohlcv, ohlcv_slices
 from agentic_fx.store.db import connect, connect_readonly, init_db
 from agentic_fx.store.enroll_marker import (
     ENROLL_IN_PROGRESS, EXIT_ENROLL_IN_PROGRESS, EnrollInProgress, enroll_marker_present,
@@ -759,10 +768,23 @@ class App:
     # build_app が解決した root (起動時表示が記録を読むために使う)。
     root: Path | None = None
     conn_signal: object | None = None
+    # 待機上限の実測 warning の評価器が使う接続と、signal 起動に関わる観測の束
+    conn_admission: object | None = None
+    admission: object | None = None
+    # scheduler の DB 書込み要求フラグ (worker はこれを見て新しい transaction を譲る)
+    writer_admission: object | None = None
     signal_connection_failures: int = 0
     # 取引 event の observer 登録と書き込み thread (settings の notify.trade_events が真のときだけ)。
     trade_event_sink: object | None = None
     trade_event_token: object | None = None
+    # slice worker と、その専用の読取接続・書込み接続 (書込みは busy_timeout 0)。
+    econ_worker: object | None = None
+    # 容量測定の thread (専用の読取接続はその thread が開いて閉じる)。
+    econ_measurer: object | None = None
+    conn_econ_read: object | None = None
+    conn_econ_write: object | None = None
+    econ_health: object | None = None
+    econ_status_cache: object | None = None
 
     def close(self, *, busy_resources: frozenset[str] = frozenset()) -> list[str]:
         skipped: list[str] = []
@@ -781,6 +803,12 @@ class App:
             ("conn_supervisor", self.conn_supervisor.close),
             ("conn_signal", lambda: self.conn_signal.close()
              if self.conn_signal is not None else None),
+            ("conn_admission", lambda: self.conn_admission.close()
+             if self.conn_admission is not None else None),
+            ("conn_econ_read", lambda: self.conn_econ_read.close()
+             if self.conn_econ_read is not None else None),
+            ("conn_econ_write", lambda: self.conn_econ_write.close()
+             if self.conn_econ_write is not None else None),
             ("conn_core", self.conn_core.close),
             ("conn_shell", self.conn_shell.close),
             ("instance_lock", self.instance_lock.close),
@@ -1050,6 +1078,16 @@ def _startup_mission_ceilings(settings, ctx: StartupContext):
     return settings
 
 
+def _startup_signal_capacity(settings, ctx: StartupContext):
+    """`econ.signal_capacity_daily_max` が承認済み strategy から導く日次上限
+    `S_producer` を下回る設定は起動を拒否する (上書きは上げる方向にだけ使える)。"""
+    try:
+        CapacityMonitor(settings, lambda: ctx.plugins).check_startup()
+    except ohlcv_slices.CapacityOverrideBelowProducer as exc:
+        raise PreflightFailure("signal_capacity_override_below_producer", str(exc)) from exc
+    return settings
+
+
 def _startup_cli_backend(which: str):
     def check(settings, ctx: StartupContext):
         settings = _check_cli_backend(settings, which=which, findings=ctx.findings,
@@ -1097,6 +1135,7 @@ STARTUP_CHECKS: tuple = (
     _startup_settings_valid,
     _startup_plugin_retention,
     _startup_mission_ceilings,
+    _startup_signal_capacity,
     _startup_cli_backend("trade"),
     _startup_cli_backend("improve"),
     _startup_watch_symbols,
@@ -1144,7 +1183,8 @@ class _SupervisorAsk:
 
 def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
                             now: datetime, resolved_by_identity, activity=None,
-                            plugins_root=None) -> None:
+                            plugins_root=None, on_terminal=None,
+                            write_scope=None) -> None:
     """`on_signal_maintenance` の実体 (裁定書 F-16/IM-10 — module レベル
     関数として抽出し、`build_app()` 全体を構築せずに単体テスト可能に
     する)。
@@ -1162,12 +1202,32 @@ def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
     終端状態への即時収束と `expire_stale` の戻り値 (呼び出し側が通知件数に
     使う) の正確さである。呼び出し元 (Scheduler._run_data_hook) が
     fail-open で包む。
+
+    `on_terminal(signal_id, kind)` は、鮮度系 (freshness_expired /
+    requeued_expired) の abandoned が commit された pass で 1 回だけ呼ぶ。
+    実測 warning の評価境界で、core_lock の外 (この関数の呼び出し元) で走る。
+    評価の失敗はこの pass を止めない。
+
+    `write_scope` は scheduler の書込み要求フラグを立てる context manager の
+    factory。`conn` が transaction を開く reclaim / expire / producer の範囲だけを
+    覆い、評価境界 (`on_terminal`) と activity の書込みは覆わない。
     """
-    signals.reclaim_expired(conn, now=now,
-                            lease_min=settings.plugin.signal_lease_min,
-                            max_requeue=settings.plugin.signal_requeue_max)
-    expired = signals.expire_stale(
-        conn, now=now, freshness_bars=settings.plugin.signal_freshness_bars)
+    scope = write_scope if write_scope is not None else nullcontext
+    with scope():
+        signals.reclaim_expired(conn, now=now,
+                                lease_min=settings.plugin.signal_lease_min,
+                                max_requeue=settings.plugin.signal_requeue_max)
+        expired = signals.expire_stale(
+            conn, now=now, freshness_bars=settings.plugin.signal_freshness_bars)
+    if on_terminal is not None:
+        # 鮮度系の終端が確定した (commit 済み) ので、実測 warning の評価境界へ 1 回渡す。
+        freshness = [row for row in expired.terminal
+                     if row.reason in FRESHNESS_ABANDON_REASONS]
+        if freshness:
+            try:
+                on_terminal(freshness[0].id, TERMINAL_FRESHNESS_ABANDONED)
+            except Exception:  # noqa: BLE001 — 評価の失敗で maintenance を止めない
+                _log.exception("wait budget evaluation failed")
     if activity is not None:
         for row in expired.invalid_timeframe:
             activity.write(
@@ -1177,11 +1237,12 @@ def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
                 ref_id=str(row.id))
     # producer はライブ cache を読む。保存名は primary と異なり得る (mt5 → mt5-live)。
     source = "mt5-live" if settings.datafeed.primary == "mt5" else settings.datafeed.primary
-    signal_producer.evaluate_due_plugins(
-        conn=conn, plugins=approved, now=now,
-        source=source, settings=settings,
-        resolved_by_identity=resolved_by_identity, activity=activity,
-        plugins_root=plugins_root)
+    with scope():
+        signal_producer.evaluate_due_plugins(
+            conn=conn, plugins=approved, now=now,
+            source=source, settings=settings,
+            resolved_by_identity=resolved_by_identity, activity=activity,
+            plugins_root=plugins_root)
 
 
 def _raise_if_start_marker_present(root: Path) -> None:
@@ -1213,6 +1274,11 @@ def _acquire_lock_unless_enrolling(root: Path):
         lock.close()
         raise
     return lock
+
+
+def _assumed_spread_pips(settings, pair: str) -> float:
+    rule = settings.risk.pair_rules.get(pair)
+    return rule.assumed_spread_pips if rule else 0.0
 
 
 def build_app(root: Path, *, runner: AgentRunner | None = None,
@@ -1276,6 +1342,9 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     # 失敗時に閉じるため、ops 層の資源は try の外で名前を用意しておく。
     conn_ops = None
     conn_signal = None
+    conn_admission = None
+    conn_econ_read = None
+    conn_econ_write = None
     ops_service = None
     trade_sink = None
     trade_token = None
@@ -1291,6 +1360,15 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         # instance lock を持ったまま、最初の tick より前に時刻規則の切替を判定する。
         time_cutover.ensure_cutover(conn_core, now=clock.now(), activity=activity)
         conn_signal = connect(root / "data" / "agentic.db")
+        # 待機上限の実測 warning の評価器だけが使う書込み接続 (評価は mission の
+        # thread からも呼ばれるので、core / signal の接続は共有しない)
+        conn_admission = connect(root / "data" / "agentic.db")
+        # BEGIN が他の writer を待たない (BUSY は即 rollback して次の機会に取り直す)
+        conn_admission.execute("PRAGMA busy_timeout=0")
+        # slice worker の接続。読取は mode=ro、書込みは他の writer を待たない。
+        conn_econ_read = connect_readonly(root / "data" / "agentic.db")
+        conn_econ_write = connect(root / "data" / "agentic.db")
+        conn_econ_write.execute("PRAGMA busy_timeout=0")
         if settings.notify.trade_events is True:
             # scheduler / supervisor / ops listener の起動前。失敗したら build_app ごと失敗させる。
             trade_sink, trade_token = _start_trade_events(root, conn_core, settings, state, clock)
@@ -1373,8 +1451,14 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                 max_skew_min=settings.datafeed.conversion_skew_max_min,
                 deadline_check=deadline_check)
 
-        econ = EconCalendar(conn_core, activity, clock,
-                            timeout_sec=settings.worker.data_hook_timeout_sec)
+        # 注入された spec_fn ではなく定義表そのものを引く
+        pair_currencies = currencies_by_pair(
+            settings.pairs, lambda pair: PriceProvider.spec(provider, pair))
+        econ_window_settings = WindowSettings.from_config(settings.econ.window)
+        econ = EconCalendar(
+            conn_core, activity, clock,
+            timeout_sec=settings.worker.data_hook_timeout_sec,
+            window=econ_window_settings, pair_currencies=pair_currencies)
         rag = Rag(root / "data" / "rag", embedding_function=embedding_fn,
                  lock_timeout_sec=settings.worker.rpc_timeout_sec)
         collector = NewsCollector(conn_core, rag, activity, clock,
@@ -1630,6 +1714,16 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         # プラン 7 Task 8: signal 起動の判定・保守処理を Scheduler へ配線する。
 
         def on_signal_maintenance(now: datetime) -> None:
+            # 運用日境界の通過と承認 strategy 集合の変更で、実測 warning を再評価する
+            # 観測機能の例外で、後続の reclaim / expire / producer を止めない
+            try:
+                deployed.refresh(now)
+            except Exception:  # noqa: BLE001
+                _log.exception("deployed strategies refresh failed")
+            try:
+                wait_budget.tick(now)
+            except Exception:  # noqa: BLE001
+                _log.exception("wait budget tick failed")
             if not _repair_signal_connection(app):
                 return
             # codex plan r2 束2 Critical: キーは `InventoryBuildResult.
@@ -1643,11 +1737,57 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                         conn=app.conn_signal, signal_producer=signal_producer,
                         approved=approved, settings=settings, now=now,
                         resolved_by_identity=dict(inventory_result.resolved),
-                        activity=activity, plugins_root=plugins_dir)
+                        activity=activity, plugins_root=plugins_dir,
+                        on_terminal=wait_budget.on_signal_terminal,
+                        write_scope=writer_admission.scheduler_write)
             except Exception:  # noqa: BLE001
                 _log.exception("signal maintenance failed")
             finally:
                 _repair_signal_connection(app)
+
+        writer_admission = WriterAdmission()
+        # 実行中の S と評価器が見る配備済み strategy 集合。起動時は承認集合そのもの。
+        # 運用日境界と deploy op の表の変化で、既存の inventory 読みから取り直す
+        # (起動時の retention 検査で外した plugin は取り直しでも外す)。
+        startup_removed = {getattr(m, "name", None)
+                           for m in inventory_result.inventory.metas} - {
+            getattr(m, "name", None) for m in approved}
+
+        def _load_deployed() -> list:
+            if not plugins_dir.is_dir():
+                return []
+            conn = connect_readonly(root / "data" / "agentic.db")
+            try:
+                metas = plugin_loader.approved_plugins(
+                    conn, plugins_dir, settings=settings).inventory.metas
+            finally:
+                conn.close()
+            return [m for m in metas if m.name not in startup_removed]
+
+        def _deploy_ops_version() -> tuple:
+            conn = connect_readonly(root / "data" / "agentic.db")
+            try:
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(op_id), 0), COALESCE(MAX(updated_at), '') "
+                    "FROM plugin_deploy_ops").fetchone()
+            finally:
+                conn.close()
+            return (row[0], row[1])
+
+        deployed = DeployedStrategies(
+            approved, load_fn=_load_deployed, version_fn=_deploy_ops_version)
+        capacity_monitor = CapacityMonitor(settings, deployed.current)
+        wait_budget = WaitBudgetEvaluator(
+            conn=conn_admission, settings=settings, strategies_fn=deployed.current,
+            activity=activity, now_fn=clock.now, writer_admission=writer_admission)
+        trade_loop.signal_terminal = wait_budget.on_signal_terminal
+        calendar_notice = CalendarFreshnessNotice(
+            conn=conn_core, freshness_fn=econ.freshness, activity=activity)
+        admission = SignalAdmission(
+            settings=settings, strategies_fn=deployed.current,
+            pair_currencies=pair_currencies, capacity=capacity_monitor,
+            wait_budget=wait_budget, calendar_notice=calendar_notice,
+            suppressed_limits_fn=lambda: scheduler.suppressed_limit_count)
 
         requirement_registry = build_registry(settings, approved)
         retention_plan = ohlcv.build_retention_plan(
@@ -1721,16 +1861,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             ohlcv.prune_cache(conn_core, plan=retention_plan)
 
         def signal_due_fn(now: datetime) -> bool:
-            # D2: オープンポジション or pending_fill の注文が無いなら signal
-            # 起動は無意味 (新規建玉を提案しても executor が gate で弾くだけ
-            # ではなく、そもそも判断 Mission を起こす価値が薄い運用判断)。
-            if not orders.list_by_status(conn_core, "open", "pending_fill"):
-                return False
-            if not signals.pending_exists(
-                    conn_core, now=now,
-                    freshness_bars=settings.plugin.signal_freshness_bars):
-                return False
-            return missions.signals_rate_ok(conn_core, now, settings)
+            # eligible な pending が鮮度内にあり rate 内なら、建玉の有無によらず起動する
+            return signal_due(conn_core, settings, now)
 
         scheduler = Scheduler(conn=conn_core, executor=executor,
                               settings=settings, state_store=state,
@@ -1742,9 +1874,21 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                               on_signal_maintenance=on_signal_maintenance,
                               on_cache_maintenance=on_cache_maintenance,
                               on_improve_tick=improve_supervisor.tick,
+                              on_calendar_observe=calendar_notice.observe,
                               signal_due_fn=signal_due_fn,
                               stop_event=stop_event,
-                              state_fn=lambda: outage.state)
+                              state_fn=lambda: outage.state,
+                              econ_window=econ_window_settings,
+                              pair_currencies=pair_currencies,
+                              writer_admission=writer_admission)
+
+        # 起動時の補完: 対象 event × pair の set 台帳を保存済みの event に揃える。
+        # 失敗しても取引は止めない。
+        try:
+            econ.sync_sets()
+        except Exception as exc:  # noqa: BLE001
+            activity.write(Category.NEWS, "econ_refresh_failed",
+                           f"sets: {safe_error_text(exc)}")
 
         # 起動時 reclaim 1 回 (コントローラ裁定): 前回停止時に claimed のまま
         # 残った signal を、次の tick を待たずに起動直後から回収対象にする。
@@ -1769,16 +1913,44 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         # ops 層は reconcile → sweep → expire (上) の後に作り、対話シェルにも同じ
         # レーンを使わせる。回復は listener を開く前 (run_service) に済ませる。
         conn_ops = connect(root / "data" / "agentic.db")
+        econ_health = econ_signal_report.WorkerHealth()
+        capacity_reader = econ_signal_report.CapacityReader(
+            capacity_monitor.plan, root / "data" / "agentic.db", clock=clock.now)
+        econ_status_cache = econ_signal_report.EconStatusCache(
+            lambda: _compute_econ_signal(root, clock, capacity_reader, econ_health))
         ops_service = _build_ops_service(
             root, settings, clock, conn_ops=conn_ops, state=state, activity=activity,
             health_latch=health_latch, supervisor=supervisor,
             improve_supervisor=improve_supervisor, plugins_dir=plugins_dir, outage=outage,
-            trade_event_sink=trade_sink, ingest=ingest)
+            trade_event_sink=trade_sink, ingest=ingest, admission=admission,
+            econ_health=econ_health, capacity_reader=capacity_reader,
+            econ_status_cache=econ_status_cache)
+        # 親専有の日次 report。市場の当日 close 後に 1 回、起動時は当日分が無ければ 1 回
+        # (scheduler が呼ぶ。生成側が取引日で一意にする)。
+        scheduler.register_daily_report(econ_signal_report.make_daily_report_callback(
+            reports_dir=root / "data" / "improve_reports" / econ_signal_report.REPORT_DIR_NAME,
+            anchor=root,
+            open_conn=lambda: connect_readonly(root / "data" / "agentic.db"),
+            capacity=capacity_reader, worker=econ_health,
+            admission_status=admission.status))
         # 取りこぼした改善通知の event を、listener を開く前・supervisor の開始前に出す。
         ops_service.emit_pending_improve_notices(
             enabled=settings.notify.improve_events)
         commands.use_ops_service(ops_service)
+        commands.use_econ_status_source(econ_status_cache.get)
         ops_recovered = _recover_ops(ops_service, conn_ops, activity)
+        econ_worker = EconSliceWorker(
+            read_conn=conn_econ_read, write_conn=conn_econ_write,
+            core_lock=core_lock, admission=writer_admission,
+            quote_fn=lambda pair: executor.quote_fn(pair),
+            pip_size_fn=lambda pair: executor.spec_fn(pair).pip_size,
+            assumed_spread_pips_fn=lambda pair: _assumed_spread_pips(settings, pair),
+            now_fn=clock.now)
+        econ_measurer = CapacityMeasurer(
+            open_conn=lambda: connect_readonly(root / "data" / "agentic.db"),
+            measure_fn=econ_signal_report.slice_related_bytes, now_fn=clock.now)
+        capacity_reader.attach_bytes_source(lambda: econ_measurer.measurement)
+        capacity_reader.attach_measure_info_source(econ_measurer.info)
         app = App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
                    state=state, activity=activity, broker=broker,
                    executor=executor, provider=provider, econ=econ,
@@ -1796,7 +1968,14 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                    fatal_reason=None, ingest=ingest, outage=outage,
                    ops=ops_service, conn_ops=conn_ops, ops_recovered=ops_recovered,
                    root=root, conn_signal=conn_signal,
-                   trade_event_sink=trade_sink, trade_event_token=trade_token)
+                   conn_admission=conn_admission, admission=admission,
+                   writer_admission=writer_admission,
+                   trade_event_sink=trade_sink, trade_event_token=trade_token,
+                   econ_worker=econ_worker, econ_measurer=econ_measurer,
+                   conn_econ_read=conn_econ_read,
+                   conn_econ_write=conn_econ_write, econ_health=econ_health,
+                   econ_status_cache=econ_status_cache)
+        wait_budget.evaluate_wait_budget(clock.now(), trigger="startup")
         return app
     except BaseException:
         # 2 周目レビュー (sonnet Minor / KAT-Coder Critical): 素の
@@ -1832,6 +2011,17 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                 conn_signal.close()
             except Exception:  # noqa: BLE001
                 pass
+        if conn_admission is not None:
+            try:
+                conn_admission.close()
+            except Exception:  # noqa: BLE001
+                pass
+        for econ_conn in (conn_econ_read, conn_econ_write):
+            if econ_conn is not None:
+                try:
+                    econ_conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
         try:
             instance_lock.close()
         except Exception:  # noqa: BLE001 — 元の例外を握り潰さないための抑制
@@ -1912,9 +2102,21 @@ def _reference_status_rows(conn, ingest, now: datetime, settings) -> list[dict] 
         return None
 
 
+def _compute_econ_signal(root: Path, clock, capacity_reader, econ_health) -> dict:
+    """status 用の econ 集計。専用の短命な読取接続で、他の lock を持たずに計算する。"""
+    conn = connect_readonly(root / "data" / "agentic.db")
+    try:
+        return econ_signal_report.econ_signal_status(
+            conn, now=clock.now(), capacity=capacity_reader, worker=econ_health)
+    finally:
+        conn.close()
+
+
 def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity,
                        health_latch, supervisor, improve_supervisor, plugins_dir,
-                       outage, trade_event_sink=None, ingest=None) -> OpsService:
+                       outage, trade_event_sink=None, ingest=None,
+                       admission=None, econ_health=None,
+                       capacity_reader=None, econ_status_cache=None) -> OpsService:
     db_path = root / "data" / "agentic.db"
     status_lock = threading.Lock()
     landlock_cache: list[bool] = []
@@ -1942,6 +2144,8 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
                 references = (
                     _reference_status_rows(conn, ingest, clock.now(), settings)
                     if ingest is not None else None)
+                admission_status = (admission.status(conn, clock.now())
+                                    if admission is not None else None)
             try:
                 landlock_ok = landlock_state()
                 # 配備先が無いときは approved_plugins の存在しない旨の log を出さない。
@@ -1957,6 +2161,13 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
                 setup = {"record_state": "unknown", "pending_steps": []}
         finally:
             conn.close()
+        # 重い集計は status_lock の外で、共有 cache から読む。
+        econ_signal = None
+        if econ_status_cache is not None:
+            try:
+                econ_signal = econ_status_cache.get()
+            except Exception as exc:  # noqa: BLE001 — 補助表示は status を止めない
+                _log.warning("econ signal status unavailable: %s", type(exc).__name__)
         mission = None
         if recent:
             mission = {"loop": recent[0]["loop"], "status": recent[0]["status"],
@@ -1968,6 +2179,10 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
                   "data": {"state": data_state}, "setup": setup}
         if references:
             status["references"] = references
+        if admission_status is not None:
+            status.update(admission_status)
+        if econ_signal is not None:
+            status["econ_signal"] = econ_signal
         if trade_event_sink is not None:
             # 理由別の件数だけ。理由の文言や event の中身は載せない
             status["trade_events"] = trade_event_sink.counters()
@@ -2167,6 +2382,32 @@ def _all_hard_keys_failed(app: App, exc: Exception) -> IngestTickReport:
 
 
 def _scheduler_tick_once(app: App) -> None:
+    """`_scheduler_tick_body` を tick の観測印で覆う (単体テスト用シーム)。
+
+    scheduler の DB 書込み要求フラグは、ここでは立てない。フラグは `conn_core` /
+    `conn_signal` が実際に write transaction を開く範囲 (ingest の commit、
+    `Scheduler.tick` の本体、signal maintenance の書込み) だけを、それぞれの場所で
+    覆う。ingest の取得 (network)、日次 report の callback、improve の発火、
+    deferred な通知はフラグの外で走る。
+    """
+    writer = getattr(app, "writer_admission", None)
+    if writer is None:
+        _scheduler_tick_body(app)
+        return
+    writer.tick_started()
+    try:
+        _scheduler_tick_body(app)
+    finally:
+        writer.tick_finished()
+
+
+def _writer_scope(app: App):
+    """scheduler の書込み要求フラグを立てる範囲。writer_admission が無ければ何もしない。"""
+    writer = getattr(app, "writer_admission", None)
+    return nullcontext() if writer is None else writer.scheduler_write()
+
+
+def _scheduler_tick_body(app: App) -> None:
     """scheduler_thread の 1 tick 分 (抽出 — 単体テスト用シーム)。
 
     app.clock.now() を読んで scheduler に渡すことを固定する。
@@ -2215,7 +2456,8 @@ def _scheduler_tick_once(app: App) -> None:
                 # commit が例外を出した tick も同じ扱いにする。
                 try:
                     if not prepare_failed:
-                        app.ingest.commit(app.conn_core)
+                        with _writer_scope(app):
+                            app.ingest.commit(app.conn_core)
                 except Exception as exc:  # noqa: BLE001 -- protection must still tick
                     _log.warning("ingest commit failed: %s", safe_error_text(exc))
                     if app.outage is not None:
@@ -2432,11 +2674,20 @@ def _check_watchdog_health(app: App, watchdog_thread_obj: threading.Thread,
 
 def _busy_resources_after_join(scheduler_still_busy: bool,
                                supervisor_still_busy: bool,
-                               improve_still_busy: bool = False) -> frozenset[str]:
+                               improve_still_busy: bool = False,
+                               report_still_busy: bool = False,
+                               econ_still_busy: bool = False) -> frozenset[str]:
     busy: set[str] = set()
-    if scheduler_still_busy or supervisor_still_busy or improve_still_busy:
+    if econ_still_busy:
+        busy.add("conn_econ_read")
+        busy.add("conn_econ_write")
+        # 残った worker は旧 App の DB に書ける。単一起動の所有権は離さない。
+        busy.add("instance_lock")
+    if (scheduler_still_busy or supervisor_still_busy or improve_still_busy
+            or report_still_busy):
         busy.add("conn_core")
         busy.add("conn_signal")
+        busy.add("conn_admission")
         # 残った thread が遷移を起こし得る間は observer と sink を外さない (event を無記録にしない)。
         busy.add("trade_event_observer")
         busy.add("trade_event_sink")
@@ -2467,10 +2718,12 @@ def _busy_resources_after_join(scheduler_still_busy: bool,
 
 
 def _exit_code(app: App, scheduler_alive: bool,
-               supervisor_alive: bool, improve_alive: bool = False) -> int:
+               supervisor_alive: bool, improve_alive: bool = False,
+               report_alive: bool = False, econ_alive: bool = False) -> int:
     if app.fatal_reason is not None:
         return 1
-    return 1 if scheduler_alive or supervisor_alive or improve_alive else 0
+    return 1 if (scheduler_alive or supervisor_alive or improve_alive
+                 or report_alive or econ_alive) else 0
 
 
 #: 起動時診断 thread の shutdown 時の join 上限。通常は即座に終わる。集合外で自己試験が
@@ -2530,6 +2783,31 @@ def _wait_for_improve_host_start(isolation_thread: threading.Thread) -> None:
             _log.warning("improve isolation: host start did not finish within 10s; continuing")
             return
         isolation_thread.join(timeout=min(_IMPROVE_HOST_START_POLL_SEC, remaining))
+
+
+#: slice worker の thread の shutdown 時の join 上限。worker は 1 本の短い transaction
+#: ごとに、また quote を取りに行く前に停止要求を見る。待つ可能性があるのは取得中の
+#: quote 1 回だけで、これは止められない。quote の source 連鎖は最大 3 つ (mt5 /
+#: twelvedata / yfinance) で各 10 秒の timeout なので最悪 30 秒、余白を足して 45 秒。
+_ECON_WORKER_JOIN_TIMEOUT_SEC = 45.0
+
+
+def _run_econ_slice_worker(app: App, stop_event: threading.Event) -> None:
+    """停止まで worker を回す。set 台帳の起動時補完は `build_app` が scheduler の
+    起動前に済ませている。worker が例外で抜けても daemon は止めない。
+    """
+    try:
+        app.econ_worker.run(stop_event)
+    except Exception:  # noqa: BLE001
+        _log.exception("econ slice worker stopped")
+
+
+def _run_econ_capacity_measurer(app: App, stop_event: threading.Event) -> None:
+    """停止まで容量を定期に測る。例外で抜けても daemon は止めない。"""
+    try:
+        app.econ_measurer.run(stop_event)
+    except Exception:  # noqa: BLE001
+        _log.exception("econ capacity measurer stopped")
 
 
 def run_service(root: Path, *, daemon: bool = False,
@@ -2605,7 +2883,7 @@ def run_service(root: Path, *, daemon: bool = False,
     def scheduler_thread() -> None:
         last = 0.0
         while not stop_event.is_set():
-            if time.monotonic() - last >= 60:
+            if time.monotonic() - last >= TICK_INTERVAL_SEC:
                 last = time.monotonic()
                 if stop_event.is_set():
                     break  # 停止フェーズ: 新しい tick を開始しない
@@ -2616,6 +2894,9 @@ def run_service(root: Path, *, daemon: bool = False,
                     _log.exception("tick failed")
                 finally:
                     scheduler_busy.clear()
+                    writer = getattr(app, "writer_admission", None)
+                    if writer is not None:
+                        writer.note_next_tick(last + TICK_INTERVAL_SEC)
                 if not stop_event.is_set():
                     _sweep_improve_notices(app)
                 if not stop_event.is_set():
@@ -2667,8 +2948,37 @@ def run_service(root: Path, *, daemon: bool = False,
     wd = threading.Thread(target=watchdog_thread, daemon=True, name="watchdog")
     th.start()
     wd.start()
+    # 資金保護の scheduler と watchdog の後に起こす (worker の起動時補完は資金保護を
+    # 待たせない)。起動時回復と schema の初期化は build_app で済んでいる。
+    econ_thread: threading.Thread | None = None
+    econ_still_busy = False
+    measure_thread: threading.Thread | None = None
 
     try:
+        if app.econ_measurer is not None:
+            try:
+                measure_thread = threading.Thread(
+                    target=_run_econ_capacity_measurer, args=(app, stop_event),
+                    daemon=True, name="afx-econ-capacity")
+                measure_thread.start()
+            except Exception:  # noqa: BLE001 — 測れなくてもサービスは続ける
+                if measure_thread is not None and measure_thread.ident is None:
+                    measure_thread = None
+                _log.exception("econ capacity measurer could not start")
+        try:
+            econ_thread = threading.Thread(
+                target=_run_econ_slice_worker, args=(app, stop_event),
+                daemon=True, name="afx-econ-slices")
+            app.econ_health.attach(econ_thread)
+            econ_thread.start()
+        except Exception as exc:  # noqa: BLE001 — worker を起こせなくてもサービスは続ける
+            started = econ_thread is not None and econ_thread.ident is not None
+            _log.exception("econ slice worker could not start")
+            if not started:
+                econ_thread = None
+                app.econ_health.mark_start_failed()
+            app.activity.write(Category.SYSTEM, "econ_slice_worker_start_failed",
+                               safe_error_text(exc))
         # 起動時回復 (build_app 内) の後に listener を開く。tick の起動は待たせない。
         start_ops_api(app, root)
         if daemon:
@@ -2758,12 +3068,26 @@ def run_service(root: Path, *, daemon: bool = False,
         app.supervisor.join(timeout=supervisor_join_timeout_sec)
         supervisor_still_busy = app.supervisor.is_alive()
         improve_still_busy = app.improve_supervisor.is_alive()
+        # 日次 report の thread。scheduler thread が止まった後は新しく積まれない
+        join_report = getattr(app.scheduler, "join_daily_report", None)
+        report_still_busy = (join_report is not None
+                             and not join_report(timeout=supervisor_join_timeout_sec))
         # F3 (fix round 1): watchdog の join を service_stopped 記録より前に
         # 行う。notifier は最大 10 秒ブロックしうるため、記録を先にすると
         # 「graceful」記録の後に watchdog がまだ activity へ書き込める窓が
         # 生じる。判定権威は th.join(30) + supervisor.join(...) — wd は
         # ここで待つだけで graceful/timeout の判定には関与しない。
         wd.join(timeout=15)
+        if econ_thread is not None:
+            econ_thread.join(timeout=_ECON_WORKER_JOIN_TIMEOUT_SEC)
+            econ_still_busy = econ_thread.is_alive()
+        if measure_thread is not None:
+            # 測定 thread は自分の読取接続だけを持ち自分で閉じる。止まらなくても
+            # worker の接続・単一起動 lock は閉じてよく、終了コードにも数えない。
+            measure_thread.join(timeout=_ECON_WORKER_JOIN_TIMEOUT_SEC)
+            if measure_thread.is_alive():
+                _log.warning("econ capacity measurer did not stop within %.0fs",
+                             _ECON_WORKER_JOIN_TIMEOUT_SEC)
         # **(レビュー 3 周目 codex E2)** タイムアウトでも runner.close()
         # は呼ぶ — 子プロセス/接続の leak は停止の目的に反する
         # (以前は join 成功時のみ close していた「上書き 7」の判断を、
@@ -2771,7 +3095,7 @@ def run_service(root: Path, *, daemon: bool = False,
         # シーケンスを止めない。
         skipped = app.close(busy_resources=_busy_resources_after_join(
             scheduler_still_busy, supervisor_still_busy,
-            improve_still_busy))
+            improve_still_busy, report_still_busy, econ_still_busy))
         try:
             reap_orphans()
         except Exception:
@@ -2780,14 +3104,16 @@ def run_service(root: Path, *, daemon: bool = False,
             app.activity.write(Category.SYSTEM, "close_skipped_resources",
                                f"{skipped} (join timeout — used-in-flight)")
         if (th.is_alive() or app.supervisor.is_alive()
-                or app.improve_supervisor.is_alive()):
+                or app.improve_supervisor.is_alive() or report_still_busy
+                or econ_still_busy):
             app.activity.write(Category.SYSTEM, "service_stopped",
                                "shutdown_timeout (Mission 継続中の可能性)")
         else:
             app.activity.write(Category.SYSTEM, "service_stopped", "graceful")
 
     if _exit_code(app, th.is_alive(), app.supervisor.is_alive(),
-                  app.improve_supervisor.is_alive()):
+                  app.improve_supervisor.is_alive(), report_still_busy,
+                  econ_still_busy):
         print("警告: 停止タイムアウト。実行中の処理が残っている可能性があります。")
         return 1
     print("停止しました。")

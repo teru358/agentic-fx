@@ -34,3 +34,12 @@ def test_set_gate_result_requires_category_and_persists_it(tmp_path):
     intents.set_gate_result(c, iid, accepted=False,
                             reject_reason="RR", reject_category="risk_gate")
     assert intents.get(c, iid)["reject_category"] == "risk_gate"
+
+
+def test_insert_in_tx_does_not_commit(tmp_path):
+    c = connect(tmp_path / "t.db"); init_db(c)
+    mid = missions.start(c, "trade", "local", "m", NOW)
+    iid = intents.insert_in_tx(c, mid, {"action": "open"}, NOW, action="open")
+    assert c.in_transaction
+    c.rollback()
+    assert intents.get(c, iid) is None

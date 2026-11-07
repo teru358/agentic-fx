@@ -187,7 +187,7 @@ def test_record_intent_commits_op_and_revocation_together(conn):
     signal_id = signals_store.add(
         conn, plugin="sma", content_hash="content-a", pair="USDJPY",
         timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
-        payload={"direction": "long"}, now=NOW)
+        payload={"direction": "long"}, now=NOW, contract_version="executable_v1")
     op_id = deploy_ops.record_intent(
         conn,
         intent_row={
@@ -213,7 +213,7 @@ def test_record_intent_rolls_back_every_table_when_signal_linking_fails(conn, mo
     signals_store.add(
         conn, plugin="sma", content_hash="content-a", pair="USDJPY",
         timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
-        payload={"direction": "long"}, now=NOW)
+        payload={"direction": "long"}, now=NOW, contract_version="executable_v1")
 
     def fail_link(*args, **kwargs):
         raise sqlite3.OperationalError("link failed")
@@ -243,7 +243,7 @@ def test_record_intent_rolls_back_when_after_insert_fails(conn):
     signal_id = signals_store.add(
         conn, plugin="sma", content_hash="content-a", pair="USDJPY",
         timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
-        payload={"direction": "long"}, now=NOW)
+        payload={"direction": "long"}, now=NOW, contract_version="executable_v1")
 
     def fail_after_insert(op_id):
         raise RuntimeError(f"destination failed for {op_id}")
@@ -276,7 +276,7 @@ def test_record_intent_with_revoke_rolls_back_every_row_when_signal_linking_fail
     signals_store.add(
         conn, plugin="sma", content_hash="content-a", pair="USDJPY",
         timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
-        payload={"direction": "long"}, now=NOW)
+        payload={"direction": "long"}, now=NOW, contract_version="executable_v1")
     before_approvals = [tuple(r) for r in conn.execute(
         "SELECT id,status FROM approval_requests ORDER BY id")]
 

@@ -135,3 +135,28 @@ _READ_ONLY_TRADE_TOOLS = [
     "get_ohlcv", "get_indicators", "search_news", "get_econ_calendar",
     "get_positions", "get_account", "get_recent_reflections",
     "search_reflections", "get_signals"]
+
+
+def test_build_app_gives_the_calendar_its_pairs_and_window(tmp_path):
+    from unittest.mock import patch
+
+    from agentic_fx.core.econ_window import WindowSettings
+    from agentic_fx.datafeed.econ_calendar import EconCalendar as Real
+    root = _root_with_settings(tmp_path)
+    seen = {}
+
+    def spy(*a, **kw):
+        seen.update(kw)
+        return Real(*a, **kw)
+
+    with patch.object(service_mod, "EconCalendar", side_effect=spy):
+        app = build_app(root, runner=FakeRunner([]), clock=FixedClock(NOW))
+    try:
+        settings = app.settings if hasattr(app, "settings") else None
+        assert seen["pair_currencies"]
+        assert all(len(v) == 2 for v in seen["pair_currencies"].values())
+        if settings is not None:
+            assert list(seen["pair_currencies"]) == list(settings.pairs)
+            assert seen["window"] == WindowSettings.from_config(settings.econ.window)
+    finally:
+        app.close()

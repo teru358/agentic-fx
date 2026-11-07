@@ -9,6 +9,7 @@ sandbox サブプロセスは一切起動しない — 全テストで `sandbox_
 from __future__ import annotations
 
 import logging
+import pytest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -420,6 +421,31 @@ def test_freshness_window_does_not_expand_by_closed_bar_grace(tmp_path):
     assert len(fake.calls) == 1
 
 
+@pytest.mark.parametrize("override", [
+    {"stop_loss": None},
+    {"direction": None},
+    {"action": "close"},
+    {"entry_type": "limit", "limit_price": None},
+    {"stop_loss": -1.0},
+])
+def test_strategy_open_that_cannot_be_normalized_stores_no_row(tmp_path, override):
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 6 * 60 + 1)
+    meta = _meta(name="strat", kind="strategy", timeframe="1h")
+    fake = _FakeSandbox()
+    result = {"action": "open", "rationale": "r", "direction": "long",
+              "entry_type": "market", "limit_price": None,
+              "stop_loss": 99.0, "take_profit": None}
+    result.update(override)
+    fake.queue("strat", result)
+    inserted = SignalProducer().evaluate_due_plugins(
+        conn, plugins=[meta], now=H + timedelta(hours=1),
+        source=SOURCE, sandbox_run=fake, settings=SETTINGS,
+        resolved_by_identity=_resolved_by_identity(meta))
+    assert inserted == 0
+    assert conn.execute("SELECT COUNT(*) c FROM signals").fetchone()["c"] == 0
+
+
 # ---------------------------------------------------------------------
 # ⑯ sandbox 失敗 → cursor が進まず次 tick で同一バケットを再試行
 # ---------------------------------------------------------------------
@@ -541,6 +567,14 @@ def test_strategy_open_action_is_stored(tmp_path):
     assert inserted == 1
     row = conn.execute("SELECT * FROM signals").fetchone()
     assert row["kind"] == "strategy"
+    assert row["contract_version"] == "executable_v1"
+    assert row["payload_json"] == (
+        '{"action": "open", "pair": "USDJPY", "direction": "long", '
+        '"entry_type": "market", "horizon": "day", "stop_loss": 100.0, '
+        '"confidence": 0.5, "reasoning": "go", "live_source": "yfinance", '
+        '"source": "yfinance", "interval": "1h", '
+        '"bar_time": "2026-07-22T11:00:00+00:00", '
+        '"bars_origin": "yfinance:1h"}')
 
 
 # ---------------------------------------------------------------------
@@ -1285,3 +1319,71 @@ def test_one_failing_session_close_does_not_skip_the_next(tmp_path):
             conn, plugins=metas, now=H + timedelta(hours=1), source=SOURCE,
             settings=SETTINGS, resolved_by_identity={}, activity=None)
     assert closed == ["a", "b"]
+
+
+def test_migrated_legacy_payloads_byte_match_the_live_producer(tmp_path):
+    """旧 payload の移行結果が、同じ strategy 結果を live producer に通した
+    保存 payload と 1 バイトも違わない。正規化不能な行は abandoned になる。"""
+    import json
+    fixtures = Path(__file__).resolve().parents[1] / "fixtures"
+    rows = json.loads((fixtures / "legacy_signal_payloads.json"
+                       ).read_text(encoding="utf-8").replace(
+                           '"mt5"', '"mt5-live"').replace('"mt5:', '"mt5-live:')
+                       )["rows"]
+    legacy = connect(tmp_path / "legacy.db")
+    legacy.executescript((fixtures / "db_schema_v5.sql").read_text(encoding="utf-8"))
+    cur = legacy.execute(
+        "INSERT INTO missions (loop,runner,model,status,started_at) "
+        "VALUES ('trade','local','m','running','2026-10-30T13:00:00+00:00')")
+    mid = cur.lastrowid
+    ids = {}
+    for row in rows:
+        ids[row["key"]] = legacy.execute(
+            "INSERT INTO signals (plugin,content_hash,pair,timeframe,bar_ts,"
+            "kind,payload_json,status,claimed_by_mission_id,claimed_at,"
+            "requeue_count,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (row["plugin"], row["content_hash"], row["pair"], row["timeframe"],
+             row["bar_ts"], row["kind"], json.dumps(row["payload"]),
+             row["status"], mid if row["status"] == "claimed" else None,
+             row["claimed_at"], row["requeue_count"], row["created_at"])
+        ).lastrowid
+    legacy.commit()
+    init_db(legacy)
+
+    live = _conn(tmp_path)
+    fields = ("action", "rationale", "direction", "entry_type", "limit_price",
+              "stop_loss", "take_profit")
+    normalizable = [r for r in rows if r["expected_after_normalization"] == "normalize"]
+    assert len(normalizable) == 2
+    for row in normalizable:
+        bar = datetime.fromisoformat(row["bar_ts"])
+        ohlcv_store.upsert_cache_bars(live, [
+            Bar(row["pair"], "15m", bar - timedelta(minutes=15 * i),
+                100.0, 100.0, 100.0, 100.0, 10.0) for i in range(8)],
+            source="mt5-live")
+        meta = _meta(name=row["plugin"], kind="strategy", timeframe="15m",
+                     content_hash=row["content_hash"], pairs=(row["pair"],))
+        fake = _FakeSandbox()
+        fake.queue(row["plugin"], {k: row["payload"].get(k) for k in fields})
+        inserted = SignalProducer().evaluate_due_plugins(
+            live, plugins=[meta], now=bar + timedelta(minutes=15, seconds=30),
+            source="mt5-live", sandbox_run=fake, settings=SETTINGS,
+            resolved_by_identity=_resolved_by_identity(meta))
+        assert inserted == 1, row["key"]
+        stored = live.execute(
+            "SELECT payload_json, contract_version FROM signals WHERE bar_ts=?",
+            (row["bar_ts"],)).fetchone()
+        migrated = legacy.execute(
+            "SELECT payload_json, contract_version, status FROM signals WHERE id=?",
+            (ids[row["key"]],)).fetchone()
+        assert migrated["payload_json"] == stored["payload_json"], row["key"]
+        assert migrated["contract_version"] == stored["contract_version"] == "executable_v1"
+        assert migrated["status"] == row["status"]
+
+    failed = legacy.execute(
+        "SELECT status, abandon_reason, abandoned_at, contract_version "
+        "FROM signals WHERE id=?", (ids["pending_missing_stop_loss"],)).fetchone()
+    assert failed["status"] == "abandoned"
+    assert failed["abandon_reason"] == "normalization_failed"
+    assert failed["abandoned_at"] is not None
+    assert failed["contract_version"] is None

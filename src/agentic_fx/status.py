@@ -17,6 +17,7 @@ from agentic_fx.config import load_settings_text
 from agentic_fx.core.contracts import SystemClock
 from agentic_fx.ops.contracts import Principal
 from agentic_fx.ops.keys import key_dir, key_file_name
+from agentic_fx.loops import econ_signal_report
 from agentic_fx.ops.redactor import redact
 from agentic_fx.ops.tail import tail_lines
 from agentic_fx.ops_setup.stages import InvalidState, read_marker, read_stage
@@ -173,6 +174,7 @@ class StatusData:
     activity: str
     steps: tuple[str, ...] | None
     unavailable: bool
+    econ: tuple[str, ...] = ()
 
 
 def _settings(root: Path) -> tuple[str, Any | None]:
@@ -256,7 +258,8 @@ def _database(db_path: Path, kind: str, conn: sqlite3.Connection | None) -> tupl
         return unavailable, True
     try:
         rows = missions.recent(conn, 1)
-        mission = (f"#{rows[0]['id']} {rows[0].get('state', rows[0].get('status', 'unknown'))} at "
+        mission = (f"#{rows[0]['id']} "
+                   f"{econ_signal_report.display_mission_status(rows[0].get('state', rows[0].get('status', 'unknown')))} at "
                    f"{rows[0].get('started_at', rows[0].get('created_at', 'unknown'))}"
                    if rows else "none")
     except Exception:  # noqa: BLE001
@@ -274,6 +277,23 @@ def _database(db_path: Path, kind: str, conn: sqlite3.Connection | None) -> tupl
     if all(line == "unavailable" for line in lines):
         return unavailable, True
     return ("ok", *lines), "unavailable" in lines
+
+
+def _econ(conn: sqlite3.Connection | None) -> tuple[str, ...]:
+    """signal 採否・abandoned の集計行。daemon の容量算定と worker は持たないので出さない。
+    読めなければ 1 行 unavailable で、他の source の判定には影響させない。"""
+    if conn is None:
+        return ()
+    try:
+        econ = econ_signal_report.econ_signal_status(
+            conn, now=SystemClock().now(), capacity=None, worker=None)
+        econ.pop("slice_capacity", None)
+        econ.pop("slice_worker", None)
+        if all(econ[key] is None for key in ("abandoned", "decisions")):
+            return ("econ signal: unavailable",)
+        return tuple(econ_signal_report.format_econ_lines(econ))
+    except Exception:  # noqa: BLE001 - optional detail must not suppress status
+        return ("econ signal: unavailable",)
 
 
 def _activity(root: Path) -> tuple[str, bool]:
@@ -341,6 +361,7 @@ def collect_status(root: Path, *, run: Callable[..., Any] = subprocess.run,
         except Exception:  # noqa: BLE001
             db, db_bad = ("unavailable",) * 4, True
         steps, pending_bad = _pending(root, instance, settings_value, conn)
+        econ = _econ(conn)
     finally:
         if conn is not None:
             conn.close()
@@ -348,7 +369,7 @@ def collect_status(root: Path, *, run: Callable[..., Any] = subprocess.run,
     state_bad = state[0] == "unavailable" and instance != "unknown"
     return StatusData(instance, setup_state, settings_state, unit, ops, state, *db,
                       activity, steps, any((setup_bad, unit_bad, ops_bad, state_bad, db_bad,
-                                            activity_bad, pending_bad)))
+                                            activity_bad, pending_bad)), econ)
 
 
 def render_status(data: StatusData, *, root: Path | None = None) -> str:
@@ -363,6 +384,7 @@ def render_status(data: StatusData, *, root: Path | None = None) -> str:
                   f"recent activity: {data.activity}",
                   f"pending steps: {'unavailable' if data.steps is None else len(data.steps)}"))
     lines.extend(f"  - {step}" for step in data.steps or ())
+    lines.extend(data.econ)
     lines.append(_NOTE)
     if data.setup in {"missing", "corrupt"}:
         next_step = "afx init"

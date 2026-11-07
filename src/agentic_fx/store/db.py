@@ -9,6 +9,7 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 from urllib.parse import quote
 
 _log = logging.getLogger("agentic_fx.store.db")
@@ -39,6 +40,52 @@ CREATE TABLE IF NOT EXISTS signals (
   requeue_count INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   UNIQUE(plugin, content_hash, pair, timeframe, bar_ts)
+);
+"""
+
+# signals v3: 採否契約の版 (`contract_version`) と abandoned の理由・時刻を持つ。
+# `signals` は `plugin_deploy_op_signals` / `signal_decisions` / `signal_shadow`
+# から参照される側なので、既存 DB の rebuild は新名で作ってから旧表を DROP
+# して RENAME する (`_migrate_signals_v3`)。fresh (_SCHEMA) と rebuild は同じ
+# 本文を使い、`name` / `ine` だけを差し替える。`_SIGNALS_V2_DDL` は FK 追加前の
+# 旧 DB を v2 へ移す `_migrate_signals_fk` が使うので残す。
+#
+# abandoned 以外は理由も時刻も持たない。abandoned は理由を必ず持ち、時刻を
+# 持たないのは v3 rebuild 前から abandoned だった `legacy_unknown` だけ。
+# `IS NOT NULL` を明示するのは、NULL を含む比較が NULL になり CHECK を素通り
+# させないため (trade_intents の CHECK と同じ三値の扱い)。
+SIGNAL_ABANDON_REASONS = (
+    "freshness_expired", "requeued_expired", "retry_exhausted",
+    "source_inactive", "normalization_failed", "deploy_op", "deploy_linked",
+    "ineligible_cleanup", "legacy_unknown")
+SIGNAL_CONTRACT_VERSIONS = ("executable_v1",)
+_SIGNALS_V2_COLUMNS = (
+    "id", "plugin", "content_hash", "pair", "timeframe", "bar_ts", "kind",
+    "payload_json", "status", "claimed_by_mission_id", "claimed_at",
+    "requeue_count", "created_at")
+_SIGNALS_V3_DDL = """
+CREATE TABLE {ine}{name} (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  plugin TEXT NOT NULL, content_hash TEXT NOT NULL,
+  pair TEXT NOT NULL, timeframe TEXT NOT NULL, bar_ts TEXT NOT NULL,
+  kind TEXT NOT NULL, payload_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK(status IN ('pending','claimed','consumed','abandoned')),
+  claimed_by_mission_id INTEGER REFERENCES missions(id), claimed_at TEXT,
+  requeue_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  contract_version TEXT
+    CHECK(contract_version IS NULL OR contract_version IN (""" + ",".join(
+        f"'{v}'" for v in SIGNAL_CONTRACT_VERSIONS) + """)),
+  abandon_reason TEXT,
+  abandoned_at TEXT,
+  UNIQUE(plugin, content_hash, pair, timeframe, bar_ts),
+  CHECK ((status='abandoned' AND abandon_reason IS NOT NULL
+          AND abandon_reason IN (""" + ",".join(
+        f"'{v}'" for v in SIGNAL_ABANDON_REASONS) + """)
+          AND (abandoned_at IS NOT NULL OR abandon_reason='legacy_unknown'))
+         OR (status<>'abandoned' AND abandon_reason IS NULL
+             AND abandoned_at IS NULL))
 );
 """
 
@@ -96,7 +143,7 @@ CREATE TABLE {ine}{name} (
   action TEXT,                   -- open | close | cancel | hold (NULL = 移行前の行)
   gate_result TEXT,              -- accepted | rejected (NULL = 未判定)
   reject_reason TEXT,
-  reject_category TEXT,          -- risk_gate | origin | mission | execution | signal
+  reject_category TEXT,          -- risk_gate | origin | mission | execution | signal | econ_window
   created_at TEXT NOT NULL,
   -- `action IS NULL` は移行前の行を対象外にする意図の明示である。
   -- **SQL の NULL 意味論により、この節が無くても legacy 行は通る**
@@ -117,9 +164,183 @@ CREATE TABLE {ine}{name} (
          OR (gate_result='accepted' AND reject_category IS NULL)
          OR (gate_result='rejected' AND reject_category IS NOT NULL
              AND reject_category IN
-             ('risk_gate','origin','mission','execution','signal')))
+             ('risk_gate','origin','mission','execution','signal',
+              'econ_window')))
 );
 """
+
+# signal の最終採否。accept (LLM、intent あり)、LLM reject (固定 2 語)、
+# system reject (回避帯) の 3 正規形だけを許す。
+_SIGNAL_DECISIONS_DDL = """
+CREATE TABLE IF NOT EXISTS signal_decisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mission_id INTEGER NOT NULL REFERENCES missions(id),
+  signal_id INTEGER NOT NULL UNIQUE REFERENCES signals(id),
+  trade_intent_id INTEGER REFERENCES trade_intents(id),
+  decision TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  reject_code TEXT,
+  decided_at TEXT NOT NULL,
+  UNIQUE(id, signal_id),
+  CHECK ((decision='accept' AND actor='llm' AND trade_intent_id IS NOT NULL
+          AND reject_code IS NULL)
+         OR (decision='reject' AND actor='llm' AND trade_intent_id IS NULL
+             AND reject_code IS NOT NULL
+             AND reject_code IN ('news_shock','opposite_position'))
+         OR (decision='reject' AND actor='system' AND trade_intent_id IS NULL
+             AND reject_code IS NOT NULL AND reject_code='econ_window'))
+);
+"""
+
+# accept / reject の両方に 1 行作る仮想約定の追跡。decision の値は snapshot。
+# state と結果列は pending_entry / filled / resolved / expired の 4 正規形だけ。
+_SIGNAL_SHADOW_DDL = """
+CREATE TABLE IF NOT EXISTS signal_shadow (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  decision_id INTEGER NOT NULL UNIQUE,
+  signal_id INTEGER NOT NULL UNIQUE REFERENCES signals(id),
+  decision TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  reject_code TEXT,
+  state TEXT NOT NULL,
+  entry_price REAL, entry_at TEXT,
+  result_code TEXT,
+  exit_price REAL, pnl_pips REAL, resolved_at TEXT,
+  pip_size REAL NOT NULL,
+  spread_pips REAL NOT NULL,
+  spread_source TEXT NOT NULL CHECK(spread_source IN ('quote','assumed')),
+  rule_version INTEGER NOT NULL,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  FOREIGN KEY (decision_id, signal_id)
+    REFERENCES signal_decisions(id, signal_id),
+  CHECK ((decision='accept' AND actor='llm' AND reject_code IS NULL)
+         OR (decision='reject' AND actor='llm' AND reject_code IS NOT NULL
+             AND reject_code IN ('news_shock','opposite_position'))
+         OR (decision='reject' AND actor='system' AND reject_code IS NOT NULL
+             AND reject_code='econ_window')),
+  CHECK ((entry_price IS NULL) = (entry_at IS NULL)),
+  CHECK ((state='pending_entry' AND result_code IS NULL
+          AND entry_price IS NULL AND entry_at IS NULL
+          AND exit_price IS NULL AND pnl_pips IS NULL AND resolved_at IS NULL)
+         OR (state='filled' AND result_code IS NULL
+             AND entry_price IS NOT NULL AND entry_at IS NOT NULL
+             AND exit_price IS NULL AND pnl_pips IS NULL AND resolved_at IS NULL)
+         OR (state='resolved' AND result_code IS NOT NULL
+             AND result_code IN ('sl','tp','day_close')
+             AND entry_price IS NOT NULL AND entry_at IS NOT NULL
+             AND exit_price IS NOT NULL AND pnl_pips IS NOT NULL
+             AND resolved_at IS NOT NULL)
+         OR (state='resolved' AND result_code IS NOT NULL
+             AND result_code='data_insufficient'
+             AND exit_price IS NULL AND pnl_pips IS NULL AND resolved_at IS NULL)
+         OR (state='expired' AND result_code IS NOT NULL
+             AND result_code='no_fill'
+             AND entry_price IS NULL AND entry_at IS NULL
+             AND exit_price IS NULL AND pnl_pips IS NULL AND resolved_at IS NULL))
+);
+"""
+
+# slice worker の起動世代。AUTOINCREMENT なので id は再利用されず単調増加する。
+_OHLCV_SLICE_GENERATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS ohlcv_slice_generations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  started_at TEXT NOT NULL
+);
+"""
+
+# 1m 足の退避単位 (event × pair、または shadow 1 行) と完備 marker。
+# 区間は UTC の半開区間 [range_start, range_end)。
+_OHLCV_SLICE_SETS_DDL = """
+CREATE TABLE IF NOT EXISTS ohlcv_slice_sets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER REFERENCES econ_events(id),
+  shadow_id INTEGER REFERENCES signal_shadow(id),
+  pair TEXT NOT NULL,
+  range_start TEXT NOT NULL, range_end TEXT NOT NULL,
+  expected_rows INTEGER NOT NULL CHECK(expected_rows >= 0),
+  state TEXT NOT NULL CHECK(state IN
+    ('awaiting','staging','complete','unrecoverable','cancelled')),
+  generation INTEGER REFERENCES ohlcv_slice_generations(id),
+  spread_pips REAL, spread_source TEXT,
+  created_at TEXT NOT NULL, completed_at TEXT, purged_at TEXT,
+  rule_version INTEGER NOT NULL,
+  UNIQUE(event_id, pair),
+  UNIQUE(shadow_id),
+  CHECK (range_start < range_end),
+  CHECK ((event_id IS NULL) <> (shadow_id IS NULL)),
+  CHECK ((state='staging') = (generation IS NOT NULL)),
+  CHECK ((state IN ('complete','unrecoverable','cancelled'))
+         = (completed_at IS NOT NULL)),
+  CHECK (purged_at IS NULL OR state IN ('complete','unrecoverable')),
+  CHECK ((spread_pips IS NULL) = (spread_source IS NULL)),
+  CHECK (spread_source IS NULL OR spread_source IN ('quote','assumed')),
+  CHECK (shadow_id IS NULL OR spread_pips IS NULL)
+);
+"""
+
+# 退避した 1m 足。observed は OHLC と volume を持ち、有限正数で
+# low <= open, close <= high を満たす。datafeed_outage_gap は障害欠損の印で、
+# OHLC と volume を持たない。
+# 1e308 未満は無限を弾くため (NaN は SQLite が NULL として格納する)。
+_OHLCV_SLICES_DDL = """
+CREATE TABLE IF NOT EXISTS ohlcv_slices (
+  set_id INTEGER NOT NULL REFERENCES ohlcv_slice_sets(id),
+  bar_time TEXT NOT NULL,
+  open REAL, high REAL, low REAL, close REAL, volume REAL,
+  source TEXT NOT NULL,
+  quality TEXT NOT NULL CHECK(quality IN
+    ('observed','datafeed_outage_gap')),
+  UNIQUE(set_id, bar_time),
+  CHECK ((quality='datafeed_outage_gap'
+          AND open IS NULL AND high IS NULL AND low IS NULL
+          AND close IS NULL AND volume IS NULL)
+         OR (quality='observed'
+             AND open IS NOT NULL AND high IS NOT NULL AND low IS NOT NULL
+             AND close IS NOT NULL AND volume IS NOT NULL
+             AND low > 0 AND high < 1e308
+             AND low <= open AND open <= high
+             AND low <= close AND close <= high
+             AND volume >= 0 AND volume < 1e308))
+);
+"""
+
+# 反応集計の一意キー (event, 通貨) と、算定時点の canonical pair の set。
+_ECON_REACTION_KEYS_DDL = """
+CREATE TABLE IF NOT EXISTS econ_reaction_keys (
+  event_id INTEGER NOT NULL REFERENCES econ_events(id),
+  currency TEXT NOT NULL,
+  set_id INTEGER NOT NULL REFERENCES ohlcv_slice_sets(id),
+  decided_at TEXT NOT NULL,
+  UNIQUE(event_id, currency)
+);
+"""
+
+# event set ごとの窓別反応値の snapshot。slice 行の purge 後も残る。
+_ECON_REACTION_VALUES_DDL = """
+CREATE TABLE IF NOT EXISTS econ_reaction_values (
+  set_id INTEGER NOT NULL REFERENCES ohlcv_slice_sets(id),
+  window_min INTEGER NOT NULL CHECK(window_min IN (15,60,240)),
+  status TEXT NOT NULL CHECK(status IN ('resolved','unresolvable')),
+  range_pips REAL, close_change_pips REAL,
+  abs_close_change_pips REAL, net_abs_close_change_pips REAL,
+  rule_version INTEGER NOT NULL,
+  computed_at TEXT NOT NULL,
+  UNIQUE(set_id, window_min),
+  CHECK ((status='resolved' AND range_pips IS NOT NULL
+          AND close_change_pips IS NOT NULL
+          AND abs_close_change_pips IS NOT NULL
+          AND net_abs_close_change_pips IS NOT NULL)
+         OR (status='unresolvable' AND range_pips IS NULL
+             AND close_change_pips IS NULL
+             AND abs_close_change_pips IS NULL
+             AND net_abs_close_change_pips IS NULL))
+);
+"""
+
+_ECON_SIGNAL_TABLES_DDL = (
+    _SIGNAL_DECISIONS_DDL + _SIGNAL_SHADOW_DDL + _OHLCV_SLICE_GENERATIONS_DDL
+    + _OHLCV_SLICE_SETS_DDL + _OHLCV_SLICES_DDL + _ECON_REACTION_KEYS_DDL
+    + _ECON_REACTION_VALUES_DDL)
 
 _OHLCV_CACHE_DDL = """
 CREATE TABLE IF NOT EXISTS ohlcv_cache (
@@ -374,6 +595,7 @@ CREATE TABLE IF NOT EXISTS econ_events (
   ts TEXT NOT NULL, country TEXT NOT NULL, name TEXT NOT NULL,
   importance INTEGER NOT NULL DEFAULT 0,
   actual TEXT, forecast TEXT, previous TEXT,
+  superseded_by INTEGER REFERENCES econ_events(id),
   UNIQUE (ts, country, name)
 );
 CREATE TABLE IF NOT EXISTS approval_requests (
@@ -419,7 +641,7 @@ CREATE TABLE IF NOT EXISTS analysis_runs (
   source TEXT NOT NULL, created_at TEXT NOT NULL
 );
 """ + _CANDIDATE_ARCHIVES_DDL + """
-""" + _SIGNALS_V2_DDL + _PLUGIN_DEPLOY_OPS_DDL + _PLUGIN_DEPLOY_OPS_OPEN_UNIQUE_DDL + _PLUGIN_DEPLOY_OP_SIGNALS_DDL + """
+""" + _SIGNALS_V3_DDL.format(name="signals", ine="IF NOT EXISTS ") + _PLUGIN_DEPLOY_OPS_DDL + _PLUGIN_DEPLOY_OPS_OPEN_UNIQUE_DDL + _PLUGIN_DEPLOY_OP_SIGNALS_DDL + _ECON_SIGNAL_TABLES_DDL + """
 -- プラン 9 束 C (codex 指摘の裏取り): prune_cache (store/ohlcv.py) の
 -- `WHERE bar_time < ?` は PK (symbol, interval, bar_time, source) の先頭列に
 -- 当たらず、autoindex のカバリングスキャンになる。定常状態では cutoff を
@@ -541,6 +763,8 @@ TABLE_NAMES = frozenset({
     "cron_cursor", "mission_decision_bars",
     "ops_requests", "ops_idempotency", "ops_events", "ops_policies",
     "plugin_deploy_ops", "plugin_deploy_op_signals", "improve_run_notices",
+    "signal_decisions", "signal_shadow", "ohlcv_slice_sets", "ohlcv_slices",
+    "ohlcv_slice_generations", "econ_reaction_keys", "econ_reaction_values",
 })
 
 
@@ -997,9 +1221,14 @@ def _migrate_signals_fk(conn: sqlite3.Connection) -> None:
     suffix は移行の種類ごとに別ファイルにする規約 (`.bak-ohlcv-v2` /
     `.bak-ohlcv-split` と衝突させない)。
 
-    **FK 再構築の警告:** `signals` は現時点で参照元が無いため RENAME 先行が
-    動くにすぎない。参照される側を再構築するときは「新名 CREATE → コピー →
-    旧表 DROP → 新表を本来名へ RENAME」の順序を使う (Task 17 を参照)。
+    **FK 再構築の警告:** `signals` は `plugin_deploy_op_signals` /
+    `signal_decisions` / `signal_shadow` から参照される。`init_db` はこれらを
+    `_SCHEMA` で先に作るので、通常の RENAME は子表の `REFERENCES signals` を
+    `"signals_v1"` へ書き換え、DROP 後に宙吊りにする。RENAME の間だけ
+    `legacy_alter_table=ON` にして子表の参照名を書き換えさせない (コピー後の
+    新 `signals` を指したまま残る)。新しい rebuild は RENAME 先行を使わず
+    「新名 CREATE → コピー → 旧表 DROP → 新表を本来名へ RENAME」の順序を使う
+    (`_migrate_trade_intents_observability` / `_migrate_signals_v3`)。
     """
     fk_present = any(
         fk["table"] == "missions" and fk["from"] == "claimed_by_mission_id"
@@ -1029,7 +1258,14 @@ def _migrate_signals_fk(conn: sqlite3.Connection) -> None:
                 return
 
             if not v1_exists2:
-                conn.execute("ALTER TABLE signals RENAME TO signals_v1")
+                prior_legacy = conn.execute(
+                    "PRAGMA legacy_alter_table").fetchone()[0]
+                conn.execute("PRAGMA legacy_alter_table=ON")
+                try:
+                    conn.execute("ALTER TABLE signals RENAME TO signals_v1")
+                finally:
+                    conn.execute(
+                        f"PRAGMA legacy_alter_table={1 if prior_legacy else 0}")
             conn.execute(_SIGNALS_V2_DDL)
 
             conn.execute(
@@ -1436,15 +1672,14 @@ def _migrate_trade_intents_observability(conn: sqlite3.Connection) -> None:
     `_has_leftover_new_table()` の組を使う。
 
     CHECK の許可カテゴリ追加も既存 DB に反映するため、列だけでなく
-    `sqlite_master.sql` に `'signal'` があることも冪等ガードで確認する。
+    `sqlite_master.sql` の表定義本文が `_TRADE_INTENTS_DDL` と一致することも
+    冪等ガードで確認する (`_table_definition_matches`)。
     """
     def _needs_rebuild() -> bool:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(trade_intents)")}
-        sql_row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' "
-            "AND name='trade_intents'").fetchone()
         return (not ({"action", "reject_category"} <= cols)
-                or sql_row is None or "'signal'" not in sql_row["sql"])
+                or not _table_definition_matches(
+                    conn, "trade_intents", _TRADE_INTENTS_DDL))
 
     def _has_leftover_new_table() -> bool:
         return conn.execute(
@@ -1514,6 +1749,332 @@ def _migrate_trade_intents_observability(conn: sqlite3.Connection) -> None:
             raise
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _strip_sql_comments(sql: str) -> str:
+    """文字列リテラルの外にある `-- ...` と `/* ... */` を落とす。"""
+    out: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch in ("'", '"'):
+            j = i + 1
+            while j < n:
+                if sql[j] == ch:
+                    if j + 1 < n and sql[j + 1] == ch:
+                        j += 2
+                        continue
+                    break
+                j += 1
+            out.append(sql[i:j + 1])
+            i = j + 1
+        elif sql.startswith("--", i):
+            j = sql.find("\n", i)
+            i = n if j < 0 else j
+        elif sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            out.append(" ")
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def _canonical_sql_tokens(text: str) -> str:
+    """CHECK 式の正規形。文字列リテラル (引用符つき) は 1 文字も変えず、
+    リテラル外は空白を落としてキーワードの大小を畳む。語と語の間にだけ
+    区切りの空白を残す。"""
+    parts: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in ("'", '"'):
+            j = i + 1
+            while j < n:
+                if text[j] == ch:
+                    if j + 1 < n and text[j + 1] == ch:
+                        j += 2
+                        continue
+                    break
+                j += 1
+            parts.append(text[i:j + 1])
+            i = j + 1
+        elif ch.isspace():
+            i += 1
+        elif ch.isalnum() or ch == "_":
+            j = i
+            while j < n and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            word = text[i:j].upper()
+            if parts and (parts[-1][-1].isalnum() or parts[-1][-1] == "_"):
+                parts.append(" ")
+            parts.append(word)
+            i = j
+        else:
+            parts.append(ch)
+            i += 1
+    return "".join(parts)
+
+
+def _normalized_check_clauses(sql: str) -> list[str]:
+    """DDL 本文の `CHECK(...)` 式を、コメントと空白を落とし、キーワードの
+    大小を畳んで並べ替えた list で返す。列レベルと表レベルは区別せず集合
+    として比べる。文字列リテラルの中は括弧も空白も大小もそのまま扱う。"""
+    text = _strip_sql_comments(sql)
+    clauses: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in ("'", '"'):
+            j = i + 1
+            while j < n:
+                if text[j] == ch:
+                    if j + 1 < n and text[j + 1] == ch:
+                        j += 2
+                        continue
+                    break
+                j += 1
+            i = j + 1
+            continue
+        prev_ok = i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+        if prev_ok and text[i:i + 5].upper() == "CHECK":
+            k = i + 5
+            while k < n and text[k].isspace():
+                k += 1
+            if k < n and text[k] == "(":
+                depth, j, quote = 0, k, None
+                while j < n:
+                    c = text[j]
+                    if quote:
+                        if c == quote:
+                            quote = None
+                    elif c in ("'", '"'):
+                        quote = c
+                    elif c == "(":
+                        depth += 1
+                    elif c == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                clauses.append(_canonical_sql_tokens(text[k:j + 1]))
+                i = j + 1
+                continue
+        i += 1
+    return sorted(clauses)
+
+
+def _table_structure(conn: sqlite3.Connection, table: str) -> tuple | None:
+    """表の構造 (列・FK・index・CHECK 式) を比較用の tuple にする。
+    DDL 内のコメントや空白は含まない。表が無ければ None。"""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (table,)).fetchone()
+    if row is None or row[0] is None:
+        return None
+    columns = tuple(
+        (r[1], (r[2] or "").upper(), r[3], r[4], r[5])
+        for r in conn.execute(f"PRAGMA table_info('{table}')"))
+    fks = tuple(sorted(
+        (r[2], r[3], r[4] or "", r[5], r[6], r[7])
+        for r in conn.execute(f"PRAGMA foreign_key_list('{table}')")))
+    indexes = []
+    for idx in conn.execute(f"PRAGMA index_list('{table}')"):
+        if not idx[2]:
+            continue
+        cols = tuple(c[2] for c in conn.execute(
+            f"PRAGMA index_info('{idx[1]}')"))
+        indexes.append((idx[2], idx[3], idx[4], cols))
+    return (columns, fks, tuple(sorted(indexes)),
+            tuple(_normalized_check_clauses(row[0])))
+
+
+def _table_definition_matches(conn: sqlite3.Connection, table: str,
+                              ddl_template: str) -> bool:
+    """`table` の構造が `ddl_template` (`{ine}{name}` 型) の構造と一致するか。
+
+    比べるのは列 (名前・型・NOT NULL・default・PK)、FK、UNIQUE な
+    index、CHECK 式 (コメントと空白を除く)。DDL 文字列そのものは比べない
+    ので、コメントや空白だけの変更では不一致にならない。列・CHECK・FK の
+    どれかの意味が違えば不一致になる。"""
+    actual = _table_structure(conn, table)
+    if actual is None:
+        return False
+    scratch = sqlite3.connect(":memory:")
+    try:
+        scratch.execute(ddl_template.format(name=table, ine=""))
+        expected = _table_structure(scratch, table)
+    finally:
+        scratch.close()
+    return actual == expected
+
+
+# signals を参照する子表。v3 rebuild の移行後 FK 検査はこの 3 本だけを
+# 失敗の対象にし、他の表の既存違反は数えて警告に留める。
+_SIGNALS_CHILD_TABLES = (
+    "plugin_deploy_op_signals", "signal_decisions", "signal_shadow")
+
+
+def _migrate_signals_v3(conn: sqlite3.Connection) -> None:
+    """signals を v3 (`contract_version` / `abandon_reason` / `abandoned_at` と
+    その CHECK) へ table rebuild する。
+
+    `signals` は参照される側なので `_migrate_trade_intents_observability` と
+    同じ順序を使う: FK を transaction の外で OFF → `BEGIN IMMEDIATE` →
+    再検査 → `signals_new` を作る → 全行コピー → 行数照合 → 旧表 DROP →
+    `signals_new` を `signals` へ RENAME → 子表 3 本の FK 検査 (他表の違反は警告のみ) → commit、
+    finally で FK を ON に戻す。子表の `REFERENCES signals` は名前で解決
+    されるので、RENAME 後は新表を指す。
+
+    コピーでは既存の abandoned に `abandon_reason='legacy_unknown'`・
+    `abandoned_at=NULL`、それ以外に両方 NULL、`contract_version` に NULL を
+    入れる。旧表が既にこれらの列を持つ (CHECK 本文だけが違う) 場合は値を
+    引き継ぎ、abandoned で理由が NULL の行だけを `legacy_unknown` にする。
+    AUTOINCREMENT の採番済み最大値 (`sqlite_sequence`) も引き継ぐ。
+
+    冪等ガードは列ではなく表定義本文の一致 (`_table_definition_matches`) で
+    見る。一致していれば rebuild しない (2 回目の初期化は行を変えない)。
+    `signals_new` の残骸だけが残っていればそれを DROP する。
+    """
+    def _needs_rebuild() -> bool:
+        return not _table_definition_matches(conn, "signals", _SIGNALS_V3_DDL)
+
+    def _has_leftover_new_table() -> bool:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='signals_new'").fetchone() is not None
+
+    if not _needs_rebuild() and not _has_leftover_new_table():
+        return
+
+    conn.commit()
+    if not _needs_rebuild():
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if not _needs_rebuild() and _has_leftover_new_table():
+                conn.execute("DROP TABLE signals_new")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return
+
+    _backup_before_migration(conn, ".bak-signals-v3")
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if not _needs_rebuild():
+                conn.commit()
+                return
+            if _has_leftover_new_table():
+                conn.execute("DROP TABLE signals_new")
+            old_cols = {r["name"] for r in conn.execute(
+                "PRAGMA table_info(signals)")}
+            old_count = conn.execute(
+                "SELECT COUNT(*) FROM signals").fetchone()[0]
+            seq_row = conn.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name='signals'"
+            ).fetchone()
+            conn.execute(_SIGNALS_V3_DDL.format(name="signals_new", ine=""))
+            contract_expr = ("contract_version"
+                             if "contract_version" in old_cols else "NULL")
+            reason_expr = (
+                "CASE WHEN status='abandoned' THEN "
+                + ("COALESCE(abandon_reason,'legacy_unknown')"
+                   if "abandon_reason" in old_cols else "'legacy_unknown'")
+                + " END")
+            at_expr = ("CASE WHEN status='abandoned' THEN abandoned_at END"
+                       if "abandoned_at" in old_cols else "NULL")
+            columns = ",".join(_SIGNALS_V2_COLUMNS)
+            conn.execute(
+                f"INSERT INTO signals_new ({columns},contract_version,"
+                f"abandon_reason,abandoned_at) SELECT {columns},"
+                f"{contract_expr},{reason_expr},{at_expr} FROM signals")
+            new_count = conn.execute(
+                "SELECT COUNT(*) FROM signals_new").fetchone()[0]
+            if new_count != old_count:
+                raise RuntimeError(
+                    "signals v3 migration: 行数が一致しません "
+                    f"(旧={old_count}, 新={new_count})")
+            conn.execute("DROP TABLE signals")
+            conn.execute("ALTER TABLE signals_new RENAME TO signals")
+            if seq_row is not None:
+                updated = conn.execute(
+                    "UPDATE sqlite_sequence SET seq=max(seq, ?) "
+                    "WHERE name='signals'", (seq_row[0],)).rowcount
+                if updated == 0:
+                    conn.execute(
+                        "INSERT INTO sqlite_sequence (name, seq) "
+                        "VALUES ('signals', ?)", (seq_row[0],))
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            mine = [tuple(v) for v in violations
+                    if v[0] in _SIGNALS_CHILD_TABLES]
+            if mine:
+                raise RuntimeError(
+                    "signals v3 migration: 移行後に FK 違反が残っています "
+                    f"({len(mine)} 行): {mine}")
+            if len(violations) > len(mine):
+                _log.warning(
+                    "signals v3 migration: signals と無関係の表に既存の FK "
+                    "違反が %d 行あります (移行は続行): %s",
+                    len(violations) - len(mine),
+                    sorted({v[0] for v in violations
+                            if v[0] not in _SIGNALS_CHILD_TABLES}))
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _apply_data_migration_once(
+        conn: sqlite3.Connection, name: str,
+        migrate: Callable[[sqlite3.Connection], None]) -> bool:
+    """`data_migrations` に `name` が無いときだけ `migrate` を 1 回適用して
+    `name` を記録する。適用したら True、記録済みなら何もせず False。
+
+    `migrate` は commit しない。`BEGIN IMMEDIATE` の中で記録の有無を確かめて
+    から適用と記録を同じ transaction で commit するので、並行する起動が
+    二重に適用することはなく、失敗すれば記録も残らない (次回やり直す)。"""
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if conn.execute("SELECT 1 FROM data_migrations WHERE name=?",
+                        (name,)).fetchone() is not None:
+            conn.commit()
+            return False
+        migrate(conn)
+        conn.execute(
+            "INSERT INTO data_migrations(name, applied_at) VALUES (?, ?)",
+            (name, datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        return True
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _signal_data_migrations() -> tuple[
+        tuple[str, Callable[[sqlite3.Connection], None]], ...]:
+    """v3 schema を前提に、rebuild の直後に順に適用する signals の data
+    migration の `(name, 関数)`。各関数は commit せず、
+    `_apply_data_migration_once` が name を記録して 2 回目を no-op にする。
+    store 側の関数は循環 import を避けるためここで import する。"""
+    from agentic_fx.store.signals import normalize_legacy_strategy_payloads
+    return (("normalize_strategy_payloads_v1", normalize_legacy_strategy_payloads),)
+
+
+def _migrate_signals(conn: sqlite3.Connection) -> None:
+    """signals の schema と data を順に現行へ移す: FK 追加前の旧表を v2 へ
+    (`_migrate_signals_fk`) → v3 rebuild (`_migrate_signals_v3`) → v3 を前提
+    にした data migration (`_signal_data_migrations`)。"""
+    _migrate_signals_fk(conn)
+    _migrate_signals_v3(conn)
+    for name, migrate in _signal_data_migrations():
+        _apply_data_migration_once(conn, name, migrate)
 
 
 _LEGACY_PLUGIN_APPROVAL_REQUIRED_KEYS = (
@@ -1587,7 +2148,9 @@ def init_db(conn: sqlite3.Connection, *, root: Path | None = None) -> None:
         _migrate_ohlcv_split(conn)      # v2 → ohlcv_cache/ohlcv_history (新設)
     _migrate_ohlcv_cache_purge_pre_closed_v1(conn)
     _ensure_column(conn, "missions", "trigger", "trigger TEXT")
-    _migrate_signals_fk(conn)           # Task 13
+    _ensure_column(conn, "econ_events", "superseded_by",
+                   "superseded_by INTEGER REFERENCES econ_events(id)")
+    _migrate_signals(conn)
     _migrate_improvement_runs_v2(conn)  # Task 19 (追加するのはこの 1 行だけ)
     _migrate_trade_intents_observability(conn)   # Task 17
     # --- プラン 10 Task 8 ここから ---

@@ -1,145 +1,48 @@
-"""state が restricted の間の trade loop (signal 起動) の requeue と解除後の再 claim。"""
-from datetime import timedelta
+"""専用採否経路は data state が使えない間、判断確定を保留する。"""
+from types import SimpleNamespace
 
-import pytest
-
-from agentic_fx.core.contracts import FixedClock
+from tests.loops.test_trade_loop import NOW
 from agentic_fx.runners.base import MissionResult
-from agentic_fx.store import missions, orders
 
-from tests.loops.test_trade_loop import NOW, SETTINGS, _loop
+from tests.loops.test_trade_loop import _loop
 from tests.loops.test_trade_loop_signal import _add_signal
 
-OPEN_RESULT = {"action": "open", "pair": "USDJPY", "direction": "long",
-               "entry_type": "market", "horizon": "day", "stop_loss": 147.0,
-               "take_profit": 149.0, "reasoning": "x"}
 
-
-def _signal_row(conn, sid):
-    return dict(conn.execute(
-        "SELECT status, requeue_count FROM signals WHERE id=?", (sid,)).fetchone())
-
-
-def _set_now(loop, when):
-    clock = FixedClock(when)
-    loop.clock = clock
-    loop.executor.clock = clock
-
-
-@pytest.mark.parametrize("data_state", ["degraded", "restricted"])
-def test_claimed_open_signal_is_abandoned_once_requeue_limit_is_reached(tmp_path, data_state):
-    limit = SETTINGS.plugin.signal_requeue_max
-    conn, loop, runner, _ = _loop(
-        tmp_path, [MissionResult("completed", OPEN_RESULT, [])] * (limit + 1))
-    loop.executor.state_fn = lambda: data_state
-    sid = _add_signal(conn)
-
-    for attempt in range(limit):
-        loop.run_once("signal")
-        assert _signal_row(conn, sid) == {"status": "pending", "requeue_count": attempt + 1}
-    loop.run_once("signal")
-
-    assert _signal_row(conn, sid)["status"] == "abandoned"
-    assert orders.list_by_status(conn, "open", "pending_fill", "submitting") == []
-    rejected = conn.execute(
-        "SELECT count(*) FROM trade_intents WHERE gate_result='rejected' "
-        "AND reject_category='risk_gate'").fetchone()[0]
-    assert rejected == limit + 1
-
-
-@pytest.mark.parametrize("data_state", ["degraded", "restricted"])
-def test_after_the_data_state_clears_the_signal_is_claimed_again_only_after_the_min_interval(
-        tmp_path, data_state):
-    interval = SETTINGS.plugin.signal_min_interval_min
-    conn, loop, _, _ = _loop(tmp_path, [
-        MissionResult("completed", OPEN_RESULT, []),
-        MissionResult("completed", {"action": "hold", "reasoning": "ok"}, [])])
-    state = {"v": data_state}
-    loop.executor.state_fn = lambda: state["v"]
-    sid = _add_signal(conn)
-    loop.run_once("signal")
-    assert _signal_row(conn, sid)["status"] == "pending"
-
-    # 直前の signal mission から min_interval 未満の間は、解除されていても起動しない
-    state["v"] = "ready"
-    assert not missions.signals_rate_ok(
-        conn, NOW + timedelta(minutes=interval - 1), SETTINGS)
-    assert missions.signals_rate_ok(conn, NOW + timedelta(minutes=interval), SETTINGS)
-
-    # 間隔が経過し、まだ fresh (13:00 まで) なら再 claim されて consume される
-    _set_now(loop, NOW + timedelta(minutes=interval))
-    loop.run_once("signal")
-    assert _signal_row(conn, sid)["status"] == "consumed"
-
-
-def test_close_and_cancel_signals_are_consumed_and_executed_when_restricted(tmp_path):
-    conn, loop, _, _ = _loop(tmp_path, [])
+def test_non_ready_state_requeues_without_decision_or_intent(tmp_path):
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"decision": "accept", "reject_code": None}, [])])
     loop.executor.state_fn = lambda: "restricted"
-    open_oid = orders.insert(
-        conn, pair="USDJPY", direction="long", entry_type="market", horizon="day",
-        status="open", now=NOW, quantity=0.1, avg_fill_price=148.50)
-    pending_oid = orders.insert(
-        conn, pair="USDJPY", direction="long", entry_type="limit", horizon="day",
-        status="pending_fill", now=NOW, quantity=0.1, remaining_quantity=0.1,
-        requested_price=148.20, stop_loss=147.80, take_profit=149.00, expires_at=None)
-    sid_close = _add_signal(conn, plugin="sigc")
-    sid_cancel = _add_signal(conn, plugin="sigd")
-
-    for result in ({"action": "close", "order_id": open_oid, "reasoning": "x"},
-                   {"action": "cancel", "order_id": pending_oid, "reasoning": "x"}):
-        loop.runner._results = [MissionResult("completed", result, [])]
-        loop.run_once("signal")
-
-    assert _signal_row(conn, sid_close)["status"] == "consumed"
-    assert _signal_row(conn, sid_cancel)["status"] == "consumed"
-    assert orders.get(conn, open_oid)["status"] == "closed"
-    assert orders.get(conn, pending_oid)["status"] == "cancelled"
-
-
-def _run_with_clock_jump(loop, runner, jump_to):
-    """mission の実行中 (claim の後・consume の前) に時刻が進む状況を作る。"""
-    original = runner.run
-
-    def run(mission):
-        result = original(mission)
-        _set_now(loop, jump_to)
-        return result
-
-    runner.run = run
-
-
-def test_claimed_open_signal_that_went_stale_during_the_mission_is_abandoned_not_requeued(
-        tmp_path):
-    conn, loop, runner, _ = _loop(
-        tmp_path, [MissionResult("completed", OPEN_RESULT, [])])
-    loop.executor.state_fn = lambda: "restricted"
-    sid = _add_signal(conn)
-    _run_with_clock_jump(loop, runner, NOW + timedelta(hours=5))
+    signal_id = _add_signal(conn)
+    loop.executor.gather_open_snapshot = lambda intent, **kwargs: SimpleNamespace(
+        captured_at=NOW)
 
     loop.run_once("signal")
 
-    assert _signal_row(conn, sid) == {"status": "abandoned", "requeue_count": 0}
+    row = conn.execute(
+        "SELECT status,requeue_count FROM signals WHERE id=?", (signal_id,)
+    ).fetchone()
+    assert tuple(row) == ("pending", 1)
+    assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM trade_intents").fetchone()[0] == 0
 
 
-def test_claimed_open_signal_that_is_still_fresh_is_requeued_when_restricted(tmp_path):
-    conn, loop, runner, _ = _loop(
-        tmp_path, [MissionResult("completed", OPEN_RESULT, [])])
-    loop.executor.state_fn = lambda: "restricted"
-    sid = _add_signal(conn)
-    _run_with_clock_jump(loop, runner, NOW + timedelta(minutes=5))
+def test_ready_state_accepts_payload_and_executor_runs_after_commit(tmp_path):
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"decision": "accept", "reject_code": None}, [])])
+    signal_id = _add_signal(conn)
+    loop.econ.window_view.return_value.in_window = False
+    loop.executor.gather_open_snapshot = lambda intent, **kwargs: SimpleNamespace(
+        captured_at=NOW)
 
-    loop.run_once("signal")
+    def execute(intent, iid, snapshot, **kwargs):
+        assert conn.execute(
+            "SELECT 1 FROM signal_decisions WHERE signal_id=? AND trade_intent_id=?",
+            (signal_id, iid)).fetchone()
+        return {"result": "submitted", "order_id": None, "reasons": []}
 
-    assert _signal_row(conn, sid) == {"status": "pending", "requeue_count": 1}
+    loop.executor.open_from_snapshot = execute
+    out = loop.run_once("signal")
 
-
-def test_a_failed_mission_still_requeues_its_claimed_signal_even_when_it_has_gone_stale(
-        tmp_path):
-    # 実行失敗 (state と無関係) の requeue 経路は従来どおり
-    conn, loop, runner, _ = _loop(tmp_path, [MissionResult("timeout", None, [])])
-    sid = _add_signal(conn)
-    _run_with_clock_jump(loop, runner, NOW + timedelta(hours=5))
-
-    loop.run_once("signal")
-
-    assert _signal_row(conn, sid) == {"status": "pending", "requeue_count": 1}
+    assert out["result"] == "submitted"
+    assert conn.execute(
+        "SELECT status FROM signals WHERE id=?", (signal_id,)).fetchone()[0] == "consumed"

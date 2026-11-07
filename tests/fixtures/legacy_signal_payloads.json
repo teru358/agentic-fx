@@ -1,0 +1,60 @@
+{
+  "description": "contract_version を持たない旧形の signals 行。正規化 migration の入力で、v3 rebuild はこれらを変えない。expected_after_normalization は正規化 migration の期待 (normalize / abandon / normalize / unchanged)。",
+  "rows": [
+    {
+      "key": "pending_normalizable",
+      "expected_after_normalization": "normalize",
+      "plugin": "legacy_strategy", "content_hash": "c1", "pair": "USDJPY",
+      "timeframe": "15m", "bar_ts": "2026-10-30T12:00:00+00:00",
+      "kind": "strategy", "status": "pending", "claimed_at": null,
+      "requeue_count": 0, "created_at": "2026-10-30T12:15:05+00:00",
+      "payload": {"action": "open", "rationale": "breakout", "direction": "long",
+                  "entry_type": "market", "limit_price": null,
+                  "stop_loss": 151.2, "take_profit": 152.4,
+                  "live_source": "mt5", "source": "mt5", "interval": "15m",
+                  "bar_time": "2026-10-30T12:00:00+00:00",
+                  "bars_origin": "mt5:15m"}
+    },
+    {
+      "key": "pending_missing_stop_loss",
+      "expected_after_normalization": "abandon",
+      "plugin": "legacy_strategy", "content_hash": "c1", "pair": "USDJPY",
+      "timeframe": "15m", "bar_ts": "2026-10-30T12:15:00+00:00",
+      "kind": "strategy", "status": "pending", "claimed_at": null,
+      "requeue_count": 0, "created_at": "2026-10-30T12:30:05+00:00",
+      "payload": {"action": "open", "rationale": "breakout", "direction": "short",
+                  "entry_type": "market", "limit_price": null,
+                  "take_profit": 150.1,
+                  "live_source": "mt5", "source": "mt5", "interval": "15m",
+                  "bar_time": "2026-10-30T12:15:00+00:00",
+                  "bars_origin": "mt5:15m"}
+    },
+    {
+      "key": "claimed_limit_normalizable",
+      "expected_after_normalization": "normalize",
+      "plugin": "legacy_strategy", "content_hash": "c1", "pair": "USDJPY",
+      "timeframe": "15m", "bar_ts": "2026-10-30T12:30:00+00:00",
+      "kind": "strategy", "status": "claimed",
+      "claimed_at": "2026-10-30T12:46:00+00:00",
+      "requeue_count": 1, "created_at": "2026-10-30T12:45:05+00:00",
+      "payload": {"action": "open", "rationale": "pullback", "direction": "long",
+                  "entry_type": "limit", "limit_price": 151.05,
+                  "stop_loss": 150.6, "take_profit": null,
+                  "live_source": "mt5", "source": "mt5", "interval": "15m",
+                  "bar_time": "2026-10-30T12:30:00+00:00",
+                  "bars_origin": "mt5:15m"}
+    },
+    {
+      "key": "pending_reference_signal",
+      "expected_after_normalization": "unchanged",
+      "plugin": "legacy_signal", "content_hash": "s1", "pair": "USDJPY",
+      "timeframe": "1h", "bar_ts": "2026-10-30T12:00:00+00:00",
+      "kind": "signal", "status": "pending", "claimed_at": null,
+      "requeue_count": 0, "created_at": "2026-10-30T13:00:05+00:00",
+      "payload": {"direction": "long", "strength": 0.7, "rationale": "up",
+                  "live_source": "mt5", "source": "mt5", "interval": "1h",
+                  "bar_time": "2026-10-30T12:00:00+00:00",
+                  "bars_origin": "mt5:1h"}
+    }
+  ]
+}

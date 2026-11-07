@@ -22,6 +22,7 @@ import contextlib
 import json
 import logging
 import math
+import re
 import sqlite3
 import threading
 import time
@@ -31,7 +32,11 @@ from pathlib import Path
 from typing import Callable
 
 from agentic_fx.core import improve_repeat as ir
+from agentic_fx.loops.econ_signal_report import (ABANDON_REASONS, KNOWN_MISSION_TERMINALS,
+                                                  OTHER_KIND)
 from agentic_fx.store import plugin_deploy_ops as deploy_store
+from agentic_fx.store import signal_decisions as _sig_dec
+from agentic_fx.store import signal_shadow as _sig_shadow
 from agentic_fx.policy_projection import (POLICY_TEXT_LIMIT, MigrationRecordUnknown, insert_policy,
                                           inspect_policy_file, reconcile_policy_file,
                                           regenerate_policy_file, unmanaged_policy_lines)
@@ -265,6 +270,155 @@ class _PatientConnection:
 
 
 IMPROVE_OUTBOX_WINDOW = timedelta(days=7)
+
+
+_ECON_WORKER_STATES = frozenset({"alive", "stopped", "start_failed", "not_started", "unknown"})
+_ECON_LEVELS = frozenset({"ok", "warn", "full"})
+_ECON_MEASURE_OUTCOMES = frozenset({"ok", "aborted", "failed"})
+_ECON_CAPACITY_INTS = ("signal_daily", "signal_producer", "signal_override", "rows",
+                       "row_capacity", "slice_bytes", "used_bytes", "byte_capacity",
+                       "base_bytes", "bytes_per_row", "db_bytes", "wal_bytes", "free_bytes")
+_ECON_REJECT_CODES = frozenset({*_sig_dec.LLM_REJECT_CODES, _sig_dec.SYSTEM_REJECT_CODE})
+_ECON_SHADOW_WORDS = {
+    "decision": frozenset({_sig_dec.DECISION_ACCEPT, _sig_dec.DECISION_REJECT}),
+    "actor": frozenset({_sig_dec.ACTOR_LLM, _sig_dec.ACTOR_SYSTEM}),
+    "reject_code": _ECON_REJECT_CODES,
+    "state": frozenset(_sig_shadow.STATES),
+    "result_code": frozenset({*_sig_shadow.NUMERIC_RESULTS, _sig_shadow.RESULT_DATA_INSUFFICIENT,
+                              _sig_shadow.RESULT_NO_FILL}),
+}
+_ECON_DECISION_KINDS = frozenset({
+    _sig_dec.DECISION_ACCEPT,
+    *(f"{_sig_dec.DECISION_REJECT}:{_sig_dec.ACTOR_LLM}:{code}"
+      for code in _sig_dec.LLM_REJECT_CODES),
+    f"{_sig_dec.DECISION_REJECT}:{_sig_dec.ACTOR_SYSTEM}:{_sig_dec.SYSTEM_REJECT_CODE}"})
+
+
+def _econ_int(value: object) -> int | None:
+    return value if type(value) is int and value >= 0 else None
+
+
+def _econ_known(value: object, allowed: frozenset) -> str | None:
+    return value if type(value) is str and value in allowed else None
+
+
+def _econ_time(value: object) -> str | None:
+    if type(value) is not str or len(value) > 40:
+        return None
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return value
+
+
+def _econ_counts(value: object, keys: tuple[str, ...]) -> dict | None:
+    if type(value) is not dict:
+        return None
+    return {key: _econ_int(value.get(key)) for key in keys}
+
+
+def _econ_abandoned(raw: object) -> dict | None:
+    if type(raw) is not dict:
+        return None
+    cleanup = raw.get("cleanup") if type(raw.get("cleanup")) is dict else {}
+    return {"total": _econ_counts(raw.get("total"), ABANDON_REASONS),
+            "latest_day": _econ_counts(raw.get("latest_day"), ABANDON_REASONS),
+            "latest_day_start": _econ_time(raw.get("latest_day_start")),
+            "cleanup": {"total": _econ_int(cleanup.get("total")),
+                        "latest_day": _econ_int(cleanup.get("latest_day"))},
+            "legacy_unknown_total": _econ_int(raw.get("legacy_unknown_total"))}
+
+
+def _econ_decisions(raw: object) -> dict | None:
+    if type(raw) is not dict or type(raw.get("by_kind")) is not dict:
+        return None
+    by_kind: dict[str, int] = {}
+    other = 0
+    for key, value in raw["by_kind"].items():
+        count = _econ_int(value)
+        if count is None:
+            continue
+        if type(key) is str and key in _ECON_DECISION_KINDS:
+            by_kind[key] = count
+        else:
+            other += count
+    if other:
+        by_kind[OTHER_KIND] = other
+    return {"total": _econ_int(raw.get("total")), "by_kind": by_kind}
+
+
+_ECON_SHADOW_MAX = 64
+
+
+def _econ_shadow_omitted(raw: object) -> int | None:
+    """投影で表に載せなかった組の数 (上限を超えた分と、形の崩れた行)。"""
+    if type(raw) is not list:
+        return None
+    shown = _econ_shadow(raw)
+    return len(raw) - len(shown or [])
+
+
+def _econ_shadow(raw: object) -> list | None:
+    if type(raw) is not list:
+        return None
+    rows = []
+    for row in raw[:_ECON_SHADOW_MAX]:
+        if type(row) is not dict:
+            continue
+        item = {key: _econ_known(row.get(key), allowed)
+                for key, allowed in _ECON_SHADOW_WORDS.items()}
+        item["n"] = _econ_int(row.get("n"))
+        avg = row.get("avg_pnl_pips")
+        item["avg_pnl_pips"] = avg if type(avg) in (int, float) and math.isfinite(avg) else None
+        rows.append(item)
+    return rows
+
+
+def _econ_capacity(raw: object) -> dict | None:
+    if type(raw) is not dict:
+        return None
+    out = {key: _econ_int(raw.get(key)) for key in _ECON_CAPACITY_INTS}
+    for key in ("row_level", "byte_level", "level"):
+        out[key] = _econ_known(raw.get(key), _ECON_LEVELS)
+    below = raw.get("capacity_override_below_producer")
+    out["capacity_override_below_producer"] = below if type(below) is bool else None
+    out["slice_bytes_measured_at"] = _econ_time(raw.get("slice_bytes_measured_at"))
+    stale = raw.get("slice_bytes_stale")
+    out["slice_bytes_stale"] = stale if type(stale) is bool else None
+    out["measure_outcome"] = _econ_known(raw.get("measure_outcome"), _ECON_MEASURE_OUTCOMES)
+    elapsed = raw.get("measure_elapsed_sec")
+    out["measure_elapsed_sec"] = (
+        round(float(elapsed), 1)
+        if type(elapsed) in (int, float) and math.isfinite(elapsed) and elapsed >= 0
+        else None)
+    return out
+
+
+def _econ_section(project: Callable[[], object]) -> object:
+    """節ごとに例外を隔離する。壊れた節は None にして他の節を残す。"""
+    try:
+        return project()
+    except Exception:
+        return None
+
+
+def econ_signal_view(raw: object) -> dict | None:
+    """status に載せる econ_signal の許可投影。数値・固定語・短い識別子だけを通す。"""
+    if type(raw) is not dict:
+        return None
+    state = raw.get("slice_worker")
+    return {
+        "slice_worker": _econ_section(lambda: _econ_known(state, _ECON_WORKER_STATES))
+        or "unknown",
+        "decisions": _econ_section(lambda: _econ_decisions(raw.get("decisions"))),
+        "abandoned": _econ_section(lambda: _econ_abandoned(raw.get("abandoned"))),
+        "missions_latest_day": _econ_section(lambda: _econ_counts(
+            raw.get("missions_latest_day"), (*KNOWN_MISSION_TERMINALS, "running", "other"))),
+        "shadow": _econ_section(lambda: _econ_shadow(raw.get("shadow"))),
+        "shadow_omitted": _econ_section(lambda: _econ_shadow_omitted(raw.get("shadow"))),
+        "slice_capacity": _econ_section(lambda: _econ_capacity(raw.get("slice_capacity"))),
+    }
 
 
 def _parse_time(value: object) -> datetime | None:
@@ -695,6 +849,12 @@ class OpsService:
         _authorize(principal, "status")
         deadline = self._deadline(deadline)
         data = dict(self._status_provider() if self._status_provider is not None else {})
+        if "econ_signal" in data:
+            view = econ_signal_view(data["econ_signal"])
+            if view is None:
+                del data["econ_signal"]
+            else:
+                data["econ_signal"] = view
         if self._state_store is not None:
             try:
                 state = self._state_store.load(deadline=self._foreign(deadline), stop_event=self.stop_event)

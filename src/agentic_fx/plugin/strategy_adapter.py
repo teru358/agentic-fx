@@ -44,6 +44,7 @@ run_replay を続行させたりしない)。
 """
 from __future__ import annotations
 
+import math
 import sqlite3
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Callable, Protocol
@@ -188,7 +189,7 @@ class PluginStrategyIntentSource:
             raise
         if self._decision_sink is not None:
             self._decision_sink(bucket_end, result)
-        return _strategy_result_to_intent(result, self._pair)
+        return normalize_strategy_result(result, self._pair)
 
     def _count_skip(self, reason: str) -> None:
         self.skip_counts[reason] = self.skip_counts.get(reason, 0) + 1
@@ -309,7 +310,27 @@ def build_intent_source(meta: PluginMeta, *, conn: sqlite3.Connection,
         resolved=resolved, session=session, decision_sink=decision_sink)
 
 
-def _strategy_result_to_intent(result: dict[str, Any], pair: str) -> dict | None:
+def _require_validated_open(result: dict[str, Any]) -> None:
+    """検証済み入力だけを受ける契約の番人。未検証の形は ValueError。"""
+    def positive(v: Any) -> bool:
+        return (isinstance(v, (int, float)) and not isinstance(v, bool)
+                and math.isfinite(v) and v > 0)
+
+    if result.get("action") != "open":
+        raise ValueError(f"unvalidated action: {result.get('action')!r}")
+    if result.get("direction") not in ("long", "short"):
+        raise ValueError("unvalidated direction")
+    if result.get("entry_type") not in ("market", "limit"):
+        raise ValueError("unvalidated entry_type")
+    if not positive(result.get("stop_loss")):
+        raise ValueError("unvalidated stop_loss")
+    if result.get("take_profit") is not None and not positive(result["take_profit"]):
+        raise ValueError("unvalidated take_profit")
+    if result["entry_type"] == "limit" and not positive(result.get("limit_price")):
+        raise ValueError("unvalidated limit_price")
+
+
+def normalize_strategy_result(result: dict[str, Any], pair: str) -> dict | None:
     """`sandbox._validate_strategy_result` が返す検証済み dict
     (`{"action", "rationale", "direction", "entry_type", "limit_price",
     "stop_loss", "take_profit"}`) を LLM 出力と同形の intent dict へ写像
@@ -324,6 +345,7 @@ def _strategy_result_to_intent(result: dict[str, Any], pair: str) -> dict | None
     """
     if result["action"] == "hold":
         return None
+    _require_validated_open(result)
 
     intent: dict[str, Any] = {
         "action": "open",
@@ -341,3 +363,19 @@ def _strategy_result_to_intent(result: dict[str, Any], pair: str) -> dict | None
         intent["limit_price"] = result["limit_price"]
         intent["expires_in"] = "4h"
     return intent
+
+
+def normalize_strategy_payload(result: dict[str, Any], pair: str,
+                               provenance: dict[str, Any]) -> dict | None:
+    """Return the executable stored payload shared by live and deployment paths."""
+    intent = normalize_strategy_result(result, pair)
+    if intent is None:
+        return None
+    return {
+        **intent,
+        "live_source": provenance["live_source"],
+        "source": provenance["source"],
+        "interval": provenance["interval"],
+        "bar_time": provenance["bar_time"],
+        "bars_origin": provenance["bars_origin"],
+    }
