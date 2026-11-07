@@ -898,5 +898,25 @@ def test_retryable_selftest_no_then_yes_logs_one_admitted_transition(tmp_path):
 def test_initial_admission_yes_does_not_log_transition(tmp_path):
     emitted = []
     adm = _admission(technical_log=emitted.append)
-    decision = adm.admit(backend="codex", artifact_path=str(_elf(tmp_path)), host=Host())
+    path = str(_elf(tmp_path))
+    decision = adm.admit(backend="codex", artifact_path=path, host=Host())
     assert decision.admitted and emitted == []
+    assert adm.admit(backend="codex", artifact_path=path, host=Host()).admitted
+    assert emitted == []
+
+
+def test_permanent_no_then_different_fingerprint_yes_logs_transition(tmp_path):
+    emitted = []
+    canary = Probe(IA.ProbeOutcome(False, transient=False, detail="permanent"), OK)
+    adm = _admission(canary=canary, technical_log=emitted.append)
+    first_path = str(_elf(tmp_path, extra=b"first"))
+    second_path = str(_elf(tmp_path, name="cli-next", extra=b"second"))
+
+    first = adm.admit(backend="codex", artifact_path=first_path, host=Host())
+    assert not first.admitted and not first.retryable
+    second = adm.admit(backend="codex", artifact_path=second_path, host=Host())
+
+    assert second.admitted and second.fingerprint.aggregate != first.fingerprint.aggregate
+    expected = (f"improve isolation: enabled; backend=codex admitted=yes "
+                f"fingerprint={second.fingerprint.aggregate}")
+    assert emitted == [expected]

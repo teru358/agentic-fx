@@ -195,6 +195,7 @@ class ImproveAdmission:
         self._lock = threading.Lock()
         self._kernel: F.KernelCapabilities | None = None
         self._cache: dict[tuple[str, str], tuple[AdmissionDecision, float]] = {}
+        self._last_admitted: dict[str, bool] = {}
         #: 進行中の判定 ((backend, aggregate) → 終わりの合図)
         self._running: dict[tuple[str, str], threading.Event] = {}
         #: canary / 自己試験を呼んだ回数 (fingerprint ごと)
@@ -234,6 +235,7 @@ class ImproveAdmission:
                 if cached is not None:
                     decision, ts = cached
                     if not decision.retryable or now - ts < self._retry:
+                        self._last_admitted[backend] = decision.admitted
                         return decision
                 done = self._running.get(key)
                 if done is None:
@@ -257,11 +259,11 @@ class ImproveAdmission:
                             decision = self._stopping_decision(backend, fp, artifact)
                         else:
                             # 再試行の間隔は判定が終わった時刻から数える (長い試験で即失効させない)
-                            previous = self._cache.get(key)
-                            if (decision.admitted and previous is not None
-                                    and not previous[0].admitted):
+                            previous_admitted = self._last_admitted.get(backend)
+                            if decision.admitted and previous_admitted is False:
                                 admitted_transition = _admission_status_line(
                                     backend, True, fp.aggregate)
+                            self._last_admitted[backend] = decision.admitted
                             self._cache[key] = (decision, self._clock())
                 finally:
                     self._running.pop(key, None)

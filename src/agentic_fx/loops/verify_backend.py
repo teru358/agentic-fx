@@ -89,6 +89,8 @@ class VerifyBackendResult:
     reason: object = None
     watch: object | None = None
     unreaped: object | None = None
+    cli_child_seen: bool | None = None
+    reaped: bool | None = None
     refusal: object = None
     blocking: object = None
 
@@ -100,9 +102,13 @@ class VerifyBackendResult:
             self.gate == "incomplete" and self.status == "completed" and watch is not None
             and getattr(watch, "seen", False) is True
             and getattr(watch, "initialized", False) is True
-            and bool(getattr(watch, "listed", None))
-            and getattr(watch, "calls", None) == 0
+            and isinstance(getattr(watch, "listed", None), list)
+            and bool(watch.listed)
+            and type(getattr(watch, "calls", None)) is int
+            and watch.calls == 0
             and getattr(watch, "grace_expired", True) is False
+            and self.cli_child_seen is True
+            and self.reaped is True
         )
 
 
@@ -244,13 +250,15 @@ def selftest_detail_or_default(detail: object, *, gate: str = "incomplete",
 def _failure_result(*, backend: str, provider: Literal["chatgpt"] | None, gate: str,
                     status: object, reason: object = None, watch: object | None = None,
                     unreaped: object | None = None, refusal: object = None,
-                    blocking: object = None, operator_detail: str) -> VerifyBackendResult:
+                    blocking: object = None, cli_child_seen: bool | None = None,
+                    reaped: bool | None = None, operator_detail: str) -> VerifyBackendResult:
     return VerifyBackendResult(
         ok=False, backend=backend, provider=provider, fingerprint=None,
         detail=selftest_failure_detail(gate, status=status, reason=reason, watch=watch,
                                        unreaped=unreaped, refusal=refusal, blocking=blocking),
         operator_detail=operator_detail, gate=gate, status=status, reason=reason, watch=watch,
-        unreaped=unreaped, refusal=refusal, blocking=blocking)
+        unreaped=unreaped, refusal=refusal, blocking=blocking,
+        cli_child_seen=cli_child_seen, reaped=reaped)
 
 
 def _watch_progress(watch: object | None) -> str:
@@ -672,10 +680,13 @@ def verify_backend(
         progress = _watch_progress(watch)
         echoed = watch is not None and watch.ok
         if watch is not None and not watch.ok:
+            cli_child_seen = backend == "local" or watcher.saw_any_descendant()
+            reaped = backend == "local" or not after_descendants
             # 自己試験は echo と MCP の両方が揃って初めて成功 (CLI の最終出力だけでは足りない)
             return _failure_result(
                 backend=backend, provider=effective_provider, gate="incomplete",
                 status=result.status, reason=result.reason, watch=watch,
+                cli_child_seen=cli_child_seen, reaped=reaped,
                 operator_detail=(f"mission did not complete: status={result.status} "
                                  f"reason={result.reason}{progress}"))
         if not echoed and (result.status != "completed" or not result.output):

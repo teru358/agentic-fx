@@ -1295,6 +1295,7 @@ def test_echo_watch_success_summary_has_no_grace_expired_after_ok():
 
 def test_call0_transcript_is_classified_by_watch_structure():
     """実 transcript の echo は call=0 として retryable 分類の条件に使われる。"""
+    from types import SimpleNamespace
     from agentic_fx.loops.verify_backend import _EchoWatch
 
     fixture = (Path(__file__).resolve().parents[1] / "fixtures" / "selftest_call0"
@@ -1321,7 +1322,8 @@ def test_call0_transcript_is_classified_by_watch_structure():
 
     def classified(watch, *, gate="incomplete", status="completed"):
         return VerifyBackendResult(False, "codex", None, None, "opaque", gate=gate,
-                                   status=status, watch=watch).tool_not_called
+                                   status=status, watch=watch,
+                                   cli_child_seen=True, reaped=True).tool_not_called
 
     valid = make_watch()
     assert valid.seen and valid.initialized and valid.listed and valid.calls == 0
@@ -1338,3 +1340,37 @@ def test_call0_transcript_is_classified_by_watch_structure():
     assert classified(None) is False
     assert classified(valid, gate="nonce") is False
     assert classified(valid, status="failed") is False
+    for listed, calls in (("invalid", 0), ([], 0), (["tool"], False), (["tool"], 0.0)):
+        malformed = SimpleNamespace(seen=True, initialized=True, listed=listed, calls=calls,
+                                     grace_expired=False)
+        assert classified(malformed) is False
+    missing = SimpleNamespace(seen=True, initialized=True, listed=["tool"], calls=0)
+    assert classified(missing) is False
+    assert VerifyBackendResult(False, "codex", None, None, "opaque", gate="incomplete",
+                               status="completed", watch=valid).tool_not_called is False
+
+
+@pytest.mark.parametrize(("seen_child", "remaining", "expected"), [
+    (False, False, False), (True, True, False), (True, False, True),
+])
+def test_call0_requires_child_observed_and_reaped_in_verify_branch(
+        tmp_path, monkeypatch, seen_child, remaining, expected):
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner", _StreamingRunner)
+    monkeypatch.setattr("agentic_fx.loops.verify_backend._DescendantWatcher",
+                        lambda pid: _FixedWatcher(saw=seen_child))
+    monkeypatch.setattr("agentic_fx.loops.verify_backend._descendant_pids",
+                        lambda pid: {999999} if remaining else set())
+
+    def events(nonce):
+        yield _mcp("initialize", ())
+        yield _mcp("tools/list", ("list_staging",))
+        yield _event({"type": "text", "part": {"text": json.dumps(
+            {"echo": nonce, "count": 0})}})
+
+    _BEHAVIOR["current"] = {"result": _echo_ok, "events": events,
+                            "final": MissionResult("completed", None, [])}
+    result = _run_stop_on_echo(tmp_path)
+    assert result.ok is False and result.gate == "incomplete"
+    assert result.cli_child_seen is seen_child
+    assert result.reaped is (not remaining)
+    assert result.tool_not_called is expected
