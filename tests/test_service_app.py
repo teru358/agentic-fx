@@ -783,7 +783,7 @@ def test_service_tick_records_deferred_with_supervisor_phase(tmp_path):
                  (tmp_path / "logs" / "activity.log").read_text(
                      encoding="utf-8").splitlines()]
         deferred = [row[3] for row in lines if row[2] == "cron_mission_deferred"]
-        assert deferred == ["USDJPY 1h bar=2026-07-22T11:00 busy (queued)"]
+        assert deferred == ["USDJPY 1h bar=2026-07-22T11:00 UTC busy (queued)"]
     finally:
         if not hung:
             app.supervisor.shutdown(drain_exc=RuntimeError("test shutdown"))

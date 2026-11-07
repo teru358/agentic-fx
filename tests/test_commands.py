@@ -121,8 +121,8 @@ def test_status_shows_restricted_origin_and_deadline(tmp_path):
     assert _stall(conn, outage, NOW)[0] == "restricted"
     out = cmds.dispatch("status")
     assert "data: RESTRICTED" in out
-    assert "since 2026-07-22T11:52:30+00:00" in out
-    assert "deadline 2026-07-22T12:22:30+00:00" in out
+    assert "since 2026-07-22 11:52:30 +00:00" in out
+    assert "deadline 2026-07-22 12:22:30 +00:00" in out
     assert "since None" not in out
 
 
@@ -133,8 +133,8 @@ def test_status_shows_where_a_degraded_state_came_from_when_it_rose_from_restric
     assert outage.observe(later, report) == "degraded"
     out = cmds.dispatch("status")
     assert "data: DEGRADED" in out
-    assert f"since {later.isoformat()}" in out
-    assert "restricted from 2026-07-22T11:52:30+00:00" in out
+    assert "since 2026-07-22 12:31:00 +00:00" in out
+    assert "restricted from 2026-07-22 11:52:30 +00:00" in out
 
 
 def test_status_shows_no_restricted_origin_for_a_degraded_state_that_never_was_restricted(
@@ -431,10 +431,11 @@ def test_killswitch_reset_refuses_when_latch_was_renewed(tmp_path):
 def test_killswitch_reset_without_generation_only_shows_the_latch(tmp_path):
     conn, state, activity, cmds = _commands(tmp_path)
     state.update(kill_switch_latched=True)
+    state.update(kill_switch_latched_at="2026-07-22T03:04:05+00:00")
     s = state.load()
     out = cmds.dispatch("killswitch reset")
     assert f"gen={s.kill_switch_generation}" in out
-    assert s.kill_switch_latched_at in out
+    assert "since=2026-07-22 03:04:05 +00:00" in out
     assert state.load() == s
     assert not any("kill_switch_reset" in r
                    for r in activity.tail(10, Category.SYSTEM))
@@ -452,10 +453,11 @@ def test_status_shows_generation_and_time_only_while_latched(tmp_path):
     conn, state, activity, cmds = _commands(tmp_path)
     assert "kill switch: ok\n" in cmds.dispatch("status")
     state.update(kill_switch_latched=True)
+    state.update(kill_switch_latched_at="2026-07-22T03:04:05+00:00")
     s = state.load()
     out = cmds.dispatch("status")
     assert (f"kill switch: LATCHED gen={s.kill_switch_generation} "
-            f"since={s.kill_switch_latched_at}") in out
+            "since=2026-07-22 03:04:05 +00:00") in out
 
 
 def _fail_dir_fsync(monkeypatch, *, times):
@@ -1362,8 +1364,9 @@ def test_approval_list_line_is_verbatim_and_pending_only(tmp_path):
 
     lines = cmds.dispatch("approval list").splitlines()
 
-    assert lines == [f"#{a1} kind=plugin name=sma created_at={created} "
-                     f"content_hash=aaaaaaaa"]
+    assert created == NOW.isoformat()
+    assert lines == [f"#{a1} kind=plugin name=sma "
+                     "created_at=2026-07-22 12:00:00 +00:00 content_hash=aaaaaaaa"]
 
 
 def test_approval_list_journal_line_distinguishes_op_id_from_approval_id(tmp_path):
@@ -1822,13 +1825,14 @@ def test_killswitch_reset_activity_records_generation_and_old_latch_time(
         tmp_path):
     conn, state, activity, cmds = _commands(tmp_path)
     state.update(kill_switch_latched=True)
+    state.update(kill_switch_latched_at="2026-07-22T03:04:05+00:00")
     s = state.load()
     cmds.dispatch(f"killswitch reset {s.kill_switch_generation}")
     rec = [r for r in activity.tail(10, Category.SYSTEM)
            if "kill_switch_reset" in r]
     assert len(rec) == 1
     assert f"gen={s.kill_switch_generation}" in rec[0]
-    assert s.kill_switch_latched_at in rec[0]
+    assert "latched_at=2026-07-22T03:04:05Z" in rec[0]
 
 
 def test_killswitch_reset_refusals_leave_an_activity_with_generation(tmp_path):

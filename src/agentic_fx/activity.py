@@ -29,7 +29,7 @@ class ActivityLog:
         self._on_write_failure = on_write_failure
         path.parent.mkdir(parents=True, exist_ok=True)
 
-    def write(self, category: Category, event: str, summary: str,
+    def write(self, category: Category | str, event: str, summary: str,
               ref_id: str | None = None) -> None:
         """activity 行を追記する。
 
@@ -51,7 +51,7 @@ class ActivityLog:
         try:
             ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
             clean = " ".join(summary.split())
-            cat_value = category.value
+            cat_value = Category(category).value
             line = "\t".join([ts, cat_value, event, clean, ref_id or "-"])
             with self._path.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")

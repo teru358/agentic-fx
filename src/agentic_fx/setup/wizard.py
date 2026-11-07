@@ -40,6 +40,7 @@ from agentic_fx.commands import (
 from agentic_fx.config import MAX_STORED_DECISION_INTERVAL_MIN, Settings, load_settings_text
 from agentic_fx.core import improve_admission, landlock
 from agentic_fx.core.contracts import Mode
+from agentic_fx.core.display_time import convert_time
 from agentic_fx.core.idea_check import idea_looks_unintended, normalize_idea_display
 from agentic_fx.core.mission_ceiling import worker_ceiling
 from agentic_fx.core.scheduler import (
@@ -47,6 +48,7 @@ from agentic_fx.core.scheduler import (
 )
 from agentic_fx.datafeed import sources
 from agentic_fx.datafeed import news_probe
+from agentic_fx.display_tz import is_region_name
 from agentic_fx.store import news_sources
 from agentic_fx.logging_setup import setup_technical_logging
 from agentic_fx.ops_setup.interactive import EnableResult, interactive_enable
@@ -772,7 +774,7 @@ def _safe_int(fn: Callable[[], int]) -> int:
 # ---------------------------------------------------------------------------
 
 _HELP_STAGE = {
-    2: "表示タイムゾーンは改善の時刻 (improve_at) の解釈にも使われます。口座通貨と初期残高は後から変えると過去の損益と混ざります。",
+    2: "表示タイムゾーンは画面に出す時刻と改善の時刻 (improve_at) に効きます。変えると次回の改善が数時間前後します。地域名 (Asia/Tokyo など) で書いてください。口座通貨と初期残高は後から変えると過去の損益と混ざります。",
     3: "取引判断と約定判定に使う価格の取得元です。どれを選んでも後の振る舞いが大きく違うので、既定は置いていません。",
     4: "取引判断と改善にそれぞれ LLM を割り当てます。claude / codex はサブスクの枠を使います (従量課金 API ではありません)。",
     5: "1 回の判断が判断足の幅より短い時間で終わらないと、1 足に 1 回の判断が成立しません。",
@@ -789,7 +791,7 @@ def _initial_answers(sess: _Session, st: _Start) -> Answers:
         guess = sess.deps.local_timezone() or "UTC"
         try:
             ZoneInfo(guess)
-            zone = guess
+            zone = guess if is_region_name(guess) else "UTC"
         except (ZoneInfoNotFoundError, ValueError, OSError):
             zone = "UTC"
     unit_dir = sess.deps.unit_dir or unit_module.default_unit_dir(sess.deps.environ)
@@ -832,8 +834,12 @@ def _stage2(sess: _Session, st: _Start, a: Answers) -> None:
         zone = sess.text("表示タイムゾーン (例 Asia/Tokyo)", a.display_timezone, help_text=help_text)
         try:
             ZoneInfo(zone)
+            valid = is_region_name(zone)
         except (ZoneInfoNotFoundError, ValueError, OSError):
-            sess.say("'JST' のような略称は使えません。'Asia/Tokyo' のような地域名で入力してください。")
+            valid = False
+        if not valid:
+            sess.say("'JST' や 'EST' のような略称、'Etc/GMT-9' や 'Japan' のような名前は使えません。"
+                     "'America/New_York' のような地域名で入力してください。")
             continue
         a.display_timezone = zone
         break
@@ -982,7 +988,9 @@ def _stage3_price_choose(sess: _Session, st: _Start, a: Answers) -> None:
         result = _bridge_check(sess, a, url)
         if result.result == "ok":
             server_time = result.params.get("server_time", "")
-            sess.say(f"MT5 bridge OK: {a.pairs[0]} (bridge の時刻 {server_time})")
+            shown = convert_time(server_time, a.display_timezone)
+            sess.say(f"MT5 bridge OK: {a.pairs[0]} (bridge の時刻 "
+                     f"{shown.text if shown.ok else server_time})")
             a.price = _check_record(result)
             a.bridge_plan = "connected"
             _stage3_watch_symbols(sess, st, a, url)

@@ -711,25 +711,25 @@ def test_versions_prints_live_versions_history_ops_and_dependents_exactly(world,
         "-- live --",
         f"symlink -> .versions/sma/{c.name} (version {v(c)})",
         "-- 版 (先頭 = `rollback --to` に使う版、content = `revoke --version` に使う識別) --",
-        f"* {v(c)}  content={h(c)}  決定=approved  承認=2026-10-16T03:03:00+00:00 by human"
+        f"* {v(c)}  content={h(c)}  決定=approved  承認=2026-10-16 12:03:00 +09:00 by human"
         "  版dir=整合",
-        f"  {v(a)}  content={h(a)}  決定=rejected  承認=2026-10-16T03:01:00+00:00 by human"
-        "  却下=2026-10-16T03:10:00+00:00 by human_cli  版dir=整合",
-        f"  {v(b)}  content={h(b)}  決定=approved  承認=2026-10-16T03:02:00+00:00 by human"
+        f"  {v(a)}  content={h(a)}  決定=rejected  承認=2026-10-16 12:01:00 +09:00 by human"
+        "  却下=2026-10-16 12:10:00 +09:00 by human_cli  版dir=整合",
+        f"  {v(b)}  content={h(b)}  決定=approved  承認=2026-10-16 12:02:00 +09:00 by human"
         "  版dir=整合",
         "-- 経歴 (live の変遷) --",
-        f"2026-10-16T03:01:00+00:00  approve  absent -> {v(a)}",
-        f"2026-10-16T03:02:00+00:00  approve  {v(a)} -> {v(b)}",
-        f"2026-10-16T03:03:00+00:00  approve  {v(b)} -> {v(c)}",
-        f"2026-10-16T03:20:00.000001+00:00  rollback_symlink  {v(c)} -> absent",
+        f"2026-10-16 12:01:00 +09:00  approve  absent -> {v(a)}",
+        f"2026-10-16 12:02:00 +09:00  approve  {v(a)} -> {v(b)}",
+        f"2026-10-16 12:03:00 +09:00  approve  {v(b)} -> {v(c)}",
+        f"2026-10-16 12:20:00 +09:00  rollback_symlink  {v(c)} -> absent",
         "-- deploy op --",
-        f"未完 op_id=4 rollback_symlink intent updated_at=2026-10-16T03:22:00+00:00 "
+        f"未完 op_id=4 rollback_symlink intent updated_at=2026-10-16 12:22:00 +09:00 "
         f"subject={h(c)} to={v(b)} 通知試行済み=いいえ",
         "  同じコマンドの再実行で続きから完遂します。進まなければ daemon を再起動"
         " (起動時の reconcile) するか reconcile を待ってください",
         f"要注意 op_id=2 rollback_symlink needs_retry/verify_failed "
-        f"updated_at=2026-10-16T03:20:00.000001+00:00 subject={h(c)} to={v(b)} 通知試行済み=はい",
-        f"要注意 op_id=3 disable_symlink foreign updated_at=2026-10-16T03:21:00.000001+00:00 "
+        f"updated_at=2026-10-16 12:20:00 +09:00 subject={h(c)} to={v(b)} 通知試行済み=はい",
+        f"要注意 op_id=3 disable_symlink foreign updated_at=2026-10-16 12:21:00 +09:00 "
         f"subject={h(c)} to=- 通知試行済み=いいえ",
         "-- 依存 strategy --",
         "(なし)",

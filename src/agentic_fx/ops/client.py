@@ -33,6 +33,9 @@ import httpcore
 import httpx
 
 from agentic_fx.core import improve_repeat as ir
+from agentic_fx.core.display_time import (
+    PRECISION_MINUTE, PRECISION_SECOND, TIME_FIELDS, convert_activity_line,
+    convert_log_line, convert_time, display_header, effective_tz_name)
 from agentic_fx.datafeed.reference_status import REFERENCE_STATES
 from agentic_fx.loops import approval_facts
 from agentic_fx.loops.approval_facts import display_text
@@ -574,6 +577,33 @@ def _num(value) -> str:
     return "-"
 
 
+def _tz_of(data) -> str:
+    """描画する応答の表示 tz。無い (古い daemon)・使えないときは UTC。"""
+    if isinstance(data, dict):
+        return effective_tz_name(data.get("display_timezone"))
+    return "UTC"
+
+
+def _when(value, tz: str, precision: str = PRECISION_SECOND, *,
+          limit: int | None = None, redact: bool = False) -> str:
+    """時刻 field の値。無害化 → 換算 → 長さ制限の順。換算できなければ無害化した値のまま。"""
+    if not isinstance(value, str):
+        return "-"
+    text = display_text(redactor.redact_value(value) if redact else value, 1 << 20)
+    converted = convert_time(text, tz, precision)
+    shown = converted.text if converted.ok else text
+    if limit is None:
+        return display_text(shown)
+    return shown if len(shown) <= limit else shown[:limit] + "…"
+
+
+def _cell(key, value, tz: str) -> str:
+    """`k=v` の v。時刻 field の宣言に入る名前の文字列は表示 tz に換算する。"""
+    if key in TIME_FIELDS and isinstance(value, str):
+        return _when(value, tz)
+    return display_text(str(value))
+
+
 _SETUP_SEVERITIES = frozenset({"info", "warn", "action"})
 
 
@@ -643,16 +673,17 @@ def _references_line(rows) -> str | None:
 
 
 def format_status(data: dict) -> str:
+    tz = _tz_of(data)
     kill = data.get("kill_switch") if isinstance(data.get("kill_switch"), dict) else {}
     if kill.get("latched") is True:
         ks = (f"LATCHED gen={_ident(kill.get('generation'))} "
-              f"since={display_text(kill.get('latched_at'))}")
+              f"since={_when(kill.get('latched_at'), tz)}")
     else:
         ks = "ok"
     mission = data.get("mission")
     if isinstance(mission, dict):
         last = (f"{display_text(mission.get('loop'))}:{display_text(mission.get('status'))} "
-                f"({display_text(mission.get('started_at'))})")
+                f"({_when(mission.get('started_at'), tz)})")
     else:
         last = "なし"
     orders = data.get("orders") if isinstance(data.get("orders"), dict) else {}
@@ -713,8 +744,13 @@ def format_status(data: dict) -> str:
     return "\n".join(lines)
 
 
-def _lines(data: dict) -> str:
+def _lines(data: dict, convert: Callable[[str, object], str] | None = None) -> str:
+    """log / activity の行。行頭の換算は tab 区切りの形を使うので無害化の前に行い、
+    換算が書くのは検証済みの時刻の文字だけ。その後に無害化と長さ制限をかける。"""
+    tz = _tz_of(data)
     lines = data.get("lines") if isinstance(data.get("lines"), list) else []
+    if convert is not None:
+        lines = [convert(line, tz) if isinstance(line, str) else line for line in lines]
     text = "\n".join(display_text(line, _TEXT_LIMIT) for line in lines) or "(なし)"
     if data.get("truncated") is True:
         text += "\n(走査上限で打ち切り)"
@@ -722,6 +758,7 @@ def _lines(data: dict) -> str:
 
 
 def format_approval_list(data: dict) -> str:
+    tz = _tz_of(data)
     lines = []
     for row in data.get("approvals") or []:
         if not isinstance(row, dict):
@@ -730,7 +767,7 @@ def format_approval_list(data: dict) -> str:
         short = content_hash[:8] if isinstance(content_hash, str) and content_hash != "-" else "-"
         lines.append(f"#{_ident(row.get('id'))} kind={display_text(row.get('kind'))} "
                      f"name={display_text(row.get('name'))} "
-                     f"created_at={display_text(row.get('created_at'))} "
+                     f"created_at={_when(row.get('created_at'), tz)} "
                      f"content_hash={display_text(short)}")
     if not lines:
         lines.append("承認待ちはありません")
@@ -797,7 +834,7 @@ def _change_is_well_formed(change: dict) -> bool:
     return isinstance(params, dict) and isinstance(params.get("items", []), list)
 
 
-def format_change_lines(change) -> list[str]:
+def format_change_lines(change, tz: str = "UTC") -> list[str]:
     """承認の変更要約 (diff は出さない)。固定文以外の自由文は redactor を通した値だけ。"""
     if not isinstance(change, dict):
         return []
@@ -813,7 +850,7 @@ def format_change_lines(change) -> list[str]:
              + (" (前版なし)" if cls == change_limits.CLASS_NEW else ""),
              f"候補: {_hash_head(change.get('candidate_hash'))} "
              f"比較対象: {_hash_head(change.get('baseline_hash'))} "
-             f"計算時刻: {_safe_cell(change.get('computed_at'), 40)}"]
+             f"計算時刻: {_when(change.get('computed_at'), tz, limit=40, redact=True)}"]
     params = change.get("params") if isinstance(change.get("params"), dict) else {}
     items = [i for i in params.get("items") or [] if isinstance(i, dict)]
     if items:
@@ -838,6 +875,7 @@ def format_change_lines(change) -> list[str]:
 
 
 def format_approval_detail(data: dict) -> str:
+    tz = _tz_of(data)
     # in_sample / holdout の行は対話シェルの承認詳細と同じ renderer を使う。
     from agentic_fx.commands import Commands
     lines = [f"approval #{_ident(data.get('id'))} kind={display_text(data.get('kind'))} "
@@ -852,23 +890,23 @@ def format_approval_detail(data: dict) -> str:
                   for line in gate if isinstance(line, str)]
     else:
         lines += approval_facts.gate_lines(data)
-    lines += format_change_lines(data.get("change"))
+    lines += format_change_lines(data.get("change"), tz)
     facts = data.get("facts_lines")
     if isinstance(facts, list):
         lines += [_safe_text(line, approval_facts.CLAIM_DISPLAY_LIMIT) for line in facts]
     lines.append(
         f"reason={_safe_text(data.get('reason'), approval_facts.CLAIM_DISPLAY_LIMIT)} "
         f"decided_by={display_text(data.get('decided_by'))} "
-        f"decided_at={display_text(data.get('decided_at'))}")
+        f"decided_at={_when(data.get('decided_at'), tz)}")
     lines.append(f"payload_sha256={display_text(data.get('payload_sha256'))}")
     return "\n".join(lines)
 
 
-def format_event(event: dict) -> str:
+def format_event(event: dict, tz: str = "UTC") -> str:
     fields = event.get("fields") if isinstance(event.get("fields"), dict) else {}
-    cells = " ".join(f"{display_text(str(k))}={display_text(str(v))}"
+    cells = " ".join(f"{display_text(str(k))}={_cell(k, v, tz)}"
                      for k, v in sorted(fields.items()))
-    return (f"#{display_text(str(event.get('id')))} {display_text(event.get('ts'))} "
+    return (f"#{display_text(str(event.get('id')))} {_when(event.get('ts'), tz)} "
             f"{display_text(event.get('code'))} {display_text(event.get('ref'))} {cells}").rstrip()
 
 
@@ -1164,7 +1202,8 @@ class Runner:
 
     # ---- 読取
     def _op_status(self, *, terminal) -> int:
-        self.say(format_status(self._get("/v1/status")))
+        data = self._get("/v1/status")
+        self.say(display_header(_tz_of(data)) + "\n" + format_status(data))
         return RC_OK
 
     def _op_whoami(self, *, terminal) -> int:
@@ -1175,14 +1214,16 @@ class Runner:
         return RC_OK
 
     def _op_log(self, n: int, *, terminal) -> int:
-        self.say(_lines(self._get("/v1/log", n=n)))
+        data = self._get("/v1/log", n=n)
+        self.say(display_header(_tz_of(data)) + "\n" + _lines(data, convert_log_line))
         return RC_OK
 
     def _op_activity(self, n: int, category: str | None, *, terminal) -> int:
         params = {"n": n}
         if category is not None:
             params["category"] = category
-        self.say(_lines(self._get("/v1/activity", **params)))
+        data = self._get("/v1/activity", **params)
+        self.say(display_header(_tz_of(data)) + "\n" + _lines(data, convert_activity_line))
         return RC_OK
 
     def _op_approval_list(self, limit: int, *, terminal) -> int:
@@ -1219,8 +1260,9 @@ class Runner:
                         "を削除してください" if persist else "")
                 raise ClientError(RC_FAILED, "event の high watermark が後退しました。"
                                   f"cursor は進めていません{hint}")
+            tz = _tz_of(data)
             for event in fresh:
-                self.say(format_event(event))
+                self.say(format_event(event, tz))
             # 表示してから cursor を保存する (切断後は同じ位置から再開する)。
             # 位置も watermark も変わらない周回では書かない (follow の常駐中の無駄な I/O)。
             current = (cursor.position, cursor.high_watermark)
@@ -1295,7 +1337,7 @@ class Runner:
                     shown_runs = result.get("max_runs")
                     self.say(
                         "improve を繰り返します: "
-                        f"期限 {_format_deadline(result.get('deadline_at'))} ({span})、"
+                        f"期限 {_format_deadline(result.get('deadline_at'), _tz_of(job))} ({span})、"
                         f"最大 {shown_runs if type(shown_runs) is int else (max_runs or ir.MAX_RUNS)} 回"
                         + ("、一時指示あり" if comment is not None else ""))
                 runs, mission_id = result.get("runs"), result.get("mission_id")
@@ -1344,6 +1386,7 @@ class Runner:
 
     def _op_backlog_list(self, all_statuses: bool, limit: int, *, terminal) -> int:
         data = self._get("/v1/backlog", all="true" if all_statuses else "false", limit=limit)
+        tz = _tz_of(data)
         rows = data.get("items") if isinstance(data.get("items"), list) else []
         if not rows:
             self.say("backlog: 0 件")
@@ -1352,7 +1395,7 @@ class Runner:
             if not isinstance(row, dict):
                 continue
             self.say(f"#{_ident(row.get('id'))} {_safe_cell(row.get('status'), 200)} "
-                     f"{_safe_cell(row.get('source'), 200)} {_safe_cell(row.get('updated_at'), 200)} "
+                     f"{_safe_cell(row.get('source'), 200)} {_when(row.get('updated_at'), tz, limit=200, redact=True)} "
                      f"{_backlog_display(row.get('idea'))}")
             if row.get("last_result") not in (None, ""):
                 self.say("  " + _backlog_display(row.get("last_result")))
@@ -1385,12 +1428,13 @@ class Runner:
 
     def _op_policy_show(self, *, terminal) -> int:
         data = self._get("/v1/policy")
+        tz = _tz_of(data)
         managed = [row for row in data.get("managed") or [] if isinstance(row, dict)]
         unmanaged = [row for row in data.get("unmanaged") or [] if isinstance(row, dict)]
         self.say("管理対象:")
         if managed:
             for row in managed:
-                self.say(f"  #{_ident(row.get('id'))} {_safe_cell(row.get('created_at'), 200)} "
+                self.say(f"  #{_ident(row.get('id'))} {_when(row.get('created_at'), tz, limit=200, redact=True)} "
                          f"{_backlog_display(row.get('directive'))}")
         else:
             self.say("  0 件")
@@ -1454,13 +1498,15 @@ class Runner:
         return RC_OK
 
     def _op_killswitch_show(self, *, terminal) -> int:
-        kill = _kill_switch(self._get("/v1/status"))
+        status = self._get("/v1/status")
+        tz = _tz_of(status)
+        kill = _kill_switch(status)
         if kill.get("latched") is not True:
             self.say("kill switch はラッチされていません")
             return RC_OK
         generation = _ident(kill.get("generation"))
         self.say(f"kill switch は LATCHED です (gen={generation} "
-                 f"since={display_text(kill.get('latched_at'))})。解除するには "
+                 f"since={_when(kill.get('latched_at'), tz)})。解除するには "
                  f"`afx ctl --as approver killswitch reset {generation}` を実行してください")
         return RC_OK
 
@@ -1529,7 +1575,7 @@ class Runner:
         kill = _kill_switch(data)
         self.say(f"kill switch: {'LATCHED' if kill.get('latched') is True else '解除済み'} "
                  f"gen={_ident(kill.get('generation'))} "
-                 f"発動時刻={display_text(kill.get('latched_at'))} "
+                 f"発動時刻={_when(kill.get('latched_at'), _tz_of(data))} "
                  f"エクイティ={_num(data.get('equity'))}")
         if kill.get("reconcile_required") is True:
             self.say("解除の途中で止まった印があります。先に `afx ctl --as approver killswitch "
@@ -1551,7 +1597,9 @@ class Runner:
         return RC_OK
 
     def _op_killswitch_reconcile(self, *, terminal: Terminal) -> int:
-        kill = _kill_switch(self._get("/v1/status"))
+        status = self._get("/v1/status")
+        tz = _tz_of(status)
+        kill = _kill_switch(status)
         if kill.get("reconcile_required") is not True:
             self.say("確認が必要な状態はありません (解除の途中で止まった印は無し)")
             return RC_OK
@@ -1560,7 +1608,7 @@ class Runner:
                  f"状態ファイルの値: {file_line}\n"
                  f"印の内容: requested_generation="
                  f"{_ident(kill.get('requested_generation'))} "
-                 f"started_at={display_text(kill.get('started_at'))}\n"
+                 f"started_at={_when(kill.get('started_at'), tz)}\n"
                  "ラッチ中として確定し、印を消します (解除側には倒しません)。")
         if not terminal.yes("ラッチ中として確定しますか"):
             raise ClientError(RC_FAILED, MESSAGES["cancelled"])
@@ -1607,12 +1655,13 @@ class Runner:
         if repeat is not None:
             return f"job {display_text(job.get('id'))}: {repeat}"
         result = job.get("result")
+        tz = _tz_of(job)
         text = (f"job {display_text(job.get('id'))} kind={display_text(job.get('kind'))} "
                 f"state={display_text(job.get('state'))}")
         if job.get("result_code"):
             text += f" result_code={display_text(job.get('result_code'))}"
         if isinstance(result, dict):
-            cells = " ".join(f"{display_text(str(k))}={display_text(str(v))}"
+            cells = " ".join(f"{display_text(str(k))}={_cell(k, v, tz)}"
                              for k, v in sorted(result.items()) if k != "answer")
             if cells:
                 text += f" {cells}"
@@ -1707,8 +1756,9 @@ def _repeat_span(minutes: int) -> str:
     return f"{hours}h{minutes:02d}m" if hours > 0 else f"{minutes}m"
 
 
-def _format_deadline(value) -> str:
-    """wire の ISO-8601 UTC を人向けの表記にする。読めなければ無害化して返す。"""
+def _format_deadline(value, tz: str = "UTC") -> str:
+    """wire の ISO-8601 を表示 tz の分精度にする。naive は UTC とみなす。
+    読めなければ無害化して返す。"""
     if isinstance(value, str):
         try:
             moment = datetime.fromisoformat(value)
@@ -1716,7 +1766,11 @@ def _format_deadline(value) -> str:
             return display_text(value)
         if moment.tzinfo is None:
             moment = moment.replace(tzinfo=timezone.utc)
-        return moment.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        for zone in (tz, "UTC"):
+            converted = convert_time(moment, zone, PRECISION_MINUTE)
+            if converted.ok:
+                return converted.text
+        return display_text(value)
     return display_text(value)
 
 

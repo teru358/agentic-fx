@@ -243,9 +243,9 @@ def test_list_prints_one_line_and_a_folded_url_per_source(tmp_path, monkeypatch,
     assert (rc, err) == (0, "")
     assert out.splitlines() == [
         "ニュース源: 3 件 (有効 2 / 無効 1)",
-        "alpha           有効  feed  直近: 成功 12 件       2026-10-25 09:30 UTC",
+        "alpha           有効  feed  直近: 成功 12 件       2026-10-25 18:30 +09:00",
         "  https://example.invalid:8443/…",
-        "beta-long-name  無効  web   直近: 失敗 (HTTP 404)  2026-10-25 09:30 UTC",
+        "beta-long-name  無効  web   直近: 失敗 (HTTP 404)  2026-10-25 18:30 +09:00",
         "  http://example.invalid/…",
         "fresh           有効  feed  直近: 未取得",
         "  https://[2001:db8::1]/…",
@@ -265,8 +265,8 @@ def _write_health(root, name, sequence, *, retry_after=None):
 
 
 @pytest.mark.parametrize(("sequence", "tail"), [
-    (("failure", "failure", "failure"), "連続 3 回、2026-10-25 10:30 UTC まで待機 (連続失敗)"),
-    (("refusal", "refusal", "refusal"), "連続 3 回、2026-10-25 10:30 UTC まで待機 (先方の拒否が続く)"),
+    (("failure", "failure", "failure"), "連続 3 回、2026-10-25 19:30 +09:00 まで待機 (連続失敗)"),
+    (("refusal", "refusal", "refusal"), "連続 3 回、2026-10-25 19:30 +09:00 まで待機 (先方の拒否が続く)"),
     (("failure", "failure"), ""),
 ])
 def test_list_shows_the_wait_with_its_cause_label(tmp_path, monkeypatch, capsys, sequence, tail):
@@ -275,7 +275,7 @@ def test_list_shows_the_wait_with_its_cause_label(tmp_path, monkeypatch, capsys,
     monkeypatch.setattr(news_cli, "_now", lambda: NOW)
     _, out, _ = run_news(capsys, monkeypatch, root, "list")
     line = out.splitlines()[1]
-    assert line.endswith(("2026-10-25 09:30 UTC  " + tail) if tail else "2026-10-25 09:30 UTC")
+    assert line.endswith(("2026-10-25 18:30 +09:00  " + tail) if tail else "2026-10-25 18:30 +09:00")
 
 
 def test_list_shows_a_directive_wait_and_a_streak_after_the_wait_expired(tmp_path, monkeypatch, capsys):
@@ -290,7 +290,7 @@ def test_list_shows_a_directive_wait_and_a_streak_after_the_wait_expired(tmp_pat
     monkeypatch.setattr(news_cli, "_now", lambda: NOW + timedelta(hours=2))
     _, out, _ = run_news(capsys, monkeypatch, root, "list")
     lines = out.splitlines()
-    assert "2026-10-25 12:30 UTC まで待機 (先方の指示)" in lines[1]
+    assert "2026-10-25 21:30 +09:00 まで待機 (先方の指示)" in lines[1]
     assert lines[3].endswith("連続 3 回")
 
 
@@ -692,7 +692,7 @@ def test_test_announces_a_wait_but_still_fetches_once(tmp_path, monkeypatch, cap
     monkeypatch.setattr(news_cli, "_now", lambda: NOW)
     rc, out, _ = run_news(capsys, monkeypatch, root, "test", "src")
     assert rc == 0 and http.count == 1
-    assert out.splitlines()[0] == ("この源は 2026-10-25 10:30 UTC まで待機中です"
+    assert out.splitlines()[0] == ("この源は 2026-10-25 19:30 +09:00 まで待機中です"
                                    " (先方の拒否が続く、収集器は取得しません)。")
 
 
@@ -730,3 +730,29 @@ def test_a_closed_stdin_for_dash_is_the_same_as_an_empty_value(tmp_path, monkeyp
     monkeypatch.setattr(news_cli.getpass, "getpass", eof)
     rc, out, err = run_news(capsys, monkeypatch, root, "add", "x", "-", stdin=FakeStdin("", tty=True))
     assert (rc, out, err) == (2, "", "標準入力の URL が正しくありません\n")
+
+
+# --- 表示 tz ---------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("settings", ["missing", "broken"])
+def test_list_falls_back_to_utc_when_the_settings_cannot_be_read(tmp_path, monkeypatch, capsys, settings):
+    root = make_root(tmp_path, sources=(("src", "feed", OK_URL, True),), settings=settings)
+    _write_health(root, "src", ("failure", "failure", "failure"))
+    monkeypatch.setattr(news_cli, "_now", lambda: NOW)
+    rc, out, err = run_news(capsys, monkeypatch, root, "list")
+    assert (rc, err) == (0, "")
+    assert out.splitlines()[1].endswith(
+        "2026-10-25 09:30 +00:00  連続 3 回、2026-10-25 10:30 +00:00 まで待機 (連続失敗)")
+
+
+def test_list_uses_the_zone_of_the_settings_file_without_loading_settings(tmp_path, monkeypatch, capsys):
+    root = make_root(tmp_path, sources=(("src", "feed", OK_URL, True),))
+    path = root / "config" / "settings.yaml"
+    path.write_text(path.read_text().replace("display_timezone: Asia/Tokyo",
+                                             "display_timezone: America/New_York"))
+    _write_health(root, "src", ("failure",))
+    monkeypatch.setattr(news_cli, "load_settings", lambda *a: pytest.fail("settings loaded"))
+    monkeypatch.setattr(news_cli, "load_env_file", lambda *a: pytest.fail("env loaded"))
+    rc, out, _ = run_news(capsys, monkeypatch, root, "list")
+    assert rc == 0
+    assert out.splitlines()[1].endswith("2026-10-25 05:30 -04:00")

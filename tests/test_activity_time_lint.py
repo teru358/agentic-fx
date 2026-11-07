@@ -172,17 +172,11 @@ def scan_tree() -> list[Violation]:
 
 # 手で時刻を埋めている既存の書き込み。builder / bar_label へ載せ替えたら、
 # その項目をここから消す (消さないと「もう違反が無い」で落ちる)。
-ALLOWED: frozenset[tuple[str, str]] = frozenset({
-    ("core/scheduler.py", "_record_cron_deferred"),
-    ("core/scheduler.py", "_record_cron_coalesced"),
-    ("core/scheduler.py", "_drop_previous_session_bars"),
-    ("core/scheduler.py", "_note_cron_cursor_write_failure"),
-    ("core/scheduler.py", "_hold_future_cursor"),
-    ("core/scheduler.py", "_release_future_cursor"),
-    ("core/scheduler.py", "_load_fetch_anchors"),
-    ("datafeed/news_collector.py", "_report_skip"),
-    ("datafeed/outage.py", "_observe_open"),
-})
+ALLOWED: frozenset[tuple[str, str]] = frozenset()
+
+
+def test_the_allowed_list_is_empty():
+    assert ALLOWED == frozenset()
 
 
 def test_tree_has_no_hand_written_time_in_activity_bodies_except_the_listed_ones():

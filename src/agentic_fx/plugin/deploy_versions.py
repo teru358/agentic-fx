@@ -6,6 +6,7 @@ import re
 import sqlite3
 from pathlib import Path
 
+from agentic_fx.core.display_time import convert_time
 from agentic_fx.plugin import deploy_ops, loader
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import plugin_deploy_ops as deploy_store
@@ -124,8 +125,14 @@ def _short(value: str | None, others: list[str]) -> str:
     return value
 
 
-def render_versions(data: dict) -> list[str]:
-    """Text lines for ``collect_versions`` output."""
+def _when(value: object, tz: str) -> str:
+    """A stored UTC instant in the display zone; anything unconvertible stays as written."""
+    converted = convert_time(value, tz)
+    return converted.text if converted.ok else str(value)
+
+
+def render_versions(data: dict, tz: str = "UTC") -> list[str]:
+    """Text lines for ``collect_versions`` output; instants are shown in ``tz``."""
     name = data["name"]
     live = data["live"]
     all_hashes = [v["artifact_hash"] for v in data["versions"]]
@@ -151,9 +158,9 @@ def render_versions(data: dict) -> list[str]:
                  f"content={_short(version['content_hash'], all_contents)}",
                  f"決定={decision}"]
         if version["approved_at"]:
-            parts.append(f"承認={version['approved_at']} by {version['approved_by']}")
+            parts.append(f"承認={_when(version['approved_at'], tz)} by {version['approved_by']}")
         if version["decision"] == "rejected":
-            parts.append(f"却下={version['decided_at']} by {version['decided_by']}")
+            parts.append(f"却下={_when(version['decided_at'], tz)} by {version['decided_by']}")
         if version.get("dir_error"):
             parts.append(f"版dir=整合: 読めない ({version['dir_error']})")
         else:
@@ -163,18 +170,18 @@ def render_versions(data: dict) -> list[str]:
     if not data["history"]:
         lines.append("(なし)")
     for event in data["history"]:
-        lines.append(f"{event['effective_at']}  {event['kind']}  "
+        lines.append(f"{_when(event['effective_at'], tz)}  {event['kind']}  "
                      f"{_target_text(event['from'])} -> {_target_text(event['to'])}")
     lines.append("-- deploy op --")
     ops = data["ops"]
     if not ops["open"] and not ops["attention"]:
         lines.append("(未完・要注意の op はありません)")
     for row in ops["open"]:
-        lines.append("未完 " + _op_text(row))
+        lines.append("未完 " + _op_text(row, tz))
         lines.append("  同じコマンドの再実行で続きから完遂します。進まなければ daemon を再起動"
                      " (起動時の reconcile) するか reconcile を待ってください")
     for row in ops["attention"]:
-        lines.append("要注意 " + _op_text(row))
+        lines.append("要注意 " + _op_text(row, tz))
     lines.append("-- 依存 strategy --")
     deps = data["dependents"]
     if deps is None:
@@ -195,12 +202,12 @@ def _target_text(value: str | None) -> str:
     return value.rsplit("/", 1)[-1][:12] if "/" in value and ".versions" in value else value
 
 
-def _op_text(row: dict) -> str:
+def _op_text(row: dict, tz: str = "UTC") -> str:
     detail = row["phase"] + (f"/{row['fail_reason']}" if row["fail_reason"] else "")
     flags = "".join((" --revoke" if row["revoke"] else "", " --force" if row["force"] else ""))
     subject = row["subject_content_hash"]
     return (f"op_id={row['op_id']} {row['op_kind']}{flags} {detail} "
-            f"updated_at={row['updated_at']} "
+            f"updated_at={_when(row['updated_at'], tz)} "
             f"subject={subject[:12] if subject else '-'} "
             f"to={_target_text(row['to_target'] or row['retired_path'])} "
             f"通知試行済み={'はい' if row['notify_attempted'] else 'いいえ'}")

@@ -15,6 +15,8 @@ from typing import Any, Callable
 
 from agentic_fx.config import load_settings_text
 from agentic_fx.core.contracts import SystemClock
+from agentic_fx.core.display_time import convert_time, display_header
+from agentic_fx.display_tz import read_display_timezone, region_name_warning
 from agentic_fx.ops.contracts import Principal
 from agentic_fx.ops.keys import key_dir, key_file_name
 from agentic_fx.ops.redactor import redact
@@ -173,6 +175,8 @@ class StatusData:
     activity: str
     steps: tuple[str, ...] | None
     unavailable: bool
+    display_timezone: str = "UTC"
+    warnings: tuple[str, ...] = ()
 
 
 def _settings(root: Path) -> tuple[str, Any | None]:
@@ -248,7 +252,14 @@ def _observer_db_path(root: Path) -> tuple[Path, str]:
     return db_path, "file" if stat.S_ISREG(mode) else "other"
 
 
-def _database(db_path: Path, kind: str, conn: sqlite3.Connection | None) -> tuple[tuple[str, str, str, str], bool]:
+def _shown_time(value: object, tz: str) -> str:
+    """A stored UTC instant in the display zone; unconvertible values stay as written."""
+    converted = convert_time(value, tz)
+    return converted.text if converted.ok else str(value)
+
+
+def _database(db_path: Path, kind: str, conn: sqlite3.Connection | None,
+              tz: str = "UTC") -> tuple[tuple[str, str, str, str], bool]:
     if kind == "missing":
         return ("missing", "none", "0", "none"), False
     unavailable = ("unavailable", "unavailable", "unavailable", "unavailable")
@@ -257,7 +268,7 @@ def _database(db_path: Path, kind: str, conn: sqlite3.Connection | None) -> tupl
     try:
         rows = missions.recent(conn, 1)
         mission = (f"#{rows[0]['id']} {rows[0].get('state', rows[0].get('status', 'unknown'))} at "
-                   f"{rows[0].get('started_at', rows[0].get('created_at', 'unknown'))}"
+                   f"{_shown_time(rows[0].get('started_at', rows[0].get('created_at', 'unknown')), tz)}"
                    if rows else "none")
     except Exception:  # noqa: BLE001
         mission = "unavailable"
@@ -276,7 +287,7 @@ def _database(db_path: Path, kind: str, conn: sqlite3.Connection | None) -> tupl
     return ("ok", *lines), "unavailable" in lines
 
 
-def _activity(root: Path) -> tuple[str, bool]:
+def _activity(root: Path, tz: str = "UTC") -> tuple[str, bool]:
     try:
         result = tail_lines(Path(root) / "logs" / "activity.log", 1)
         if not result.lines:
@@ -284,7 +295,9 @@ def _activity(root: Path) -> tuple[str, bool]:
         fields = result.lines[-1].split("\t")
         if len(fields) < 3:
             return "unavailable", True
-        return " ".join(redact(field) for field in fields[:3])[:200], False
+        head = [redact(field) for field in fields[:3]]
+        head[0] = _shown_time(head[0], tz)
+        return " ".join(head)[:200], False
     except Exception:  # noqa: BLE001 - log is a separate source
         return "unavailable", True
 
@@ -313,6 +326,12 @@ def collect_status(root: Path, *, run: Callable[..., Any] = subprocess.run,
     except Exception:  # noqa: BLE001 - each source is independent
         setup_state, setup_bad = "unavailable", True
     settings_state, settings_value = _settings(root)
+    tz = read_display_timezone(Path(root) / "config" / "settings.yaml")
+    warnings: list[str] = []
+    if settings_value is not None:
+        note = region_name_warning(getattr(settings_value, "display_timezone", None))
+        if note is not None:
+            warnings.append(note)
     try:
         unit, unit_bad = _unit(run, unit_path or default_unit_dir() / UNIT_NAME)
     except Exception:  # noqa: BLE001
@@ -337,22 +356,24 @@ def collect_status(root: Path, *, run: Callable[..., Any] = subprocess.run,
             conn = None
     try:
         try:
-            db, db_bad = _database(db_path, db_kind, conn)
+            db, db_bad = _database(db_path, db_kind, conn, tz)
         except Exception:  # noqa: BLE001
             db, db_bad = ("unavailable",) * 4, True
         steps, pending_bad = _pending(root, instance, settings_value, conn)
     finally:
         if conn is not None:
             conn.close()
-    activity, activity_bad = _activity(root)
+    activity, activity_bad = _activity(root, tz)
     state_bad = state[0] == "unavailable" and instance != "unknown"
     return StatusData(instance, setup_state, settings_state, unit, ops, state, *db,
                       activity, steps, any((setup_bad, unit_bad, ops_bad, state_bad, db_bad,
-                                            activity_bad, pending_bad)))
+                                            activity_bad, pending_bad)),
+                      tz, tuple(warnings))
 
 
 def render_status(data: StatusData, *, root: Path | None = None) -> str:
-    lines = ["agentic-fx offline status", *_root_line(root), f"instance: {data.instance}",
+    lines = ["agentic-fx offline status", *_root_line(root), display_header(data.display_timezone),
+             f"instance: {data.instance}",
              f"setup: {data.setup}",
              f"settings: {data.settings}",
              f"unit: afx.service={data.unit[0]} active={data.unit[1]} linger={data.unit[2]}"]
@@ -363,6 +384,7 @@ def render_status(data: StatusData, *, root: Path | None = None) -> str:
                   f"recent activity: {data.activity}",
                   f"pending steps: {'unavailable' if data.steps is None else len(data.steps)}"))
     lines.extend(f"  - {step}" for step in data.steps or ())
+    lines.extend(f"warning: {note}" for note in data.warnings)
     lines.append(_NOTE)
     if data.setup in {"missing", "corrupt"}:
         next_step = "afx init"

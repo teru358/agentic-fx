@@ -19,7 +19,9 @@ from pathlib import Path
 
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.config import load_env_file, load_settings
+from agentic_fx.core.display_time import PRECISION_MINUTE, convert_time
 from agentic_fx.datafeed import news_probe
+from agentic_fx.display_tz import read_display_timezone
 from agentic_fx.datafeed.news_url import NewsInputError, fold_url, normalize_url, validate_name, validate_url
 from agentic_fx.store import news_health, news_sources
 from agentic_fx.store.db import connect_existing_rw, connect_observer_readonly
@@ -73,8 +75,13 @@ def _pad(text: str, width: int) -> str:
     return text + " " * (width - _width(text))
 
 
-def _utc_text(moment: datetime) -> str:
-    return moment.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+def _when_text(moment: datetime, tz: str) -> str:
+    """表示 tz の分精度。換算できなければ UTC で出す。"""
+    for zone in (tz, "UTC"):
+        converted = convert_time(moment, zone, PRECISION_MINUTE)
+        if converted.ok:
+            return converted.text
+    return "?"
 
 
 def _check_existing_name(name: str) -> None:
@@ -117,14 +124,14 @@ def _print_result(result: news_probe.ProbeResult) -> None:
     print(f"取得: {result.count} 件 (うち本文・要約あり {result.with_body} 件)")
 
 
-def _latest(observed: news_health.HealthRead) -> tuple[str, str]:
+def _latest(observed: news_health.HealthRead, tz: str = "UTC") -> tuple[str, str]:
     """(detail, time text) of the last retrieval, from the health record only."""
     record = observed.record
     if observed.corrupt:
         return "読めません", ""
     if record is None or record.last_outcome is None:
         return "未取得", ""
-    when = _utc_text(record.last_at) if record.last_at else ""
+    when = _when_text(record.last_at, tz) if record.last_at else ""
     if record.last_outcome == "ok":
         return f"成功 {record.last_count or 0} 件", when
     reason = record.last_reason
@@ -133,7 +140,7 @@ def _latest(observed: news_health.HealthRead) -> tuple[str, str]:
     return f"失敗 ({reason})", when
 
 
-def _list(conn: sqlite3.Connection) -> int:
+def _list(conn: sqlite3.Connection, tz: str = "UTC") -> int:
     rows = news_sources.list_all(conn)
     if not rows:
         print("ニュース源はありません。")
@@ -147,14 +154,14 @@ def _list(conn: sqlite3.Connection) -> int:
         state = "有効" if row["enabled"] else "無効"
         try:
             observed = news_health.read(conn, row["name"])
-            detail, when = _latest(observed)
+            detail, when = _latest(observed, tz)
             wait = news_health.read_effective_wait(conn, row["name"], now)
             streak = (max(observed.record.consecutive_failures, observed.record.retry_after_streak)
                       if observed.record else 0)
             if wait:
                 until, cause = wait
                 prefix = "" if cause == "directive" else f"連続 {streak} 回、"
-                note = f"{prefix}{_utc_text(until)} まで待機 ({_WAIT_LABELS[cause]})"
+                note = f"{prefix}{_when_text(until, tz)} まで待機 ({_WAIT_LABELS[cause]})"
             elif streak >= news_health.N:
                 note = f"連続 {streak} 回"
             else:
@@ -259,7 +266,8 @@ def _test(args, root: Path, conn: sqlite3.Connection) -> int:
     wait = news_health.read_effective_wait(conn, row["name"], _now())
     if wait:
         until, cause = wait
-        print(f"この源は {_utc_text(until)} まで待機中です ({_WAIT_LABELS[cause]}、収集器は取得しません)。")
+        tz = read_display_timezone(root / "config" / "settings.yaml")
+        print(f"この源は {_when_text(until, tz)} まで待機中です ({_WAIT_LABELS[cause]}、収集器は取得しません)。")
     try:
         result = news_probe.probe(row["fetcher"], row["url"], row["name"], timeout_sec=timeout)
     except (news_probe.ProbeFailure, NewsInputError) as exc:
@@ -279,7 +287,7 @@ def _run(args, root: Path) -> int:
     conn = _open(root, write=command in _WRITE_COMMANDS)
     try:
         if command == "list":
-            return _list(conn)
+            return _list(conn, read_display_timezone(root / "config" / "settings.yaml"))
         if command == "add":
             return _add(args, root, conn, *add_input)
         if command == "test":

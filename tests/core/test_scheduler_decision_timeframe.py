@@ -89,7 +89,7 @@ def test_busy_defers_once_with_elapsed_and_accepts_latest_closed_bar(tmp_path):
     _tick(env, slot, _at(THU, 12, 45, 30))
     _tick(env, slot, _at(THU, 12, 46, 30))
     assert _activity(env, "cron_mission_deferred") == [
-        "USDJPY 15m bar=2026-09-24T12:30 busy (running 15.0 min)"]
+        "USDJPY 15m bar=2026-09-24T12:30 UTC busy (running 15.0 min)"]
     assert env.sched._cron_watermarks[("USDJPY", "15m")] == _at(THU, 12, 15)
     # 12:45 足 (確定 13:00:30) が DB に先に在っても 12:47:30 では採らない
     _seed_bar(env, _at(THU, 12, 45))
@@ -112,9 +112,9 @@ def test_busy_across_two_bars_coalesces_to_latest_counting_db_bars(tmp_path):
     assert slot.accepted_at == [_at(THU, 12, 30, 31), _at(THU, 13, 2, 30)]
     assert env.sched._cron_watermarks[("USDJPY", "15m")] == _at(THU, 12, 45)
     assert _activity(env, "cron_mission_coalesced") == [
-        "USDJPY 15m accepted=2026-09-24T12:45 skipped=1 (2026-09-24T12:30)"]
+        "USDJPY 15m accepted=2026-09-24T12:45 UTC skipped=1 (2026-09-24T12:30 UTC)"]
     assert [s.split(" busy")[0] for s in _activity(env, "cron_mission_deferred")] == [
-        "USDJPY 15m bar=2026-09-24T12:30", "USDJPY 15m bar=2026-09-24T12:45"]
+        "USDJPY 15m bar=2026-09-24T12:30 UTC", "USDJPY 15m bar=2026-09-24T12:45 UTC"]
 
 
 def test_coalesced_is_not_written_when_intermediate_bar_is_missing(tmp_path):
@@ -197,7 +197,7 @@ def test_friday_last_bar_committed_at_sunday_open_is_skipped_not_fired(tmp_path)
     assert env.sched._cron_watermarks[KEY] == _at(FRI, 20, 45)
     assert cron_cursor.load_all(env.conn) == {KEY: _at(FRI, 20, 45)}
     assert _activity(env, "cron_previous_session_bar_skipped") == [
-        "USDJPY 15m bar=2026-09-25T20:45 session_start=2026-09-27T21:00"]
+        "USDJPY 15m bar=2026-09-25T20:45 UTC session_start=2026-09-27T21:00 UTC"]
     _seed_bar(env, _at(SUN, 21, 0))
     _tick(env, slot, _at(SUN, 21, 15, 30))
     assert slot.accepted_at[-1] == _at(SUN, 21, 15, 30) and len(slot.accepted_at) == 3
@@ -216,7 +216,7 @@ def test_bar_ending_exactly_at_session_start_is_previous_session_boundary(
     _tick(env, slot, _at(SUN, 21, 0, 30))
     assert slot.accepted_at == []
     assert _activity(env, "cron_previous_session_bar_skipped") == [
-        "USDJPY 15m bar=2026-09-27T20:45 session_start=2026-09-27T21:00"]
+        "USDJPY 15m bar=2026-09-27T20:45 UTC session_start=2026-09-27T21:00 UTC"]
     assert env.sched._cron_watermarks[KEY] == bar
     assert cron_cursor.load_all(env.conn) == {KEY: bar}
 
@@ -234,7 +234,7 @@ def test_holiday_not_joined_to_weekend_skips_pre_holiday_bar(tmp_path):
     _tick(env, slot, _dt(2025, 12, 25, 22, 0, 30))
     assert env.sched._was_open is True and len(slot.accepted_at) == 1
     assert _activity(env, "cron_previous_session_bar_skipped") == [
-        "USDJPY 15m bar=2025-12-24T21:45 session_start=2025-12-25T22:00"]
+        "USDJPY 15m bar=2025-12-24T21:45 UTC session_start=2025-12-25T22:00 UTC"]
     _seed_bar(env, _dt(2025, 12, 25, 22, 0))
     _tick(env, slot, _dt(2025, 12, 25, 22, 15, 30))
     assert len(slot.accepted_at) == 2
@@ -257,7 +257,7 @@ def test_new_year_joined_to_weekend_skips_until_sunday_open(tmp_path):
     assert len(slot.accepted_at) == 1
     assert env.sched._cron_watermarks[KEY] == _dt(2026, 12, 31, 21, 45)
     assert _activity(env, "cron_previous_session_bar_skipped") == [
-        "USDJPY 15m bar=2026-12-31T21:45 session_start=2027-01-03T22:00"]
+        "USDJPY 15m bar=2026-12-31T21:45 UTC session_start=2027-01-03T22:00 UTC"]
     _seed_bar(env, _dt(2027, 1, 3, 22, 0))
     _tick(env, slot, _dt(2027, 1, 3, 22, 15, 30))
     assert len(slot.accepted_at) == 2
@@ -278,7 +278,7 @@ def test_christmas_friday_joined_to_weekend_is_not_a_session_start(tmp_path):
     assert len(slot.accepted_at) == 1
     assert env.sched._cron_watermarks[KEY] == _dt(2026, 12, 24, 21, 45)
     assert _activity(env, "cron_previous_session_bar_skipped") == [
-        "USDJPY 15m bar=2026-12-24T21:45 session_start=2026-12-27T22:00"]
+        "USDJPY 15m bar=2026-12-24T21:45 UTC session_start=2026-12-27T22:00 UTC"]
     _seed_bar(env, _dt(2026, 12, 27, 22, 0))
     _tick(env, slot, _dt(2026, 12, 27, 22, 15, 30))
     assert len(slot.accepted_at) == 2
@@ -295,7 +295,7 @@ def test_default_1h_friday_last_bar_is_skipped_at_sunday_open(tmp_path):
     env.sched.tick(_at(SUN, 21, 0, 30))
     assert env.trade_reasons == ["cron"]
     assert _activity(env, "cron_previous_session_bar_skipped") == [
-        "USDJPY 1h bar=2026-09-25T20:00 session_start=2026-09-27T21:00"]
+        "USDJPY 1h bar=2026-09-25T20:00 UTC session_start=2026-09-27T21:00 UTC"]
     _seed_decision_bar(env, SUN)
     env.sched.tick(SUN + timedelta(hours=1, seconds=30))
     assert env.trade_reasons == ["cron", "cron"]
@@ -531,7 +531,7 @@ def test_future_cursor_holds_only_that_pair_and_resumes_when_w_catches_up(tmp_pa
     assert env.sched._due_cron_watermarks == {("EURUSD", "15m"): _at(THU, 13, 0)}
     assert env.sched._cron_watermarks[("USDJPY", "15m")] == _at(THU, 13, 15)
     assert _activity(env, "cron_cursor_future_watermark") == [
-        "USDJPY 15m L=2026-09-24T13:15 W=2026-09-24T13:00 "
+        "USDJPY 15m L=2026-09-24T13:15 UTC W=2026-09-24T13:00 UTC "
         "(この pair の cron 判定を保留、W が L に追いつくと自動で再開)"]
     _tick(env, slot, _at(THU, 13, 16, 30))
     assert len(_activity(env, "cron_cursor_future_watermark")) == 1
@@ -539,7 +539,7 @@ def test_future_cursor_holds_only_that_pair_and_resumes_when_w_catches_up(tmp_pa
         _seed_bar(env, _at(THU, 13, 15), pair=pair)
     _tick(env, slot, _at(THU, 13, 30, 30))
     assert _activity(env, "cron_cursor_future_watermark_resolved") == [
-        "USDJPY 15m L=2026-09-24T13:15 W=2026-09-24T13:15 (cron 判定を再開)"]
+        "USDJPY 15m L=2026-09-24T13:15 UTC W=2026-09-24T13:15 UTC (cron 判定を再開)"]
     assert env.sched._due_cron_watermarks == {("EURUSD", "15m"): _at(THU, 13, 15)}
     _seed_bar(env, _at(THU, 13, 30), pair="USDJPY")
     _tick(env, slot, _at(THU, 13, 45, 30))
@@ -574,7 +574,7 @@ def test_cursor_written_by_another_connection_while_running_is_picked_up_next_ti
     assert env.sched._due_cron_watermarks == {("EURUSD", "15m"): _at(THU, 13, 0)}
     assert env.sched._cron_watermarks[("USDJPY", "15m")] == _at(THU, 13, 15)
     assert _activity(env, "cron_cursor_future_watermark") == [
-        "USDJPY 15m L=2026-09-24T13:15 W=2026-09-24T13:00 "
+        "USDJPY 15m L=2026-09-24T13:15 UTC W=2026-09-24T13:00 UTC "
         "(この pair の cron 判定を保留、W が L に追いつくと自動で再開)"]
     _tick(env, slot, _at(THU, 13, 16, 30))
     assert len(_activity(env, "cron_cursor_future_watermark")) == 1
@@ -583,7 +583,7 @@ def test_cursor_written_by_another_connection_while_running_is_picked_up_next_ti
         _seed_bar(env, _at(THU, 13, 15), pair=pair)
     _tick(env, slot, _at(THU, 13, 30, 30))
     assert _activity(env, "cron_cursor_future_watermark_resolved") == [
-        "USDJPY 15m L=2026-09-24T13:15 W=2026-09-24T13:15 (cron 判定を再開)"]
+        "USDJPY 15m L=2026-09-24T13:15 UTC W=2026-09-24T13:15 UTC (cron 判定を再開)"]
     assert env.sched._due_cron_watermarks == {("EURUSD", "15m"): _at(THU, 13, 15)}
 
 
@@ -660,8 +660,8 @@ def test_busy_defers_every_advanced_pair_once(tmp_path):
     _tick(env, slot, _at(THU, 12, 45, 30))
     _tick(env, slot, _at(THU, 12, 46, 30))
     assert _activity(env, "cron_mission_deferred") == [
-        "EURUSD 15m bar=2026-09-24T12:30 busy (running 15.0 min)",
-        "USDJPY 15m bar=2026-09-24T12:30 busy (running 15.0 min)"]
+        "EURUSD 15m bar=2026-09-24T12:30 UTC busy (running 15.0 min)",
+        "USDJPY 15m bar=2026-09-24T12:30 UTC busy (running 15.0 min)"]
 
 
 def test_mt5_primary_uses_mt5_live_rows_for_due_and_coalesced(tmp_path):
@@ -796,4 +796,4 @@ def test_previous_session_bar_of_one_pair_does_not_hold_back_other_pair(tmp_path
     assert env.sched._cron_watermarks == {
         ("USDJPY", "15m"): _at(FRI, 20, 45), ("EURUSD", "15m"): _at(SUN, 21, 0)}
     assert _activity(env, "cron_previous_session_bar_skipped") == [
-        "USDJPY 15m bar=2026-09-25T20:45 session_start=2026-09-27T21:00"]
+        "USDJPY 15m bar=2026-09-25T20:45 UTC session_start=2026-09-27T21:00 UTC"]

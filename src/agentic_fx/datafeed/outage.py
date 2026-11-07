@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from agentic_fx.activity import Category
+from agentic_fx.core import display_time
 from agentic_fx.core.executor import _EXPOSURE
 from agentic_fx.core import market_hours
 from agentic_fx.core.timeutil import as_utc
@@ -374,7 +375,10 @@ class OutageStateMachine:
                 ready_streak = 0
                 restricted_since = _iso(origin)
                 deadline = _iso(origin + timedelta(seconds=self.flat_stall_max_sec))
-                activities.append(("datafeed_restricted", f"epoch={epoch} stalled={sorted(stalled)} expected={_iso(origin)} deadline={deadline}"))
+                _, restricted_event, restricted_body = display_time.datafeed_restricted(
+                    epoch, stalled, origin,
+                    origin + timedelta(seconds=self.flat_stall_max_sec))
+                activities.append((restricted_event, restricted_body))
         elif state == "restricted":
             if (deadline is not None and now > _parse(deadline)) or immediate or not flat:
                 degrade()
