@@ -29,7 +29,7 @@ def test_approval_payload_counts_only_accepted_entries(loop_min, conn):
         conn, name="x", kind="indicator", content_hash="c",
         artifact_hash="a", ctx_ledger=ledger, mission_id=1,
         backlog_id=1, candidate_origin="staging", candidate_path="p",
-        gate_metrics={}, output={}, now=loop_min._clock.now())
+        gate_metrics={}, output={}, now=loop_min._clock.now(), base={"kind": "none"})
     assert payload["trial_count"] == 4
     assert payload["analysis_call_count"] == 1
     assert payload["backtest_call_count"] == 0
@@ -47,7 +47,7 @@ def test_payload_profitability_floor_snapshot_f6_8_like(loop_min, conn):
         conn, name="x", kind="indicator", content_hash="c",
         artifact_hash="a", ctx_ledger=ledger, mission_id=1,
         backlog_id=1, candidate_origin="staging", candidate_path="p",
-        gate_metrics={}, output={}, now=loop_min._clock.now())
+        gate_metrics={}, output={}, now=loop_min._clock.now(), base={"kind": "none"})
     g = loop_min._settings.improve.gate
     assert payload["profitability_floor"] == {
         "min_pf": g.min_pf,
@@ -74,7 +74,7 @@ def test_payload_analysis_fields_come_from_ledger_not_agent_output(
         conn, name="myind", kind="indicator", content_hash="h",
         artifact_hash="a", ctx_ledger=ledger, mission_id=1, backlog_id=2,
         candidate_origin="staging", candidate_path="plugins/_staging/1/myind",
-        gate_metrics={}, output=output, now=datetime(2026, 8, 22))
+        gate_metrics={}, output=output, now=datetime(2026, 8, 22), base={"kind": "none"})
 
     assert payload["trial_count"] == 35  # sum(25, 10, 0)
     assert payload["analysis_call_count"] == 2  # analyze_corr の呼出数
@@ -94,7 +94,7 @@ def test_payload_trial_count_is_sum_not_call_count(loop_min, conn):
         artifact_hash="a", ctx_ledger=ledger, mission_id=1, backlog_id=2,
         candidate_origin="staging", candidate_path="plugins/_staging/1/myind",
         gate_metrics={}, output={"selection_rationale": ""},
-        now=datetime(2026, 8, 22))
+        now=datetime(2026, 8, 22), base={"kind": "none"})
     assert payload["trial_count"] == 25
     assert payload["analysis_call_count"] == 1
 
@@ -165,7 +165,7 @@ def test_payload_base_interval_follows_backtest_settings_for_strategy(
         artifact_hash="a", ctx_ledger=ledger, mission_id=1, backlog_id=2,
         candidate_origin="staging", candidate_path="plugins/_staging/1/myst",
         gate_metrics={"meta": _Meta()}, output={"selection_rationale": ""},
-        now=datetime(2026, 8, 22))
+        now=datetime(2026, 8, 22), base={"kind": "none"})
     assert payload["base_interval"] == "5m"
     assert payload["eval_timeframe"] == "1h"
 
@@ -174,7 +174,7 @@ def test_payload_base_interval_follows_backtest_settings_for_strategy(
         artifact_hash="a", ctx_ledger=ledger, mission_id=1, backlog_id=2,
         candidate_origin="staging", candidate_path="plugins/_staging/1/myind",
         gate_metrics={}, output={"selection_rationale": ""},
-        now=datetime(2026, 8, 22))
+        now=datetime(2026, 8, 22), base={"kind": "none"})
     assert payload_indicator["base_interval"] is None
     assert payload_indicator["eval_timeframe"] is None
 
@@ -198,7 +198,7 @@ def test_payload_eval_timeframe_maps_1d_to_24h_for_strategy(loop_min, conn):
         artifact_hash="a", ctx_ledger=ledger, mission_id=1, backlog_id=2,
         candidate_origin="staging", candidate_path="plugins/_staging/1/myst_1d",
         gate_metrics={"meta": _Meta()}, output={"selection_rationale": ""},
-        now=datetime(2026, 8, 22))
+        now=datetime(2026, 8, 22), base={"kind": "none"})
     assert payload["eval_timeframe"] == "24h"
 
 

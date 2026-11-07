@@ -42,12 +42,13 @@ from agentic_fx.datafeed.reference_status import REFERENCE_STATES
 from agentic_fx.loops.econ_signal_report import format_econ_lines
 from agentic_fx.loops import approval_facts
 from agentic_fx.ops import reevaluation_view
+from agentic_fx.plugin import base_identity
 from agentic_fx.loops.approval_facts import display_text
 from agentic_fx.cli_surface import render_ctl_help
 from agentic_fx.setup.pending_text import (STEP_PARAMS, PendingStep, is_ident,
                                            parse_observed_at, render_pending_step)
 
-from . import change_limits, keys, redactor
+from . import base_view, change_limits, keys, redactor
 from .contracts import Principal
 from .events import EventCursor, EventPage
 from .tail import ACTIVITY_CATEGORIES
@@ -954,6 +955,7 @@ def format_approval_detail(data: dict) -> str:
     lines += Commands._metrics_lines("holdout", data.get("holdout"))
     lines += Commands._baseline_comparison_lines(data.get("baseline"),
                                                  data.get("baseline_hash_warning"))
+    lines += base_view.lines(data.get("base_check"))
     gate = data.get("gate_lines")
     if isinstance(gate, list):
         lines += [_safe_text(line, approval_facts.CLAIM_DISPLAY_LIMIT)
@@ -1651,10 +1653,14 @@ class Runner:
             raise ClientError(RC_FAILED, error_text(code if isinstance(code, str) else None))
         stale = result.get("outcome") == "invalidated" and result.get(
             "reason") == "reevaluation_stale"
+        base_changed = result.get("outcome") == "invalidated" and result.get(
+            "reason") == base_identity.BASE_CHANGED
         if stale:
             self.say(f"approval #{approval_id} " + (
                 reevaluation_view.STALE_STOP_TEXT.format(name=name or "<name>")
                 if kind == "reject" else reevaluation_view.STALE_TEXT))
+        elif base_changed:
+            self.say(f"approval #{approval_id} " + base_identity.BASE_CHANGED_TEXT)
         elif kind == "reject":
             phase = result.get("deploy_phase")
             if phase is None:

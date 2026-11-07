@@ -102,7 +102,7 @@ artifact_hash を使うのは、切替・journal・再評価の照合がすべ�
 - ctl / shell の文面 (`commands.py:853-858` は通常の invalidated を「既に決着」としか言わない)
 - Discord の終端カード。`gate/render.py:58` の `STATUS_LABELS` には `invalidated` が無く、`render_terminal` (`gate/render.py:351-377`) は None を返す (`bot/adapter.py:701-704` が固定文に置き換える)。`STATUS_LABELS` に `invalidated` (表示名「無効」) を足し、詳細 API の `reason == "base_changed"` のときに固定文を 1 段落足す。通知 event は拡張しない
 
-文面は固定で「土台の版が配備中の版と違うため配備しませんでした。配備中の版から作り直して提出してください」。reason は `apply_decision` → backlog の `last_result` を経て改善 prompt に流れる (`store/approvals.py:243-247`) ので、hash などを含めず固定の token `base_changed` のままにする。
+文面は固定で「土台の版が配備中の版と違うため配備しませんでした。配備中の版から作り直して提出してください」。reason は hash などを含めず、固定の token `base_changed` のままにする。backlog の `last_result` には reason は流れない。invalidated の template は固定の `invalidated` で、`{reason}` を持たない (`store/backlog.py`)。改善 prompt に届くのは「無効」だけになる。
 
 ## 2. 承認画面での見え方
 
@@ -186,5 +186,6 @@ T1 → T2 の順。T1 だけでも lost update は止まる。
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
 | 2026-11-07 | C0 | 初版 | チケット approval-base-identity-cas の設計 | — |
+| 2026-11-07 | C2.1 | §1.5: backlog の last_result に reason は流れない (invalidated の template は固定) ことを実コードに合わせて記す | T1 実装で判明 | — |
 | 2026-11-07 | C2 | bless に照合しない印 `unchecked` を書き、`base` 無し = 配備前だけを成立させる (3 経路すべてが `base` を書く)。staging の土台を `meta.path` から導く規則 (live を読み直さない)、照合の行位置 (live 読取と T11 の間) と `ApprovalOutcome` の形、dangling の扱い、Discord の終端カードに invalidated を足す、判定 helper と `base_check` の形で T1/T2 の境界を切る、reason は固定 token (`last_result` に流れる)、却下の文言、plain の注、ABA と improve 繰り返しの帰結を残余に、人間の提出で live が読めなければ拒否、受入 16 項目に | Fable 2 周目 (Important 5 / Minor 10) | — |
 | 2026-11-07 | C1 | journal の収束と tx・片付けの順 (§1.3)、再開の除外を外して既存の制御構造を維持、人間の経路と bless を残余と裁定に、「スナップショットに同名なし」の定義、plain と壊れた `base` の規則、ABA と `_is_superseded` の関係、照合の位置と表示の文面、reason の運び先 (§1.5)、土台の表示を比較成績から独立 (§2)、既存の content_hash 警告は残す、受入 15 項目に | sol 1 周目 (Critical 1 / Important 8 / Minor 1) | — |
