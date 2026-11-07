@@ -52,7 +52,7 @@ def run_pass(*, read, write, stopped, pair_currencies, pip_size_fn, now: datetim
                                   else pip_size_fn(item['pair'])), spread_pips=spread,
                         set_state=item['state'])
                 except Exception as e:
-                    log.exception("econ reaction calculation failed for set %s event %s: %s",
+                    log.error("econ reaction calculation failed for set %s event %s: %s",
                                   item['id'], item['event_id'], safe_error_text(e))
                     continue
             keys = [(item['event_id'], c) for c in currencies]
@@ -62,7 +62,7 @@ def run_pass(*, read, write, stopped, pair_currencies, pip_size_fn, now: datetim
             if result is None:
                 break
         except Exception as e:
-            log.exception("econ reaction pass failed for set %s event %s: %s",
+            log.error("econ reaction pass failed for set %s event %s: %s",
                           item['id'], item['event_id'], safe_error_text(e))
     else:
         if advance:

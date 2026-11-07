@@ -211,7 +211,8 @@ def test_a_failing_set_is_logged_and_the_rest_of_the_pass_continues(tmp_path, ca
         _run(conn, write=write)
     assert _values(conn, first) == []
     assert len(_values(conn, second)) == 3
-    assert any("injected" in (r.exc_text or "") for r in caplog.records)
+    assert any(f"set {first}" in r.getMessage() and "RuntimeError" in r.getMessage()
+               for r in caplog.records)
     _run(conn)
     assert len(_values(conn, first)) == 3
 
@@ -341,3 +342,6 @@ def test_failure_logs_name_the_set_and_event_and_the_exception_type(tmp_path, ca
     text = " ".join(r.getMessage() for r in caplog.records)
     assert f"set {set2} event {event2}" in text
     assert "OSError" in text and "secret.example" not in text and "abc" not in text
+    # 整形済みの出力 (traceback を含む) にも元の例外の本文が残らない
+    assert all(r.exc_info is None for r in caplog.records)
+    assert "secret.example" not in caplog.text and "apikey" not in caplog.text
