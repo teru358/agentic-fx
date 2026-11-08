@@ -225,3 +225,22 @@ def test_a_throttled_reply_defers_the_next_question_for_that_approval():
     assert client.asked == [7]
     assert second.text == "Reject で配備を止める可能性があります"
     assert adapter._next_poll_at[7] > 100.0
+
+
+def test_the_comparison_cells_round_like_the_card_numbers():
+    from afx_ops import reevaluation_text
+
+    rough = {"pf": 1.0165433487012487, "trades": 40, "avg_r": float("nan"),
+             "max_drawdown": 0.14966326623788673}
+
+    assert (reevaluation_text._cells(rough)
+            == "pf=1.017 trades=40 avg_r=- max_drawdown=0.1497")
+    assert reevaluation_text._cells({"trades": True}) == "pf=- trades=- avg_r=- max_drawdown=-"
+
+
+def test_a_huge_integer_cell_is_cut_instead_of_raising():
+    from afx_ops import reevaluation_text
+
+    cell = reevaluation_text._cells({"trades": 10 ** 309})
+
+    assert cell.startswith("pf=- trades=1000") and cell.endswith("…(省略) avg_r=- max_drawdown=-")

@@ -276,6 +276,41 @@ def test_the_approval_detail_reads_the_deployed_version_as_unchanged(fx, ops_env
     assert change["candidate_hash"] == fx.artifact
 
 
+@pytest.mark.parametrize("status", ["approved", "rejected", "invalidated", "expired"])
+def test_a_decided_reevaluation_without_a_journal_is_classified_as_the_same_version(
+        fx, ops_env, status):
+    approvals_store.apply_decision(ops_env.conn, fx.approval_id, status,
+                                   decided_by="human", now=THEN)
+
+    change = ops_env.service().approval_detail(OPERATOR, fx.approval_id)["change"]
+
+    assert change["classification"] == L.CLASS_SAME
+    assert change["reason"] is None and change["baseline_hash"] == fx.artifact
+
+
+def test_a_decided_reevaluation_shows_the_same_unchanged_diff_as_a_pending_one(fx, ops_env):
+    pending = ops_env.service().approval_change(OPERATOR, fx.approval_id)["diff"]
+    approvals_store.apply_decision(ops_env.conn, fx.approval_id, "approved",
+                                   decided_by="human", now=THEN)
+
+    decided = ops_env.service().approval_change(OPERATOR, fx.approval_id)["diff"]
+
+    assert pending["files"]
+    assert [(f["path"], f["status"]) for f in decided["files"]] == [
+        (f["path"], f["status"]) for f in pending["files"]]
+    assert all(f["status"] == "unchanged" for f in decided["files"])
+
+
+def test_a_decided_ordinary_approval_without_a_journal_stays_unknown(ops_env):
+    approval_id = ops_env.make_plugin_approval()
+    approvals_store.apply_decision(ops_env.conn, approval_id, "rejected",
+                                   decided_by="human", now=THEN)
+
+    change = ops_env.service().approval_detail(OPERATOR, approval_id)["change"]
+
+    assert change["classification"] == L.CLASS_UNKNOWN
+
+
 def test_the_approval_detail_refuses_a_locator_that_is_not_the_canonical_path(fx, ops_env):
     payload = {**fx.payload(), "candidate_path": f"plugins/.versions/{NAME}/{'f' * 64}"}
     ops_env.conn.execute("UPDATE approval_requests SET payload_json=? WHERE id=?",

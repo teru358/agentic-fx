@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from agentic_fx.loops import approval_facts
 from agentic_fx.core.display_time import effective_tz_name
 from agentic_fx.ops import client, reevaluation_view
 from agentic_fx.ops.contracts import Principal
@@ -127,6 +128,72 @@ def test_a_later_disable_of_the_same_version_does_not_change_the_rejected_reques
     detail = ops_env.service().approval_detail(OPERATOR, fx.approval_id)
 
     assert detail["deploy_phase"] == "done"
+
+
+# ---------------------------------------------------------------- 数値の丸め・事実表の欄
+
+ROUGH = {"pf": 1.0165433487012487, "trades": 40, "avg_r": 0.123456789,
+         "max_drawdown": 0.14966326623788673}
+
+
+def test_the_comparison_cells_round_floats_to_four_significant_digits_and_keep_ints():
+    row = {"pair": "USDJPY", "scope": "holdout",
+           "previous": {"metrics": ROUGH, "source": "payload", "run_id": None},
+           "current": {"pf": 1.0165433487012487, "max_drawdown": 0.14966326623788673,
+                       "trades": 7}}
+
+    text = reevaluation_view.row_text(row)
+
+    assert "pf=1.017 trades=40 avg_r=0.1235 max_drawdown=0.1497 (承認時の記録)" in text
+    assert "今回 pf=1.017 trades=7 avg_r=- max_drawdown=0.1497" in text
+    assert "1.0165" not in text and "0.14966" not in text
+
+
+def test_the_shell_detail_rounds_the_comparison(fx, ops_env):
+    _with_comparison(fx, ops_env)
+    payload = json.loads(ops_env.conn.execute(
+        "SELECT payload_json FROM approval_requests WHERE id=?",
+        (fx.approval_id,)).fetchone()[0])
+    payload["in_sample"]["USDJPY"] = ROUGH
+    ops_env.conn.execute("UPDATE approval_requests SET payload_json=? WHERE id=?",
+                         (json.dumps(payload), fx.approval_id))
+    ops_env.conn.commit()
+
+    text = _shell(ops_env, ops_env.service()).dispatch(f"approval {fx.approval_id}")
+
+    comparison = [line for line in text.split("\n") if "前回" in line and "今回" in line]
+    assert any("今回 pf=1.017 trades=40 avg_r=0.1235 max_drawdown=0.1497" in line
+               for line in comparison)
+    assert not any("1.0165433" in line for line in comparison)
+
+
+def test_a_reevaluation_request_has_no_facts_lines():
+    payload = {"candidate_origin": "reevaluation", "name": NAME, "summary": "x"}
+
+    assert approval_facts.render_facts_lines(payload) == []
+
+
+def test_an_ordinary_request_keeps_the_legacy_note():
+    lines = approval_facts.render_facts_lines({"name": NAME})
+
+    assert lines and approval_facts.LEGACY_LINE in lines
+
+
+def test_the_reevaluation_detail_and_shell_do_not_carry_the_legacy_note(fx, ops_env):
+    _with_comparison(fx, ops_env)
+
+    detail = ops_env.service().approval_detail(OPERATOR, fx.approval_id)
+    text = _shell(ops_env, ops_env.service()).dispatch(f"approval {fx.approval_id}")
+
+    assert detail["facts_lines"] == []
+    assert "旧形式" not in text
+
+
+def test_the_ctl_detail_without_facts_lines_renders_cleanly():
+    text = client.format_approval_detail({"id": 3, "kind": "plugin", "status": "approved",
+                                          "facts_lines": []})
+
+    assert "payload_sha256=" in text
 
 
 # ---------------------------------------------------------------- shell の承認詳細
@@ -388,3 +455,11 @@ def test_the_wording_in_afx_ops_matches_the_daemon_side():
         {"reevaluates_approval_id": 1}, lambda v: v))
     assert daemon_lines.startswith(other.HEADING)
     assert other.PERIOD_NOTE.strip("()") in daemon_lines
+    for metrics in ({"pf": 1.0165433487012487, "trades": 40, "avg_r": float("inf"),
+                     "max_drawdown": 0.14966326623788673},
+                    {"pf": True, "trades": 10 ** 309, "avg_r": -0.0001234567},
+                    {"trades": 7 * 10 ** 250, "max_drawdown": None}):
+        assert other._cells(metrics) == reevaluation_view._cells(metrics)
+    from agentic_fx.loops import approval_facts
+    assert other._CELL_LIMIT == approval_facts.FIELD_DISPLAY_LIMIT
+    assert other._CUT == approval_facts.TRUNCATION_SUFFIX

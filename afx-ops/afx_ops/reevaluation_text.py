@@ -52,15 +52,26 @@ def safe_name(value: object) -> str | None:
     return value if type(value) is str and _NAME.fullmatch(value) else None
 
 
+_CELL_LIMIT = 200
+_CUT = "…(省略)"
+
+
 def _number(value: object) -> bool:
-    return type(value) in (int, float) and math.isfinite(value)
+    return type(value) is int or (type(value) is float and math.isfinite(value))
+
+
+def _shown(value: object) -> str:
+    """int はそのまま、有限の float は有効 4 桁。daemon 側と同じ長さで切る。"""
+    if not _number(value):
+        return "-"
+    text = str(value) if type(value) is int else f"{value:.4g}"
+    return text if len(text) <= _CELL_LIMIT else text[:_CELL_LIMIT] + _CUT
 
 
 def _cells(metrics: object) -> str:
     if type(metrics) is not dict:
         return "不明"
-    return " ".join(f"{key}={metrics[key] if _number(metrics.get(key)) else '-'}"
-                    for key in METRIC_KEYS)
+    return " ".join(f"{key}={_shown(metrics.get(key))}" for key in METRIC_KEYS)
 
 
 def _row_text(row: dict) -> str:
