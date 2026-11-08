@@ -616,3 +616,11 @@ def test_output_for_storage_scrubs_keys_and_secret_named_fields():
     assert stored["nested"]["client_secret"] == "***"
     assert stored["nested"]["password"] == "***"
     assert stored["list"][0]["access_token"] == "***"
+
+
+def test_output_for_storage_keeps_count_like_names():
+    stored = rs.output_for_storage({"tokens": 120, "token_count": 5, "max_tokens": 9,
+                                    "apiKey": "k1", "accessToken": "t1", "password_hint": "h"})
+    assert stored["tokens"] == 120 and stored["token_count"] == 5 and stored["max_tokens"] == 9
+    assert stored["apiKey"] == "***" and stored["accessToken"] == "***"
+    assert stored["password_hint"] == "***"

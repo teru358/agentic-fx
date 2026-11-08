@@ -258,10 +258,23 @@ def _plugin_name(value: object) -> str | None:
     return None
 
 
-_SECRET_FIELD = re.compile(
-    r"(api[_-]?key|apikey|token|secret|passw(or)?d|credential|authorization|cookie)",
-    re.IGNORECASE)
+_SECRET_WORDS = frozenset({
+    "apikey", "token", "secret", "password", "passwd", "credential", "credentials",
+    "authorization", "cookie"})
+_COUNT_WORDS = frozenset({"count", "counts", "total", "num", "len", "length", "limit",
+                          "used", "max", "min"})
 _REDACTED = "***"
+
+
+def _is_secret_name(key: str) -> bool:
+    """key 名を語に分けて、秘密を表す名前かを決める (`api_key`・`access_token`・
+    `client_secret` は秘密、`tokens`・`token_count` のような件数の名前は秘密でない)。"""
+    words = [w for w in re.split(r"[^a-z0-9]+", re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key).lower())
+             if w]
+    if any(w in _COUNT_WORDS for w in words):
+        return False
+    joined = ["".join(words[i:i + 2]) for i in range(len(words) - 1)]
+    return any(w in _SECRET_WORDS for w in words) or "apikey" in joined
 
 
 def _sanitized(value: object) -> object:
@@ -274,7 +287,7 @@ def _sanitized(value: object) -> object:
         out: dict = {}
         for key, item in value.items():
             name = safe_text(key) if isinstance(key, str) else key
-            secret = isinstance(key, str) and _SECRET_FIELD.search(key) is not None
+            secret = isinstance(key, str) and _is_secret_name(key)
             out[name] = _REDACTED if secret else _sanitized(item)
         return out
     if isinstance(value, (list, tuple)):
