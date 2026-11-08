@@ -315,7 +315,8 @@ def main() -> None:
                         # structured code, the traceback goes to stderr as before
                         raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
                     rows = None
-                    if frame_id is not None:
+                    if frame_id is not None and any(
+                            isinstance(v, pd.Series) for v in validated.values()):
                         from agentic_fx.plugin.reference import align_reference_rows
                         rows = align_reference_rows(
                             sub_df.index, main_index=df.index,
