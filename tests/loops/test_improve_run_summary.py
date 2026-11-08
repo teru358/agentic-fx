@@ -210,7 +210,7 @@ def test_holdout_measured_when_present():
 # --- 比較 -------------------------------------------------------------------
 
 def _comparison(verdict="not_improved", reason="holdout_not_exceeds"):
-    side = {"trades": 40, "pf": 1.1, "avg_r": 0.05, "win_rate": 0.5}
+    side = {"trades": 40, "pf": 1.1, "avg_r": 0.05, "win_rate": 0.5, "evaluable": True}
     return {"mode": "enforce", "verdict": verdict, "reason": reason,
             "stages": {"holdout": {"USDJPY": {
                 "candidate": side, "deployed": {**side, "pf": 1.3},
@@ -223,8 +223,8 @@ def test_comparison_item_keeps_fixed_words_and_the_compared_metrics_only():
     assert item["verdict"] == "not_improved" and item["metrics"] == ["pf", "avg_r"]
     assert item["pairs"] == [{
         "pair": "USDJPY", "verdict": "not_improved",
-        "candidate": {"trades": 40, "pf": 1.1, "avg_r": 0.05},
-        "deployed": {"trades": 40, "pf": 1.3, "avg_r": 0.05}}]
+        "candidate": {"trades": 40, "pf": 1.1, "avg_r": 0.05, "evaluable": True},
+        "deployed": {"trades": 40, "pf": 1.3, "avg_r": 0.05, "evaluable": True}}]
 
 
 def test_comparison_with_unknown_words_is_left_out():

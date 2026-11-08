@@ -23,6 +23,7 @@ from agentic_fx._safe_error import safe_text
 from agentic_fx import improve_notice_codes as notice_codes
 from agentic_fx.loops.approval_facts import TRUNCATION_SUFFIX, display_text
 from agentic_fx.loops.summary import IMPROVE_OUTPUT_SCHEMA
+from agentic_fx.plugin.logic_identity import FAMILY_KEY_MAX_BYTES
 from agentic_fx.plugin.strategy_gate import _floor_fail_items, trades_per_eval_bar
 from agentic_fx.store import improve_run_summaries as summaries_store
 from agentic_fx.store.improve_run_summaries import (
@@ -59,6 +60,7 @@ def _nullable(kind: str) -> dict:
 _NUMBER = {"type": ["number", "null"]}
 _TEXT = {"type": "string", "minLength": 1, "maxLength": _TEXT_MAX_LENGTH}
 _NAME = {"type": "string", "minLength": 1, "maxLength": NAME_LIMIT}
+_FAMILY = {"type": "string", "minLength": 1, "maxLength": FAMILY_KEY_MAX_BYTES}
 
 
 def _object(properties: dict, required: Iterable[str] | None = None) -> dict:
@@ -81,7 +83,7 @@ _STAGE = _object({
     "pairs": {"type": "array", "maxItems": PAIR_ROWS_MAX, "items": _PAIR_ROW}})
 _SIDE = _object({
     "trades": {"type": ["integer", "null"], "minimum": 0},
-    "pf": _NUMBER, "avg_r": _NUMBER})
+    "pf": _NUMBER, "avg_r": _NUMBER, "evaluable": _nullable("boolean")})
 _COMPARISON_PAIR = _object({
     "pair": _NAME, "verdict": {"enum": list(COMPARISON_VERDICTS)},
     "candidate": _SIDE, "deployed": _SIDE})
@@ -121,7 +123,7 @@ ITEMS_SCHEMA: dict = _object({
         "pairs": {"type": "array", "maxItems": PAIR_ROWS_MAX,
                   "items": _COMPARISON_PAIR}}),
     "handoff": _object({
-        "family": _NAME,
+        "family": _FAMILY,
         "attempts": {"type": "integer", "minimum": 0},
         "outcomes": {"type": "object", "additionalProperties": False,
                      "properties": {}, "patternProperties": {
@@ -227,6 +229,12 @@ def _name(value: object) -> str | None:
     if not isinstance(value, str) or not value:
         return None
     return value if len(value) <= NAME_LIMIT else None
+
+
+def _family_name(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return value if len(value.encode("utf-8")) <= FAMILY_KEY_MAX_BYTES else None
 
 
 def _plugin_name(value: object) -> str | None:
@@ -410,7 +418,8 @@ def _side(metrics: object) -> dict:
     metrics = metrics if isinstance(metrics, dict) else {}
     return {"trades": _count(metrics.get("trades")),
             "pf": _number(metrics.get("pf")),
-            "avg_r": _number(metrics.get("avg_r"))}
+            "avg_r": _number(metrics.get("avg_r")),
+            "evaluable": _flag(metrics.get("evaluable"))}
 
 
 def _comparison_item(comparison: dict, allowed_pairs: list[str]
@@ -476,7 +485,7 @@ def with_handoff(prepared: PreparedSummary, tally: dict | None
     """申し送り (`improve_context.family_tally` の結果) を足した写し。"""
     if tally is None or prepared.failed:
         return prepared
-    family = _name(tally.get("family_key"))
+    family = _family_name(tally.get("family_key"))
     attempts = _count(tally.get("attempts"))
     outcomes = tally.get("outcomes")
     if family is None or attempts is None or not isinstance(outcomes, dict):
