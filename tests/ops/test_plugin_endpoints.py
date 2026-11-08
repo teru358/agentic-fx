@@ -352,6 +352,51 @@ def test_an_unreadable_entry_with_an_io_error_is_not_remembered(ops_env, world):
     assert row["entity"]["state"] == "symlink"
 
 
+def _lock_down(path):
+    previous = path.stat().st_mode & 0o777
+    os.chmod(path, 0o000)
+    return previous
+
+
+def test_a_file_that_cannot_be_read_is_shown_and_read_again_once_it_recovers(ops_env, world):
+    meta = world.deploy("rsi")
+    svc = service(ops_env)
+    target = meta.path / "config.yaml"
+    previous = _lock_down(target)
+    try:
+        [row] = _rows_of(svc)
+        assert row["entity"]["reason"] == "io_error"
+        [row] = _rows_of(svc)
+        assert row["entity"]["reason"] == "io_error"
+        assert svc._plugin_views.builds == 2
+    finally:
+        os.chmod(target, previous)
+    [row] = _rows_of(svc)
+    assert row["entity"]["state"] == "symlink" and row["entity"].get("reason") is None
+    assert svc._plugin_views.builds == 3
+    _rows_of(svc)
+    assert svc._plugin_views.builds == 3
+
+
+def test_an_unreadable_versions_folder_is_not_remembered(ops_env, world):
+    world.deploy("rsi")
+    world.version_only("other")
+    svc = service(ops_env)
+    folder = ops_env.plugins_root / ".versions" / "other"
+    previous = _lock_down(folder)
+    try:
+        svc.plugin_list(Principal.OPERATOR)
+        svc.plugin_list(Principal.OPERATOR)
+        assert svc._plugin_views.builds == 2
+    finally:
+        os.chmod(folder, previous)
+    listing = svc.plugin_list(Principal.OPERATOR)
+    assert svc._plugin_views.builds == 3
+    assert "other" in [row["name"] for row in listing["plugins"]]
+    svc.plugin_list(Principal.OPERATOR)
+    assert svc._plugin_views.builds == 3
+
+
 class _SlowScan:
     """scan_live を、合図があるまで止める差し替え。"""
 
@@ -411,3 +456,55 @@ def test_concurrent_requests_share_one_rebuild(ops_env, world):
             thread.join(10)
     assert len(results) == 4
     assert slow.calls == 1 and svc._plugin_views.builds == 1
+
+
+def test_a_request_waiting_for_the_rebuild_gives_up_at_its_deadline(ops_env, world):
+    import threading
+    from agentic_fx.plugin import read_model_inputs
+    world.deploy("rsi")
+    svc = service(ops_env)
+    slow = _SlowScan(read_model_inputs.scan_live)
+    results: list = []
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(read_model_inputs, "scan_live", slow)
+        thread = threading.Thread(
+            target=lambda: results.append(svc.plugin_list(Principal.OPERATOR)))
+        thread.start()
+        try:
+            assert slow.entered.wait(10)
+            started = time.monotonic()
+            with pytest.raises(OpsError) as caught:
+                svc.plugin_list(Principal.OPERATOR, deadline=ops_env.mono() + 0.3)
+            assert caught.value.code is ErrorCode.UNAVAILABLE
+            assert time.monotonic() - started < 3.0
+            with pytest.raises(OpsError) as caught:
+                svc.plugin_detail(Principal.OPERATOR, "rsi", deadline=ops_env.mono() + 0.2)
+            assert caught.value.code is ErrorCode.UNAVAILABLE
+            assert svc.status(Principal.OPERATOR) is not None
+            assert svc.approval_list(Principal.OPERATOR)["approvals"] == []
+        finally:
+            slow.release.set()
+            thread.join(10)
+    assert results and results[0]["plugins"][0]["name"] == "rsi"
+    assert slow.calls == 1
+
+
+def test_a_waiting_request_stops_when_the_service_stops(ops_env, world):
+    import threading
+    from agentic_fx.plugin import read_model_inputs
+    world.deploy("rsi")
+    svc = service(ops_env)
+    slow = _SlowScan(read_model_inputs.scan_live)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(read_model_inputs, "scan_live", slow)
+        thread = threading.Thread(target=lambda: svc.plugin_list(Principal.OPERATOR))
+        thread.start()
+        try:
+            assert slow.entered.wait(10)
+            svc.stop_event.set()
+            with pytest.raises(OpsError) as caught:
+                svc.plugin_list(Principal.OPERATOR)
+            assert caught.value.code is ErrorCode.UNAVAILABLE
+        finally:
+            slow.release.set()
+            thread.join(10)

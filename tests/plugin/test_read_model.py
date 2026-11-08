@@ -535,3 +535,23 @@ def test_the_approval_rows_are_read_by_column_not_with_a_star(world):
                             if text.lstrip().upper().startswith("SELECT"))
     assert not any("reason" in text.split("FROM")[0] or "decided_by" in text.split("FROM")[0]
                    for text in mine)
+
+
+def test_a_version_folder_that_is_a_link_outside_the_plugins_root_is_not_readable(world, tmp_path):
+    rsi = world.deploy("rsi")
+    world.request(rsi, status="approved")
+    strategy = world.deploy("mom", "strategy", dep("rsi", rsi.content_hash))
+    world.request(strategy, status="approved", inventory=(rsi,))
+    healthy = by_name(model_of(world), "mom")
+    assert [item.state for item in healthy.deps] != ["not_found"]
+    matched = [item.state for item in healthy.deps]
+    folder = world.plugins / ".versions" / "rsi"
+    outside = tmp_path / "outside"
+    folder.rename(outside)
+    os.symlink(outside, folder)
+    model = model_of(world)
+    row = by_name(model, "rsi")
+    assert row.entity.state == ENTITY_UNREADABLE and row.entity.reason == "invalid_symlink"
+    assert row.admission.state == ADMISSION_NONE
+    assert [item.state for item in by_name(model, "mom").deps] != matched
+    assert row.issues == ("broken:invalid_symlink",)

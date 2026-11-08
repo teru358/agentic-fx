@@ -40,15 +40,17 @@ def _classify(entry: Path) -> LiveEntry:
             if not loader.is_canonical_symlink_target(name, target):
                 return LiveEntry(name, ENTITY_UNREADABLE, reason="invalid_symlink")
             artifact = target.rsplit("/", 1)[-1]
-            if not entry.resolve().is_dir():
+            if loader._resolve_entity(entry.parent, name) is None:
                 return LiveEntry(name, ENTITY_UNREADABLE, artifact, reason="invalid_symlink")
         missing = [item for item in loader.REQUIRED_FILES if not (entry / item).is_file()]
-        meta, _reason = loader.discover_one_with_reason(entry, name)
+        meta, loader_reason = loader.discover_one_with_reason(entry, name)
     except OSError:
         return LiveEntry(name, ENTITY_UNREADABLE, artifact, reason="io_error")
     except Exception:  # noqa: BLE001 — 診断は 1 件の壊れた plugin で止めない
         return LiveEntry(name, ENTITY_UNREADABLE, artifact, reason="invalid_manifest")
     if meta is None:
+        if loader_reason is not None and loader_reason.startswith(loader.IO_ERROR_REASON):
+            return LiveEntry(name, ENTITY_UNREADABLE, artifact, reason="io_error")
         return LiveEntry(name, ENTITY_UNREADABLE, artifact,
                          reason="missing_files" if missing else "invalid_manifest")
     if state == ENTITY_SYMLINK and meta.artifact_hash != artifact:
@@ -56,13 +58,17 @@ def _classify(entry: Path) -> LiveEntry:
     return LiveEntry(name, state, artifact, meta=meta)
 
 
-def _versions(plugins_root: Path) -> dict[str, tuple[str, ...]]:
+def _versions(plugins_root: Path) -> tuple[dict[str, tuple[str, ...]], bool]:
+    """``.versions`` の一覧と、読み損ねがあったか。dir が無いのは読み損ねではない。"""
     base = plugins_root / ".versions"
     result: dict[str, tuple[str, ...]] = {}
+    unread = False
     try:
         names = sorted(item for item in base.iterdir() if item.is_dir())
+    except FileNotFoundError:
+        return result, False
     except OSError:
-        return result
+        return result, True
     for directory in names:
         if not loader.is_canonical_plugin_name(directory.name):
             continue
@@ -72,8 +78,9 @@ def _versions(plugins_root: Path) -> dict[str, tuple[str, ...]]:
                 if child.is_dir() and _VERSION_DIR.fullmatch(child.name)))
         except OSError:
             hashes = ()
+            unread = True
         result[directory.name] = hashes
-    return result
+    return result, unread
 
 
 def scan_live(plugins_root: Path) -> LiveScan:
@@ -98,7 +105,8 @@ def scan_live(plugins_root: Path) -> LiveScan:
         root = plugins_root.resolve()
     except OSError:
         root = plugins_root
-    return LiveScan(SOURCE_OK, root, tuple(entries), _versions(plugins_root))
+    versions, unread = _versions(plugins_root)
+    return LiveScan(SOURCE_OK, root, tuple(entries), versions, unread)
 
 
 def live_signature(plugins_root: Path) -> tuple:
@@ -223,6 +231,7 @@ def is_degraded(inputs: ReadInputs) -> bool:
     """読み損ねた入力を含むか。一時的な失敗かもしれないので、結果を覚えてはいけない。"""
     return (inputs.live.status == SOURCE_UNAVAILABLE
             or SOURCE_UNAVAILABLE in (inputs.pending_status, inputs.journal_status)
+            or inputs.live.versions_unread
             or any(entry.reason == "io_error" for entry in inputs.live.entries))
 
 

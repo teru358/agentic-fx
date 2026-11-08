@@ -1042,7 +1042,13 @@ class OpsService:
         if self._plugin_views is None:
             from .plugins_view import PluginViewCache
             self._plugin_views = PluginViewCache(self._plugins_root, self._settings)
-        return self._plugin_views.get(self._conn, lambda: self._ops_lane(deadline))
+        def acquire(lock) -> None:
+            try:
+                self._acquire(lock, deadline, self.limits.ops_lock_wait_seconds)
+            except OpsError:
+                raise OpsError(ErrorCode.UNAVAILABLE) from None
+
+        return self._plugin_views.get(self._conn, lambda: self._ops_lane(deadline), acquire)
 
     def plugin_list(self, principal: Caller, *, deadline: float | None = None) -> dict:
         _authorize(principal, "plugin_list")

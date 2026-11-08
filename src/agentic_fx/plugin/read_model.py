@@ -89,6 +89,8 @@ class LiveScan:
     entries: tuple[LiveEntry, ...] = ()
     # ``.versions/<name>/<artifact_hash>`` の一覧 (名前 -> 版の hash)。
     versions: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    # ``.versions`` の一部が読めなかった (一時的な失敗かもしれない)。
+    versions_unread: bool = False
 
 
 @dataclass(frozen=True, slots=True)
