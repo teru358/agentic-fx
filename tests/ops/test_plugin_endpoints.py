@@ -378,6 +378,20 @@ def test_a_file_that_cannot_be_read_is_shown_and_read_again_once_it_recovers(ops
     assert svc._plugin_views.builds == 3
 
 
+def test_a_plugin_py_that_cannot_be_read_is_read_again_once_its_mode_recovers(ops_env, world):
+    meta = world.deploy("rsi")
+    svc = service(ops_env)
+    target = meta.path / "plugin.py"
+    previous = _lock_down(target)
+    try:
+        [row] = _rows_of(svc)
+        assert row["entity"]["state"] == "unreadable"
+    finally:
+        os.chmod(target, previous)
+    [row] = _rows_of(svc)
+    assert row["entity"]["state"] == "symlink" and row["entity"].get("reason") is None
+
+
 def test_an_unreadable_versions_folder_is_not_remembered(ops_env, world):
     world.deploy("rsi")
     world.version_only("other")

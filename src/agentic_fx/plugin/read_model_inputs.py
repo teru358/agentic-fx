@@ -140,7 +140,10 @@ def live_signature(plugins_root: Path) -> tuple:
 
 
 def _file_stamps(entry: Path) -> tuple:
-    """必須 3 ファイルの stat と、loader が直下で検査する entry の名前の構成。"""
+    """必須 3 ファイルの stat と、loader が直下で検査する entry の名前の構成。
+
+    ctime と mode も含める。権限の変更 (chmod) は mtime を変えないが ctime を変えるので、
+    一時的に読めなかった file の権限が戻れば key が変わり、作り直す。"""
     try:
         listing = tuple(sorted(child.name for child in entry.iterdir()))
     except OSError:
@@ -149,7 +152,8 @@ def _file_stamps(entry: Path) -> tuple:
     for name in loader.REQUIRED_FILES:
         try:
             info = (entry / name).stat()
-            stamps.append((name, info.st_mtime_ns, info.st_size, info.st_ino))
+            stamps.append((name, info.st_mtime_ns, info.st_ctime_ns, info.st_mode,
+                           info.st_size, info.st_ino))
         except OSError:
             stamps.append((name, None))
     return tuple(stamps)
