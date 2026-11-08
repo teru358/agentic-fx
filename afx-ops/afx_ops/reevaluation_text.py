@@ -56,11 +56,16 @@ def _number(value: object) -> bool:
     return type(value) in (int, float) and math.isfinite(value)
 
 
+def _shown(value: object) -> str:
+    if not _number(value):
+        return "-"
+    return str(value) if type(value) is int else f"{value:.4g}"
+
+
 def _cells(metrics: object) -> str:
     if type(metrics) is not dict:
         return "不明"
-    return " ".join(f"{key}={metrics[key] if _number(metrics.get(key)) else '-'}"
-                    for key in METRIC_KEYS)
+    return " ".join(f"{key}={_shown(metrics.get(key))}" for key in METRIC_KEYS)
 
 
 def _row_text(row: dict) -> str:

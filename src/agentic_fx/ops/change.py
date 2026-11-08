@@ -61,7 +61,7 @@ def _candidate_source(plugins_root: Path, status: str, payload: dict,
             raise safe_open.SourceError(L.UNSAFE_SOURCE)
         _lexical_locator_check(plugins_root, origin, path, name)
         return source
-    if status == "approved":
+    if status == "approved" or payload.get("candidate_origin") == "reevaluation":
         return safe_open.version_source(name, artifact_hash)
     if mission_id is None:
         raise safe_open.SourceError(L.UNAVAILABLE)
@@ -77,6 +77,10 @@ def _lexical_locator_check(plugins_root: Path, origin: str, path: str, name: str
         raise safe_open.SourceError(L.UNAVAILABLE) from None
     except (ValueError, OSError):
         raise safe_open.SourceError(L.UNSAFE_SOURCE) from None
+
+
+# 再評価は配備中の版を測り直す依頼で切替 journal を作らないため、決定後も同一版と読む
+_DECIDED_STATUSES = ("approved", "rejected", "invalidated")
 
 
 @dataclass(frozen=True, slots=True)
@@ -487,8 +491,11 @@ def compute_change(*, status: str, payload: dict, journal_rows: list[dict],
         return fail(exc.code)
     except Exception:  # noqa: BLE001 — 読めない理由は固定 code にして path を出さない
         return fail(L.UNSAFE_SOURCE)
-    baseline = _baseline(plugins_root, status, name, candidate_hash, journal_rows,
-                         need_files=True)
+    if payload.get("candidate_origin") == "reevaluation" and status in _DECIDED_STATUSES:
+        baseline = _Baseline(L.CLASS_SAME, candidate_hash)
+    else:
+        baseline = _baseline(plugins_root, status, name, candidate_hash, journal_rows,
+                             need_files=True)
     summary["classification"] = baseline.classification
     summary["baseline_hash"] = baseline.hash
     summary["reason"] = baseline.reason

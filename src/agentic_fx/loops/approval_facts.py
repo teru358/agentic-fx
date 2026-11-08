@@ -363,7 +363,11 @@ def _claims_lines(claims: dict) -> list[str]:
 
 
 def render_facts_lines(payload: dict) -> list[str]:
-    """親欄と自己申告欄の行。`payload` は dict であること。例外にしない。"""
+    """親欄と自己申告欄の行。`payload` は dict であること。例外にしない。
+
+    再評価の依頼は親が測り直したもので自己申告が無く、数値は再評価の表にあるので欄を出さない。"""
+    if payload.get("candidate_origin") == "reevaluation":
+        return []
     version = payload.get("facts_version")
     if type(version) is int and version == FACTS_VERSION:
         facts = payload.get("parent_facts")

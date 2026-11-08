@@ -107,10 +107,20 @@ def build_view(conn: sqlite3.Connection, payload: dict) -> dict | None:
         "rows": rows}
 
 
+def _rounded(value: object) -> str | None:
+    """int はそのまま、有限の float は有効 4 桁。数でなければ None。"""
+    if type(value) is int:
+        return str(value)
+    if type(value) is float and math.isfinite(value):
+        return f"{value:.4g}"
+    return None
+
+
 def _cells(metrics: dict | None) -> str:
     if metrics is None:
         return "不明"
-    return " ".join(f"{key}={approval_facts.num_text(metrics.get(key))}" for key in METRIC_KEYS)
+    return " ".join(f"{key}={approval_facts.num_text(_rounded(metrics.get(key)))}"
+                    for key in METRIC_KEYS)
 
 
 def row_text(row: dict) -> str:
