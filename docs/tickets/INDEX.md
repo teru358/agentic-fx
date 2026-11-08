@@ -1,15 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 159 件。完了分は closed/。
-
-## 実装中 (1)
-
-### 保守 (1)
-
-| id | 優先 | 起票 | 概要 |
-|---|---|---|---|
-| [reevaluation-approval-detail-display-polish](open/reevaluation-approval-detail-display-polish.md) | 低 | 2026-11-07 | 再評価の承認詳細の数値が丸められず、旧形式の注記と分類「不明」が出る |
+未完了: 158 件。完了分は closed/。
 
 ## 実装待ち (12)
 
