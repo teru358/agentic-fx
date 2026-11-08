@@ -51,7 +51,7 @@ payload に `base` を 1 つ足す。DB の列は足さない (schema を変え�
 "base": {"kind": "unchecked", "by": "bless"}             # bless の依頼。照合しない印
 ```
 
-人間の提出で live が読めない形 (非正規の target、root の外、版 dir の欠損など、`live_identity` が `unknown` を返すもの) のときは、提出を拒否する (`ValueError("live_unreadable")`、fail closed)。
+人間の提出で live が読めない形 (非正規の target、root の外へ解決されるもの) のときは、提出を拒否する (`ValueError("live_unreadable")`、fail closed)。正規の target で版 dir が欠損・空のものは受け付け、承認で上書きして直す (disable・rollback・retire はこの状態を拒否するため、提出まで拒否すると手で symlink を消すしかなくなる)。
 
 artifact_hash を使うのは、切替・journal・再評価の照合がすべて live symlink の target で動いているため。同じ mission が同名を 2 回提出しても、土台は mission 開始時のまま変えない (1 つ目の候補を 2 つ目の土台にしない)。
 
@@ -151,7 +151,7 @@ Discord では、Approve / Retry を押した後の確認文 (ephemeral の「Co
 12. 決定の tx が失敗すると staging は残り、commit の後に消える。人間の候補は消えない。backlog と候補台帳は `apply_decision` で終端する (`store/approvals.py:243-253`)。
 13. `base_changed` が ops の結果、ctl / shell の文面、Discord の終端カードに出る。Discord では invalidated が終端カードとして描かれる (今は固定文に置き換わる)。backlog の `last_result` には固定 token だけが入る。
 14. 承認画面の土台の項目が、比較成績の無い依頼 (indicator・re-lock・人間の提出) を含めて、ctl / shell / web / Discord に出る。一致・旧形式・bless では出ない。shell は service と同じ helper の判定を使う。
-15. 対象の 3 経路 (`_build_approval_payload`・`submit_candidate`・`bless_candidate`) がすべて `base` を書く。人間の提出で live が読めないと提出を拒否する。
+15. 対象の 3 経路 (`_build_approval_payload`・`submit_candidate`・`bless_candidate`) がすべて `base` を書く。人間の提出で live が非正規の target か root の外へ解決されるときは提出を拒否する。正規の target で版 dir が欠損・空の live は受け付け、承認で配備して直せる。
 16. 変異: 照合を外す / 土台を提出時の live にする / staging の土台を live の読み直しにする / journal を閉じる手順を外す / 壊れた `base` を旧形式扱いにする / いずれかの経路で `base` を書かない、のいずれでも上の test が落ちる。
 
 ## 5. task
@@ -189,6 +189,7 @@ T1 → T2 の順。T1 だけでも lost update は止まる。
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
 | 2026-11-07 | C0 | 初版 | チケット approval-base-identity-cas の設計 | — |
+| 2026-11-08 | C2.3 | §1.2・受入 15: 人間の提出の拒否は非正規の target と root の外への解決だけにし、正規の target で版 dir が欠損・空の live は受け付けて承認で直す | 利用者の裁定: 壊れた live を人間の提出で直す道を残す | — |
 | 2026-11-08 | C2.2 | §1.1: 人間の CLI が staging を提出する経路は人間の提出。§2: helper の配置を `ops/base_view.py` / `plugin/base_identity.py` に直し、Approve / Retry の確認文に警告を添える。§6: 投稿済みカードの本文は描き直さない。人間の提出の土台は版 dir の実在・root 内・読取可能まで確かめる | レビュー 1 周目の裁定 | — |
 | 2026-11-07 | C2.1 | §1.5: backlog の last_result に reason は流れない (invalidated の template は固定) ことを実コードに合わせて記す | T1 実装で判明 | — |
 | 2026-11-07 | C2 | bless に照合しない印 `unchecked` を書き、`base` 無し = 配備前だけを成立させる (3 経路すべてが `base` を書く)。staging の土台を `meta.path` から導く規則 (live を読み直さない)、照合の行位置 (live 読取と T11 の間) と `ApprovalOutcome` の形、dangling の扱い、Discord の終端カードに invalidated を足す、判定 helper と `base_check` の形で T1/T2 の境界を切る、reason は固定 token (`last_result` に流れる)、却下の文言、plain の注、ABA と improve 繰り返しの帰結を残余に、人間の提出で live が読めなければ拒否、受入 16 項目に | Fable 2 周目 (Important 5 / Minor 10) | — |

@@ -244,16 +244,54 @@ def _break_version_dir(env, how: str) -> None:
         (plugins_dir / ".versions" / "sma").symlink_to(outside)
 
 
-@pytest.mark.parametrize("how", ["dangling", "empty_dir", "outside_root"])
-def test_human_submit_refuses_a_live_that_does_not_resolve_to_a_readable_version(env, how):
-    """提出時の live は実体まで確かめる: 版 dir の欠損・中身の欠け・root 外への解決は拒否する。"""
+def test_human_submit_refuses_a_live_that_resolves_outside_the_root(env):
+    """提出時の live が root の外へ解決されるなら拒否し、行を作らない。"""
     _deploy_v1(env)
     before = env[1].execute("SELECT COUNT(*) c FROM approval_requests").fetchone()["c"]
-    _break_version_dir(env, how)
+    _break_version_dir(env, "outside_root")
     with pytest.raises(ValueError, match="live_unreadable"):
         _human_submit(env)
     assert env[1].execute(
         "SELECT COUNT(*) c FROM approval_requests").fetchone()["c"] == before
+
+
+@pytest.mark.parametrize("how", ["dangling", "empty_dir"])
+def test_human_submit_accepts_a_live_whose_version_dir_is_broken(env, how):
+    """正規の target で版 dir が欠損・空の live でも提出でき、土台は target の hash になる。"""
+    v1_target = _deploy_v1(env)
+    _break_version_dir(env, how)
+    approval_id = _human_submit(env)
+    assert _payload(env, approval_id)["base"] == {
+        "kind": "version", "artifact_hash": v1_target.rsplit("/", 1)[1]}
+
+
+@pytest.mark.parametrize("how", ["dangling", "empty_dir"])
+def test_human_submit_repairs_a_live_whose_version_dir_is_broken(env, how):
+    """壊れた live に人間が提出して承認すると、新しい版が配備されて読める。"""
+    from agentic_fx.plugin import loader
+    v1_target = _deploy_v1(env)
+    _break_version_dir(env, how)
+    approval_id = _human_submit(env)
+
+    outcome = _approve(env, approval_id)
+
+    assert outcome.outcome == "deployed"
+    assert _live(env) != v1_target
+    assert (env[0] / "sma" / "plugin.py").is_file()
+    assert loader.is_canonical_symlink_target("sma", _live(env))
+
+
+def test_human_submit_on_a_broken_live_is_invalidated_when_live_changes_meanwhile(env):
+    """壊れた live への提出も、承認までに live が別の版へ変われば base_changed で無効になる。"""
+    _deploy_v1(env)
+    other = _submit(env, 2, 2.0)
+    _break_version_dir(env, "dangling")
+    approval_id = _human_submit(env)
+    assert _approve(env, other).outcome == "deployed"
+
+    outcome = _approve(env, approval_id)
+
+    assert (outcome.outcome, outcome.reason) == ("invalidated", "base_changed")
 
 
 def test_bless_writes_unchecked_base_and_ignores_the_live_version(env):
