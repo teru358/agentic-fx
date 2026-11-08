@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Literal
 
@@ -257,13 +258,25 @@ def _plugin_name(value: object) -> str | None:
     return None
 
 
+_SECRET_FIELD = re.compile(
+    r"(api[_-]?key|apikey|token|secret|passw(or)?d|credential|authorization|cookie)",
+    re.IGNORECASE)
+_REDACTED = "***"
+
+
 def _sanitized(value: object) -> object:
-    """辞書・リストの構造を保ったまま、文字列の葉だけに `safe_text` を掛けた
-    写しを返す。それ以外の値と引数は変えない。"""
+    """辞書・リストの構造を保ったまま、文字列の葉と辞書の key に `safe_text` を
+    掛けた写しを返す。秘密を表す名前の欄 (api_key・token・password など) は、
+    値の型を問わず伏せる。それ以外の値と引数は変えない。"""
     if isinstance(value, str):
         return safe_text(value)
     if isinstance(value, dict):
-        return {key: _sanitized(item) for key, item in value.items()}
+        out: dict = {}
+        for key, item in value.items():
+            name = safe_text(key) if isinstance(key, str) else key
+            secret = isinstance(key, str) and _SECRET_FIELD.search(key) is not None
+            out[name] = _REDACTED if secret else _sanitized(item)
+        return out
     if isinstance(value, (list, tuple)):
         return [_sanitized(item) for item in value]
     return value

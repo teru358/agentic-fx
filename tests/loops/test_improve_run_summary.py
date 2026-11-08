@@ -599,3 +599,20 @@ def test_floor_fail_items_is_a_public_name_of_the_gate():
     items = strategy_gate.floor_fail_items(
         {"USDJPY": _metrics(pf=0.3)}, settings=_SETTINGS, scope="in_sample")
     assert [(i.pair, i.kind) for i in items] == [("USDJPY", "pf")]
+
+
+def test_output_for_storage_scrubs_keys_and_secret_named_fields():
+    leaked = {"https://leak.example/?apikey=SECRET9": "x",
+              "nested": {"api_key": "123456", "Token": 7, "client_secret": ["a"],
+                         "password": {"v": 1}, "ordinary": "keep"},
+              "list": [{"access_token": "zzz"}]}
+    stored = rs.output_for_storage(leaked)
+    text = json.dumps(stored, ensure_ascii=False)
+    for secret in ("SECRET9", "leak.example", "123456", '"zzz"'):
+        assert secret not in text
+    assert stored["nested"]["ordinary"] == "keep"
+    assert stored["nested"]["api_key"] == "***"
+    assert stored["nested"]["Token"] == "***"
+    assert stored["nested"]["client_secret"] == "***"
+    assert stored["nested"]["password"] == "***"
+    assert stored["list"][0]["access_token"] == "***"
