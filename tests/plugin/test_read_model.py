@@ -483,3 +483,55 @@ def test_admit_still_excludes_with_the_resolver_reason_and_raises_nothing(world,
         ("bad", "fast", "pin_mismatch")]
     assert {meta.name for meta in result.inventory.metas} == {"rsi"}
     assert "indicator_unresolved:fast:pin_mismatch" in caplog.text
+
+
+# ---------------------------------------------------------------- 空名・開いた op・読めない理由
+
+@pytest.mark.parametrize("name", ["", "Bad Name", "../x"])
+def test_a_pending_request_with_an_empty_or_ungrammatical_name_is_an_invalid_pending(world, name):
+    approval = world.raw_request(
+        {"name": name, "content_hash": "a" * 64, "kind": "strategy"})
+    model = model_of(world)
+    assert model.invalid_pending == (approval,)
+
+
+def test_the_open_rule_is_the_deploy_store_rule(world):
+    from agentic_fx.store import plugin_deploy_ops
+    world.deploy_op("rsi", op_kind="rollback_symlink", phase="done")
+    assert by_name(model_of(world), "rsi").open_ops == ()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(plugin_deploy_ops, "is_open", lambda row: row["phase"] == "done")
+        assert len(by_name(model_of(world), "rsi").open_ops) == 1
+
+
+@pytest.mark.parametrize("case,reason", [
+    ("missing_files", "missing_files"), ("invalid_symlink", "invalid_symlink"),
+    ("non_canonical_name", "non_canonical_name"),
+])
+def test_the_issue_of_an_unreadable_entity_carries_its_own_reason(world, case, reason):
+    name = "Bad-Name" if case == "non_canonical_name" else "victim"
+    directory = world.plugins / name
+    if case == "missing_files":
+        directory.mkdir()
+        (directory / "config.yaml").write_text("kind: indicator\n")
+    elif case == "invalid_symlink":
+        os.symlink("../../etc", directory)
+    else:
+        directory.mkdir()
+    row = by_name(model_of(world), name)
+    assert row.entity.reason == reason
+    assert row.issues == (f"broken:{reason}",)
+
+
+def test_the_approval_rows_are_read_by_column_not_with_a_star(world):
+    statements = []
+    world.conn.set_trace_callback(statements.append)
+    try:
+        model_of(world)
+    finally:
+        world.conn.set_trace_callback(None)
+    mine = [text for text in statements if "approval_requests" in text]
+    assert mine and not any("*" in text.split("FROM")[0] for text in mine
+                            if text.lstrip().upper().startswith("SELECT"))
+    assert not any("reason" in text.split("FROM")[0] or "decided_by" in text.split("FROM")[0]
+                   for text in mine)

@@ -19,7 +19,7 @@
   "history": [],
   "history_total": 0,
   "issues": [
-   "broken:invalid_manifest"
+   "broken:missing_files"
   ],
   "kind": "unknown",
   "name": "junk",

@@ -36,6 +36,7 @@ def test_every_word_the_read_model_can_return_has_a_label():
 def test_every_issue_the_read_model_raises_has_a_label():
     source = (ROOT / "src" / "agentic_fx" / "plugin" / "read_model.py").read_text()
     issued = set(re.findall(r'issues\.add\("([^"]+)"\)', source))
+    issued |= {f"broken:{reason}" for reason in read_model.UNREADABLE_REASONS}
     assert issued and issued == set(_labels().ISSUE)
 
 
@@ -49,3 +50,18 @@ def test_the_statuses_origins_and_operation_kinds_have_labels():
         text.OPEN_OP_KIND)
     assert {read_model.SOURCE_OK, read_model.SOURCE_MISSING,
             read_model.SOURCE_UNAVAILABLE} == set(text.SOURCE_STATE)
+
+
+def test_the_resolution_reasons_are_exactly_the_words_the_resolver_raises():
+    import ast
+    raised: set[str] = set()
+    for path in (ROOT / "src" / "agentic_fx").rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not (isinstance(node, ast.Call) and getattr(node.func, "id", None)
+                    == "IndicatorResolutionError"):
+                continue
+            reason = node.args[1] if len(node.args) > 1 else None
+            assert isinstance(reason, ast.Constant) and isinstance(reason.value, str), (
+                f"{path}:{node.lineno} raises a reason the vocabulary cannot be checked for")
+            raised.add(reason.value)
+    assert raised == set(resolve.RESOLUTION_REASONS)

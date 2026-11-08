@@ -118,7 +118,7 @@ def test_the_list_shows_every_name_with_kind_axes_hash_pending_and_usefulness():
     assert cells(html, "bol")[7] == "提出 0 / 配備成功 0"
     assert cells(html, "junk")[0] == "不明"
     assert cells(html, "junk")[1] == "読めない (必要なファイルが無い)"
-    assert cells(html, "junk")[8] == "config.yaml が不正"
+    assert cells(html, "junk")[8] == "読めない (必要なファイルが無い)"
     assert cells(html, "ghost")[0] == "signal"
 
 
@@ -128,7 +128,7 @@ def test_the_list_shows_unknown_submissions_and_a_way_to_the_approvals():
     assert "古い strategy の提出: 1 件" in html
     listing = sample("plugins_list")
     listing["unknown_submissions"] = 0
-    assert "古い strategy の提出: 0 件" in page("/plugins", Client(listing=listing))
+    assert "古い strategy の提出" not in page("/plugins", Client(listing=listing))
     del listing["unknown_submissions"]
     assert "古い strategy の提出" not in page("/plugins", Client(listing=listing))
 
@@ -227,7 +227,7 @@ def test_without_display_timezone_the_times_are_utc():
 
 def test_the_detail_of_unreadable_and_absent_names_renders_without_missing_parts():
     junk = page("/plugins/junk")
-    assert "読めない (必要なファイルが無い)" in junk and "config.yaml が不正" in junk
+    assert "読めない (必要なファイルが無い)" in junk and "config.yaml が不正" not in junk
     assert "<h2>使う indicator</h2>" not in junk and "<h2>参照する strategy</h2>" not in junk
     ghost = page("/plugins/ghost")
     assert "却下" in ghost and "配備なし" in ghost

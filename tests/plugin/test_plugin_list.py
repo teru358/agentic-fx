@@ -88,7 +88,7 @@ def test_plugin_list_golden_for_live_pending_and_open_rollback_without_writing(t
         "source journal: ok\n"
         "NAME      KIND      LIVE          PENDING       OPEN_OP                   ISSUES\n"
         f"momentum  strategy  {live_hash[:12]}  {H_PENDING[:12]}  17:rollback:{H_TARGET[:12]}  -\n"
-        "rsi       unknown   -             -             -                         broken:invalid_manifest\n")
+        "rsi       unknown   -             -             -                         broken:missing_files\n")
     assert tree_snapshot(tmp_path) == before
 
 
@@ -340,7 +340,7 @@ def test_plugin_list_missing_table_is_unavailable_for_that_source_only(tmp_path,
     db.parent.mkdir()
     conn = sqlite3.connect(db)
     conn.execute("CREATE TABLE approval_requests (id INTEGER PRIMARY KEY, kind TEXT, "
-                 "payload_json TEXT, status TEXT, created_at TEXT)")
+                 "payload_json TEXT, status TEXT, decided_at TEXT, created_at TEXT)")
     conn.execute("INSERT INTO approval_requests (kind,payload_json,status,created_at) "
                  "VALUES ('plugin',?, 'pending', 'x')",
                  (json.dumps({"name": "alpha", "content_hash": H_PENDING, "kind": "strategy"}),))

@@ -26,6 +26,7 @@ from agentic_fx.plugin.loader import PluginMeta, is_canonical_plugin_name
 from agentic_fx.plugin.resolve import (
     STATE_MATCH, STATE_UNKNOWN, AliasState, ApprovedInventory, enumerate_indicator_states,
 )
+from agentic_fx.store import plugin_deploy_ops as deploy_store
 from agentic_fx.tools.plugin_loader import approved_hashes_from_rows
 
 KIND_STRATEGY = "strategy"
@@ -284,8 +285,11 @@ def _live_metas(scan: LiveScan) -> list[PluginMeta]:
 
 
 def _open_deploy(row: DeployOpRow) -> bool:
-    return row.phase == "intent" or (
-        row.phase == "needs_retry" and row.fail_reason == "syscall_failed")
+    return deploy_store.is_open({"phase": row.phase, "fail_reason": row.fail_reason})
+
+
+def _reason_of(entry: LiveEntry) -> str:
+    return entry.reason if entry.reason in UNREADABLE_REASONS else "invalid_manifest"
 
 
 def _open_journal(row: JournalRow) -> bool:
@@ -293,7 +297,8 @@ def _open_journal(row: JournalRow) -> bool:
 
 
 def _is_pending_valid(request: _Request) -> bool:
-    return (request.name is not None and request.content_hash is not None
+    return (request.name is not None and is_canonical_plugin_name(request.name)
+            and request.content_hash is not None
             and HASH_PATTERN.fullmatch(request.content_hash) is not None)
 
 
@@ -447,8 +452,9 @@ def _build_row(name, entries, requests, scan, approved, phase1_keys, dependency,
     issues: set[str] = set()
     if len(readable) > 1:
         issues.add("duplicate_live")
-    if any(entry.meta is None for entry in entries):
-        issues.add("broken:invalid_manifest")
+    for entry in entries:
+        if entry.meta is None:
+            issues.add(f"broken:{_reason_of(entry)}")
     meta = readable[0].meta if readable else None
 
     if meta is not None:

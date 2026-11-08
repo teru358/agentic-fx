@@ -1036,18 +1036,17 @@ class OpsService:
                                    "name": display_text(j["name"]), "phase": j["phase"]}
                                   for j in journals]}
 
-    def _plugin_view(self):
+    def _plugin_view(self, deadline: float):
         if self._plugins_root is None:
             raise OpsError(ErrorCode.UNAVAILABLE)
         if self._plugin_views is None:
             from .plugins_view import PluginViewCache
             self._plugin_views = PluginViewCache(self._plugins_root, self._settings)
-        return self._plugin_views.get(self._conn)
+        return self._plugin_views.get(self._conn, lambda: self._ops_lane(deadline))
 
     def plugin_list(self, principal: Caller, *, deadline: float | None = None) -> dict:
         _authorize(principal, "plugin_list")
-        with self._ops_lane(self._deadline(deadline)):
-            return self._plugin_view().listing
+        return self._plugin_view(self._deadline(deadline)).listing
 
     def plugin_detail(self, principal: Caller, name: str, *,
                       deadline: float | None = None) -> dict:
@@ -1055,8 +1054,7 @@ class OpsService:
         from agentic_fx.plugin import loader, read_model
         if not isinstance(name, str) or not loader.is_canonical_plugin_name(name):
             raise OpsError(ErrorCode.INVALID_ARGUMENT)
-        with self._ops_lane(self._deadline(deadline)):
-            view = self._plugin_view()
+        view = self._plugin_view(self._deadline(deadline))
         detail = read_model.detail_to_dto(view.model, name)
         if detail is None:
             raise OpsError(ErrorCode.NOT_FOUND)

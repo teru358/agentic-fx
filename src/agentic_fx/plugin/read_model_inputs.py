@@ -147,20 +147,17 @@ def _file_stamps(entry: Path) -> tuple:
     return tuple(stamps)
 
 
-def _column(row, name: str):
-    return row[name] if name in row.keys() else None
-
-
 def read_db_inputs(conn: sqlite3.Connection) -> dict:
     """承認・配備 op・switch journal の行を読む。表ごとに失敗を状態に落とす。"""
     result: dict = {"approvals": (), "deploy_ops": (), "journals": (),
                     "pending_status": SOURCE_OK, "journal_status": SOURCE_OK}
     try:
         result["approvals"] = tuple(
-            ApprovalRow(row["id"], row["status"], _column(row, "decided_at"),
-                        _column(row, "created_at"), row["payload_json"])
+            ApprovalRow(row["id"], row["status"], row["decided_at"],
+                        row["created_at"], row["payload_json"])
             for row in conn.execute(
-                "SELECT * FROM approval_requests WHERE kind='plugin' ORDER BY id").fetchall())
+                "SELECT id,status,decided_at,created_at,payload_json FROM approval_requests "
+                "WHERE kind='plugin' ORDER BY id").fetchall())
     except sqlite3.Error:
         result["pending_status"] = SOURCE_UNAVAILABLE
     try:
@@ -214,8 +211,19 @@ def collect_inputs(plugins_root: Path, conn: sqlite3.Connection | None, *,
     live = scan_live(plugins_root)
     if conn is None:
         return ReadInputs(live=live, pending_status=db_status, journal_status=db_status)
-    rows = read_db_inputs(conn)
-    return ReadInputs(live=live, **rows)
+    return assemble_inputs(live, read_db_inputs(conn))
+
+
+def assemble_inputs(live: LiveScan, db_rows: dict) -> ReadInputs:
+    """FS の走査結果と、``read_db_inputs`` が返した DB の行から入力を組む。"""
+    return ReadInputs(live=live, **db_rows)
+
+
+def is_degraded(inputs: ReadInputs) -> bool:
+    """読み損ねた入力を含むか。一時的な失敗かもしれないので、結果を覚えてはいけない。"""
+    return (inputs.live.status == SOURCE_UNAVAILABLE
+            or SOURCE_UNAVAILABLE in (inputs.pending_status, inputs.journal_status)
+            or any(entry.reason == "io_error" for entry in inputs.live.entries))
 
 
 def open_observer(root: Path) -> tuple[sqlite3.Connection | None, str]:

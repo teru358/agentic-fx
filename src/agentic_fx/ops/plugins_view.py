@@ -21,6 +21,12 @@ class PluginView:
 
 
 class PluginViewCache:
+    """世代 key が同じ間は組み立て済みの view を返す。
+
+    ``lane`` は ops lane を取る context manager の factory。lane の中では DB を読むだけで、
+    FS の走査・hash・resolver は memo 自身の lock の中 (lane の外) で行う。一時的に読み損ねた
+    入力を含む view は返すが覚えない。"""
+
     def __init__(self, plugins_root: Path, settings) -> None:
         self._plugins_root = plugins_root
         self._settings = settings
@@ -29,15 +35,22 @@ class PluginViewCache:
         self._view: PluginView | None = None
         self.builds = 0
 
-    def get(self, conn: sqlite3.Connection) -> PluginView:
-        key = (read_model_inputs.live_signature(self._plugins_root),
-               read_model_inputs.db_generation(conn))
+    def get(self, conn: sqlite3.Connection, lane) -> PluginView:
+        signature = read_model_inputs.live_signature(self._plugins_root)
+        with lane():
+            generation = read_model_inputs.db_generation(conn)
+        key = (signature, generation)
+        keyable = None not in generation and signature != ("unavailable",)
         with self._lock:
-            if self._view is not None and key == self._key and None not in key[1]:
+            if self._view is not None and key == self._key and keyable:
                 return self._view
-            inputs = read_model_inputs.collect_inputs(self._plugins_root, conn)
+            with lane():
+                db_rows = read_model_inputs.read_db_inputs(conn)
+            live = read_model_inputs.scan_live(self._plugins_root)
+            inputs = read_model_inputs.assemble_inputs(live, db_rows)
             model = read_model.build_read_model(inputs, settings=self._settings)
             view = PluginView(model, read_model.model_to_dto(model))
-            self._key, self._view = key, view
             self.builds += 1
+            if keyable and not read_model_inputs.is_degraded(inputs):
+                self._key, self._view = key, view
             return view

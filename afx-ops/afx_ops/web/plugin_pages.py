@@ -214,7 +214,7 @@ def _header_section(data: Mapping[str, object]) -> str:
     parts = ['<p><a href="/approvals">承認待ちの一覧 (Pending approvals)</a></p>',
              _sources_note(listing.get("sources"))]
     unknown = listing.get("unknown_submissions")
-    if type(unknown) is int:
+    if type(unknown) is int and unknown > 0:
         parts.append("<p>indicator の依存を記録していない古い strategy の提出: "
                      f"{unknown} 件 (有用性の数には含めない)</p>")
     invalid = listing.get("invalid_pending")
@@ -314,7 +314,7 @@ def _usefulness_section(row: dict, unknown_submissions: object) -> str:
                  _count(item.get("deployed"))] for item in pins]
         body += _table(("pin", "提出", "配備成功"), rows, SECTION_BUDGET["usefulness"],
                        _hidden(useful.get("by_pin")))
-    if type(unknown_submissions) is int:
+    if type(unknown_submissions) is int and unknown_submissions > 0:
         body += (f"<p>indicator の依存を記録していない古い strategy の提出 "
                  f"{unknown_submissions} 件は、上の数に含めていません</p>")
     return _section("有用性", body)

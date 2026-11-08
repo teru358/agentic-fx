@@ -949,7 +949,7 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
     if args.command == "plugin" and args.plugin_command == "list":
         try:
             settings = load_settings(root / "config" / "settings.yaml")
-        except ConfigError:
+        except (ConfigError, OSError, UnicodeError):
             settings = None
         return plugin_deploy_cli.plugin_list(root, kind=args.kind, settings=settings)
     if not read_only_view:

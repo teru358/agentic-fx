@@ -41,7 +41,8 @@ DEPENDENCY = {
 ISSUE = {
     "duplicate_live": "配備が重複", "duplicate_pending": "承認待ちが重複",
     "duplicate_open_op": "途中の操作が重複", "kind_missing": "承認待ちに kind なし",
-    "kind_mismatch": "承認待ちの kind が配備と違う", "broken:invalid_manifest": "config.yaml が不正",
+    "kind_mismatch": "承認待ちの kind が配備と違う",
+    **{f"broken:{reason}": f"読めない ({text})" for reason, text in ENTITY_REASON.items()},
 }
 
 APPROVAL_STATUS = {"pending": "承認待ち", "approved": "承認済み", "rejected": "却下",

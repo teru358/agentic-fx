@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import time
 from contextlib import redirect_stdout
 
 import pytest
@@ -286,3 +287,127 @@ def test_over_the_wire_ops_web_reads_and_a_bad_name_is_a_400(api5):
     assert notify.get("/v1/plugins").status_code == 403
     assert notify.get("/v1/plugins/rsi").status_code == 403
     assert os.path.exists(env.plugins_root / "rsi")
+
+
+# ---- 再構築は lane の外、劣化した結果は memo しない ----
+
+def _rows_of(svc):
+    return svc.plugin_list(Principal.OPERATOR)["plugins"]
+
+
+@pytest.mark.parametrize("fault", ["approval_table", "journal_table", "live_scan"])
+def test_a_degraded_read_is_shown_but_not_remembered(ops_env, world, fault):
+    from agentic_fx.plugin import read_model, read_model_inputs
+    world.deploy("rsi")
+    svc = service(ops_env)
+    real_db, real_scan = read_model_inputs.read_db_inputs, read_model_inputs.scan_live
+    calls = {"n": 0}
+
+    def flaky_db(conn):
+        rows = real_db(conn)
+        if calls["n"] == 0 and fault == "approval_table":
+            rows = {**rows, "approvals": (), "pending_status": read_model.SOURCE_UNAVAILABLE}
+        if calls["n"] == 0 and fault == "journal_table":
+            rows = {**rows, "journals": (), "journal_status": read_model.SOURCE_UNAVAILABLE}
+        calls["n"] += 1
+        return rows
+
+    def flaky_scan(root):
+        calls["scans"] = calls.get("scans", 0) + 1
+        if calls["scans"] == 1 and fault == "live_scan":
+            return read_model.LiveScan(read_model.SOURCE_UNAVAILABLE)
+        return real_scan(root)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(read_model_inputs, "read_db_inputs", flaky_db)
+        patch.setattr(read_model_inputs, "scan_live", flaky_scan)
+        first = svc.plugin_list(Principal.OPERATOR)
+        assert "unavailable" in first["sources"].values()
+        second = svc.plugin_list(Principal.OPERATOR)
+    assert set(second["sources"].values()) == {"ok"}
+    assert [row["name"] for row in second["plugins"]] == ["rsi"]
+    assert svc._plugin_views.builds == 2
+    svc.plugin_list(Principal.OPERATOR)
+    assert svc._plugin_views.builds == 2
+
+
+def test_an_unreadable_entry_with_an_io_error_is_not_remembered(ops_env, world):
+    from agentic_fx.plugin import loader
+    world.deploy("rsi")
+    svc = service(ops_env)
+    real = loader.discover_one_with_reason
+    state = {"fail": True}
+
+    def discover(directory, name):
+        if state["fail"]:
+            raise OSError("transient")
+        return real(directory, name)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(loader, "discover_one_with_reason", discover)
+        [row] = _rows_of(svc)
+        assert row["entity"]["reason"] == "io_error"
+        state["fail"] = False
+        [row] = _rows_of(svc)
+    assert row["entity"]["state"] == "symlink"
+
+
+class _SlowScan:
+    """scan_live を、合図があるまで止める差し替え。"""
+
+    def __init__(self, real):
+        import threading
+        self.real, self.entered, self.release = real, threading.Event(), threading.Event()
+        self.calls = 0
+
+    def __call__(self, root):
+        self.calls += 1
+        self.entered.set()
+        assert self.release.wait(10)
+        return self.real(root)
+
+
+def test_a_slow_rebuild_does_not_hold_the_ops_lane(ops_env, world):
+    import threading
+    from agentic_fx.plugin import read_model_inputs
+    world.deploy("rsi")
+    svc = service(ops_env)
+    slow = _SlowScan(read_model_inputs.scan_live)
+    results: list = []
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(read_model_inputs, "scan_live", slow)
+        thread = threading.Thread(
+            target=lambda: results.append(svc.plugin_list(Principal.OPERATOR)))
+        thread.start()
+        try:
+            assert slow.entered.wait(10)
+            # 再構築の最中でも、ほかの ops 呼び出しは lane を取れる。
+            assert svc.approval_list(Principal.OPERATOR)["approvals"] == []
+            assert svc.status(Principal.OPERATOR) is not None
+        finally:
+            slow.release.set()
+            thread.join(10)
+    assert results and results[0]["plugins"][0]["name"] == "rsi"
+
+
+def test_concurrent_requests_share_one_rebuild(ops_env, world):
+    import threading
+    from agentic_fx.plugin import read_model_inputs
+    world.deploy("rsi")
+    svc = service(ops_env)
+    slow = _SlowScan(read_model_inputs.scan_live)
+    results: list = []
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(read_model_inputs, "scan_live", slow)
+        threads = [threading.Thread(
+            target=lambda: results.append(svc.plugin_list(Principal.OPERATOR)))
+            for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        assert slow.entered.wait(10)
+        time.sleep(0.3)      # 残りの thread が memo の入口まで来るのを待つ
+        slow.release.set()
+        for thread in threads:
+            thread.join(10)
+    assert len(results) == 4
+    assert slow.calls == 1 and svc._plugin_views.builds == 1
