@@ -37,6 +37,7 @@ from agentic_fx.store import approvals as approvals_store
 from agentic_fx.core.history_epoch import history_epoch
 from agentic_fx.store import backtest_runs as backtest_runs_store  # [profitability-floor] T1 Step 1-6: 人間 corridor の gate 行保存
 from agentic_fx.store import candidate_archives as candidate_archives_store  # T4 §1 L4 の archive GC が使う
+from agentic_fx.plugin import base_identity
 from agentic_fx.plugin import deploy_ops as deploy_ops_common
 from agentic_fx.plugin import indicator_pipeline
 from agentic_fx.store import plugin_deploy_ops as deploy_store
@@ -1471,6 +1472,8 @@ def submit_candidate(
     candidate_dir = staging_dir / name
 
     with _plugin_locks(plugins_root, _dependency_names(candidate_dir, name)):
+        # 土台は提出時の live。読めない形なら gate に進まず拒否する。
+        base = base_identity.base_of_live(plugins_root, name)
         meta, content_hash, artifact_hash, outcome = _run_full_gate(
             conn, candidate_dir, name=name, settings=settings, now=now,
             floor_mode="enforce", plugins_root=plugins_root, activity=activity)
@@ -1481,6 +1484,7 @@ def submit_candidate(
             "candidate_origin": candidate_origin,
             "candidate_path": candidate_path,
             "content_hash": content_hash, "artifact_hash": artifact_hash,
+            "base": base,
             "metrics": outcome.metrics, "evaluable": outcome.evaluable,
             "eval_source": (settings.backtest.eval_source
                             if meta.kind == "strategy" else None),
@@ -2312,6 +2316,33 @@ def approve_candidate(
         else:
             old_kind, old_target = "absent", None
 
+        base_result = base_identity.check(payload, plugins_root, name)
+        if not base_result.passes:
+            # 自分の未完の journal を閉じてから、同じ lock の中で終端にする。
+            closed = _close_own_unfinished_journal_if_any()
+            if closed is not None:
+                rolled_back_op_id = closed
+                op_id = None
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                approvals_store.apply_decision(
+                    conn, approval_id, "invalidated", decided_by="system",
+                    reason=base_identity.BASE_CHANGED, now=now, commit=False)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+            _drop_staging_candidate(plugins_root, payload, activity=activity)
+            if activity is not None:
+                activity.write(
+                    Category.APPROVAL, "approval_base_changed",
+                    f"name={name} approval_id={approval_id} "
+                    f"state={base_result.state}")
+            return ApprovalOutcome(
+                outcome="invalidated", name=name, status="invalidated",
+                reason=base_identity.BASE_CHANGED, op_id=None,
+                rolled_back_op_id=rolled_back_op_id)
+
         new_target = f".versions/{name}/{artifact_hash}"
         switch_required = not (old_kind == "symlink" and old_target == new_target)
 
@@ -2699,6 +2730,7 @@ def bless_candidate(
             "candidate_origin": "human",
             "candidate_path": f"plugins/_human/{name}",
             "content_hash": content_hash, "artifact_hash": artifact_hash,
+            "base": dict(base_identity.UNCHECKED_BY_BLESS),
             "metrics": outcome.metrics, "evaluable": outcome.evaluable,
             "eval_source": (settings.backtest.eval_source
                             if meta.kind == "strategy" else None),

@@ -72,6 +72,7 @@ from agentic_fx.plugin.gate_pytest import (
     run_gate_pytest,
 )
 from agentic_fx.plugin import loader as plugin_loader
+from agentic_fx.plugin import base_identity
 from agentic_fx.plugin import indicator_pipeline
 from agentic_fx.plugin.noop_gate import count_self_test_functions, find_noop_copy
 from agentic_fx.plugin.resolve import InventoryBuildResult, is_relock_transition
@@ -2315,7 +2316,7 @@ class ImproveLoop:
     def _build_approval_payload(self, conn, *, name, kind, content_hash,
                                 artifact_hash, ctx_ledger, mission_id,
                                 backlog_id, candidate_origin, candidate_path,
-                                gate_metrics, output, now,
+                                gate_metrics, output, now, base,
                                 resolved: "ResolvedIndicatorSet | None" = None,
                                 indicator_report=None,
                                 ) -> dict:
@@ -2328,6 +2329,7 @@ class ImproveLoop:
             "candidate_origin": candidate_origin,
             "candidate_path": candidate_path,
             "content_hash": content_hash, "artifact_hash": artifact_hash,
+            "base": base,
             "eval_source": (self._settings.backtest.eval_source
                             if kind == "strategy" else None),
             "base_interval": (self._settings.backtest.dataset().base_interval
@@ -3790,12 +3792,20 @@ class ImproveLoop:
                         candidate_outcome="gate_failed",
                         notice=NOTICE_LOADER_REJECTED)
                     return
-                if (final_candidate is not None
-                        and final_candidate.logic_hash is None):
+                try:
+                    # 土台は mission 開始時に写した版。live は読み直さない。
+                    base = base_identity.base_of_snapshot(
+                        ctx.inventory.phase1_metas, artifact["name"],
+                        self._root / "plugins")
+                except base_identity.BaseUnresolvable:
+                    base = None
+                if base is None or (final_candidate is not None
+                                    and final_candidate.logic_hash is None):
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
                         reason="gate_failed:unverified", now=now,
-                        activity_extra=" cause=candidate_identity_unavailable",
+                        activity_extra=(" cause=base_unresolvable" if base is None
+                                        else " cause=candidate_identity_unavailable"),
                         tool_calls=tool_calls,
                         candidate=final_candidate,
                         candidate_outcome="gate_failed",
@@ -4017,6 +4027,7 @@ class ImproveLoop:
                     backlog_id=selection.backlog_id,
                     candidate_origin="staging", candidate_path=candidate_path,
                     gate_metrics=gate_metrics, output=output, now=now,
+                    base=base,
                     # [indicator-consumption-wiring] T5b Step 5-5c:
                     # `resolved` は strategy 分岐でのみ束縛される
                     # (indicator 候補には依存解決が無い、既定 None →

@@ -1,16 +1,16 @@
 ---
 id: approval-base-identity-cas
 title: 承認時に候補の土台版を照合し、同名候補の上書き (lost update) を防ぐ
-status: 実装中
+status: 是正済
 priority: 高
 kind: 不具合
 opened: 2026-10-27
-closed: null
+closed: 2026-11-08
 related: [ctl-improve-repeat-duration-and-oneoff-comment, same-name-candidate-must-beat-deployed-baseline]
 ---
 # [approval-base-identity-cas] 承認時に候補の土台版を照合し、同名候補の上書き (lost update) を防ぐ
 
-**状態**: 実装中 / **優先**: 高 / **種別**: 不具合
+**状態**: 是正済 / **優先**: 高 / **種別**: 不具合
 
 ## 現象
 
@@ -22,8 +22,11 @@ related: [ctl-improve-repeat-duration-and-oneoff-comment, same-name-candidate-mu
 
 ## 修正内容
 
+- 2026-11-08: 承認依頼の payload に土台 (base: version / plain / none / unchecked) を記録し、approve・retry が live と照合して違えば invalidated / base_changed にする。改善 mission は開始時のスナップショット、人間の提出は提出時の live (版 dir が欠損・空でも受け付け、root 外は拒否)、bless は照合しない印。ctl・shell・web・Discord に土台の警告と無効の案内を出し、Approve / Retry の確認文にも警告を添える。レビュー: codex sol 1 周目 (Important 3 是正)、/code-review high (8 件却下)、codex 閉鎖 2 回。判定: plugin 2877 / loops 2121 / ops 2527 / afx-ops 3889 ほか tests/ 全体で既知の失敗のみ
+
 ## 経緯
 
 - 2026-10-27: 起票。
 - 2026-10-29: 優先: 高、関連: [ctl-improve-repeat-duration-and-oneoff-comment, same-name-candidate-must-beat-deployed-baseline] — 2026-10-29 棚卸し: 承認の中身の正しさ: 同名候補 A→B 承認で B が A を黙って消す。同名更新が増える (plugin-naming 方針・比較 gate) 前に塞ぐ
 - 2026-11-07: 状態: 実装中 — 設計 C1 (docs/superpowers/specs/2026-11-07-approval-base-identity-cas-design.md) を 2026-11-07 に利用者承認、§7 の裁定 3 点は推奨どおり。T1 (土台の保存と照合) → T2 (承認画面の土台の項目)
+- 2026-11-08: 是正内容 — 承認依頼の payload に土台 (base: version / plain / none / unchecked) を記録し、approve・retry が live と照合して違えば invalidated / base_changed にする。改善 mission は開始時のスナップショット、人間の提出は提出時の live (版 dir が欠損・空でも受け付け、root 外は拒否)、bless は照合しない印。ctl・shell・web・Discord に土台の警告と無効の案内を出し、Approve / Retry の確認文にも警告を添える。レビュー: codex sol 1 周目 (Important 3 是正)、/code-review high (8 件却下)、codex 閉鎖 2 回。判定: plugin 2877 / loops 2121 / ops 2527 / afx-ops 3889 ほか tests/ 全体で既知の失敗のみ
