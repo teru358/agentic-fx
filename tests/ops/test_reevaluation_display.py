@@ -460,3 +460,6 @@ def test_the_wording_in_afx_ops_matches_the_daemon_side():
                     {"pf": True, "trades": 10 ** 309, "avg_r": -0.0001234567},
                     {"trades": 7 * 10 ** 250, "max_drawdown": None}):
         assert other._cells(metrics) == reevaluation_view._cells(metrics)
+    from agentic_fx.loops import approval_facts
+    assert other._CELL_LIMIT == approval_facts.FIELD_DISPLAY_LIMIT
+    assert other._CUT == approval_facts.TRUNCATION_SUFFIX

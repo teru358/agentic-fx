@@ -276,7 +276,7 @@ def test_the_approval_detail_reads_the_deployed_version_as_unchanged(fx, ops_env
     assert change["candidate_hash"] == fx.artifact
 
 
-@pytest.mark.parametrize("status", ["approved", "rejected", "invalidated"])
+@pytest.mark.parametrize("status", ["approved", "rejected", "invalidated", "expired"])
 def test_a_decided_reevaluation_without_a_journal_is_classified_as_the_same_version(
         fx, ops_env, status):
     approvals_store.apply_decision(ops_env.conn, fx.approval_id, status,
