@@ -178,3 +178,101 @@ def test_ac13_a_legacy_invalidated_card_keeps_the_fixed_sentence_path():
     content = render_terminal(RECORD, detail)
     assert content.startswith("承認 #7\n\n状態: 無効")
     assert "旧形式のため要約なし" in content
+
+
+# 確認文 (Approve / Retry) の警告
+
+from afx_ops.api_client import Reply
+from afx_ops.bot.adapter import BotAdapter
+from afx_ops.gate.render import ViewModel
+from afx_ops.gate.types import GateResult, Interaction, encode_custom_id
+
+CONFIRM = GateResult("Confirm this decision.", confirm_view=ViewModel(()))
+
+
+class _Client:
+    def __init__(self, reply):
+        self.reply, self.asked = reply, []
+
+    def approval(self, approval_id):
+        self.asked.append(approval_id)
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        return self.reply
+
+
+def _adapter(client):
+    adapter = BotAdapter.__new__(BotAdapter)
+    adapter.client = client
+    adapter._next_poll_at = {}
+    adapter._now = lambda: 100.0
+    return adapter
+
+
+def _request(action):
+    return Interaction(custom_id=encode_custom_id(action, 7), guild_id=1, channel_id=2,
+                       user_id=3, message_id=4, display_generation=1)
+
+
+@pytest.mark.parametrize("action", ["claim", "approve", "retry"])
+def test_the_confirmation_carries_the_base_warning(action):
+    client = _Client(Reply(200, _detail(MISMATCH), None))
+    result = _adapter(client)._with_base_warning(_request(action), CONFIRM)
+    assert result.text == ("Confirm this decision.\n"
+                           + base_text.warning_line(MISMATCH))
+    assert result.confirm_view is CONFIRM.confirm_view and client.asked == [7]
+
+
+@pytest.mark.parametrize("base_check", [None, {"state": "match", "base": "a" * 12,
+                                               "live": "a" * 12}, "broken", [1]])
+def test_the_confirmation_stays_plain_without_a_warning_state(base_check):
+    result = _adapter(_Client(Reply(200, _detail(base_check), None)))._with_base_warning(
+        _request("claim"), CONFIRM)
+    assert result is CONFIRM
+
+
+@pytest.mark.parametrize("reply", [RuntimeError("down"), Reply(500, None, None),
+                                   Reply(404, None, None), Reply(429, None, 30),
+                                   Reply(200, "not-a-dict", None)])
+def test_the_confirmation_stays_plain_when_the_detail_cannot_be_read(reply):
+    assert _adapter(_Client(reply))._with_base_warning(_request("claim"), CONFIRM) is CONFIRM
+
+
+def test_a_reject_confirmation_never_asks_for_the_base():
+    client = _Client(Reply(200, _detail(MISMATCH), None))
+    assert _adapter(client)._with_base_warning(_request("reject"), CONFIRM) is CONFIRM
+    assert client.asked == []
+
+
+def test_a_throttled_detail_defers_the_next_warning_question():
+    client = _Client(Reply(429, None, 30))
+    adapter = _adapter(client)
+    adapter._with_base_warning(_request("claim"), CONFIRM)
+    assert adapter._with_base_warning(_request("claim"), CONFIRM) is CONFIRM
+    assert client.asked == [7]
+
+
+def test_a_pressed_approve_returns_the_warning_through_the_real_gate(tmp_path):
+    import os
+    from afx_ops.bot.adapter import BotAdapter as Adapter
+    from afx_ops.gate.service import GateService
+    from afx_ops.gate.state import BotState
+    guild, channel, user = 12345678901234567, 12345678901234568, 12345678901234569
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    client = _Client(Reply(200, _detail(MISMATCH), None))
+    gate = GateService(BotState.empty().with_record(RECORD), guild_id=guild, channel_id=channel,
+                       allowlist_user_ids=(user,), client=client, state_dir_fd=fd,
+                       nonce_factory=lambda: "n" * 32)
+    adapter = Adapter.__new__(Adapter)
+    adapter.gate, adapter.client = gate, client
+    adapter._next_poll_at = {}
+    adapter._now = lambda: 1000.0
+    adapter._reconcile_in_flight = lambda *_: None
+    try:
+        result = adapter._decide(Interaction(
+            custom_id=encode_custom_id("claim", 7), guild_id=guild, channel_id=channel,
+            user_id=user, message_id=101, display_generation=1))
+        assert result.text == "Confirm this decision.\n" + base_text.warning_line(MISMATCH)
+        assert gate.state.record(7).state == "claimed"
+    finally:
+        os.close(fd)

@@ -207,6 +207,55 @@ def test_human_submit_refuses_unreadable_live(env):
     assert conn.execute("SELECT COUNT(*) c FROM approval_requests").fetchone()["c"] == 0
 
 
+def _human_submit(env):
+    plugins_dir, conn, settings = env
+    human = plugins_dir / "_human"
+    _write_candidate_v(human / "sma", 5.0)
+    return switch.submit_candidate(
+        conn, name="sma", staging_dir=human, candidate_origin="human",
+        mission_id=None, backlog_id=None, settings=settings, now=NOW)
+
+
+def _remove_tree(path: Path) -> None:
+    import shutil
+    for item in [path, *path.rglob("*")]:
+        if not item.is_symlink():
+            item.chmod(0o700)
+    shutil.rmtree(path)
+
+
+def _break_version_dir(env, how: str) -> None:
+    import shutil
+    plugins_dir = env[0]
+    version_dir = plugins_dir / _live(env)
+    if how == "dangling":
+        _remove_tree(version_dir)
+    elif how == "empty_dir":
+        version_dir.chmod(0o700)
+        for item in version_dir.iterdir():
+            item.chmod(0o600)
+            item.unlink()
+    elif how == "outside_root":
+        outside = plugins_dir.parent / "outside" / "sma"
+        outside.parent.mkdir()
+        version_dir.chmod(0o700)
+        shutil.copytree(plugins_dir / ".versions" / "sma", outside)
+        _remove_tree(plugins_dir / ".versions" / "sma")
+        (plugins_dir / ".versions" / "sma").symlink_to(outside)
+
+
+@pytest.mark.parametrize("how", ["dangling", "empty_dir", "outside_root"])
+def test_human_submit_refuses_a_live_that_does_not_resolve_to_a_readable_version(env, how):
+    """提出時の live は実体まで確かめる: 版 dir の欠損・中身の欠け・root 外への解決は拒否する。"""
+    _deploy_v1(env)
+    before = env[1].execute("SELECT COUNT(*) c FROM approval_requests").fetchone()["c"]
+    _break_version_dir(env, how)
+    with pytest.raises(ValueError, match="live_unreadable"):
+        _human_submit(env)
+    assert env[1].execute(
+        "SELECT COUNT(*) c FROM approval_requests").fetchone()["c"] == before
+
+
 def test_bless_writes_unchecked_base_and_ignores_the_live_version(env):
     """受入5・15: bless は照合しない印を書き、live が何であっても配備できる。"""
     plugins_dir, conn, settings = env
@@ -474,3 +523,88 @@ def test_invalidation_settles_backlog_with_a_fixed_token_only(env):
     assert row["status"] == "observation"
     assert row["last_result"] in ("invalidated", "base_changed")
     assert base_hash not in row["last_result"]
+
+
+def _submit_with_test_file(env, mission_id: int, value: float, test_py: str,
+                           name: str = "sma") -> int:
+    plugins_dir, conn, settings = env
+    staging = plugins_dir / "_staging" / str(mission_id)
+    _write_candidate_v(staging / name, value)
+    (staging / name / "test_plugin.py").write_text(test_py)
+    return switch.submit_candidate(
+        conn, name=name, staging_dir=staging, candidate_origin="staging",
+        mission_id=mission_id, backlog_id=None, settings=settings, now=NOW)
+
+
+def test_an_update_that_changes_only_the_test_file_moves_the_base(env):
+    """受入10: content_hash が同じで test_plugin.py だけ違う版の更新も土台を動かす。"""
+    v1_target = _deploy_v1(env)
+    v1_artifact = v1_target.rsplit("/", 1)[1]
+    only_test = _submit_with_test_file(
+        env, 2, 1.0, "def test_x():\n    assert True\n")
+    other = _submit(env, 3, 3.0)
+    assert _payload(env, only_test)["base"]["artifact_hash"] == v1_artifact
+    from agentic_fx.plugin import loader
+    assert _payload(env, only_test)["content_hash"] == loader.content_hash(env[0] / "sma")
+
+    assert _approve(env, only_test).outcome == "deployed"
+    moved = _live(env).rsplit("/", 1)[1]
+    assert moved != v1_artifact
+
+    outcome = _approve(env, other)
+
+    assert (outcome.outcome, outcome.reason) == ("invalidated", "base_changed")
+    follower = _submit(env, 4, 4.0)
+    assert _payload(env, follower)["base"] == {"kind": "version", "artifact_hash": moved}
+
+
+def _crash_after_switch(env, approval_id: int) -> None:
+    def crash(*args, **kwargs):
+        raise RuntimeError("crash before decision")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(switch, "_finalize_decision", crash)
+        with pytest.raises(RuntimeError):
+            _approve(env, approval_id)
+
+
+def _reconcile(env, **kwargs) -> None:
+    switch.reconcile_switch_journals(
+        env[1], plugins_root=env[0], now=NOW, settings=env[2], **kwargs)
+
+
+def test_a_candidate_is_checked_against_the_live_a_reconcile_decided(env):
+    """受入11: reconcile が切替済みの A を確定した後の B は、A が動かした live と照合される。"""
+    _deploy_v1(env)
+    a = _submit(env, 2, 2.0)
+    b = _submit(env, 3, 3.0)
+    _crash_after_switch(env, a)
+    a_target = _live(env)
+    assert _open_journals(env) == 1
+
+    _reconcile(env)
+
+    assert _open_journals(env) == 0 and _live(env) == a_target
+    outcome = _approve(env, b)
+    assert (outcome.outcome, outcome.reason) == ("invalidated", "base_changed")
+    assert _live(env) == a_target
+
+
+def test_approve_and_retry_after_a_reconcile_revert_use_the_restored_live(env):
+    """受入11: reconcile が巻き戻した後は、戻った live が土台との照合に使われる。"""
+    v1_target = _deploy_v1(env)
+    b = _submit(env, 2, 2.0)
+    a = _submit(env, 3, 3.0)
+    _crash_after_switch(env, a)
+    (op_id,) = [r["op_id"] for r in env[1].execute(
+        "SELECT op_id FROM plugin_switch_journal WHERE phase IN "
+        "('preparing','versioned','recorded','switched')")]
+
+    _reconcile(env, force_revert_op_id=op_id)
+
+    assert _live(env) == v1_target and _status(env, a) == "pending"
+    assert _approve(env, b).outcome == "deployed"
+    retried = switch.retry_approval(
+        env[1], a, decided_by="h", now=NOW, plugins_root=env[0], settings=env[2])
+    assert (retried.outcome, retried.reason) == ("invalidated", "base_changed")
+    assert _status(env, a) == "invalidated"

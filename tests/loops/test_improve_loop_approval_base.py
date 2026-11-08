@@ -8,7 +8,7 @@ from pathlib import Path
 
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.loops.improve_run_context import ImproveRunContext
-from agentic_fx.plugin import loader, version_store
+from agentic_fx.plugin import base_identity, loader, version_store
 from agentic_fx.plugin.resolve import ApprovedInventory, InventoryBuildResult
 from agentic_fx.runners.base import Mission, MissionResult
 
@@ -131,3 +131,61 @@ def test_unresolvable_base_fails_the_submission_without_an_approval(
                       monkeypatch, (odd,))
 
     assert payload is None
+    last = conn.execute(
+        "SELECT last_result FROM improvement_backlog WHERE id=?",
+        (mission_and_run_fixture[2],)).fetchone()[0]
+    assert last == "gate_failed:unverified"
+    assert conn.execute("SELECT COUNT(*) FROM approval_requests").fetchone()[0] == 0
+
+
+def test_a_strategy_whose_dependency_pin_broke_still_gives_its_base_from_the_snapshot(
+        conn, tmp_path):
+    """受入10: 依存 pin が破れた strategy は配備の対象外でも snapshot に残り、
+    pin だけを変える再ロックの土台は mission 開始時の版から取れる。"""
+    from agentic_fx.store import approvals as approvals_store
+    from agentic_fx.tools.plugin_loader import approved_plugins
+    from tests.backtest.factories import SETTINGS
+
+    plugins = tmp_path / "plugins"
+    plugins.mkdir()
+    dep_v1 = _install_version(plugins, 1.0)
+    scratch_dep_v1 = loader.content_hash(plugins.parent / "scratch-1.0")
+
+    def install_strategy(pin: str) -> tuple[str, str]:
+        scratch = plugins.parent / "scratch-strategy"
+        scratch.mkdir(exist_ok=True)
+        (scratch / "plugin.py").write_text(
+            "def evaluate(df, indicators, signals, params):\n"
+            "    return {'action': 'hold', 'rationale': 'x'}\n")
+        (scratch / "config.yaml").write_text(
+            "kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\nexit_mode: levels\n"
+            f"max_bars: 200\nindicators:\n  e: {{plugin: {NAME}, pin: '{pin}'}}\n")
+        (scratch / "test_plugin.py").write_text("def test_x():\n    pass\n")
+        files = [(scratch / n).read_bytes()
+                 for n in ("plugin.py", "config.yaml", "test_plugin.py")]
+        artifact = loader.artifact_hash_bytes(*files)
+        version_store.create_version_dir(
+            plugins, "strat", artifact, plugin_py=files[0], config_yaml=files[1],
+            test_plugin=files[2], op_identity="t")
+        return artifact, loader.content_hash(scratch)
+
+    strat_artifact, strat_content = install_strategy(scratch_dep_v1)
+    (plugins / NAME).symlink_to(f".versions/{NAME}/{dep_v1}")
+    (plugins / "strat").symlink_to(f".versions/strat/{strat_artifact}")
+    dep_v2 = _install_version(plugins, 2.0)
+    (plugins / NAME).unlink()
+    (plugins / NAME).symlink_to(f".versions/{NAME}/{dep_v2}")
+    for name, content in ((NAME, loader.content_hash(plugins / NAME)),
+                          ("strat", strat_content)):
+        approval_id = approvals_store.create(
+            conn, "plugin", {"name": name, "content_hash": content}, NOW)
+        approvals_store.apply_decision(conn, approval_id, "approved",
+                                       decided_by="h", now=NOW)
+
+    result = approved_plugins(conn, plugins, settings=SETTINGS)
+
+    assert [r.name for r in result.rejected_strategies] == ["strat"]
+    assert "strat" not in [m.name for m in result.inventory.metas]
+    assert base_identity.base_of_snapshot(
+        result.phase1_metas, "strat", plugins) == {
+            "kind": "version", "artifact_hash": strat_artifact}

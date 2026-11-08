@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agentic_fx.plugin import loader
+from agentic_fx.store import plugin_deploy_ops as deploy_store
 
 BASE_CHANGED = "base_changed"
 BASE_CHANGED_TEXT = ("土台の版が配備中の版と違うため配備しませんでした。"
@@ -78,10 +79,18 @@ def read_live(plugins_root: Path, name: str) -> dict:
 
 
 def base_of_live(plugins_root: Path, name: str) -> dict:
-    """提出時の live をそのまま土台にする。読めない形は拒否する。"""
+    """提出時の live をそのまま土台にする。読めない形は拒否する。
+
+    symlink は target の文字列だけでなく、root 内の版 dir が実在して読めることまで確かめる
+    (承認時の `check` は文字列の比較のままで、ここだけが実体を見る)。"""
     current = read_live(plugins_root, name)
     if current["kind"] == "unreadable":
         raise BaseUnresolvable("live_unreadable")
+    if current["kind"] == "version":
+        identity = deploy_store.live_identity(plugins_root, name)
+        if (identity is None or identity.kind != "symlink"
+                or identity.artifact_hash is None):
+            raise BaseUnresolvable("live_unreadable")
     return current
 
 

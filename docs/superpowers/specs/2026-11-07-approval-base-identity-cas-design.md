@@ -22,7 +22,7 @@
 | 経路 | 土台 | 理由 |
 |---|---|---|
 | 改善 mission (`candidate_origin=staging`) | mission の開始時に読取専用スナップショットへ写した版 (`copy_source_snapshot` の `meta`)。同名が写されていなければ「スナップショットに同名なし」 | agent が見て手を入れたのはスナップショットの版。提出時の live を土台にすると、mission の途中で別の承認が入ったときに取りこぼす |
-| 人間の提出 (`afx plugin submit --from _human`) | 提出時の live | 人間が `_human` に何を複製したか (`materialize_plugin`、`switch.py:2434`) は記録が無い。提出時点を土台とみなす。提出前の競合は残余 (§6) |
+| 人間の提出 (`afx plugin submit --from _human`)。人間の CLI が staging を提出する経路 (`submit_candidate(candidate_origin="staging")`) も、人間の提出として扱う | 提出時の live | 人間が `_human` に何を複製したか (`materialize_plugin`、`switch.py:2434`) は記録が無い。提出時点を土台とみなす。提出前の競合は残余 (§6) |
 | 人間の bless | 照合しない。payload に照合しない印を書く (§1.2) | 利用者による明示的な上書き。plain の pending や中断後の再試行 (`retry_approval`) も同じ (§6) |
 | 再評価 (`candidate_origin=reevaluation`) | 照合しない | 専用の `_reevaluation_is_fresh` (`switch.py:1887-`) が配備世代まで見る |
 
@@ -106,7 +106,7 @@ artifact_hash を使うのは、切替・journal・再評価の照合がすべ�
 
 ## 2. 承認画面での見え方
 
-承認待ちの依頼の詳細に、比較成績とは独立した項目「土台」を足す。判定は `ops/service.py` の helper 1 箇所 (`_baseline_hash_warning` の隣) に置き、detail に次を足す。shell (`commands.py:996-1007` は今 service の helper を使わず自前で比べている) も同じ helper を呼ぶ。
+承認待ちの依頼の詳細に、比較成績とは独立した項目「土台」を足す。判定の helper は `ops/base_view.py` (detail の `base_check` を作る) と `plugin/base_identity.py` (照合) に置き、detail に次を足す。shell (`commands.py:996-1007` は今 service の helper を使わず自前で比べている) も同じ helper を呼ぶ。
 
 ```
 "base_check": {"state": "match|mismatch|none_but_live|unreadable|legacy|unchecked",
@@ -128,6 +128,8 @@ artifact_hash を使うのは、切替・journal・再評価の照合がすべ�
 文面は「配備できません」にとどめ、「無効になります」とは言わない。照合より前の検査が別の理由で止めることがあるため。
 
 出す場所は ctl・shell・web・Discord の承認カード (`render_approval`、`gate/render.py:298-323`)。Discord では、文字数で省くときの優先順位を比較成績より上にする。
+
+Discord では、Approve / Retry を押した後の確認文 (ephemeral の「Confirm this decision.」) にも、同じ警告の 1 行を添える。確認を返す直前に lock の外で詳細を取り直し、取得の失敗・先送り中・形が不正・警告が要らない状態では何も足さない。Reject の確認には足さない。
 
 ## 3. 配備前の依頼
 
@@ -170,6 +172,7 @@ T1 → T2 の順。T1 だけでも lost update は止まる。
 - `afx ctl improve` の繰り返しで同じ版から候補が複数出ると、どれか 1 つを承認した時点で残りは承認で無効になる。候補の中身は `candidate_archives` に残る (`improve_loop.py:3498-3509`)。
 - 無効になった候補を作り直すかは、次の改善周の判断に任せる。必ず作り直されるわけではない。却下 (利用者の判断) と無効 (`base_changed`、仕組みの判断) は別の終端として残る。
 - 土台なしの候補が、配備中の同名版を上書きしようとすることは提出の時点では止めず、承認で止める。
+- 投稿済みの Discord カードの本文は、他の候補の承認で土台が変わっても描き直さない。押したときの確認文に警告が付き、承認時の照合が無効にして終端カードと理由を出す。
 
 ## 7. 裁定 (2026-11-07 利用者承認、3 点とも推奨どおり)
 
@@ -186,6 +189,7 @@ T1 → T2 の順。T1 だけでも lost update は止まる。
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
 | 2026-11-07 | C0 | 初版 | チケット approval-base-identity-cas の設計 | — |
+| 2026-11-08 | C2.2 | §1.1: 人間の CLI が staging を提出する経路は人間の提出。§2: helper の配置を `ops/base_view.py` / `plugin/base_identity.py` に直し、Approve / Retry の確認文に警告を添える。§6: 投稿済みカードの本文は描き直さない。人間の提出の土台は版 dir の実在・root 内・読取可能まで確かめる | レビュー 1 周目の裁定 | — |
 | 2026-11-07 | C2.1 | §1.5: backlog の last_result に reason は流れない (invalidated の template は固定) ことを実コードに合わせて記す | T1 実装で判明 | — |
 | 2026-11-07 | C2 | bless に照合しない印 `unchecked` を書き、`base` 無し = 配備前だけを成立させる (3 経路すべてが `base` を書く)。staging の土台を `meta.path` から導く規則 (live を読み直さない)、照合の行位置 (live 読取と T11 の間) と `ApprovalOutcome` の形、dangling の扱い、Discord の終端カードに invalidated を足す、判定 helper と `base_check` の形で T1/T2 の境界を切る、reason は固定 token (`last_result` に流れる)、却下の文言、plain の注、ABA と improve 繰り返しの帰結を残余に、人間の提出で live が読めなければ拒否、受入 16 項目に | Fable 2 周目 (Important 5 / Minor 10) | — |
 | 2026-11-07 | C1 | journal の収束と tx・片付けの順 (§1.3)、再開の除外を外して既存の制御構造を維持、人間の経路と bless を残余と裁定に、「スナップショットに同名なし」の定義、plain と壊れた `base` の規則、ABA と `_is_superseded` の関係、照合の位置と表示の文面、reason の運び先 (§1.5)、土台の表示を比較成績から独立 (§2)、既存の content_hash 警告は残す、受入 15 項目に | sol 1 周目 (Critical 1 / Important 8 / Minor 1) | — |
