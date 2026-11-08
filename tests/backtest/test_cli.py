@@ -117,6 +117,25 @@ def test_cli_plugin_list_skips_initialization_and_does_not_create_a_tree(
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize("damage", ["bad_bytes", "unreadable"])
+def test_cli_plugin_list_still_runs_when_the_settings_file_cannot_be_read(
+        tmp_path, monkeypatch, capsys, damage):
+    monkeypatch.chdir(tmp_path)
+    settings = tmp_path / "config" / "settings.yaml"
+    settings.parent.mkdir()
+    if damage == "bad_bytes":
+        settings.write_bytes(b"\xff\xfe\x00bad: [")
+    else:
+        settings.write_text("x: 1\n")
+
+        def refuse(path):
+            raise PermissionError(13, "denied")
+
+        monkeypatch.setattr(cli, "load_settings", refuse)
+    assert main(["plugin", "list"]) == 0
+    assert capsys.readouterr().out.splitlines()[0] == "source live: missing"
+
+
 # ---- history import ---------------------------------------------------
 
 

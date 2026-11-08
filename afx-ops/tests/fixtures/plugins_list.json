@@ -1,0 +1,235 @@
+{
+ "display_timezone": "Asia/Tokyo",
+ "invalid_pending": [],
+ "plugins": [
+  {
+   "admission": {
+    "alias": null,
+    "detail": null,
+    "reason": null,
+    "state": "none"
+   },
+   "dependencies": [],
+   "dependencies_set_state": null,
+   "dependents": [],
+   "entity": {
+    "artifact_hash": null,
+    "content_hash": null,
+    "reason": null,
+    "state": "absent"
+   },
+   "issues": [],
+   "kind": "indicator",
+   "name": "bol",
+   "open_ops": [],
+   "pending": [
+    {
+     "content_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "id": 6,
+     "kind": "indicator"
+    }
+   ],
+   "pending_count": 1,
+   "usefulness": {
+    "by_pin": [],
+    "deployed": 0,
+    "submitted": 0
+   }
+  },
+  {
+   "admission": {
+    "alias": "a",
+    "detail": "pin_mismatch",
+    "reason": "indicator_unresolved",
+    "state": "excluded"
+   },
+   "dependencies": [
+    {
+     "alias": "a",
+     "pin": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "plugin": "rsi",
+     "state": "pin_mismatch"
+    }
+   ],
+   "dependencies_set_state": null,
+   "dependents": [],
+   "entity": {
+    "artifact_hash": "b10ec48fd047fe67f59af6632a8c646140caef6c550902569e99fbf5168d3e5b",
+    "content_hash": "c3b8f61fc3a5234c2a1befd71c078b405f4b8395011a43e5fc893597bc9b6dfb",
+    "reason": null,
+    "state": "symlink"
+   },
+   "issues": [],
+   "kind": "strategy",
+   "name": "brk",
+   "open_ops": [],
+   "pending": [],
+   "pending_count": 0,
+   "usefulness": null
+  },
+  {
+   "admission": {
+    "alias": null,
+    "detail": null,
+    "reason": null,
+    "state": "none"
+   },
+   "dependencies": [],
+   "dependencies_set_state": null,
+   "dependents": [],
+   "entity": {
+    "artifact_hash": null,
+    "content_hash": null,
+    "reason": null,
+    "state": "absent"
+   },
+   "issues": [],
+   "kind": "signal",
+   "name": "ghost",
+   "open_ops": [],
+   "pending": [],
+   "pending_count": 0,
+   "usefulness": null
+  },
+  {
+   "admission": {
+    "alias": null,
+    "detail": null,
+    "reason": null,
+    "state": "none"
+   },
+   "dependencies": [],
+   "dependencies_set_state": null,
+   "dependents": [],
+   "entity": {
+    "artifact_hash": null,
+    "content_hash": null,
+    "reason": "missing_files",
+    "state": "unreadable"
+   },
+   "issues": [
+    "broken:missing_files"
+   ],
+   "kind": "unknown",
+   "name": "junk",
+   "open_ops": [],
+   "pending": [],
+   "pending_count": 0,
+   "usefulness": null
+  },
+  {
+   "admission": {
+    "alias": null,
+    "detail": null,
+    "reason": null,
+    "state": "loaded"
+   },
+   "dependencies": [
+    {
+     "alias": "fast",
+     "pin": "5bf58e23cba8727a080f31023a0a02a5397e2029f61eb6ac4ff3a04d085a67e5",
+     "plugin": "rsi",
+     "state": "match"
+    }
+   ],
+   "dependencies_set_state": null,
+   "dependents": [],
+   "entity": {
+    "artifact_hash": "79124b7469170b355d0c1389f69dd4855b034d29f61d41e375ad526ea085edc4",
+    "content_hash": "1ea4bf764a8617615150cc991f520ffc93681ded62e1d9301fd7471ee24a73f4",
+    "reason": null,
+    "state": "symlink"
+   },
+   "issues": [],
+   "kind": "strategy",
+   "name": "mom",
+   "open_ops": [],
+   "pending": [],
+   "pending_count": 0,
+   "usefulness": null
+  },
+  {
+   "admission": {
+    "alias": null,
+    "detail": null,
+    "reason": null,
+    "state": "none"
+   },
+   "dependencies": [],
+   "dependencies_set_state": null,
+   "dependents": [],
+   "entity": {
+    "artifact_hash": null,
+    "content_hash": null,
+    "reason": null,
+    "state": "absent"
+   },
+   "issues": [],
+   "kind": "strategy",
+   "name": "old",
+   "open_ops": [],
+   "pending": [],
+   "pending_count": 0,
+   "usefulness": null
+  },
+  {
+   "admission": {
+    "alias": null,
+    "detail": null,
+    "reason": null,
+    "state": "loaded"
+   },
+   "dependencies": [],
+   "dependencies_set_state": null,
+   "dependents": [
+    {
+     "alias": "a",
+     "pin": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "state": "pin_mismatch",
+     "strategy": "brk"
+    },
+    {
+     "alias": "fast",
+     "pin": "5bf58e23cba8727a080f31023a0a02a5397e2029f61eb6ac4ff3a04d085a67e5",
+     "state": "match",
+     "strategy": "mom"
+    }
+   ],
+   "entity": {
+    "artifact_hash": "4f6687e789c24a117f40d1d42a67cde09288965c0a7833e12894f26bbc23df3c",
+    "content_hash": "5bf58e23cba8727a080f31023a0a02a5397e2029f61eb6ac4ff3a04d085a67e5",
+    "reason": null,
+    "state": "symlink"
+   },
+   "issues": [],
+   "kind": "indicator",
+   "name": "rsi",
+   "open_ops": [],
+   "pending": [
+    {
+     "content_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+     "id": 4,
+     "kind": "indicator"
+    }
+   ],
+   "pending_count": 1,
+   "usefulness": {
+    "by_pin": [
+     {
+      "content_hash": "5bf58e23cba8727a080f31023a0a02a5397e2029f61eb6ac4ff3a04d085a67e5",
+      "deployed": 2,
+      "submitted": 2
+     }
+    ],
+    "deployed": 2,
+    "submitted": 2
+   }
+  }
+ ],
+ "sources": {
+  "journal": "ok",
+  "live": "ok",
+  "pending": "ok"
+ },
+ "unknown_submissions": 1
+}

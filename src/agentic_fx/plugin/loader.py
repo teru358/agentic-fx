@@ -181,6 +181,10 @@ def content_hash(plugin_dir: Path) -> str:
     return plugin_files.content_hash_of_dir(plugin_dir)
 
 
+# I/O 失敗で拒否したときの reject reason の先頭語。
+IO_ERROR_REASON = "I/O error"
+
+
 def _reject(name: str, reason: str) -> None:
     _log.warning("plugin %s: %s — rejecting", name, reason)
     sink = _reject_sink.get()
@@ -526,7 +530,7 @@ def discover(plugins_dir: Path, *, activity=None) -> list[PluginMeta]:
             # C10: config 読み込み・AST 解析対象の stat/read・content_hash の
             # いずれで OSError が出ても、そのフォルダのみ reject して次へ
             # 進む (他フォルダの discovery を道連れにしない)。
-            _reject(name, f"I/O error ({exc})")
+            _reject(name, f"{IO_ERROR_REASON} ({exc})")
             continue
         if meta is None:
             continue
@@ -644,7 +648,7 @@ def discover_one_with_reason(
             try:
                 meta = _discover_one(entry, name)
             except OSError as exc:
-                _reject(name, f"I/O error ({exc})")
+                _reject(name, f"{IO_ERROR_REASON} ({exc})")
                 meta = None
     finally:
         _reject_sink.reset(token)

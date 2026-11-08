@@ -71,7 +71,7 @@ from afx_ops.web import headers, render  # noqa: E402
 from afx_ops.web.routes import ROUTE_TABLE  # noqa: E402
 
 # CSS を変えたらこの値も変える (CSP の hash と埋め込む CSS の取り違えを防ぐ)
-PINNED_STYLE_HASH = "sha256-dIAw3Rfkv/SAUhYuTRQUAz5UAqeCbdU2MPWMfhMTwaA="
+PINNED_STYLE_HASH = "sha256-LTD12P28Uy1nqEG8Ug154drZ3pH6F9EnG8flNemSejY="
 
 
 class ReadClient:
@@ -94,8 +94,15 @@ class ReadClient:
     def activity(self, *, n, category):
         return Reply(200, {"lines": ["a"]}, None)
 
+    def plugins(self):
+        return Reply(200, {"plugins": [], "sources": {}}, None)
 
-PAGES = ["/", "/approvals", "/approvals/7", "/logs", "/activity", "/missing"]
+    def plugin(self, name):
+        return Reply(200, {"plugin": {"name": name}}, None)
+
+
+PAGES = ["/", "/approvals", "/approvals/7", "/logs", "/activity", "/plugins", "/plugins/rsi",
+         "/missing"]
 
 
 def test_the_csp_style_hash_is_the_hash_of_the_embedded_css():
@@ -113,10 +120,14 @@ def test_the_csp_style_hash_is_the_hash_of_the_embedded_css():
 
 def test_every_page_has_the_route_nav_and_a_read_only_refresh():
     static = [route.path for route in ROUTE_TABLE if "{" not in route.path]
+    # /approvals は nav に出さず、/plugins の画面から辿る
+    in_nav = ["/", "/plugins", "/logs", "/activity"]
+    assert sorted(in_nav + ["/approvals"]) == sorted(static)
     for path in PAGES:
         page = handle_request(Request("GET", path, {}), ReadClient()).body.decode()
         nav = re.search(r"<nav>(.*?)</nav>", page, re.S).group(1)
-        assert re.findall(r'<a href="([^"]*)">', nav) == static, path
+        assert re.findall(r'<a href="([^"]*)">', nav) == in_nav, path
+        assert 'Approvals</a>' not in nav, path
         assert page.count('<meta http-equiv="refresh" content="30">') == 1, path
 
 
@@ -158,3 +169,9 @@ def test_log_and_activity_show_the_newest_lines_of_a_long_window():
         html = handle_request(Request("GET", path, {}), Client()).body.decode()
         assert "entry-099" in html and "entry-050" in html, path
         assert "entry-049" not in html and "entry-000" not in html, path
+
+
+def test_the_plugins_pages_link_to_the_approvals_that_the_nav_no_longer_shows():
+    for path in ("/plugins", "/plugins/rsi"):
+        page = handle_request(Request("GET", path, {}), ReadClient()).body.decode()
+        assert '<a href="/approvals">' in page.split("</nav>", 1)[1], path

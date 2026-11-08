@@ -384,11 +384,12 @@ def test_ac13_unknown_fields_never_reach_the_page():
     assert marker not in text
 
 
-def test_ac13_routes_and_style_are_unchanged():
+def test_ac13_the_approval_routes_are_unchanged_and_new_ones_are_appended():
     from afx_ops.web.routes import ROUTE_TABLE, resolve_route
     assert [(r.path, r.client_method) for r in ROUTE_TABLE] == [
         ("/", "status"), ("/approvals", "approvals"), ("/approvals/{id}", "approval"),
-        ("/logs", "log"), ("/activity", "activity")]
+        ("/logs", "log"), ("/activity", "activity"),
+        ("/plugins", "plugins"), ("/plugins/{name}", "plugin")]
     assert resolve_route("/approvals/7/change") is None
     assert handle_request(Request("GET", "/approvals/7/change", {}), Client()).status == 404
     assert handle_request(Request("POST", "/approvals/7", {}), Client()).status == 405

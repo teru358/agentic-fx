@@ -95,6 +95,8 @@ ENDPOINTS: dict[str, Endpoint] = {e.code: e for e in (
     Endpoint("approval_detail", "GET /v1/approvals/{id}", Scope.APPROVALS_DETAIL, False),
     Endpoint("approval_change", "GET /v1/approvals/{id}/change", Scope.APPROVALS_DETAIL, False),
     Endpoint("approval_list", "GET /v1/approvals", Scope.APPROVALS_LIST, False),
+    Endpoint("plugin_list", "GET /v1/plugins", Scope.APPROVALS_LIST, False),
+    Endpoint("plugin_detail", "GET /v1/plugins/{name}", Scope.APPROVALS_DETAIL, False),
     Endpoint("improve_run", "GET /v1/improve/runs/{id}", Scope.APPROVALS_DETAIL, False),
     Endpoint("reflection_status", "GET /v1/reflections/{order_id}", Scope.STATUS_READ, False),
     Endpoint("whoami", "GET /v1/whoami", Scope.STATUS_READ, False),
@@ -690,6 +692,7 @@ class OpsService:
         self._ask_submitter = ask_submitter
         self._improve_supervisor = improve_supervisor
         self._plugins_root = plugins_root
+        self._plugin_views = None
         self._improve_reports_dir = improve_reports_dir
         self._settings = settings
         self._activity_log = activity_log
@@ -1032,6 +1035,36 @@ class OpsService:
                 "open_journals": [{"approval_id": j["approval_id"],
                                    "name": display_text(j["name"]), "phase": j["phase"]}
                                   for j in journals]}
+
+    def _plugin_view(self, deadline: float):
+        if self._plugins_root is None:
+            raise OpsError(ErrorCode.UNAVAILABLE)
+        if self._plugin_views is None:
+            from .plugins_view import PluginViewCache
+            self._plugin_views = PluginViewCache(self._plugins_root, self._settings)
+        def acquire(lock) -> None:
+            try:
+                self._acquire(lock, deadline, self.limits.ops_lock_wait_seconds)
+            except OpsError:
+                raise OpsError(ErrorCode.UNAVAILABLE) from None
+
+        return self._plugin_views.get(self._conn, lambda: self._ops_lane(deadline), acquire)
+
+    def plugin_list(self, principal: Caller, *, deadline: float | None = None) -> dict:
+        _authorize(principal, "plugin_list")
+        return self._plugin_view(self._deadline(deadline)).listing
+
+    def plugin_detail(self, principal: Caller, name: str, *,
+                      deadline: float | None = None) -> dict:
+        _authorize(principal, "plugin_detail")
+        from agentic_fx.plugin import loader, read_model
+        if not isinstance(name, str) or not loader.is_canonical_plugin_name(name):
+            raise OpsError(ErrorCode.INVALID_ARGUMENT)
+        view = self._plugin_view(self._deadline(deadline))
+        detail = read_model.detail_to_dto(view.model, name)
+        if detail is None:
+            raise OpsError(ErrorCode.NOT_FOUND)
+        return detail
 
     def approval_detail(self, principal: Caller, approval_id: int, *,
                         deadline: float | None = None) -> dict:

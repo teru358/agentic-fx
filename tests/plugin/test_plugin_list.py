@@ -88,7 +88,7 @@ def test_plugin_list_golden_for_live_pending_and_open_rollback_without_writing(t
         "source journal: ok\n"
         "NAME      KIND      LIVE          PENDING       OPEN_OP                   ISSUES\n"
         f"momentum  strategy  {live_hash[:12]}  {H_PENDING[:12]}  17:rollback:{H_TARGET[:12]}  -\n"
-        "rsi       unknown   -             -             -                         broken:invalid_manifest\n")
+        "rsi       unknown   -             -             -                         broken:missing_files\n")
     assert tree_snapshot(tmp_path) == before
 
 
@@ -190,7 +190,7 @@ def test_plugin_list_any_per_plugin_failure_is_a_broken_row(tmp_path, capsys, mo
     assert [line.split()[0] for line in lines[4:]] == ["alpha", "boom"]
 
 
-def test_plugin_list_orders_by_name_then_kind_and_keeps_same_name_kinds_apart(tmp_path, capsys):
+def test_plugin_list_has_one_row_per_name_ordered_by_name(tmp_path, capsys):
     _write_plugin(tmp_path, "zeta", "indicator")
     _write_plugin(tmp_path, "beta")
     db, conn = _new_db(tmp_path)
@@ -202,11 +202,10 @@ def test_plugin_list_orders_by_name_then_kind_and_keeps_same_name_kinds_apart(tm
     plugin_list(tmp_path)
 
     rows = [line.split()[:2] for line in _lines(capsys)[4:]]
-    assert rows == [["alpha", "strategy"], ["beta", "indicator"], ["beta", "strategy"],
-                    ["zeta", "indicator"]]
+    assert rows == [["alpha", "strategy"], ["beta", "strategy"], ["zeta", "indicator"]]
 
 
-def test_plugin_list_pending_with_other_kind_than_live_gets_its_own_row(tmp_path, capsys):
+def test_plugin_list_pending_with_other_kind_than_live_is_flagged_on_the_live_row(tmp_path, capsys):
     _write_plugin(tmp_path, "beta")
     db, conn = _new_db(tmp_path)
     _pending(conn, {"name": "beta", "content_hash": H_PENDING, "kind": "indicator"})
@@ -216,13 +215,11 @@ def test_plugin_list_pending_with_other_kind_than_live_gets_its_own_row(tmp_path
     assert plugin_list(tmp_path) == 1
 
     rows = [line.split() for line in _lines(capsys)[4:]]
-    assert [row[:2] for row in rows] == [["beta", "indicator"], ["beta", "strategy"]]
+    assert [row[:2] for row in rows] == [["beta", "strategy"]]
     assert rows[0][3] == H_PENDING[:12] and rows[0][-1] == "kind_mismatch"
-    assert H_PENDING[:12] not in rows[1] and "kind_mismatch" not in rows[1]
 
-    assert plugin_list(tmp_path, kind="indicator") == 1
-    rows = [line.split() for line in _lines(capsys)[4:]]
-    assert [row[:2] for row in rows] == [["beta", "indicator"]] and rows[0][3] == H_PENDING[:12]
+    assert plugin_list(tmp_path, kind="indicator") == 0
+    assert _lines(capsys)[4:] == []
 
 
 def test_plugin_list_pending_without_kind_is_kind_missing_and_survives_the_kind_filter(tmp_path, capsys):
@@ -343,7 +340,7 @@ def test_plugin_list_missing_table_is_unavailable_for_that_source_only(tmp_path,
     db.parent.mkdir()
     conn = sqlite3.connect(db)
     conn.execute("CREATE TABLE approval_requests (id INTEGER PRIMARY KEY, kind TEXT, "
-                 "payload_json TEXT, status TEXT, created_at TEXT)")
+                 "payload_json TEXT, status TEXT, decided_at TEXT, created_at TEXT)")
     conn.execute("INSERT INTO approval_requests (kind,payload_json,status,created_at) "
                  "VALUES ('plugin',?, 'pending', 'x')",
                  (json.dumps({"name": "alpha", "content_hash": H_PENDING, "kind": "strategy"}),))
@@ -433,3 +430,18 @@ def test_plugin_list_pending_with_an_unhashable_or_unknown_kind_is_kind_missing(
 
     rows = [line.split() for line in _lines(capsys)[4:]]
     assert len(rows) == 1 and rows[0][-1] == "kind_missing"
+
+
+def test_plugin_list_kind_filter_finds_a_name_that_only_has_requests(tmp_path, capsys):
+    db, conn = _new_db(tmp_path)
+    _pending(conn, {"name": "old", "content_hash": H_TARGET, "kind": "strategy"})
+    conn.execute("UPDATE approval_requests SET status='rejected'")
+    _pending(conn, {"name": "old", "content_hash": H_PENDING, "kind": "indicator"})
+    _pending(conn, {"name": "only_strategy", "content_hash": H_PENDING, "kind": "strategy"})
+    conn.commit()
+    conn.close()
+
+    assert plugin_list(tmp_path, kind="indicator") == 0
+
+    rows = [line.split()[:2] for line in _lines(capsys)[4:]]
+    assert rows == [["old", "indicator"]]

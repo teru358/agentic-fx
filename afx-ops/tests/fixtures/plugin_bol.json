@@ -1,0 +1,66 @@
+{
+ "display_timezone": "Asia/Tokyo",
+ "plugin": {
+  "admission": {
+   "alias": null,
+   "detail": null,
+   "reason": null,
+   "state": "none"
+  },
+  "dependencies": [],
+  "dependencies_set_state": null,
+  "dependents": [],
+  "entity": {
+   "artifact_hash": null,
+   "content_hash": null,
+   "reason": null,
+   "state": "absent"
+  },
+  "history": [
+   {
+    "artifact_hash": "4f6687e789c24a117f40d1d42a67cde09288965c0a7833e12894f26bbc23df3c",
+    "content_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "created_at": "2026-11-01T00:00:12+00:00",
+    "decided_at": null,
+    "id": 6,
+    "kind": "indicator",
+    "mission_id": 4,
+    "origin": "staging",
+    "status": "pending"
+   }
+  ],
+  "history_total": 1,
+  "issues": [],
+  "kind": "indicator",
+  "name": "bol",
+  "open_ops": [],
+  "pending": [
+   {
+    "content_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "id": 6,
+    "kind": "indicator"
+   }
+  ],
+  "pending_count": 1,
+  "usefulness": {
+   "by_pin": [],
+   "deployed": 0,
+   "submitted": 0
+  },
+  "versions": [
+   {
+    "approval_id": 6,
+    "artifact_hash": "4f6687e789c24a117f40d1d42a67cde09288965c0a7833e12894f26bbc23df3c",
+    "content_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "is_live": false,
+    "status": "pending"
+   }
+  ]
+ },
+ "sources": {
+  "journal": "ok",
+  "live": "ok",
+  "pending": "ok"
+ },
+ "unknown_submissions": 1
+}
