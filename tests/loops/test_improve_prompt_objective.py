@@ -201,7 +201,7 @@ def test_ac17_approval_payload_floor_snapshot_carries_the_new_values(
         conn, name="x", kind="indicator", content_hash="c",
         artifact_hash="a", ctx_ledger=ledger, mission_id=1,
         backlog_id=1, candidate_origin="staging", candidate_path="p",
-        gate_metrics={}, output={}, now=loop_min._clock.now())
+        gate_metrics={}, output={}, now=loop_min._clock.now(), base={"kind": "none"})
 
     assert payload["profitability_floor"] == {
         "min_pf": 1.0, "require_positive_avg_r": True,

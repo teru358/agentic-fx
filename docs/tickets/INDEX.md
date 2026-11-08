@@ -1,15 +1,9 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 160 件。完了分は closed/。
+未完了: 159 件。完了分は closed/。
 
-## 実装中 (2)
-
-### 不具合 (1)
-
-| id | 優先 | 起票 | 概要 |
-|---|---|---|---|
-| [approval-base-identity-cas](open/approval-base-identity-cas.md) | 高 | 2026-10-27 | 承認時に候補の土台版を照合し、同名候補の上書き (lost update) を防ぐ |
+## 実装中 (1)
 
 ### 保守 (1)
 

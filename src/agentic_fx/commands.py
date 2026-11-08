@@ -31,7 +31,8 @@ from agentic_fx.store.approvals import AlreadyDecidedError, ApprovalNotFoundErro
 from agentic_fx.store.state import (
     GenerationMismatch, NotLatched, ResetNotApplied, StateStore, StateUncertain)
 from agentic_fx.loops import econ_signal_report
-from agentic_fx.ops import reevaluation_view
+from agentic_fx.ops import base_view, reevaluation_view
+from agentic_fx.plugin import base_identity
 from agentic_fx.ops.contracts import ErrorCode, OpsError, ShellCaller
 from agentic_fx.policy_projection import (
     POLICY_TEXT_LIMIT, MigrationRecordUnknown, ProjectionReconcileBlocked, insert_policy,
@@ -852,6 +853,8 @@ class Commands:
                     "(先に afx plugin retire が要ります)")
         if kind == "invalidated" and outcome.reason == "reevaluation_stale":
             return reevaluation_view.STALE_TEXT
+        if kind == "invalidated" and outcome.reason == base_identity.BASE_CHANGED:
+            return base_identity.BASE_CHANGED_TEXT
         if kind == "reevaluation_confirmed":
             return reevaluation_view.CONFIRMED_TEXT
         if kind in ("already_decided", "invalidated"):
@@ -1005,6 +1008,8 @@ class Commands:
             except (AttributeError, OSError, ValueError):
                 pass
         lines += self._baseline_comparison_lines(baseline, warning)
+        lines += base_view.lines(
+            base_view.detail(payload, self.plugins_root, row["status"]))
         lines += approval_facts.gate_lines(payload)
         lines += approval_facts.render_facts_lines(payload)
         # [reject-reason-leak] T0 (2026-09-12): 人間の却下理由の唯一の

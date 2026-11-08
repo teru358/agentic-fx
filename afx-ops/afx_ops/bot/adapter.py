@@ -31,7 +31,7 @@ from dataclasses import dataclass
 
 import discord
 
-from afx_ops import improve_events, reevaluation_text
+from afx_ops import base_text, improve_events, reevaluation_text
 from afx_ops.event_outcome import SkipKnown, is_improve
 from afx_ops.events_page import parse_page, unreadable_notice
 from afx_ops.gate import reconcile as gate_reconcile
@@ -528,13 +528,41 @@ class BotAdapter:
         # gate は遷移ごとに persist 口で snapshot へ確定する
         result = self.gate.handle(request, now=int(self._now()))
         if result.decision is None:
-            return self._with_reject_warning(request, result)
+            return self._with_base_warning(request, self._with_reject_warning(request, result))
         try:
             return self.gate.perform(result.decision)
         finally:
             # perform の事前 detail が受けた 429 / 503 も、その承認の次の問合せ時刻へ写す
             if result.decision.approval_id in self.gate.throttled:
                 self._absorb_throttle(result.decision.approval_id)
+
+    def _with_base_warning(self, request: Interaction, result: GateResult) -> GateResult:
+        """Approve / Retry の確認文に、土台の警告を 1 行添える。
+
+        lock の外で詳細を取り直す。先送り中・取得失敗・形が不正・警告が要らない状態では
+        gate の確認文のまま (承認の安全は承認時の照合が持つ)。"""
+        try:
+            action, approval_id = decode_custom_id(request.custom_id)
+        except CustomIdError:
+            return result
+        if action not in {"claim", "approve", "retry"} or result.confirm_view is None:
+            return result
+        if not self._poll_due(approval_id):
+            return result
+        try:
+            reply = self.client.approval(approval_id)
+        except Exception:  # noqa: BLE001 — 確認文の補足が取れないときは何も足さない
+            return result
+        self._observe(approval_id, reply)
+        data = getattr(reply, "data", None)
+        status = getattr(reply, "status", 0)
+        if not (200 <= status < 300 and type(data) is dict):
+            return result
+        line = base_text.warning_line(data.get("base_check"))
+        if line is None:
+            return result
+        return GateResult(f"{result.text}\n{line}", result.effects, result.confirm_view,
+                          result.decision)
 
     def _with_reject_warning(self, request: Interaction, result: GateResult) -> GateResult:
         """再評価の依頼の Reject の確認文に、配備を停止することを明記する。

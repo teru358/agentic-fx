@@ -34,6 +34,7 @@ from typing import Callable
 from agentic_fx.core import improve_repeat as ir
 from agentic_fx.loops.econ_signal_report import (ABANDON_REASONS, KNOWN_MISSION_TERMINALS,
                                                   OTHER_KIND)
+from agentic_fx.plugin import base_identity
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 from agentic_fx.store import signal_decisions as _sig_dec
 from agentic_fx.store import signal_shadow as _sig_shadow
@@ -41,7 +42,7 @@ from agentic_fx.policy_projection import (POLICY_TEXT_LIMIT, MigrationRecordUnkn
                                           inspect_policy_file, reconcile_policy_file,
                                           regenerate_policy_file, unmanaged_policy_lines)
 
-from . import redactor
+from . import base_view, redactor
 from .activity import SuppressedActivity
 from .audit import AcceptedRequest, AuditStore, IdempotencyReplay
 from .contracts import (ACTOR_PRINCIPALS, PRINCIPAL_SCOPES, Caller, ErrorCode, OpsError,
@@ -1067,6 +1068,7 @@ class OpsService:
                 "baseline": payload.get("baseline"),
                 "baseline_hash_warning": _baseline_hash_warning(payload, self._plugins_root,
                                                               row["status"]),
+                "base_check": base_view.detail(payload, self._plugins_root, row["status"]),
                 "payload_sha256": payload_sha256(row["payload_json"]),
                 "reason": (None if row["reason"] is None else
                            display_text(row["reason"], approval_facts.CLAIM_DISPLAY_LIMIT)),
@@ -2054,7 +2056,7 @@ class OpsService:
                         require_plugin_kind=True, expected_payload_sha256=digest)
                     result = {"approval_id": approval_id, "outcome": outcome.outcome,
                               "status": outcome.status}
-                    if outcome.reason == "reevaluation_stale":
+                    if outcome.reason in ("reevaluation_stale", base_identity.BASE_CHANGED):
                         result["reason"] = outcome.reason
             except switch.PluginBusyError:
                 raise OpsError(ErrorCode.UNAVAILABLE if self.stop_event.is_set()

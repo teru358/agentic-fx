@@ -22,7 +22,7 @@ from tests.loops.test_improve_e2e import (
     NOW, _fake_record_kwargs, _no_real_network, _install, _plugin_artifact,
     improve_env)  # noqa: F401
 from tests.loops.test_improve_quality_gate import (
-    PY_X, PY_Y, _artifact, _files)
+    PY_X, PY_Y, PY_Z, _artifact, _files)
 
 BASE_HASH = "b" * 64
 PAIR = "USDJPY"
@@ -960,3 +960,58 @@ def test_the_parent_report_ends_with_the_monitoring_section_and_nothing_else_car
             assert label not in text, f"{label} leaked to {name}"
     outside = report.split(_COMPARISON_SECTION)[0]
     assert "monotone_run" not in outside
+
+
+# --- 土台: strategy の提出 ---------------------------------------------------
+
+def _deploy_strategy_version(plugins_root, name, plugin_py):
+    from agentic_fx.plugin import loader, version_store
+    _, _, config, test_py = _strategy(name)
+    files = [plugin_py.encode(), config.encode(), test_py.encode()]
+    artifact = loader.artifact_hash_bytes(*files)
+    version_store.create_version_dir(
+        plugins_root, name, artifact, plugin_py=files[0], config_yaml=files[1],
+        test_plugin=files[2], op_identity="t")
+    return artifact
+
+
+@pytest.mark.parametrize("relock", [True, False], ids=["relock", "plain_gate"])
+def test_strategy_submission_stores_the_snapshot_version_as_base(
+        improve_env, relock):
+    """strategy の提出でも、payload の base は mission 開始時に写した版で、
+    mission の途中で live が別の版へ変わっていても live 由来にならない。"""
+    from tests.fixtures import indicator_wiring as fx
+    app, root = improve_env
+    plugins_root = root / "plugins"
+    _, plugin_py, config, test_py = _strategy()
+    cand = plugins_root / "cand"
+    cand.mkdir(parents=True)
+    (cand / "plugin.py").write_text(plugin_py)
+    (cand / "config.yaml").write_text(config)
+    (cand / "test_plugin.py").write_text(test_py)
+    fx.deploy_approved(app.conn_core, plugins_root, ["cand"], now=NOW)
+    started_with = (plugins_root / "cand").readlink().name
+    app.settings.improve.baseline_gate = "enforce"
+    gate = FakeGate(app.settings, "new_name")
+
+    def switch_live(loop, ctx):
+        switched_to = _deploy_strategy_version(
+            plugins_root, "cand", PY_Z)
+        assert switched_to != started_with
+        (plugins_root / "cand").unlink()
+        (plugins_root / "cand").symlink_to(f".versions/cand/{switched_to}")
+
+    with patch.object(ImproveLoop, "_deployed_dir_for",
+                      lambda self, name, *, inventory: root), \
+         patch("agentic_fx.loops.improve_loop.is_relock_transition",
+               lambda *a, **k: relock):
+        _run(app, root, _artifact("cand"),
+             files=("cand", PY_Y, config, test_py),
+             extra=[patch.object(ImproveLoop, "_run_strategy_gate", gate)],
+             before_commit=switch_live, seed=False)
+
+    submitted = [p for p in _approvals(app.conn_core) if "base" in p]
+    assert len(submitted) == 1
+    payload = submitted[0]
+    assert payload["kind"] == "strategy"
+    assert payload["base"] == {"kind": "version", "artifact_hash": started_with}

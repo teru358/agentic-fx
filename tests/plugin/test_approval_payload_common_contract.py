@@ -191,7 +191,7 @@ def _payload_from_improve_loop(tmp_path, kind, *, resolved=None):
         ctx_ledger=ledger, mission_id=1, backlog_id=2,
         candidate_origin="staging", candidate_path=f"plugins/_staging/1/{kind}_d",
         gate_metrics=gate_metrics, output={"selection_rationale": ""}, now=NOW,
-        resolved=resolved)
+        resolved=resolved, base={"kind": "none"})
 
 
 @pytest.mark.parametrize("kind", ["strategy", "indicator"])
@@ -229,6 +229,23 @@ def test_four_payload_systems_share_eval_contract(tmp_path, monkeypatch, kind):
             f"{system}: {_CONTRACT_KEYS - payload.keys()} キーが欠落")
         actual = {k: payload[k] for k in _CONTRACT_KEYS}
         assert actual == expected, f"{system}: {actual} != {expected}"
+
+
+@pytest.mark.parametrize("kind", ["strategy", "indicator"])
+def test_three_payload_routes_each_write_a_well_formed_base(
+        tmp_path, monkeypatch, kind):
+    """受入15: 3 経路 (submit・bless・改善 mission) がどれも `base` を書く。"""
+    from agentic_fx.plugin import base_identity
+    payloads = {
+        "submit": _payload_from_switch_submit(tmp_path, kind, monkeypatch),
+        "bless": _payload_from_switch_bless(tmp_path, kind, monkeypatch),
+        "improve": _payload_from_improve_loop(tmp_path, kind),
+    }
+    for system, payload in payloads.items():
+        assert "base" in payload, system
+        assert base_identity.is_valid_base(payload["base"]), system
+    assert payloads["submit"]["base"] == {"kind": "none"}
+    assert payloads["bless"]["base"] == {"kind": "unchecked", "by": "bless"}
 
 
 # --- [indicator-consumption-wiring] T4b Step 4-5: indicator_deps (P3/P3') ---
