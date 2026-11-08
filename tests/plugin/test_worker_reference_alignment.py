@@ -5,15 +5,44 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from agentic_fx.plugin.reference import align_reference, align_reference_rows
+from agentic_fx.plugin.reference import (
+    AlignedReference, align_reference, align_reference_rows,
+)
+from agentic_fx.plugin.reference_time import timeframe_seconds
 from agentic_fx.plugin.worker import _align_indicator_to_main
+
+
+def _oracle_align_reference(reference, *, strategy_start, strategy_timeframe,
+                            reference_timeframe, max_age_seconds):
+    """Independent one-row implementation the shared alignment is checked against."""
+    decision = pd.Timestamp(strategy_start)
+    if decision.tz is None:
+        raise ValueError("strategy_start must be timezone-aware")
+    decision += pd.Timedelta(seconds=timeframe_seconds(strategy_timeframe))
+    reference = reference.sort_index()
+    index = reference.index
+    if not isinstance(index, pd.DatetimeIndex) or index.tz is None:
+        raise ValueError("reference index must be timezone-aware DatetimeIndex")
+    if index.has_duplicates:
+        raise ValueError("reference index must not contain duplicates")
+    ends = index + pd.Timedelta(seconds=timeframe_seconds(reference_timeframe))
+    eligible = ends <= decision
+    if not eligible.any():
+        return AlignedReference(None, decision, None, None, False)
+    position = ends.argmax()
+    if not eligible[position]:
+        position = eligible.nonzero()[0][ends[eligible].argmax()]
+    end = ends[position]
+    age = decision - end
+    return AlignedReference(index[position], decision, end, age,
+                            age <= pd.Timedelta(seconds=max_age_seconds))
 
 
 def _old(value, *, source, main_index, strategy_timeframe, reference_timeframe,
          max_age_seconds):
     aligned = []
     for strategy_start in main_index:
-        selected = align_reference(
+        selected = _oracle_align_reference(
             source, strategy_start=strategy_start,
             strategy_timeframe=strategy_timeframe,
             reference_timeframe=reference_timeframe,
@@ -212,5 +241,72 @@ def test_worker_contract_hands_over_unique_float64_series():
     dup = ref.iloc[[0, 1, 1]]
     with pytest.raises(ValueError, match="duplicates"):
         align_reference_rows(dup.index, main_index=_main("2026-10-27T05:00:00Z", 2, "1h"),
+                             strategy_timeframe="1h", reference_timeframe="1h",
+                             max_age_seconds=3600)
+
+
+def _same_aligned(got, want):
+    assert got.fresh is want.fresh or got.fresh == want.fresh
+    assert isinstance(got.fresh, bool)
+    assert got.decision_time == want.decision_time
+    assert got.decision_time.tz == want.decision_time.tz
+    for field in ("row_start", "reference_end"):
+        a, b = getattr(got, field), getattr(want, field)
+        assert (a is None) == (b is None)
+        if a is not None:
+            assert isinstance(a, pd.Timestamp) and a == b and a.tz == b.tz
+    assert (got.age is None) == (want.age is None)
+    if got.age is not None:
+        assert isinstance(got.age, pd.Timedelta) and got.age == want.age
+
+
+@pytest.mark.parametrize("seed", range(200))
+def test_align_reference_wrapper_matches_the_one_row_oracle(seed):
+    rng = np.random.default_rng(1000 + seed)
+    stf, rtf = TFS[seed % len(TFS)]
+    base = pd.Timestamp("2026-10-01", tz="UTC")
+    n_ref = int(rng.integers(0, 40))
+    offs = rng.choice(500, size=n_ref, replace=False) * 900
+    ref_idx = base + pd.to_timedelta(offs, unit="s")
+    ref = _ref(ref_idx.tz_convert(["UTC", "Asia/Tokyo", "America/New_York"][seed % 3]),
+               tz=None)
+    start = (base + pd.Timedelta(seconds=int(rng.integers(0, 600)) * 900)
+             ).tz_convert("UTC" if seed % 2 else "Asia/Tokyo")
+    kw = dict(strategy_start=start, strategy_timeframe=stf,
+              reference_timeframe=rtf,
+              max_age_seconds=int(rng.choice([0, 900, 3600, 86400])))
+    _same_aligned(align_reference(ref, **kw), _oracle_align_reference(ref, **kw))
+
+
+def test_align_reference_stale_keeps_the_bar_and_age():
+    ref = _ref(["2026-10-27T09:00:00Z"])
+    got = align_reference(ref, strategy_start=pd.Timestamp("2026-10-27T12:00:00Z"),
+                          strategy_timeframe="1h", reference_timeframe="1h",
+                          max_age_seconds=60)
+    assert got.fresh is False
+    assert got.reference_end == pd.Timestamp("2026-10-27T10:00:00Z")
+    assert got.age == pd.Timedelta(hours=3)
+
+
+@pytest.mark.parametrize("bad", ["2026-10-27T10:00:00", pd.NaT])
+def test_align_reference_wrapper_rejects_naive_or_nat_start(bad):
+    ref = _ref(["2026-10-27T09:00:00Z"])
+    with pytest.raises(ValueError, match="timezone-aware"):
+        align_reference(ref, strategy_start=pd.Timestamp(bad), strategy_timeframe="1h",
+                        reference_timeframe="1h", max_age_seconds=3600)
+
+
+@pytest.mark.parametrize("main", [pd.RangeIndex(3), pd.Index(["a", "b"], dtype=object)])
+def test_non_datetime_main_index_raises_value_error(main):
+    ref = _ref(["2026-10-27T09:00:00Z"])
+    with pytest.raises(ValueError, match="timezone-aware"):
+        align_reference_rows(ref.index, main_index=main, strategy_timeframe="1h",
+                             reference_timeframe="1h", max_age_seconds=3600)
+
+
+def test_bad_main_is_reported_before_a_bad_reference():
+    naive_ref = _ref(["2026-10-27T09:00:00"], tz=None)
+    with pytest.raises(ValueError, match="strategy_start"):
+        align_reference_rows(naive_ref.index, main_index=pd.RangeIndex(2),
                              strategy_timeframe="1h", reference_timeframe="1h",
                              max_age_seconds=3600)

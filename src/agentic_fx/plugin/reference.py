@@ -4,12 +4,9 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING
 
+import numpy as np
 import pandas as pd
-
-if TYPE_CHECKING:
-    import numpy as np
 
 from agentic_fx.plugin.reference_time import (
     canonical_duration_seconds, native_reference_bars, nominal_reference_bars,
@@ -115,50 +112,23 @@ class AlignedReference:
     fresh: bool
 
 
-def align_reference(reference: pd.DataFrame, *, strategy_start: pd.Timestamp,
-                    strategy_timeframe: str, reference_timeframe: str,
-                    max_age_seconds: int) -> AlignedReference:
-    """Choose the last closed reference bar available at a strategy decision."""
-    decision = pd.Timestamp(strategy_start)
-    if decision.tz is None:
-        raise ValueError("strategy_start must be timezone-aware")
-    decision += pd.Timedelta(seconds=timeframe_seconds(strategy_timeframe))
-    reference = reference.sort_index()
-    index = reference.index
-    if not isinstance(index, pd.DatetimeIndex) or index.tz is None:
-        raise ValueError("reference index must be timezone-aware DatetimeIndex")
-    if index.has_duplicates:
-        raise ValueError("reference index must not contain duplicates")
-    index = reference.index
-    ends = index + pd.Timedelta(seconds=timeframe_seconds(reference_timeframe))
-    eligible = ends <= decision
-    if not eligible.any():
-        return AlignedReference(None, decision, None, None, False)
-    position = ends.argmax()
-    if not eligible[position]:
-        position = eligible.nonzero()[0][ends[eligible].argmax()]
-    end = ends[position]
-    age = decision - end
-    return AlignedReference(index[position], decision, end, age,
-                            age <= pd.Timedelta(seconds=max_age_seconds))
+def _closest_closed_bar(reference_index: pd.Index, *, main_index: pd.DatetimeIndex,
+                        strategy_timeframe: str, reference_timeframe: str,
+                        ) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray, np.ndarray]:
+    """Locate, for every main row, the last reference bar closed at its decision time.
 
-
-def align_reference_rows(reference_index: pd.Index, *, main_index: pd.DatetimeIndex,
-                         strategy_timeframe: str, reference_timeframe: str,
-                         max_age_seconds: int) -> tuple[pd.DatetimeIndex, "np.ndarray"]:
-    """Vector form of ``align_reference`` over every strategy start in ``main_index``.
-
-    Returns the sorted reference index and, per main row, the position in it of the
-    last closed fresh reference bar (-1 where none is usable).  Sorting, the index
-    checks and the end times are computed once.
+    Returns the sorted reference index, the position of that bar in it (-1 where no
+    bar had closed yet), and the bar end and decision time of each row as int64
+    nanoseconds since the epoch.  Sorting, the index checks and the end times are
+    computed once; this is the single place the alignment rule lives.
     """
-    import numpy as np
-
-    if len(main_index) and (main_index.tz is None or main_index.hasnans):
+    if len(main_index) and (not isinstance(main_index, pd.DatetimeIndex)
+                            or main_index.tz is None or main_index.hasnans):
         raise ValueError("strategy_start must be timezone-aware")
     index = reference_index.sort_values()
     if len(main_index) == 0:
-        return index, np.empty(0, dtype=np.int64)
+        empty = np.empty(0, dtype=np.int64)
+        return index, empty, empty, empty
     if not isinstance(index, pd.DatetimeIndex) or index.tz is None:
         raise ValueError("reference index must be timezone-aware DatetimeIndex")
     if index.has_duplicates:
@@ -168,15 +138,50 @@ def align_reference_rows(reference_index: pd.Index, *, main_index: pd.DatetimeIn
     ends = ref_ns + timeframe_seconds(reference_timeframe) * 1_000_000_000
     decisions = (main_index.tz_convert("UTC").as_unit("ns").asi8
                  + timeframe_seconds(strategy_timeframe) * 1_000_000_000)
-    positions = np.full(len(main_index), -1, dtype=np.int64)
+    chosen = np.full(len(main_index), -1, dtype=np.int64)
     if valid.any():
         valid_pos = np.nonzero(valid)[0]
         # NaT sorts last, so the valid bars are a sorted prefix of ``ends``
-        sorted_ends = ends[valid_pos]
-        found = np.searchsorted(sorted_ends, decisions, side="right") - 1
-        hit = found >= 0
-        chosen = valid_pos[np.where(hit, found, 0)]
-        age = decisions - ends[chosen]
-        fresh = hit & (age <= max_age_seconds * 1_000_000_000)
-        positions = np.where(fresh, chosen, -1)
-    return index, positions
+        found = np.searchsorted(ends[valid_pos], decisions, side="right") - 1
+        chosen = np.where(found >= 0, valid_pos[np.where(found >= 0, found, 0)], -1)
+    return index, chosen, ends, decisions
+
+
+def align_reference(reference: pd.DataFrame, *, strategy_start: pd.Timestamp,
+                    strategy_timeframe: str, reference_timeframe: str,
+                    max_age_seconds: int) -> AlignedReference:
+    """Choose the last closed reference bar available at a strategy decision."""
+    start = pd.Timestamp(strategy_start)
+    if start.tz is None:
+        raise ValueError("strategy_start must be timezone-aware")
+    decision = start + pd.Timedelta(seconds=timeframe_seconds(strategy_timeframe))
+    index, chosen, ends, decisions = _closest_closed_bar(
+        reference.index, main_index=pd.DatetimeIndex([start]),
+        strategy_timeframe=strategy_timeframe, reference_timeframe=reference_timeframe)
+    position = int(chosen[0])
+    if position < 0:
+        return AlignedReference(None, decision, None, None, False)
+    row_start = index[position]
+    end = row_start + pd.Timedelta(seconds=timeframe_seconds(reference_timeframe))
+    age = pd.Timedelta(int(decisions[0] - ends[position]), unit="ns")
+    return AlignedReference(row_start, decision, end, age,
+                            age <= pd.Timedelta(seconds=max_age_seconds))
+
+
+def align_reference_rows(reference_index: pd.Index, *, main_index: pd.DatetimeIndex,
+                         strategy_timeframe: str, reference_timeframe: str,
+                         max_age_seconds: int) -> tuple[pd.DatetimeIndex, np.ndarray]:
+    """Vector form of ``align_reference`` over every strategy start in ``main_index``.
+
+    Returns the sorted reference index and, per main row, the position in it of the
+    last closed fresh reference bar (-1 where none is usable).
+    """
+    index, chosen, ends, decisions = _closest_closed_bar(
+        reference_index, main_index=main_index, strategy_timeframe=strategy_timeframe,
+        reference_timeframe=reference_timeframe)
+    hit = chosen >= 0
+    if not hit.any():
+        return index, chosen
+    age = decisions - ends[np.where(hit, chosen, 0)]
+    fresh = hit & (age <= max_age_seconds * 1_000_000_000)
+    return index, np.where(fresh, chosen, -1)

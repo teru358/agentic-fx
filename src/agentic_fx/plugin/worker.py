@@ -315,8 +315,7 @@ def main() -> None:
                         # structured code, the traceback goes to stderr as before
                         raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
                     rows = None
-                    if frame_id is not None and any(
-                            isinstance(v, pd.Series) for v in validated.values()):
+                    if frame_id is not None:
                         from agentic_fx.plugin.reference import align_reference_rows
                         rows = align_reference_rows(
                             sub_df.index, main_index=df.index,
@@ -324,11 +323,10 @@ def main() -> None:
                             reference_timeframe=dep["timeframe"],
                             max_age_seconds=dep["max_age_seconds"])
                     indicators[dep["alias"]] = {
-                        key: (_align_indicator_to_main(
-                            value, rows=rows, main_index=df.index)
-                              if isinstance(value, pd.Series) and frame_id is not None
-                              else value.reindex(df.index)
-                              if isinstance(value, pd.Series) else value)
+                        key: (value if not isinstance(value, pd.Series)
+                              else value.reindex(df.index) if rows is None
+                              else _align_indicator_to_main(
+                                  value, rows=rows, main_index=df.index))
                         for key, value in validated.items()}
                 for dep in deps:
                     if dep.get("frame_id") is None:
