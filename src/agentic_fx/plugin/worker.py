@@ -163,23 +163,18 @@ def _write_line(fd: int, obj: dict[str, Any]) -> None:
         view = view[n:]
 
 
-def _align_indicator_to_main(value, *, source, main_index, strategy_timeframe,
-                             reference_timeframe, max_age_seconds):
+def _align_indicator_to_main(value, *, rows, main_index):
+    """Spread ``value`` onto ``main_index`` using positions from ``align_reference_rows``."""
+    import numpy as np
     import pandas as pd
 
-    from agentic_fx.plugin.reference import align_reference
-
-    aligned = []
-    for strategy_start in main_index:
-        selected = align_reference(
-            source, strategy_start=strategy_start,
-            strategy_timeframe=strategy_timeframe,
-            reference_timeframe=reference_timeframe,
-            max_age_seconds=max_age_seconds)
-        aligned.append(
-            value.loc[selected.row_start]
-            if selected.fresh and selected.row_start in value.index else float("nan"))
-    return pd.Series(aligned, index=main_index, dtype="float64")
+    index, positions = rows
+    out = np.full(len(main_index), np.nan, dtype="float64")
+    hit = positions >= 0
+    if hit.any():
+        starts = index.take(positions[hit])
+        out[hit] = value.reindex(starts).to_numpy(dtype="float64", na_value=np.nan)
+    return pd.Series(out, index=main_index, dtype="float64")
 
 
 def _load_error_text(exc: BaseException) -> str:
@@ -310,12 +305,18 @@ def main() -> None:
                         # a dependency's mismatch is not the strategy's own: no
                         # structured code, the traceback goes to stderr as before
                         raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
-                    indicators[dep["alias"]] = {
-                        key: (_align_indicator_to_main(
-                            value, source=sub_df, main_index=df.index,
+                    rows = None
+                    if frame_id is not None and any(
+                            isinstance(v, pd.Series) for v in validated.values()):
+                        from agentic_fx.plugin.reference import align_reference_rows
+                        rows = align_reference_rows(
+                            sub_df.index, main_index=df.index,
                             strategy_timeframe=handshake["timeframe"],
                             reference_timeframe=dep["timeframe"],
                             max_age_seconds=dep["max_age_seconds"])
+                    indicators[dep["alias"]] = {
+                        key: (_align_indicator_to_main(
+                            value, rows=rows, main_index=df.index)
                               if isinstance(value, pd.Series) and frame_id is not None
                               else value.reindex(df.index)
                               if isinstance(value, pd.Series) else value)

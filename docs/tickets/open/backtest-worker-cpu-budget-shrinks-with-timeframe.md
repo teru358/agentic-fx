@@ -1,6 +1,6 @@
 ---
 id: backtest-worker-cpu-budget-shrinks-with-timeframe
-status: 設計待ち
+status: 実装中
 priority: 高
 opened: 2026-09-20
 closed: null
@@ -11,7 +11,7 @@ kind: 不具合
 ---
 # [backtest-worker-cpu-budget-shrinks-with-timeframe]
 
-**状態**: 設計待ち / **優先**: 高 / **種別**: 不具合
+**状態**: 実装中 / **優先**: 高 / **種別**: 不具合
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -23,3 +23,4 @@ kind: 不具合
 - 2026-10-23: 優先: 中 — 2026-10-23 棚卸し: 症状は cpu_limit 分類で読め、暫定値 120 で運用中。高 → 中
 - 2026-10-25: 種別: 不具合 — 種別を付与
 - 2026-11-08: 優先: 高 — 2026-11-08 再観測: 手動の改善 #3370〜3373 のうち 3 回が worker_cpu_limit (120 秒) で評価できずに終わった。11-01 以降 12 回で、ほぼすべて参照系列 (EURUSD・XAUUSD・US500 など) を使う strategy。通常の依存 2 本の strategy は 15〜25 秒で、参照系列のものだけ 5〜10 倍遅い (activity の backtest_cpu)。参照系列の処理の効率を先に実測で調べる。優先を中から高へ
+- 2026-11-08: 状態: 実装中 — 原因 (2026-11-08 実測、tmp/inv-refcpu/report.md): worker の _align_indicator_to_main (plugin/worker.py:166) が strategy の窓の行ごとに align_reference を呼び、毎回参照系列の sort と終了時刻の計算をやり直す (1 回約 90 µs、O(N))。1 eval の worker CPU が参照なしの 3〜6 倍 (#3372 全期間 72.2 秒が本番 71.95 秒と一致)。処置 (利用者承認): 並べ替えと終了時刻の計算を 1 回にし searchsorted で一括に引く。旧関数との突き合わせ test で意味を固定。worker の張り替え (恒久策) は別に残す
