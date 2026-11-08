@@ -47,7 +47,9 @@ def _both(value, source, main_index, stf, rtf, age):
 
 
 def _ref(stamps, tz="UTC"):
-    idx = pd.DatetimeIndex(stamps, tz=tz)
+    idx = pd.DatetimeIndex(stamps)
+    if idx.tz is None and tz is not None:
+        idx = idx.tz_localize(tz)
     return pd.DataFrame({"close": np.arange(len(idx), dtype=float)}, index=idx)
 
 
@@ -71,7 +73,7 @@ def test_random_inputs_match_per_row_alignment(seed):
     n_ref = int(rng.integers(0, 60))
     offs = rng.choice(500, size=n_ref, replace=False) * 900  # 15m grid, no duplicates
     ref_idx = base + pd.to_timedelta(np.sort(offs) if seed % 3 else offs, unit="s")
-    ref = _ref(ref_idx)
+    ref = _ref(ref_idx.tz_convert(["UTC", "Asia/Tokyo", "America/New_York"][seed % 3]), tz=None)
     if seed % 5 == 0 and n_ref > 4:
         ref = ref.drop(ref.index[rng.integers(0, n_ref, size=2)])
     value = ref["close"].copy()
@@ -98,11 +100,10 @@ def test_end_equal_to_decision_is_eligible_and_one_second_later_is_not():
 
 
 def test_age_equal_to_max_is_fresh_and_one_second_over_is_stale():
-    ref = _ref(["2026-10-27T08:00:00Z"])  # ends 09:00
-    fresh = _both(ref["close"], ref, pd.DatetimeIndex(["2026-10-27T10:00:00Z"]),
-                  "1h", "1h", 7200)
-    stale = _both(ref["close"], ref, pd.DatetimeIndex(["2026-10-27T10:00:00Z"]),
-                  "1h", "1h", 3599)
+    ref = _ref(["2026-10-27T08:00:00Z"])  # ends 09:00, decision 11:00 -> age 7200
+    main = pd.DatetimeIndex(["2026-10-27T10:00:00Z"])
+    fresh = _both(ref["close"], ref, main, "1h", "1h", 7200)
+    stale = _both(ref["close"], ref, main, "1h", "1h", 7199)
     assert fresh.iloc[0] == 0.0 and np.isnan(stale.iloc[0])
 
 
@@ -138,3 +139,78 @@ def test_empty_main_and_empty_reference():
     out = _both(empty["close"], empty, _main("2026-10-27T10:00:00Z", 3, "1h"),
                 "1h", "1h", 3600)
     assert out.isna().all()
+
+
+def test_nat_in_main_index_raises_like_before():
+    ref = _ref(["2026-10-27T09:00:00Z"])
+    main = pd.DatetimeIndex(["2026-10-27T10:00:00Z", pd.NaT, "2026-10-27T12:00:00Z"])
+    assert _both(ref["close"], ref, main, "1h", "1h", 3600) is None
+
+
+def test_nat_in_reference_index_matches_before():
+    idx = pd.DatetimeIndex(["2026-10-27T08:00:00Z", pd.NaT, "2026-10-27T09:00:00Z"])
+    ref = pd.DataFrame({"close": [0.0, 1.0, 2.0]}, index=idx)
+    _both(ref["close"], ref, _main("2026-10-27T09:00:00Z", 4, "1h"), "1h", "1h", 7200)
+
+
+@pytest.mark.parametrize("tz", ["Asia/Tokyo", "America/New_York", "Europe/London"])
+def test_non_utc_reference_tz_matches_before(tz):
+    ref = _ref(pd.date_range("2026-10-27T00:00:00Z", periods=10, freq="h").tz_convert(tz))
+    _both(ref["close"], ref, _main("2026-10-27T02:00:00Z", 12, "1h"), "1h", "1h", 3600)
+
+
+@pytest.mark.parametrize("tz,start", [("America/New_York", "2026-11-01T03:00:00Z"),
+                                      ("Europe/London", "2026-10-25T21:00:00Z"),
+                                      ("America/New_York", "2026-03-08T03:00:00Z")])
+def test_bars_across_dst_change_match_before(tz, start):
+    ref = _ref(pd.date_range(start, periods=30, freq="h", tz="UTC").tz_convert(tz))
+    main = _main(start, 40, "1h", tz=tz)
+    for stf, rtf in (("1h", "1h"), ("1h", "4h"), ("4h", "1h")):
+        _both(ref["close"], ref, main[::1], stf, rtf, 14400)
+    _both(ref["close"], ref, _main(start, 10, "1D", tz=tz), "1h", "1h", 86400)
+
+
+@pytest.mark.parametrize("make", [lambda n: np.arange(n, dtype="int64"),
+                                  lambda n: np.arange(n) % 2 == 0,
+                                  lambda n: np.arange(n, dtype="int32"),
+                                  lambda n: np.arange(n, dtype="float32")])
+def test_bool_and_int_value_dtypes_match_before(make):
+    ref = _ref(pd.date_range("2026-10-27T00:00:00Z", periods=10, freq="h"))
+    value = pd.Series(make(10), index=ref.index)
+    _both(value, ref, _main("2026-10-27T02:00:00Z", 12, "1h"), "1h", "1h", 3600)
+
+
+def test_value_with_duplicate_index_is_refused():
+    ref = _ref(["2026-10-27T08:00:00Z", "2026-10-27T09:00:00Z"])
+    value = pd.Series([1.0, 2.0, 3.0], index=ref.index[[0, 1, 1]])
+    with pytest.raises(ValueError, match="unique"):
+        _new(value, source=ref, main_index=_main("2026-10-27T10:00:00Z", 2, "1h"),
+             strategy_timeframe="1h", reference_timeframe="1h", max_age_seconds=3600)
+
+
+@pytest.mark.parametrize("values", [[pd.NA, 1.0], ["a", "b"], [None, 1.0]])
+def test_value_with_object_dtype_is_refused(values):
+    ref = _ref(["2026-10-27T08:00:00Z", "2026-10-27T09:00:00Z"])
+    value = pd.Series(values, index=ref.index, dtype=object)
+    with pytest.raises(ValueError, match="numeric"):
+        _new(value, source=ref, main_index=_main("2026-10-27T10:00:00Z", 2, "1h"),
+             strategy_timeframe="1h", reference_timeframe="1h", max_age_seconds=3600)
+
+
+def test_worker_contract_hands_over_unique_float64_series():
+    """Equivalence with the per-row form holds for inputs the plugin contract admits:
+    a float64 Series on the frame's own index.  A duplicated frame index is refused
+    by the alignment itself.  If the contract loosens, this goes red."""
+    from agentic_fx.core.plugin_contract import validate_indicator_result
+
+    ref = _ref(pd.date_range("2026-10-27T00:00:00Z", periods=6, freq="h"))
+    for raw in (ref["close"].astype("int64"), ref["close"].astype(object),
+                ref["close"].where(ref["close"] > 2)):
+        out = validate_indicator_result({"v": raw}, df_index=ref.index, outputs=["v"])["v"]
+        assert out.dtype == np.float64 and out.index.is_unique
+        _both(out, ref, _main("2026-10-27T02:00:00Z", 8, "1h"), "1h", "1h", 3600)
+    dup = ref.iloc[[0, 1, 1]]
+    with pytest.raises(ValueError, match="duplicates"):
+        align_reference_rows(dup.index, main_index=_main("2026-10-27T05:00:00Z", 2, "1h"),
+                             strategy_timeframe="1h", reference_timeframe="1h",
+                             max_age_seconds=3600)

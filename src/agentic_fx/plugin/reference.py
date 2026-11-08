@@ -154,7 +154,7 @@ def align_reference_rows(reference_index: pd.Index, *, main_index: pd.DatetimeIn
     """
     import numpy as np
 
-    if len(main_index) and main_index.tz is None:
+    if len(main_index) and (main_index.tz is None or main_index.hasnans):
         raise ValueError("strategy_start must be timezone-aware")
     index = reference_index.sort_values()
     if len(main_index) == 0:

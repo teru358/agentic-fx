@@ -164,10 +164,19 @@ def _write_line(fd: int, obj: dict[str, Any]) -> None:
 
 
 def _align_indicator_to_main(value, *, rows, main_index):
-    """Spread ``value`` onto ``main_index`` using positions from ``align_reference_rows``."""
+    """Spread ``value`` onto ``main_index`` using positions from ``align_reference_rows``.
+
+    ``value`` must have a unique index and a numeric or bool dtype (the plugin
+    contract hands over a float64 Series on the frame's own index); anything else
+    is refused rather than silently aligned differently.
+    """
     import numpy as np
     import pandas as pd
 
+    if not value.index.is_unique:
+        raise ValueError("indicator series index must be unique")
+    if not pd.api.types.is_numeric_dtype(value.dtype):
+        raise ValueError(f"indicator series dtype must be numeric, got {value.dtype}")
     index, positions = rows
     out = np.full(len(main_index), np.nan, dtype="float64")
     hit = positions >= 0
