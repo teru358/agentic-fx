@@ -530,6 +530,14 @@ class WebClient(_Client):
         """承認の変更内容 (構造化 diff と申告)。bot は呼ばない。"""
         return self._get(f"/v1/approvals/{_int_id(approval_id)}/change")
 
+    def plugins(self) -> Reply:
+        """plugin の一覧 (種別・3 つの軸の状態・依存・有用性)。"""
+        return self._get("/v1/plugins")
+
+    def plugin(self, name: str) -> Reply:
+        """plugin 1 件の詳細。名前は loader の文法で照合し、decode しない。"""
+        return self._get(f"/v1/plugins/{_plugin_name(name)}")
+
     def log(self, *, n: int = 100) -> Reply:
         return self._get("/v1/log", n=n)
 
@@ -565,6 +573,15 @@ def _actor_of(job: DecisionJob) -> Actor:
     if not isinstance(job.job_id, str) or _JOB_ID.fullmatch(job.job_id) is None:
         raise ValueError("job id")
     return job.actor
+
+
+_PLUGIN_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+def _plugin_name(value: str) -> str:
+    if type(value) is not str or _PLUGIN_NAME.fullmatch(value) is None:
+        raise ValueError("plugin name")
+    return value
 
 
 def _int_id(value: int) -> str:

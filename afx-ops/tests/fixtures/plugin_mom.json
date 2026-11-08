@@ -1,0 +1,63 @@
+{
+ "display_timezone": "Asia/Tokyo",
+ "plugin": {
+  "admission": {
+   "alias": null,
+   "detail": null,
+   "reason": null,
+   "state": "loaded"
+  },
+  "dependencies": [
+   {
+    "alias": "fast",
+    "pin": "5bf58e23cba8727a080f31023a0a02a5397e2029f61eb6ac4ff3a04d085a67e5",
+    "plugin": "rsi",
+    "state": "match"
+   }
+  ],
+  "dependencies_set_state": null,
+  "dependents": [],
+  "entity": {
+   "artifact_hash": "79124b7469170b355d0c1389f69dd4855b034d29f61d41e375ad526ea085edc4",
+   "content_hash": "1ea4bf764a8617615150cc991f520ffc93681ded62e1d9301fd7471ee24a73f4",
+   "reason": null,
+   "state": "symlink"
+  },
+  "history": [
+   {
+    "artifact_hash": "79124b7469170b355d0c1389f69dd4855b034d29f61d41e375ad526ea085edc4",
+    "content_hash": "1ea4bf764a8617615150cc991f520ffc93681ded62e1d9301fd7471ee24a73f4",
+    "created_at": "2026-11-01T00:00:03+00:00",
+    "decided_at": "2026-11-01T00:00:04+00:00",
+    "id": 2,
+    "kind": "strategy",
+    "mission_id": 7,
+    "origin": "staging",
+    "status": "approved"
+   }
+  ],
+  "history_total": 1,
+  "issues": [],
+  "kind": "strategy",
+  "name": "mom",
+  "open_ops": [],
+  "pending": [],
+  "pending_count": 0,
+  "usefulness": null,
+  "versions": [
+   {
+    "approval_id": 2,
+    "artifact_hash": "79124b7469170b355d0c1389f69dd4855b034d29f61d41e375ad526ea085edc4",
+    "content_hash": "1ea4bf764a8617615150cc991f520ffc93681ded62e1d9301fd7471ee24a73f4",
+    "is_live": true,
+    "status": "approved"
+   }
+  ]
+ },
+ "sources": {
+  "journal": "ok",
+  "live": "ok",
+  "pending": "ok"
+ },
+ "unknown_submissions": 1
+}

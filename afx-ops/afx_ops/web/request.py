@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from urllib.parse import parse_qsl
 
 from afx_ops.api_client import ApiError, with_detail
-from afx_ops.web import auth, render
+from afx_ops.web import auth, plugin_pages, render
 from afx_ops.web.headers import response_headers
 from afx_ops.web.routes import RouteMatch, resolve_route
 
@@ -215,6 +215,11 @@ def _check_reply_shape(route: str, data: dict) -> None:
         valid = type(data.get("lines", [])) is list and type(data.get("log", [])) is list
     elif route == "activity":
         valid = type(data.get("lines", [])) is list
+    elif route == "plugins":
+        valid = (_list_of(data.get("plugins"), dict) and type(data.get("sources", {})) is dict
+                 and (not data.get("invalid_pending") or type(data["invalid_pending"]) is list))
+    elif route == "plugin":
+        valid = type(data.get("plugin")) is dict and type(data["plugin"].get("name")) is str
     else:
         valid = False
     if not valid:
@@ -293,6 +298,14 @@ def _invoke(match: RouteMatch, query: dict[str, str], client, report: _Reporter)
         if category is not None and category not in _ACTIVITY_CATEGORIES:
             raise _Reject(400)
         return _call(report, client.activity, n=n, category=category), render.render_activity
+    if method == "plugins":
+        if query:
+            raise _Reject(400)
+        return _call(report, client.plugins), plugin_pages.render_plugins
+    if method == "plugin":
+        if query:
+            raise _Reject(400)
+        return _call(report, client.plugin, match.values["name"]), plugin_pages.render_plugin
     raise _Reject(404)
 
 
@@ -403,6 +416,9 @@ def handle_request(request: Request | bytes, client, *,
             raise _Reject(400)
         report = _Reporter(match.route.client_method, report_upstream)
         reply, renderer = _invoke(match, request.query, client, report)
+        if (match.route.client_method == "plugin" and getattr(reply, "status", None) == 404
+                and getattr(reply, "code", None) == "not_found"):
+            return _error(404, head=head)
         if getattr(reply, "status", None) != 200 or getattr(reply, "code", None) is not None or type(getattr(reply, "data", None)) is not dict:
             _report_bad_reply(reply, report)
             return _error(502, head=head)

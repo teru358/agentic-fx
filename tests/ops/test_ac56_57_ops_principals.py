@@ -83,6 +83,7 @@ def test_ac56_every_route_is_allowed_only_by_the_spec_scope(api5, principal):
     for route in ROUTES:
         path = route.pattern.pattern.strip("^$")
         path = path.replace("(?P<id>[^/]+)", "999999").replace("(?P<order_id>[^/]+)", "999999")
+        path = path.replace("(?P<name>[^/]+)", "p1")
         body = {"payload_sha256": "0" * 64, "expected_generation": 0, "question": "q",
                 "idea": "i", "text": "t", "acknowledge": True, "expected_attempts": 0,
                 "expected_last_attempt_at": None}

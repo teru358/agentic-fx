@@ -1,0 +1,48 @@
+{
+ "display_timezone": "Asia/Tokyo",
+ "plugin": {
+  "admission": {
+   "alias": null,
+   "detail": null,
+   "reason": null,
+   "state": "none"
+  },
+  "dependencies": [],
+  "dependencies_set_state": null,
+  "dependents": [],
+  "entity": {
+   "artifact_hash": null,
+   "content_hash": null,
+   "reason": null,
+   "state": "absent"
+  },
+  "history": [
+   {
+    "artifact_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "content_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "created_at": "2026-11-01T00:00:13+00:00",
+    "decided_at": "2026-11-01T00:00:14+00:00",
+    "id": 7,
+    "kind": "signal",
+    "mission_id": null,
+    "origin": "human",
+    "status": "rejected"
+   }
+  ],
+  "history_total": 1,
+  "issues": [],
+  "kind": "signal",
+  "name": "ghost",
+  "open_ops": [],
+  "pending": [],
+  "pending_count": 0,
+  "usefulness": null,
+  "versions": []
+ },
+ "sources": {
+  "journal": "ok",
+  "live": "ok",
+  "pending": "ok"
+ },
+ "unknown_submissions": 1
+}

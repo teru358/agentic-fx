@@ -16,6 +16,7 @@ composition root (service / 改善 mission / 人間 CLI / 承認回廊) は
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -273,6 +274,63 @@ def resolve_indicator_deps(meta: PluginMeta, inventory: ApprovedInventory, *,
         except FamilyKeyTooLong as exc:
             raise IndicatorResolutionError(None, "family_key_too_long") from exc
     return resolved
+
+
+# resolver が返す失敗の語の全体。これ以外の語は一覧では「不明」に倒す。
+RESOLUTION_REASONS = frozenset({
+    "not_found", "not_indicator", "outputs_undeclared", "over_max_bars_limit",
+    "unpinned", "pin_mismatch", "params_not_json_safe", "reference_timeframe_invalid",
+    "symbol_not_watched", "watch_symbol_too_long", "max_age_invalid", "max_age_too_large",
+    "reference_window_exceeds_max_bars", "handshake_too_large", "family_key_too_long",
+})
+STATE_MATCH = "match"
+STATE_UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class AliasState:
+    alias: str
+    plugin: str
+    pin: str | None
+    state: str
+
+
+@dataclass(frozen=True, slots=True)
+class DependencyStates:
+    """alias ごとの状態 (config の宣言順) と、alias に帰せない集合全体の失敗 (なければ None)。"""
+    aliases: tuple[AliasState, ...]
+    set_state: str | None = None
+
+
+def _state_of(error: BaseException) -> str:
+    reason = getattr(error, "reason", None)
+    if isinstance(error, IndicatorResolutionError) and reason in RESOLUTION_REASONS:
+        return reason
+    return STATE_UNKNOWN
+
+
+def enumerate_indicator_states(meta: PluginMeta, inventory: ApprovedInventory, *,
+                               settings) -> DependencyStates:
+    """`meta.indicators` の各 alias が `pin_mode="require"` の resolver で通るかを、
+    例外を投げずに列挙する。判定の規則は `resolve_indicator_deps` を 1 alias ずつ
+    呼んで得るので、ここには複製しない。全 alias が通ったあとで集合全体を解決し直し、
+    alias に帰せない失敗 (handshake の大きさ等) だけを `set_state` に出す。"""
+    states: list[AliasState] = []
+    for ref in meta.indicators:
+        single = dataclasses.replace(meta, indicators=(ref,))
+        try:
+            resolve_indicator_deps(single, inventory, settings=settings, pin_mode="require")
+            state = STATE_MATCH
+        except Exception as exc:  # noqa: BLE001 — 一覧は 1 本の失敗で止めない
+            state = _state_of(exc)
+        states.append(AliasState(ref.alias, ref.plugin, ref.pin, state))
+    set_state = None
+    if states and all(item.state == STATE_MATCH for item in states):
+        try:
+            resolve_indicator_deps(meta, inventory, settings=settings, pin_mode="require")
+        except Exception as exc:  # noqa: BLE001
+            set_state = _state_of(exc)
+    return DependencyStates(tuple(states), set_state)
 
 
 def lock_config(candidate_dir: Path, pins: Mapping[str, str]
