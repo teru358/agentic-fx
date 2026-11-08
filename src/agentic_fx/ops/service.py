@@ -45,7 +45,8 @@ from agentic_fx.policy_projection import (POLICY_TEXT_LIMIT, MigrationRecordUnkn
 from . import base_view, redactor
 from .activity import SuppressedActivity
 from .audit import AcceptedRequest, AuditStore, IdempotencyReplay
-from .contracts import (ACTOR_PRINCIPALS, PRINCIPAL_SCOPES, Caller, ErrorCode, OpsError,
+from .contracts import (ACTOR_PRINCIPALS, IMPROVE_RUNS_DEFAULT_LIMIT,
+                        IMPROVE_RUNS_MAX_LIMIT, PRINCIPAL_SCOPES, Caller, ErrorCode, OpsError,
                         Principal, Scope, ShellCaller, assert_authorized,
                         validate_asserted_actor)
 from .events import EventSchemaError, EventStore
@@ -87,9 +88,6 @@ class Endpoint:
 class PolicyProjectionUnknown(RuntimeError):
     """A committed policy mutation may not have reached its file projection."""
 
-
-IMPROVE_RUNS_DEFAULT_LIMIT = 50
-IMPROVE_RUNS_MAX_LIMIT = 100
 
 ENDPOINTS: dict[str, Endpoint] = {e.code: e for e in (
     Endpoint("status", "GET /v1/status", Scope.STATUS_READ, False),

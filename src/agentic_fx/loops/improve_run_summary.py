@@ -24,7 +24,8 @@ from agentic_fx import improve_notice_codes as notice_codes
 from agentic_fx.loops.approval_facts import TRUNCATION_SUFFIX, display_text
 from agentic_fx.loops.summary import IMPROVE_OUTPUT_SCHEMA
 from agentic_fx.plugin.logic_identity import FAMILY_KEY_MAX_BYTES
-from agentic_fx.plugin.strategy_gate import _floor_fail_items, trades_per_eval_bar
+from agentic_fx.plugin.loader import is_canonical_plugin_name
+from agentic_fx.plugin.strategy_gate import floor_fail_items, trades_per_eval_bar
 from agentic_fx.store import improve_run_summaries as summaries_store
 from agentic_fx.store.improve_run_summaries import (
     STATE_BUILD_FAILED, STATE_EMPTY, STATE_OK, SummaryRecord)
@@ -131,7 +132,20 @@ ITEMS_SCHEMA: dict = _object({
 }, required=())
 
 # 項目を落とす順 (16 KiB を超えたとき、先に落とすものから)。
-_DROP_ORDER = ("explanation", "handoff", "floor.pairs", "tried.indicators")
+# `comparison.pairs` は後ろの pair から 1 本ずつ、収まるところまで。
+_DROP_ORDER = ("explanation", "handoff", "floor.pairs", "tried.indicators",
+               "comparison.pairs", "hypothesis")
+
+# 形の検査器。schema の検査 (`check_schema`) と作成は import 時に 1 度だけ。
+jsonschema.Draft202012Validator.check_schema(ITEMS_SCHEMA)
+jsonschema.Draft202012Validator.check_schema(IMPROVE_OUTPUT_SCHEMA)
+_ITEMS_VALIDATOR = jsonschema.Draft202012Validator(ITEMS_SCHEMA)
+_OUTPUT_VALIDATOR = jsonschema.Draft202012Validator(IMPROVE_OUTPUT_SCHEMA)
+
+
+def validate_items(items: object) -> None:
+    """`items` が `ITEMS_SCHEMA` に合わなければ `jsonschema.ValidationError`。"""
+    _ITEMS_VALIDATOR.validate(items)
 
 
 # ---------------------------------------------------------------- 材料
@@ -238,27 +252,39 @@ def _family_name(value: object) -> str | None:
 
 
 def _plugin_name(value: object) -> str | None:
-    from agentic_fx.plugin import loader as plugin_loader
-    if (isinstance(value, str)
-            and plugin_loader._PLUGIN_NAME_RE.fullmatch(value) is not None):
+    if isinstance(value, str) and is_canonical_plugin_name(value):
         return value
     return None
 
 
+def _sanitized(value: object) -> object:
+    """辞書・リストの構造を保ったまま、文字列の葉だけに `safe_text` を掛けた
+    写しを返す。それ以外の値と引数は変えない。"""
+    if isinstance(value, str):
+        return safe_text(value)
+    if isinstance(value, dict):
+        return {key: _sanitized(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitized(item) for item in value]
+    return value
+
+
 def output_for_storage(output: object) -> dict | None:
     """`missions.output_json` に入れる agent の元の出力。辞書でなければ
-    (出力が無い経路) None。直列化した大きさが 64 KiB を超えるときは、
-    本文を保存せず大きさだけを記す。"""
+    (出力が無い経路) None。文字列の葉は `safe_text` で URL と秘密の
+    パラメータを落とす (構造は保つ)。直列化した大きさが 64 KiB を超える
+    ときは、本文を保存せず大きさだけを記す。"""
     if not isinstance(output, dict):
         return None
     try:
-        size = len(json.dumps(output, ensure_ascii=False).encode("utf-8"))
+        stored = _sanitized(output)
+        size = len(json.dumps(stored, ensure_ascii=False).encode("utf-8"))
     except (TypeError, ValueError, RecursionError):
         _log.warning("improve output is not serializable", exc_info=True)
         return None
     if size > OUTPUT_JSON_MAX_BYTES:
         return {"truncated": True, "bytes": size}
-    return output
+    return stored
 
 
 # ---------------------------------------------------------------- 材料の作り方
@@ -323,14 +349,9 @@ def floor_material(settings: Any, *, in_sample: dict | None,
 def _measured_stage(settings: Any, scope: str, per_pair: dict
                     ) -> StageMaterial:
     failed: dict[str, list[str]] = {}
-    for item in _floor_fail_items(per_pair, settings=settings, scope=scope):
+    for item in floor_fail_items(per_pair, settings=settings, scope=scope):
         failed.setdefault(item.pair, []).append(item.kind)
     return StageMaterial(scope, "measured", dict(per_pair), failed)
-
-
-def comparison_material(comparison: object) -> dict | None:
-    """配備中の版との比較の材料 (`StrategyGateVerdict.comparison`)。"""
-    return comparison if isinstance(comparison, dict) else None
 
 
 # ---------------------------------------------------------------- 組み立て
@@ -347,7 +368,7 @@ def _claims(output: object, level: str) -> dict:
     if level == "none" or not isinstance(output, dict):
         return {}
     try:
-        jsonschema.validate(output, IMPROVE_OUTPUT_SCHEMA)
+        _OUTPUT_VALIDATOR.validate(output)
     except jsonschema.ValidationError:
         return {}
     selected = output["selected"]
@@ -389,17 +410,18 @@ def _floor_item(material: FloorMaterial, allowed_pairs: list[str]) -> dict:
     failed_conditions: list[str] = []
     failed_pair_count = 0
     for stage in material.stages:
-        rows = [_pair_row(pair, metrics, stage.failed.get(pair, []))
+        failed = {pair: kinds for pair, kinds in stage.failed.items()
+                  if pair in allowed_pairs}
+        rows = [_pair_row(pair, metrics, failed.get(pair, []))
                 for pair, metrics in stage.pairs.items()
                 if pair in allowed_pairs][:limit]
         stages.append({"stage": stage.stage, "state": stage.state,
                        "pairs": rows})
-        if failed_stage is None and stage.failed:
+        if failed_stage is None and failed:
             failed_stage = stage.stage
-            kinds = {kind for kinds in stage.failed.values() for kind in kinds}
+            kinds = {kind for kinds in failed.values() for kind in kinds}
             failed_conditions = [k for k in FAIL_KINDS if k in kinds]
-            failed_pair_count = len(
-                [pair for pair in stage.failed if pair in allowed_pairs])
+            failed_pair_count = len(failed)
     return {
         "thresholds": {
             "min_pf": _number(thresholds.get("min_pf")),
@@ -449,10 +471,11 @@ def prepare(material: SummaryMaterial, plan: SummaryPlan, *,
     整形の途中で例外が出たら `failed` で返す (終端は止めない)。"""
     output = output_for_storage(material.output)
     try:
-        pairs = list(allowed_pairs)
+        pairs = [pair for pair in allowed_pairs if _name(pair) is not None]
         items: dict = _claims(material.output, plan.claims)
-        if plan.tried != "none" and material.plugin_name is not None:
-            tried: dict = {"plugin": material.plugin_name, "kind": None,
+        plugin = _plugin_name(material.plugin_name)
+        if plan.tried != "none" and plugin is not None:
+            tried: dict = {"plugin": plugin, "kind": None,
                            "origin": None, "indicators": []}
             meta = material.candidate if plan.tried == "full" else None
             if meta is not None:
@@ -513,6 +536,12 @@ def _drop(items: dict, what: str) -> bool:
             return False
         tried["indicators"] = []
         return True
+    if what == "comparison.pairs":
+        comparison = items.get("comparison")
+        if not comparison or not comparison["pairs"]:
+            return False
+        comparison["pairs"].pop()
+        return True
     return items.pop(what, None) is not None
 
 
@@ -522,21 +551,21 @@ def _dump(items: dict) -> str:
 
 
 def serialize(prepared: PreparedSummary) -> SummaryRecord:
-    """最終の直列化。形を検査し、16 KiB を超えるときは説明 → 申し送り →
-    pair の順に落とす。検査や直列化に失敗したら `build_failed`。材料が
+    """最終の直列化。形を検査し、16 KiB を超えるときは `_DROP_ORDER` の順に
+    落とす。検査や直列化に失敗したら `build_failed`。材料が
     1 つも無ければ `empty`。"""
     if prepared.failed:
         return SummaryRecord(STATE_BUILD_FAILED, "{}")
     try:
         items = json.loads(_dump(prepared.items))
-        jsonschema.validate(items, ITEMS_SCHEMA)
+        validate_items(items)
         if not items:
             return SummaryRecord(STATE_EMPTY, "{}")
         text = _dump(items)
         for what in _DROP_ORDER:
-            if len(text.encode("utf-8")) <= SUMMARY_MAX_BYTES:
-                break
-            if _drop(items, what):
+            while len(text.encode("utf-8")) > SUMMARY_MAX_BYTES:
+                if not _drop(items, what):
+                    break
                 text = _dump(items)
         if len(text.encode("utf-8")) > SUMMARY_MAX_BYTES:
             return SummaryRecord(STATE_BUILD_FAILED, "{}")
@@ -560,7 +589,7 @@ def dto_of(row: Any) -> dict | None:
     if state == STATE_OK and version == summaries_store.SUMMARY_VERSION:
         try:
             parsed = json.loads(row["summary_json"])
-            jsonschema.validate(parsed, ITEMS_SCHEMA)
+            validate_items(parsed)
             items = parsed
         except (ValueError, RecursionError, jsonschema.ValidationError):
             state = STATE_BUILD_FAILED

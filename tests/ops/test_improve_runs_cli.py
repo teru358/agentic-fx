@@ -126,3 +126,15 @@ def test_route_dispatch_validates_the_limit_before_the_service(ops_env):
 def test_the_post_route_on_the_same_path_is_still_the_improve_start():
     route, _ = _match("POST", "/v1/improve/runs", "uds")
     assert route.handler == "improve"
+
+
+def test_the_cli_bounds_are_the_servers_constants(monkeypatch):
+    from agentic_fx.ops import service
+    assert client.IMPROVE_RUNS_DEFAULT_LIMIT is service.IMPROVE_RUNS_DEFAULT_LIMIT
+    assert client.IMPROVE_RUNS_MAX_LIMIT is service.IMPROVE_RUNS_MAX_LIMIT
+    monkeypatch.setattr(client, "IMPROVE_RUNS_DEFAULT_LIMIT", 4)
+    monkeypatch.setattr(client, "IMPROVE_RUNS_MAX_LIMIT", 6)
+    assert client.parse(["improve", "runs"]).args == [4]
+    assert client.parse(["improve", "runs", "--limit", "6"]).args == [6]
+    with pytest.raises(client.ClientError):
+        client.parse(["improve", "runs", "--limit", "7"])

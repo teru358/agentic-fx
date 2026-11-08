@@ -134,9 +134,9 @@ def test_floor_from_verdict_dicts_marks_failed_pairs_and_conditions():
 
 
 def test_floor_failed_items_agree_with_the_gates_own_judgement():
-    from agentic_fx.plugin.strategy_gate import _floor_fail_items
+    from agentic_fx.plugin.strategy_gate import floor_fail_items
     in_sample = {"USDJPY": _metrics(pf=0.4), "EURUSD": _metrics(trades=0)}
-    expected = {(i.pair, i.kind) for i in _floor_fail_items(
+    expected = {(i.pair, i.kind) for i in floor_fail_items(
         in_sample, settings=_SETTINGS, scope="in_sample")}
     floor = rs.floor_material(_SETTINGS, in_sample=in_sample, holdout={})
     item = _prepare(rs.SummaryMaterial(floor=floor), rs.PLAN_GATE_FAILED
@@ -350,14 +350,14 @@ def test_serialize_failure_is_build_failed_and_nothing_is_stored():
 
 def test_output_for_storage_boundary():
     small = {"k": "v"}
-    assert rs.output_for_storage(small) is small
+    assert rs.output_for_storage(small) == small
     assert rs.output_for_storage(None) is None
     assert rs.output_for_storage("not a dict") is None
     pad = rs.OUTPUT_JSON_MAX_BYTES - len(json.dumps({"k": ""}))
     exact = {"k": "a" * pad}
     assert len(json.dumps(exact, ensure_ascii=False).encode()) \
         == rs.OUTPUT_JSON_MAX_BYTES
-    assert rs.output_for_storage(exact) is exact
+    assert rs.output_for_storage(exact) == exact
     over = {"k": "a" * (pad + 1)}
     assert rs.output_for_storage(over) == {
         "truncated": True, "bytes": rs.OUTPUT_JSON_MAX_BYTES + 1}
@@ -395,3 +395,207 @@ def test_dto_of_never_returns_items_that_break_the_shape():
     future = rs.dto_of(_row(version=2, items={"observation": "x"}))
     assert future["version"] == 2 and future["items"] == {}
     assert future["state"] == "build_failed"
+
+
+# --- validator の使い回し ------------------------------------------------------
+
+def test_shape_checks_do_not_rebuild_a_validator_per_call(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("jsonschema.validate rebuilds the validator")
+
+    monkeypatch.setattr(jsonschema, "validate", boom)
+    material = rs.SummaryMaterial(output=_output(), plugin_name="cand",
+                                  observation_text="obs")
+    prepared = _prepare(material, rs.PLAN_SUBMITTED)
+    assert "hypothesis" in prepared.items
+    record = rs.serialize(prepared)
+    assert record.state == store.STATE_OK
+    dto = rs.dto_of({"summary_version": 1, "state": "ok",
+                     "summary_json": record.summary_json})
+    assert dto["state"] == "ok" and "hypothesis" in dto["items"]
+    broken = rs.dto_of(_row(items={"observation": 3}))
+    assert broken["state"] == "build_failed"
+
+
+# --- 16 KiB を超えるときの削り順 ------------------------------------------------
+
+def _many_pairs(n=rs.PAIR_ROWS_MAX):
+    pairs = [f"{'P' * 61}{i:03d}" for i in range(n)]
+    entry = {"verdict": "improved",
+             "candidate": _metrics(pf=1.123456, avg_r=0.123456),
+             "deployed": _metrics(pf=1.234567, avg_r=0.234567)}
+    comparison = {"mode": "enforce", "verdict": "improved",
+                  "reason": "holdout_exceeds",
+                  "stages": {"holdout": {p: dict(entry) for p in pairs}}}
+    floor = rs.floor_material(_SETTINGS, in_sample={pairs[0]: _metrics()},
+                              holdout=None)
+    output = _output(selected={"backlog_id": 3, "idea": "あ" * 500},
+                     selection_rationale="い" * 500)
+    material = rs.SummaryMaterial(output=output, plugin_name="cand",
+                                  floor=floor, comparison=comparison)
+    prepared = rs.with_handoff(
+        _prepare(material, rs.PLAN_SUBMITTED, pairs=pairs),
+        {"family_key": "indicator:rsi@1h", "attempts": 2,
+         "outcomes": {"pending": 2}})
+    return pairs, prepared
+
+
+def _fitted_size(prepared, *, pairs_kept, hypothesis):
+    items = json.loads(rs._dump(prepared.items))
+    for key in ("explanation", "handoff"):
+        items.pop(key)
+    for stage in items["floor"]["stages"]:
+        stage["pairs"] = []
+    items["tried"]["indicators"] = []
+    items["comparison"]["pairs"] = items["comparison"]["pairs"][:pairs_kept]
+    if not hypothesis:
+        items.pop("hypothesis")
+    return len(rs._dump(items).encode("utf-8"))
+
+
+def test_many_comparison_pairs_do_not_turn_the_summary_into_build_failed():
+    pairs, prepared = _many_pairs()
+    assert _fitted_size(prepared, pairs_kept=64, hypothesis=True) \
+        > rs.SUMMARY_MAX_BYTES
+    record = rs.serialize(prepared)
+    assert record.state == store.STATE_OK
+    assert len(record.summary_json.encode("utf-8")) <= rs.SUMMARY_MAX_BYTES
+    items = json.loads(record.summary_json)
+    assert items["hypothesis"]["backlog_id"] == 3
+    assert items["floor"]["thresholds"] and items["tried"]["plugin"] == "cand"
+    kept = [row["pair"] for row in items["comparison"]["pairs"]]
+    assert 0 < len(kept) < len(pairs) and kept == pairs[:len(kept)]
+    jsonschema.validate(items, rs.ITEMS_SCHEMA)
+
+
+def test_comparison_pairs_are_cut_from_the_back_only_as_far_as_needed(
+        monkeypatch):
+    pairs, prepared = _many_pairs()
+    cap = _fitted_size(prepared, pairs_kept=10, hypothesis=True)
+    assert _fitted_size(prepared, pairs_kept=11, hypothesis=True) > cap
+    monkeypatch.setattr(rs, "SUMMARY_MAX_BYTES", cap)
+    items = json.loads(rs.serialize(prepared).summary_json)
+    assert [row["pair"] for row in items["comparison"]["pairs"]] == pairs[:10]
+    assert "hypothesis" in items
+
+
+def test_the_hypothesis_is_dropped_after_every_comparison_pair(monkeypatch):
+    _pairs, prepared = _many_pairs()
+    cap = _fitted_size(prepared, pairs_kept=0, hypothesis=True)
+    assert _fitted_size(prepared, pairs_kept=0, hypothesis=False) < cap
+    monkeypatch.setattr(rs, "SUMMARY_MAX_BYTES", cap)
+    items = json.loads(rs.serialize(prepared).summary_json)
+    assert items["comparison"]["pairs"] == [] and "hypothesis" in items
+    monkeypatch.setattr(rs, "SUMMARY_MAX_BYTES", cap - 1)
+    items = json.loads(rs.serialize(prepared).summary_json)
+    assert "hypothesis" not in items and items["comparison"]["pairs"] == []
+    assert items["floor"]["thresholds"]
+
+
+# --- 保存する元の出力 ----------------------------------------------------------
+
+def test_output_for_storage_sanitizes_every_string_leaf_and_keeps_the_shape():
+    url = "https://leak.example/p?apikey=SECRET9"
+    output = {"a": f"x {url}", "n": 3, "f": 1.5, "b": True, "z": None,
+              "nested": {"list": [f"apikey=SECRET9 {url}", {"deep": url}, 2]}}
+    stored = rs.output_for_storage(output)
+    text = json.dumps(stored, ensure_ascii=False)
+    assert "SECRET9" not in text and "leak.example" not in text
+    assert stored["n"] == 3 and stored["f"] == 1.5 and stored["b"] is True
+    assert stored["z"] is None and stored["nested"]["list"][2] == 2
+    assert stored["a"] == "x <url>"
+    assert output["a"] == f"x {url}"  # 引数は変えない
+
+
+def test_output_for_storage_keeps_plain_text_and_whitespace_as_is():
+    output = {"k": "line1\n  line2\ttab", "n": [1, "あ"]}
+    assert rs.output_for_storage(output) == output
+
+
+def test_output_for_storage_too_deep_is_not_stored():
+    deep: dict = {}
+    node = deep
+    for _ in range(5000):
+        node["k"] = {}
+        node = node["k"]
+    assert rs.output_for_storage(deep) is None
+
+
+# --- 床の失敗は許す pair の集合から導く --------------------------------------------
+
+def test_floor_failures_of_pairs_outside_the_settings_are_not_reported():
+    bad = _metrics(pf=0.3)
+    floor = rs.floor_material(_SETTINGS, in_sample={"GBPJPY": bad},
+                              holdout=None)
+    item = _prepare(rs.SummaryMaterial(floor=floor),
+                    rs.PLAN_SUBMITTED).items["floor"]
+    assert (item["failed_stage"], item["failed_conditions"],
+            item["failed_pair_count"]) == (None, [], 0)
+
+
+def test_floor_failure_items_come_from_the_same_pair_set():
+    in_sample = {"GBPJPY": _metrics(pf=0.3),
+                 "USDJPY": _metrics(pf=1.5, avg_r=-0.1)}
+    floor = rs.floor_material(_SETTINGS, in_sample=in_sample, holdout=None)
+    item = _prepare(rs.SummaryMaterial(floor=floor),
+                    rs.PLAN_SUBMITTED).items["floor"]
+    assert item["failed_stage"] == "in_sample"
+    assert item["failed_conditions"] == ["avg_r"]
+    assert item["failed_pair_count"] == 1
+    # 外れた段の失敗だけが allowed の外なら、次の段の失敗を採る
+    holdout = {"USDJPY": _metrics(pf=0.3, avg_r=-0.1)}
+    floor = rs.floor_material(
+        _SETTINGS, in_sample={"GBPJPY": _metrics(pf=0.3)}, holdout=holdout)
+    item = _prepare(rs.SummaryMaterial(floor=floor),
+                    rs.PLAN_SUBMITTED).items["floor"]
+    assert (item["failed_stage"], item["failed_pair_count"]) == ("holdout", 1)
+    assert item["failed_conditions"] == ["pf"]
+
+
+# --- 名前の長さ ---------------------------------------------------------------
+
+def test_over_long_pair_and_plugin_names_are_left_out_not_a_build_failure():
+    long = "P" * (rs.NAME_LIMIT + 1)
+    pairs = ["USDJPY", long]
+    metrics = {"USDJPY": _metrics(), long: _metrics()}
+    comparison = {"mode": "enforce", "verdict": "improved",
+                  "reason": "holdout_exceeds",
+                  "stages": {"holdout": {p: {
+                      "verdict": "improved", "candidate": _metrics(),
+                      "deployed": _metrics()} for p in pairs}}}
+    material = rs.SummaryMaterial(
+        output=_output(), plugin_name="x" * (rs.NAME_LIMIT + 1),
+        floor=rs.floor_material(_SETTINGS, in_sample=metrics, holdout=metrics),
+        comparison=comparison)
+    prepared = _prepare(material, rs.PLAN_SUBMITTED, pairs=pairs)
+    record = rs.serialize(prepared)
+    assert record.state == store.STATE_OK
+    items = json.loads(record.summary_json)
+    assert "tried" not in items
+    assert [r["pair"] for s in items["floor"]["stages"] for r in s["pairs"]] \
+        == ["USDJPY", "USDJPY"]
+    assert [r["pair"] for r in items["comparison"]["pairs"]] == ["USDJPY"]
+
+
+# --- 他 module の private 名に依存しない --------------------------------------------
+
+def test_the_summary_module_uses_only_public_names_of_other_modules():
+    import ast
+    tree = ast.parse(Path(rs.__file__).read_text(encoding="utf-8"))
+    private = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            private += [a.name for a in node.names if a.name.startswith("_")]
+        elif isinstance(node, ast.Attribute) and node.attr.startswith("_") \
+                and not node.attr.startswith("__") \
+                and isinstance(node.value, ast.Name) \
+                and node.value.id not in ("self", "cls"):
+            private.append(f"{node.value.id}.{node.attr}")
+    assert private == []
+
+
+def test_floor_fail_items_is_a_public_name_of_the_gate():
+    from agentic_fx.plugin import strategy_gate
+    items = strategy_gate.floor_fail_items(
+        {"USDJPY": _metrics(pf=0.3)}, settings=_SETTINGS, scope="in_sample")
+    assert [(i.pair, i.kind) for i in items] == [("USDJPY", "pf")]

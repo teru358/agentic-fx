@@ -1,4 +1,4 @@
-"""改善 mission 1 回ごとの要約 (`improve_run_summaries`) の書込みと読出し。
+"""改善 mission 1 回ごとの要約 (`improve_run_summaries`) の書込み。
 
 行は終端と同じ tx で 1 度だけ書き、後から変えない (UPDATE / DELETE は
 trigger が拒む)。中身 (`summary_json`) の組み立てと検査は
@@ -44,9 +44,3 @@ def insert(conn: sqlite3.Connection, mission_id: int, record: SummaryRecord,
         (mission_id, SUMMARY_VERSION, record.state, record.summary_json,
          now.astimezone(timezone.utc).isoformat()))
 
-
-def fetch(conn: sqlite3.Connection, mission_id: int) -> sqlite3.Row | None:
-    return conn.execute(
-        "SELECT mission_id, summary_version, state, summary_json, created_at "
-        "FROM improve_run_summaries WHERE mission_id=?",
-        (mission_id,)).fetchone()

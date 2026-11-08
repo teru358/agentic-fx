@@ -875,3 +875,54 @@ def test_only_the_summary_producers_and_readers_touch_the_table():
         "store/missions.py"]
     context = (src / "loops" / "improve_context.py").read_text(encoding="utf-8")
     assert "output_json" not in context and "summary_json" not in context
+
+
+# --- 保存する元の出力の無害化 / 材料づくりの失敗の記録 -------------------------------
+
+def test_output_json_never_keeps_a_keyed_url_or_token(improve_env):
+    app, root = improve_env
+    conn = app.conn_core
+    output = _observation_output(f"see {TOKEN}")
+    output["selection_rationale"] = f"why {TOKEN} apikey=SECRET9"
+    output["selected"]["idea"] = f"idea {TOKEN}"
+    loop, ctx, _ = _run(app, root, output)
+    raw = conn.execute("SELECT output_json FROM missions WHERE id=?",
+                       (ctx.mission_id,)).fetchone()[0]
+    assert "SECRET9" not in raw and "leak.example" not in raw
+    stored = json.loads(raw)
+    assert set(stored) == set(output)
+    assert stored["selected"]["backlog_id"] is None
+    assert stored["artifact"]["type"] == "observation"
+    assert stored["selection_rationale"].startswith("why <url>")
+
+
+def test_output_json_of_a_failed_mission_is_sanitized_too(improve_env):
+    app, root = improve_env
+    conn = app.conn_core
+    broken = {"selected": {"idea": f"half {TOKEN}"},
+              "extra": {"deep": [f"k apikey=SECRET9 {TOKEN}", 3, None]}}
+    loop, ctx, _ = _run(app, root, broken, status="failed")
+    raw = conn.execute("SELECT output_json FROM missions WHERE id=?",
+                       (ctx.mission_id,)).fetchone()[0]
+    assert "SECRET9" not in raw and "leak.example" not in raw
+    stored = json.loads(raw)
+    assert stored["extra"]["deep"][1:] == [3, None]
+
+
+def test_a_floor_material_failure_leaves_an_activity_row(improve_env):
+    app, root = improve_env
+    conn = app.conn_core
+
+    def boom(*a, **k):
+        raise RuntimeError("bad floor secret=SECRET9")
+
+    with patch.object(run_summary, "floor_material", boom):
+        loop, ctx, _ = _unprofitable(app, root)
+    assert conn.execute("SELECT status FROM missions WHERE id=?",
+                        (ctx.mission_id,)).fetchone()[0] == "completed"
+    log = (root / "logs" / "activity.log").read_text()
+    lines = [line for line in log.splitlines()
+             if "summary_material_failed" in line]
+    assert len(lines) == 1
+    assert f"mission_id={ctx.mission_id}" in lines[0]
+    assert "SECRET9" not in log

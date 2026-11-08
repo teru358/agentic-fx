@@ -108,6 +108,10 @@ ACTOR_PRINCIPALS: frozenset[Principal] = frozenset({Principal.OPS_BOT})
 _ACTOR_PATTERN = re.compile(r"discord:[0-9]{17,20}")
 ACTOR_MAX_BYTES = 28
 
+# `GET /v1/improve/runs` の limit の既定と上限。サーバーと CLI が同じ値を使う。
+IMPROVE_RUNS_DEFAULT_LIMIT = 50
+IMPROVE_RUNS_MAX_LIMIT = 100
+
 
 def validate_principal_scopes(table: dict[Principal, frozenset[Scope]] = PRINCIPAL_SCOPES) -> None:
     if set(table) != set(Principal):

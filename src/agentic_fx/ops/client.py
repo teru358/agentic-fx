@@ -49,7 +49,7 @@ from agentic_fx.setup.pending_text import (STEP_PARAMS, PendingStep, is_ident,
                                            parse_observed_at, render_pending_step)
 
 from . import base_view, change_limits, keys, redactor
-from .contracts import Principal
+from .contracts import IMPROVE_RUNS_DEFAULT_LIMIT, IMPROVE_RUNS_MAX_LIMIT, Principal
 from .events import EventCursor, EventPage
 from .tail import ACTIVITY_CATEGORIES
 from .trade_events import DROP_REASONS
@@ -1203,7 +1203,7 @@ def _parse_events(args: list[str]) -> list:
 
 
 def _parse_improve_runs(args: list[str]) -> list:
-    limit = 50
+    limit = IMPROVE_RUNS_DEFAULT_LIMIT
     rest = list(args)
     seen_limit = False
     while rest:
@@ -1213,7 +1213,7 @@ def _parse_improve_runs(args: list[str]) -> list:
             limit = _int_arg(rest.pop(0))
         else:
             raise ClientError(RC_USAGE, _usage())
-    if not 1 <= limit <= 100:
+    if not 1 <= limit <= IMPROVE_RUNS_MAX_LIMIT:
         raise ClientError(RC_USAGE, _usage())
     return [limit]
 

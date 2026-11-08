@@ -84,7 +84,7 @@ from agentic_fx.plugin.strategy_gate import (
     FLOOR_CONDITION_KINDS,
     _check_profitability_floor,
     _eval_timeframe as _strategy_gate_eval_timeframe,
-    _floor_fail_items,
+    floor_fail_items,
     evaluate_strategy_adoption_gate,
     floor_rule_text as _strategy_gate_floor_rule_text,
     floor_settings_kv,
@@ -1074,11 +1074,25 @@ class ImproveLoop:
             material.floor = run_summary.floor_material(
                 self._settings, in_sample=verdict.candidate_metrics,
                 holdout=verdict.holdout_metrics, rows=rows)
-            material.comparison = run_summary.comparison_material(
-                verdict.comparison)
+            comparison = verdict.comparison
+            material.comparison = (
+                comparison if isinstance(comparison, dict) else None)
         except Exception:  # noqa: BLE001
             _log.warning("floor material failed for mission_id=%s",
                          ctx.mission_id, exc_info=True)
+            self._write_activity_quietly(
+                "summary_material_failed",
+                f"mission_id={ctx.mission_id} part=floor")
+
+    def _write_activity_quietly(self, event: str, detail: str) -> None:
+        """要約の材料が欠けたことを activity に 1 行残す。書けなくても
+        終端は止めない。detail は固定の語と id だけにする。"""
+        if self._activity is None:
+            return
+        try:
+            self._activity.write(Category.IMPROVE, event, detail)
+        except Exception:  # noqa: BLE001
+            _log.warning("activity write failed: %s", event, exc_info=True)
 
     def _count_handoff(self, conn, ctx, family_key: str) -> dict | None:
         """この候補の族が次の mission の族別試行結果でどう見えるかを、
@@ -4772,7 +4786,7 @@ class ImproveLoop:
         Markdown を組み立てる。in_sample/holdout の pair ごとに
         `trades/pf/win_rate/avg_r/max_drawdown/total_pnl/
         kill_switch_latches/evaluable` の 8 指標 + 落ちた段 + 落ちた
-        pair + 適用閾値を含める。`_floor_fail_items` (`_check_
+        pair + 適用閾値を含める。`floor_fail_items` (`_check_
         profitability_floor` と同じ判定条件) を再利用し、判定条件を
         二重実装しない。
 
@@ -4790,7 +4804,7 @@ class ImproveLoop:
         failed_pairs: list[str] = []
         tables: list[str] = []
         for scope, per_pair in stages:
-            fail_items = _floor_fail_items(
+            fail_items = floor_fail_items(
                 per_pair, settings=self._settings, scope=scope)
             if fail_items:
                 failed_scopes.append(scope)
@@ -4818,7 +4832,7 @@ class ImproveLoop:
         ]
         condition_rows = [_FLOOR_CONDITIONS_HEADER, _FLOOR_CONDITIONS_SEPARATOR]
         condition_detail: list[str] = []
-        failures = _floor_fail_items(
+        failures = floor_fail_items(
             in_sample_metrics, settings=self._settings, scope="in_sample")
         by_pair: dict[str, list] = {}
         for item in failures:
