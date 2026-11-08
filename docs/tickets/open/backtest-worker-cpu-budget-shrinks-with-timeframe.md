@@ -1,7 +1,7 @@
 ---
 id: backtest-worker-cpu-budget-shrinks-with-timeframe
 status: 設計待ち
-priority: 中
+priority: 高
 opened: 2026-09-20
 closed: null
 related: [product-vision-grown-by-its-user]
@@ -11,7 +11,7 @@ kind: 不具合
 ---
 # [backtest-worker-cpu-budget-shrinks-with-timeframe]
 
-**状態**: 設計待ち / **優先**: 中 / **種別**: 不具合
+**状態**: 設計待ち / **優先**: 高 / **種別**: 不具合
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -22,3 +22,4 @@ kind: 不具合
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-23: 優先: 中 — 2026-10-23 棚卸し: 症状は cpu_limit 分類で読め、暫定値 120 で運用中。高 → 中
 - 2026-10-25: 種別: 不具合 — 種別を付与
+- 2026-11-08: 優先: 高 — 2026-11-08 再観測: 手動の改善 #3370〜3373 のうち 3 回が worker_cpu_limit (120 秒) で評価できずに終わった。11-01 以降 12 回で、ほぼすべて参照系列 (EURUSD・XAUUSD・US500 など) を使う strategy。通常の依存 2 本の strategy は 15〜25 秒で、参照系列のものだけ 5〜10 倍遅い (activity の backtest_cpu)。参照系列の処理の効率を先に実測で調べる。優先を中から高へ
