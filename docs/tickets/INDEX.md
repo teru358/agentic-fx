@@ -3,6 +3,20 @@
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 未完了: 158 件。完了分は closed/。
 
+## 実装中 (2)
+
+### 不具合 (1)
+
+| id | 優先 | 起票 | 概要 |
+|---|---|---|---|
+| [improve-mission-output-not-persisted](open/improve-mission-output-not-persisted.md) | 中 | 2026-10-18 | 改善 mission の出力 (output_json / transcript) が DB に残らない |
+
+### 機能 (1)
+
+| id | 優先 | 起票 | 概要 |
+|---|---|---|---|
+| [improve-run-summary-for-humans](open/improve-run-summary-for-humans.md) | 高 | 2026-10-25 | 改善周ごとの要約 (仮説・使った指標・床との差) を人間に見せる |
+
 ## 実装待ち (12)
 
 ### 不具合 (7)
@@ -55,9 +69,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (140)
+## 設計待ち (138)
 
-### 不具合 (76)
+### 不具合 (75)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -78,7 +92,6 @@
 | [first-start-check-times-out-on-model-download](open/first-start-check-times-out-on-model-download.md) | 中 | 2026-10-17 | 初回起動の確認が埋め込みモデル取得中に timeout して失敗表示になる |
 | [tests-leak-tmp-dirs-outside-basetemp](open/tests-leak-tmp-dirs-outside-basetemp.md) | 中 | 2026-10-17 | 改善隔離 test helper が /tmp に afx-root-* を残す (basetemp 外) |
 | [deploy-cli-config-error-traceback](open/deploy-cli-config-error-traceback.md) | 中 | 2026-10-18 | afx の subcommand は設定不在・不正 YAML で traceback を出す |
-| [improve-mission-output-not-persisted](open/improve-mission-output-not-persisted.md) | 中 | 2026-10-18 | 改善 mission の出力 (output_json / transcript) が DB に残らない |
 | [improve-new-candidate-metric-reference-set-freeze](open/improve-new-candidate-metric-reference-set-freeze.md) | 中 | 2026-10-22 | 方向性指標の「新規候補」の参照集合を観測開始時点で凍結する |
 | [ops-probe-child-env-drops-xdg-config-home](open/ops-probe-child-env-drops-xdg-config-home.md) | 中 | 2026-10-24 | afx ops の probe 子 process に XDG_CONFIG_HOME が渡らない |
 | [scheduler-tick-watchdog-health-check-test-fails](open/scheduler-tick-watchdog-health-check-test-fails.md) | 中 | 2026-10-24 | scheduler tick が watchdog の健全性チェックを呼ぶ test が main で落ちる |
@@ -138,11 +151,10 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (41)
+### 機能 (40)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
-| [improve-run-summary-for-humans](open/improve-run-summary-for-humans.md) | 高 | 2026-10-25 | 改善周ごとの要約 (仮説・使った指標・床との差) を人間に見せる |
 | [backtest-dedup-cache](open/backtest-dedup-cache.md) | 中 | 2026-09-08 | 同一 (候補, config) の backtest 再実行で予算を消費しない (run6: 6 枠中 3 枠がビット… |
 | [strategy-attribution-and-shadow-evaluation](open/strategy-attribution-and-shadow-evaluation.md) | 中 | 2026-10-16 | 戦略ごとの帰属と影の評価 (共有建玉のまま戦略別の成績を出す) |
 | [weekly-improve-rebacktests-deployed-strategies](open/weekly-improve-rebacktests-deployed-strategies.md) | 中 | 2026-10-25 | 週次改善の冒頭で稼働中の戦略を再 backtest し、成績を改善の方向性の材料にする |
