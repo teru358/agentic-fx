@@ -16,17 +16,20 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import stat
 from pathlib import Path
 
 READY_NAME = ".ready"
 READY_VERSION = 2
 LEGACY_READY_VERSION = 1
-# manifest に現れてよい principal (本体の認可表と同じ集合)。
+# このパッケージが読む principal。manifest にはこれ以外 (本体が後から足したもの) も現れうる。
 KNOWN_PRINCIPALS = frozenset({"operator", "approver", "ops-bot", "ops-web", "ops-notify"})
 # 旧形式 v1 が持つ固定集合。v1 には ops の principal は居ない。
 LEGACY_PRINCIPALS = frozenset({"operator", "approver"})
 OPS_PRINCIPALS = ("ops-bot", "ops-web", "ops-notify")
+# manifest の principal 名の文法 (知らない名前も、この形でなければ manifest ごと拒む)。
+_PRINCIPAL_NAME = re.compile(r"[a-z][a-z0-9-]{0,31}")
 _KEY_OPS = ("enroll", "rotate", "revoke")
 _TOKEN_HEX_LEN = 64
 _MAX_FILE = 65536
@@ -126,11 +129,16 @@ def _read_ready(dir_fd: int) -> dict:
         # 旧形式は固定集合として読む (後から増えた principal を含めない)。
         if set(principals) != LEGACY_PRINCIPALS:
             raise KeyReadError("ready_invalid")
-    elif version != READY_VERSION or not set(principals) <= KNOWN_PRINCIPALS:
+    elif version != READY_VERSION:
+        raise KeyReadError("ready_invalid")
+    elif not all(isinstance(name, str) and _PRINCIPAL_NAME.fullmatch(name)
+                 for name in principals):
         raise KeyReadError("ready_invalid")
     if not all(_entry_valid(entry) for entry in principals.values()):
         raise KeyReadError("ready_invalid")
-    return principals
+    # 本体が後から足した principal (このパッケージが知らない名前) は、形だけ確かめて読まない。
+    # 配備の順 (本体と afx-ops のどちらを先に上げるか) で自分の鍵が読めなくならないため。
+    return {name: entry for name, entry in principals.items() if name in KNOWN_PRINCIPALS}
 
 
 def _parse_token(raw: bytes) -> str:
