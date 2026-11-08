@@ -35,7 +35,7 @@ from .contracts import (PRINCIPAL_SCOPES, ErrorCode, OpsError, Principal,
                         Scope, assert_authorized, validate_asserted_actor,
                         validate_principal_scopes)
 from .keys import KeySet
-from .service import ENDPOINTS
+from .service import ENDPOINTS, IMPROVE_RUNS_DEFAULT_LIMIT
 
 _log = logging.getLogger(__name__)
 
@@ -272,14 +272,14 @@ def _route(method: str, path: str, scope: Scope, handler: str, accepted: int = 2
 
 
 _ACCEPTED_202 = frozenset({"ask", "approve", "reject", "retry", "improve"})
-_ENDPOINT_COUNT = 32
+_ENDPOINT_COUNT = 33
 
 
 def build_routes(endpoints: dict) -> tuple[Route, ...]:
     """Endpoint 表から route を作る。表と route が別々に変わらないよう、
     route の定義は表だけに置き、形が崩れていれば起動時に fail closed で止める。"""
     if len(endpoints) != _ENDPOINT_COUNT:
-        raise RuntimeError("endpoint table must hold exactly 32 entries")
+        raise RuntimeError("endpoint table must hold exactly 33 entries")
     routes = []
     for code, endpoint in endpoints.items():
         method, _, path = endpoint.route.partition(" ")
@@ -347,6 +347,10 @@ def _call(ops, route: Route, params: dict, request: Request, principal: Principa
         return ops.approval_detail(principal, _int(params["id"]), deadline=deadline)
     if name == "approval_change":
         return ops.approval_change(principal, _int(params["id"]), deadline=deadline)
+    if name == "improve_runs":
+        return ops.improve_runs(
+            principal, limit=_int(q.get("limit"), default=IMPROVE_RUNS_DEFAULT_LIMIT),
+            deadline=deadline)
     if name == "improve_run":
         return ops.improve_run(principal, _int(params["id"]), deadline=deadline)
     if name == "reflection_status":

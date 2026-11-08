@@ -1,0 +1,1452 @@
+{
+ "_canary_metrics": {
+  "cand_in": {
+   "trades": 601111,
+   "pf": 3.1716,
+   "win_rate": 0.5484,
+   "avg_r": 0.6137,
+   "max_drawdown": 0.115,
+   "total_pnl": 1007.3131,
+   "kill_switch_latches": 0,
+   "evaluable": true
+  },
+  "cand_ho": {
+   "trades": 602222,
+   "pf": 2.9473,
+   "win_rate": 0.5855,
+   "avg_r": 0.5281,
+   "max_drawdown": 0.1383,
+   "total_pnl": 1014.6262,
+   "kill_switch_latches": 0,
+   "evaluable": true
+  },
+  "dep_in": {
+   "trades": 603333,
+   "pf": 2.1839,
+   "win_rate": 0.6226,
+   "avg_r": 0.4062,
+   "max_drawdown": 0.1616,
+   "total_pnl": 1021.9393,
+   "kill_switch_latches": 0,
+   "evaluable": true
+  },
+  "dep_ho_worse": {
+   "trades": 604444,
+   "pf": 1.7264,
+   "win_rate": 0.6597,
+   "avg_r": 0.3195,
+   "max_drawdown": 0.1849,
+   "total_pnl": 1029.2524,
+   "kill_switch_latches": 0,
+   "evaluable": true
+  },
+  "dep_ho_better": {
+   "trades": 605555,
+   "pf": 5.2381,
+   "win_rate": 0.6968,
+   "avg_r": 0.8473,
+   "max_drawdown": 0.2082,
+   "total_pnl": 1036.5655,
+   "kill_switch_latches": 0,
+   "evaluable": true
+  }
+ },
+ "canary_improved": {
+  "id": 1,
+  "backend": "local",
+  "model": "qwen3-coder-30b-a3b-instruct",
+  "elapsed_sec": 0,
+  "snapshot": {
+   "trigger": "manual",
+   "result_code": "submitted",
+   "reason_code": null,
+   "tool_calls": null,
+   "observation_text": null
+  },
+  "report_state": "none",
+  "approval": {
+   "id": 1,
+   "plugin": "cand",
+   "kind": "plugin"
+  },
+  "floor": null,
+  "summary": {
+   "version": 1,
+   "state": "ok",
+   "items": {
+    "comparison": {
+     "metrics": [
+      "pf",
+      "avg_r"
+     ],
+     "mode": "enforce",
+     "pairs": [
+      {
+       "candidate": {
+        "avg_r": 0.5281,
+        "evaluable": true,
+        "pf": 2.9473,
+        "trades": 602222
+       },
+       "deployed": {
+        "avg_r": 0.3195,
+        "evaluable": true,
+        "pf": 1.7264,
+        "trades": 604444
+       },
+       "pair": "USDJPY",
+       "verdict": "improved"
+      }
+     ],
+     "reason": "holdout_exceeds",
+     "stage": "holdout",
+     "verdict": "improved"
+    },
+    "explanation": {
+     "artifact_summary": "cand candidate",
+     "rationale": "test rationale"
+    },
+    "floor": {
+     "failed_conditions": [],
+     "failed_pair_count": 0,
+     "failed_stage": null,
+     "stages": [
+      {
+       "pairs": [
+        {
+         "avg_r": 0.6137,
+         "evaluable": true,
+         "failed": [],
+         "max_drawdown": 0.115,
+         "pair": "USDJPY",
+         "pf": 3.1716,
+         "trades": 601111,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "in_sample",
+       "state": "measured"
+      },
+      {
+       "pairs": [
+        {
+         "avg_r": 0.5281,
+         "evaluable": true,
+         "failed": [],
+         "max_drawdown": 0.1383,
+         "pair": "USDJPY",
+         "pf": 2.9473,
+         "trades": 602222,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "holdout",
+       "state": "measured"
+      }
+     ],
+     "thresholds": {
+      "max_drawdown": 0.2,
+      "max_trades_per_eval_bar": 0.25,
+      "min_pf": 1.0,
+      "require_holdout_evaluable": false,
+      "require_positive_avg_r": true
+     }
+    },
+    "hypothesis": {
+     "backlog_id": null,
+     "idea": "idea for cand"
+    },
+    "tried": {
+     "indicators": [],
+     "kind": "strategy",
+     "origin": "new",
+     "plugin": "cand"
+    }
+   }
+  },
+  "comparison": {
+   "holdout": {
+    "USDJPY": {
+     "candidate": {
+      "pf": 2.9473,
+      "avg_r": 0.5281,
+      "trades": 602222,
+      "evaluable": true
+     },
+     "deployed": {
+      "pf": 1.7264,
+      "avg_r": 0.3195,
+      "trades": 604444,
+      "evaluable": true
+     }
+    }
+   }
+  }
+ },
+ "canary_not_improved": {
+  "id": 1,
+  "backend": "local",
+  "model": "qwen3-coder-30b-a3b-instruct",
+  "elapsed_sec": 0,
+  "snapshot": {
+   "trigger": "manual",
+   "result_code": "gate_failed",
+   "reason_code": "not_improved",
+   "tool_calls": null,
+   "observation_text": null
+  },
+  "report_state": "published",
+  "approval": null,
+  "floor": null,
+  "summary": {
+   "version": 1,
+   "state": "ok",
+   "items": {
+    "comparison": {
+     "metrics": [
+      "pf",
+      "avg_r"
+     ],
+     "mode": "enforce",
+     "pairs": [
+      {
+       "candidate": {
+        "avg_r": 0.5281,
+        "evaluable": true,
+        "pf": 2.9473,
+        "trades": 602222
+       },
+       "deployed": {
+        "avg_r": 0.8473,
+        "evaluable": true,
+        "pf": 5.2381,
+        "trades": 605555
+       },
+       "pair": "USDJPY",
+       "verdict": "not_improved"
+      }
+     ],
+     "reason": "holdout_not_exceeds",
+     "stage": "holdout",
+     "verdict": "not_improved"
+    },
+    "explanation": {
+     "artifact_summary": "cand candidate",
+     "rationale": "test rationale"
+    },
+    "floor": {
+     "failed_conditions": [],
+     "failed_pair_count": 0,
+     "failed_stage": null,
+     "stages": [
+      {
+       "pairs": [
+        {
+         "avg_r": 0.6137,
+         "evaluable": true,
+         "failed": [],
+         "max_drawdown": 0.115,
+         "pair": "USDJPY",
+         "pf": 3.1716,
+         "trades": 601111,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "in_sample",
+       "state": "measured"
+      },
+      {
+       "pairs": [
+        {
+         "avg_r": 0.5281,
+         "evaluable": true,
+         "failed": [],
+         "max_drawdown": 0.1383,
+         "pair": "USDJPY",
+         "pf": 2.9473,
+         "trades": 602222,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "holdout",
+       "state": "measured"
+      }
+     ],
+     "thresholds": {
+      "max_drawdown": 0.2,
+      "max_trades_per_eval_bar": 0.25,
+      "min_pf": 1.0,
+      "require_holdout_evaluable": false,
+      "require_positive_avg_r": true
+     }
+    },
+    "hypothesis": {
+     "backlog_id": null,
+     "idea": "idea for cand"
+    },
+    "tried": {
+     "indicators": [],
+     "kind": "strategy",
+     "origin": "new",
+     "plugin": "cand"
+    }
+   }
+  }
+ },
+ "insufficient_trades": {
+  "id": 1,
+  "backend": "local",
+  "model": "qwen3-coder-30b-a3b-instruct",
+  "elapsed_sec": 0,
+  "snapshot": {
+   "trigger": "manual",
+   "result_code": "gate_failed",
+   "reason_code": "insufficient_trades",
+   "tool_calls": null,
+   "observation_text": null
+  },
+  "report_state": "published",
+  "approval": null,
+  "floor": null,
+  "summary": {
+   "version": 1,
+   "state": "ok",
+   "items": {
+    "explanation": {
+     "artifact_summary": "cand candidate",
+     "rationale": "test rationale"
+    },
+    "floor": {
+     "failed_conditions": [],
+     "failed_pair_count": 0,
+     "failed_stage": null,
+     "stages": [
+      {
+       "pairs": [
+        {
+         "avg_r": 0.188,
+         "evaluable": false,
+         "failed": [],
+         "max_drawdown": 0.0373,
+         "pair": "USDJPY",
+         "pf": 1.4981,
+         "trades": 16,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "in_sample",
+       "state": "reference"
+      },
+      {
+       "pairs": [],
+       "stage": "holdout",
+       "state": "not_run"
+      }
+     ],
+     "thresholds": {
+      "max_drawdown": 0.2,
+      "max_trades_per_eval_bar": 0.25,
+      "min_pf": 1.0,
+      "require_holdout_evaluable": false,
+      "require_positive_avg_r": true
+     }
+    },
+    "handoff": {
+     "attempts": 1,
+     "family": "strategy:未配備指標@1h@USDJPY",
+     "outcomes": {
+      "not_submitted": 1
+     }
+    },
+    "hypothesis": {
+     "backlog_id": null,
+     "idea": "idea for cand"
+    },
+    "tried": {
+     "indicators": [],
+     "kind": "strategy",
+     "origin": "new",
+     "plugin": "cand"
+    }
+   }
+  }
+ },
+ "long_family_submitted": {
+  "id": 1,
+  "backend": "local",
+  "model": "qwen3-coder-30b-a3b-instruct",
+  "elapsed_sec": 0,
+  "snapshot": {
+   "trigger": "manual",
+   "result_code": "submitted",
+   "reason_code": null,
+   "tool_calls": null,
+   "observation_text": null
+  },
+  "report_state": "none",
+  "approval": {
+   "id": 1,
+   "plugin": "cand",
+   "kind": "plugin"
+  },
+  "floor": null,
+  "summary": {
+   "version": 1,
+   "state": "ok",
+   "items": {
+    "explanation": {
+     "artifact_summary": "cand candidate",
+     "rationale": "test rationale"
+    },
+    "floor": {
+     "failed_conditions": [],
+     "failed_pair_count": 0,
+     "failed_stage": null,
+     "stages": [
+      {
+       "pairs": [
+        {
+         "avg_r": 0.188,
+         "evaluable": true,
+         "failed": [],
+         "max_drawdown": 0.0373,
+         "pair": "USDJPY",
+         "pf": 1.4981,
+         "trades": 194,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "in_sample",
+       "state": "measured"
+      },
+      {
+       "pairs": [
+        {
+         "avg_r": 0.037,
+         "evaluable": true,
+         "failed": [],
+         "max_drawdown": 0.0392,
+         "pair": "USDJPY",
+         "pf": 1.1,
+         "trades": 53,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "holdout",
+       "state": "measured"
+      }
+     ],
+     "thresholds": {
+      "max_drawdown": 0.2,
+      "max_trades_per_eval_bar": 0.25,
+      "min_pf": 1.0,
+      "require_holdout_evaluable": false,
+      "require_positive_avg_r": true
+     }
+    },
+    "handoff": {
+     "attempts": 1,
+     "family": "strategy:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx@1h@USDJPY",
+     "outcomes": {
+      "pending": 1
+     }
+    },
+    "hypothesis": {
+     "backlog_id": null,
+     "idea": "idea for cand"
+    },
+    "tried": {
+     "indicators": [],
+     "kind": "strategy",
+     "origin": "new",
+     "plugin": "cand"
+    }
+   }
+  }
+ },
+ "not_improved": {
+  "id": 1,
+  "backend": "local",
+  "model": "qwen3-coder-30b-a3b-instruct",
+  "elapsed_sec": 0,
+  "snapshot": {
+   "trigger": "manual",
+   "result_code": "gate_failed",
+   "reason_code": "not_improved",
+   "tool_calls": null,
+   "observation_text": null
+  },
+  "report_state": "published",
+  "approval": null,
+  "floor": null,
+  "summary": {
+   "version": 1,
+   "state": "ok",
+   "items": {
+    "comparison": {
+     "metrics": [
+      "pf",
+      "avg_r"
+     ],
+     "mode": "enforce",
+     "pairs": [
+      {
+       "candidate": {
+        "avg_r": 0.15,
+        "evaluable": true,
+        "pf": 1.4,
+        "trades": 40
+       },
+       "deployed": {
+        "avg_r": 0.4,
+        "evaluable": true,
+        "pf": 2.5,
+        "trades": 40
+       },
+       "pair": "USDJPY",
+       "verdict": "not_improved"
+      }
+     ],
+     "reason": "holdout_not_exceeds",
+     "stage": "holdout",
+     "verdict": "not_improved"
+    },
+    "explanation": {
+     "artifact_summary": "cand candidate",
+     "rationale": "test rationale"
+    },
+    "floor": {
+     "failed_conditions": [],
+     "failed_pair_count": 0,
+     "failed_stage": null,
+     "stages": [
+      {
+       "pairs": [
+        {
+         "avg_r": 0.2,
+         "evaluable": true,
+         "failed": [],
+         "max_drawdown": 0.1,
+         "pair": "USDJPY",
+         "pf": 1.5,
+         "trades": 40,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "in_sample",
+       "state": "measured"
+      },
+      {
+       "pairs": [
+        {
+         "avg_r": 0.15,
+         "evaluable": true,
+         "failed": [],
+         "max_drawdown": 0.1,
+         "pair": "USDJPY",
+         "pf": 1.4,
+         "trades": 40,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "holdout",
+       "state": "measured"
+      }
+     ],
+     "thresholds": {
+      "max_drawdown": 0.2,
+      "max_trades_per_eval_bar": 0.25,
+      "min_pf": 1.0,
+      "require_holdout_evaluable": false,
+      "require_positive_avg_r": true
+     }
+    },
+    "hypothesis": {
+     "backlog_id": null,
+     "idea": "idea for cand"
+    },
+    "tried": {
+     "indicators": [],
+     "kind": "strategy",
+     "origin": "new",
+     "plugin": "cand"
+    }
+   }
+  }
+ },
+ "not_submitted": {
+  "id": 1,
+  "backend": "local",
+  "model": "qwen3-coder-30b-a3b-instruct",
+  "elapsed_sec": 0,
+  "snapshot": {
+   "trigger": "manual",
+   "result_code": "observation",
+   "reason_code": "not_submitted",
+   "tool_calls": null,
+   "observation_text": null
+  },
+  "report_state": "none",
+  "approval": null,
+  "floor": null,
+  "summary": {
+   "version": 1,
+   "state": "ok",
+   "items": {
+    "explanation": {
+     "artifact_summary": null,
+     "rationale": "r"
+    },
+    "hypothesis": {
+     "backlog_id": null,
+     "idea": "an idea"
+    }
+   }
+  }
+ },
+ "observation": {
+  "id": 1,
+  "backend": "local",
+  "model": "qwen3-coder-30b-a3b-instruct",
+  "elapsed_sec": 0,
+  "snapshot": {
+   "trigger": "manual",
+   "result_code": "observation",
+   "reason_code": null,
+   "tool_calls": null,
+   "observation_text": "session_ranges で *ロンドン* 開始足の逆行を検証した。[確認](<url>) @everyone <@123456> `code` を含む申告。次回は別の仮説を優先する。"
+  },
+  "report_state": "none",
+  "approval": null,
+  "floor": null,
+  "summary": {
+   "version": 1,
+   "state": "ok",
+   "items": {
+    "explanation": {
+     "artifact_summary": null,
+     "rationale": "r"
+    },
+    "hypothesis": {
+     "backlog_id": null,
+     "idea": "an idea"
+    },
+    "observation": "session_ranges で *ロンドン* 開始足の逆行を検証した。[確認](<url>) @everyone <@123456> `code` を含む申告。次回は別の仮説を優先する。"
+   }
+  }
+ },
+ "quality_demotion": {
+  "id": 1,
+  "backend": "local",
+  "model": "qwen3-coder-30b-a3b-instruct",
+  "elapsed_sec": 0,
+  "snapshot": {
+   "trigger": "manual",
+   "result_code": "observation",
+   "reason_code": "duplicate_logic",
+   "tool_calls": null,
+   "observation_text": null
+  },
+  "report_state": "none",
+  "approval": null,
+  "floor": null,
+  "summary": {
+   "version": 1,
+   "state": "ok",
+   "items": {
+    "explanation": {
+     "artifact_summary": "cand candidate",
+     "rationale": "test rationale"
+    },
+    "floor": {
+     "failed_conditions": [],
+     "failed_pair_count": 0,
+     "failed_stage": null,
+     "stages": [
+      {
+       "pairs": [
+        {
+         "avg_r": 0.11,
+         "evaluable": null,
+         "failed": [],
+         "max_drawdown": 0.03,
+         "pair": "USDJPY",
+         "pf": 1.31,
+         "trades": 120,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "in_sample",
+       "state": "measured"
+      },
+      {
+       "pairs": [
+        {
+         "avg_r": 0.037,
+         "evaluable": null,
+         "failed": [],
+         "max_drawdown": 0.0392,
+         "pair": "USDJPY",
+         "pf": 1.1,
+         "trades": 53,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "holdout",
+       "state": "measured"
+      }
+     ],
+     "thresholds": {
+      "max_drawdown": 0.2,
+      "max_trades_per_eval_bar": 0.25,
+      "min_pf": 1.0,
+      "require_holdout_evaluable": false,
+      "require_positive_avg_r": true
+     }
+    },
+    "hypothesis": {
+     "backlog_id": null,
+     "idea": "idea for cand"
+    },
+    "parent_reason": "duplicate_logic",
+    "tried": {
+     "indicators": [],
+     "kind": "strategy",
+     "origin": "new",
+     "plugin": "cand"
+    }
+   }
+  }
+ },
+ "submitted": {
+  "id": 1,
+  "backend": "local",
+  "model": "qwen3-coder-30b-a3b-instruct",
+  "elapsed_sec": 0,
+  "snapshot": {
+   "trigger": "manual",
+   "result_code": "submitted",
+   "reason_code": null,
+   "tool_calls": null,
+   "observation_text": null
+  },
+  "report_state": "none",
+  "approval": {
+   "id": 1,
+   "plugin": "cand",
+   "kind": "plugin"
+  },
+  "floor": null,
+  "summary": {
+   "version": 1,
+   "state": "ok",
+   "items": {
+    "explanation": {
+     "artifact_summary": "cand candidate",
+     "rationale": "test rationale"
+    },
+    "floor": {
+     "failed_conditions": [],
+     "failed_pair_count": 0,
+     "failed_stage": null,
+     "stages": [
+      {
+       "pairs": [
+        {
+         "avg_r": 0.188,
+         "evaluable": true,
+         "failed": [],
+         "max_drawdown": 0.0373,
+         "pair": "USDJPY",
+         "pf": 1.4981,
+         "trades": 194,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "in_sample",
+       "state": "measured"
+      },
+      {
+       "pairs": [
+        {
+         "avg_r": 0.037,
+         "evaluable": true,
+         "failed": [],
+         "max_drawdown": 0.0392,
+         "pair": "USDJPY",
+         "pf": 1.1,
+         "trades": 53,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "holdout",
+       "state": "measured"
+      }
+     ],
+     "thresholds": {
+      "max_drawdown": 0.2,
+      "max_trades_per_eval_bar": 0.25,
+      "min_pf": 1.0,
+      "require_holdout_evaluable": false,
+      "require_positive_avg_r": true
+     }
+    },
+    "handoff": {
+     "attempts": 1,
+     "family": "strategy:未配備指標@1h@USDJPY",
+     "outcomes": {
+      "pending": 1
+     }
+    },
+    "hypothesis": {
+     "backlog_id": null,
+     "idea": "idea for cand"
+    },
+    "tried": {
+     "indicators": [],
+     "kind": "strategy",
+     "origin": "new",
+     "plugin": "cand"
+    }
+   }
+  }
+ },
+ "submitted_improved": {
+  "id": 1,
+  "backend": "local",
+  "model": "qwen3-coder-30b-a3b-instruct",
+  "elapsed_sec": 0,
+  "snapshot": {
+   "trigger": "manual",
+   "result_code": "submitted",
+   "reason_code": null,
+   "tool_calls": null,
+   "observation_text": null
+  },
+  "report_state": "none",
+  "approval": {
+   "id": 1,
+   "plugin": "cand",
+   "kind": "plugin"
+  },
+  "floor": null,
+  "summary": {
+   "version": 1,
+   "state": "ok",
+   "items": {
+    "comparison": {
+     "metrics": [
+      "pf",
+      "avg_r"
+     ],
+     "mode": "enforce",
+     "pairs": [
+      {
+       "candidate": {
+        "avg_r": 0.15,
+        "evaluable": true,
+        "pf": 1.4,
+        "trades": 40
+       },
+       "deployed": {
+        "avg_r": 0.05,
+        "evaluable": true,
+        "pf": 1.1,
+        "trades": 40
+       },
+       "pair": "USDJPY",
+       "verdict": "improved"
+      }
+     ],
+     "reason": "holdout_exceeds",
+     "stage": "holdout",
+     "verdict": "improved"
+    },
+    "explanation": {
+     "artifact_summary": "cand candidate",
+     "rationale": "test rationale"
+    },
+    "floor": {
+     "failed_conditions": [],
+     "failed_pair_count": 0,
+     "failed_stage": null,
+     "stages": [
+      {
+       "pairs": [
+        {
+         "avg_r": 0.2,
+         "evaluable": true,
+         "failed": [],
+         "max_drawdown": 0.1,
+         "pair": "USDJPY",
+         "pf": 1.5,
+         "trades": 40,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "in_sample",
+       "state": "measured"
+      },
+      {
+       "pairs": [
+        {
+         "avg_r": 0.15,
+         "evaluable": true,
+         "failed": [],
+         "max_drawdown": 0.1,
+         "pair": "USDJPY",
+         "pf": 1.4,
+         "trades": 40,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "holdout",
+       "state": "measured"
+      }
+     ],
+     "thresholds": {
+      "max_drawdown": 0.2,
+      "max_trades_per_eval_bar": 0.25,
+      "min_pf": 1.0,
+      "require_holdout_evaluable": false,
+      "require_positive_avg_r": true
+     }
+    },
+    "hypothesis": {
+     "backlog_id": null,
+     "idea": "idea for cand"
+    },
+    "tried": {
+     "indicators": [],
+     "kind": "strategy",
+     "origin": "new",
+     "plugin": "cand"
+    }
+   }
+  },
+  "comparison": {
+   "holdout": {
+    "USDJPY": {
+     "candidate": {
+      "pf": 1.4,
+      "avg_r": 0.15,
+      "trades": 40,
+      "evaluable": true
+     },
+     "deployed": {
+      "pf": 1.1,
+      "avg_r": 0.05,
+      "trades": 40,
+      "evaluable": true
+     }
+    }
+   }
+  }
+ },
+ "unprofitable_drawdown": {
+  "id": 1,
+  "backend": "local",
+  "model": "qwen3-coder-30b-a3b-instruct",
+  "elapsed_sec": 0,
+  "snapshot": {
+   "trigger": "manual",
+   "result_code": "gate_failed",
+   "reason_code": "unprofitable",
+   "tool_calls": null,
+   "observation_text": null
+  },
+  "report_state": "published",
+  "approval": null,
+  "floor": {
+   "stages": [
+    {
+     "stage": "in_sample",
+     "pairs": [
+      {
+       "pair": "USDJPY",
+       "trades": 194,
+       "pf": 1.4981,
+       "avg_r": 0.188,
+       "evaluable": true,
+       "conditions": [
+        "drawdown_too_deep"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  "summary": {
+   "version": 1,
+   "state": "ok",
+   "items": {
+    "explanation": {
+     "artifact_summary": "cand candidate",
+     "rationale": "test rationale"
+    },
+    "floor": {
+     "failed_conditions": [
+      "drawdown_too_deep"
+     ],
+     "failed_pair_count": 1,
+     "failed_stage": "in_sample",
+     "stages": [
+      {
+       "pairs": [
+        {
+         "avg_r": 0.188,
+         "evaluable": true,
+         "failed": [
+          "drawdown_too_deep"
+         ],
+         "max_drawdown": 0.41,
+         "pair": "USDJPY",
+         "pf": 1.4981,
+         "trades": 194,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "in_sample",
+       "state": "measured"
+      },
+      {
+       "pairs": [],
+       "stage": "holdout",
+       "state": "not_run"
+      }
+     ],
+     "thresholds": {
+      "max_drawdown": 0.2,
+      "max_trades_per_eval_bar": 0.25,
+      "min_pf": 1.0,
+      "require_holdout_evaluable": false,
+      "require_positive_avg_r": true
+     }
+    },
+    "handoff": {
+     "attempts": 1,
+     "family": "strategy:未配備指標@1h@USDJPY",
+     "outcomes": {
+      "not_submitted": 1
+     }
+    },
+    "hypothesis": {
+     "backlog_id": null,
+     "idea": "idea for cand"
+    },
+    "tried": {
+     "indicators": [],
+     "kind": "strategy",
+     "origin": "new",
+     "plugin": "cand"
+    }
+   }
+  }
+ },
+ "unprofitable_holdout": {
+  "id": 1,
+  "backend": "local",
+  "model": "qwen3-coder-30b-a3b-instruct",
+  "elapsed_sec": 0,
+  "snapshot": {
+   "trigger": "manual",
+   "result_code": "gate_failed",
+   "reason_code": "unprofitable",
+   "tool_calls": null,
+   "observation_text": null
+  },
+  "report_state": "published",
+  "approval": null,
+  "floor": {
+   "stages": [
+    {
+     "stage": "holdout",
+     "pairs": [
+      {
+       "pair": "USDJPY",
+       "trades": 53,
+       "pf": 0.62,
+       "avg_r": -0.04,
+       "evaluable": true
+      }
+     ]
+    }
+   ]
+  },
+  "summary": {
+   "version": 1,
+   "state": "ok",
+   "items": {
+    "explanation": {
+     "artifact_summary": "cand candidate",
+     "rationale": "test rationale"
+    },
+    "floor": {
+     "failed_conditions": [
+      "pf"
+     ],
+     "failed_pair_count": 1,
+     "failed_stage": "holdout",
+     "stages": [
+      {
+       "pairs": [
+        {
+         "avg_r": 0.188,
+         "evaluable": true,
+         "failed": [],
+         "max_drawdown": 0.0373,
+         "pair": "USDJPY",
+         "pf": 1.4981,
+         "trades": 194,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "in_sample",
+       "state": "measured"
+      },
+      {
+       "pairs": [
+        {
+         "avg_r": -0.04,
+         "evaluable": true,
+         "failed": [
+          "pf"
+         ],
+         "max_drawdown": 0.0392,
+         "pair": "USDJPY",
+         "pf": 0.62,
+         "trades": 53,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "holdout",
+       "state": "measured"
+      }
+     ],
+     "thresholds": {
+      "max_drawdown": 0.2,
+      "max_trades_per_eval_bar": 0.25,
+      "min_pf": 1.0,
+      "require_holdout_evaluable": false,
+      "require_positive_avg_r": true
+     }
+    },
+    "handoff": {
+     "attempts": 1,
+     "family": "strategy:未配備指標@1h@USDJPY",
+     "outcomes": {
+      "not_submitted": 1
+     }
+    },
+    "hypothesis": {
+     "backlog_id": null,
+     "idea": "idea for cand"
+    },
+    "tried": {
+     "indicators": [],
+     "kind": "strategy",
+     "origin": "new",
+     "plugin": "cand"
+    }
+   }
+  }
+ },
+ "unprofitable_holdout_report_failed": {
+  "id": 1,
+  "backend": "local",
+  "model": "qwen3-coder-30b-a3b-instruct",
+  "elapsed_sec": 0,
+  "snapshot": {
+   "trigger": "manual",
+   "result_code": "gate_failed",
+   "reason_code": "unprofitable",
+   "tool_calls": null,
+   "observation_text": null
+  },
+  "report_state": "failed",
+  "approval": null,
+  "floor": null,
+  "summary": {
+   "version": 1,
+   "state": "ok",
+   "items": {
+    "explanation": {
+     "artifact_summary": "cand candidate",
+     "rationale": "test rationale"
+    },
+    "floor": {
+     "failed_conditions": [
+      "pf"
+     ],
+     "failed_pair_count": 1,
+     "failed_stage": "holdout",
+     "stages": [
+      {
+       "pairs": [
+        {
+         "avg_r": 0.188,
+         "evaluable": true,
+         "failed": [],
+         "max_drawdown": 0.0373,
+         "pair": "USDJPY",
+         "pf": 1.4981,
+         "trades": 194,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "in_sample",
+       "state": "measured"
+      },
+      {
+       "pairs": [
+        {
+         "avg_r": -0.04,
+         "evaluable": true,
+         "failed": [
+          "pf"
+         ],
+         "max_drawdown": 0.0392,
+         "pair": "USDJPY",
+         "pf": 0.62,
+         "trades": 53,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "holdout",
+       "state": "measured"
+      }
+     ],
+     "thresholds": {
+      "max_drawdown": 0.2,
+      "max_trades_per_eval_bar": 0.25,
+      "min_pf": 1.0,
+      "require_holdout_evaluable": false,
+      "require_positive_avg_r": true
+     }
+    },
+    "handoff": {
+     "attempts": 1,
+     "family": "strategy:未配備指標@1h@USDJPY",
+     "outcomes": {
+      "not_submitted": 1
+     }
+    },
+    "hypothesis": {
+     "backlog_id": null,
+     "idea": "idea for cand"
+    },
+    "tried": {
+     "indicators": [],
+     "kind": "strategy",
+     "origin": "new",
+     "plugin": "cand"
+    }
+   }
+  }
+ },
+ "unprofitable_holdout_thin": {
+  "id": 1,
+  "backend": "local",
+  "model": "qwen3-coder-30b-a3b-instruct",
+  "elapsed_sec": 0,
+  "snapshot": {
+   "trigger": "manual",
+   "result_code": "gate_failed",
+   "reason_code": "unprofitable",
+   "tool_calls": null,
+   "observation_text": null
+  },
+  "report_state": "published",
+  "approval": null,
+  "floor": {
+   "stages": [
+    {
+     "stage": "holdout",
+     "pairs": [
+      {
+       "pair": "USDJPY",
+       "trades": 13,
+       "pf": 1.8458377992140615,
+       "avg_r": 0.3029234868346611,
+       "evaluable": false
+      }
+     ]
+    }
+   ]
+  },
+  "summary": {
+   "version": 1,
+   "state": "ok",
+   "items": {
+    "explanation": {
+     "artifact_summary": "cand candidate",
+     "rationale": "test rationale"
+    },
+    "floor": {
+     "failed_conditions": [
+      "holdout_not_evaluable"
+     ],
+     "failed_pair_count": 1,
+     "failed_stage": "holdout",
+     "stages": [
+      {
+       "pairs": [
+        {
+         "avg_r": 0.188,
+         "evaluable": true,
+         "failed": [],
+         "max_drawdown": 0.0373,
+         "pair": "USDJPY",
+         "pf": 1.4981,
+         "trades": 194,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "in_sample",
+       "state": "measured"
+      },
+      {
+       "pairs": [
+        {
+         "avg_r": 0.302923,
+         "evaluable": false,
+         "failed": [
+          "holdout_not_evaluable"
+         ],
+         "max_drawdown": 0.02,
+         "pair": "USDJPY",
+         "pf": 1.845838,
+         "trades": 13,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "holdout",
+       "state": "measured"
+      }
+     ],
+     "thresholds": {
+      "max_drawdown": 0.2,
+      "max_trades_per_eval_bar": 0.25,
+      "min_pf": 1.0,
+      "require_holdout_evaluable": true,
+      "require_positive_avg_r": true
+     }
+    },
+    "handoff": {
+     "attempts": 1,
+     "family": "strategy:未配備指標@1h@USDJPY",
+     "outcomes": {
+      "not_submitted": 1
+     }
+    },
+    "hypothesis": {
+     "backlog_id": null,
+     "idea": "idea for cand"
+    },
+    "tried": {
+     "indicators": [],
+     "kind": "strategy",
+     "origin": "new",
+     "plugin": "cand"
+    }
+   }
+  }
+ },
+ "unprofitable_in_sample": {
+  "id": 1,
+  "backend": "local",
+  "model": "qwen3-coder-30b-a3b-instruct",
+  "elapsed_sec": 0,
+  "snapshot": {
+   "trigger": "manual",
+   "result_code": "gate_failed",
+   "reason_code": "unprofitable",
+   "tool_calls": null,
+   "observation_text": null
+  },
+  "report_state": "published",
+  "approval": null,
+  "floor": {
+   "stages": [
+    {
+     "stage": "in_sample",
+     "pairs": [
+      {
+       "pair": "USDJPY",
+       "trades": 60,
+       "pf": 0.3,
+       "avg_r": -0.1,
+       "evaluable": true
+      }
+     ]
+    }
+   ]
+  },
+  "summary": {
+   "version": 1,
+   "state": "ok",
+   "items": {
+    "explanation": {
+     "artifact_summary": "cand candidate",
+     "rationale": "test rationale"
+    },
+    "floor": {
+     "failed_conditions": [
+      "pf"
+     ],
+     "failed_pair_count": 1,
+     "failed_stage": "in_sample",
+     "stages": [
+      {
+       "pairs": [
+        {
+         "avg_r": -0.1,
+         "evaluable": true,
+         "failed": [
+          "pf"
+         ],
+         "max_drawdown": 0.2,
+         "pair": "USDJPY",
+         "pf": 0.3,
+         "trades": 60,
+         "trades_per_eval_bar": null
+        }
+       ],
+       "stage": "in_sample",
+       "state": "measured"
+      },
+      {
+       "pairs": [],
+       "stage": "holdout",
+       "state": "not_run"
+      }
+     ],
+     "thresholds": {
+      "max_drawdown": 0.2,
+      "max_trades_per_eval_bar": 0.25,
+      "min_pf": 1.0,
+      "require_holdout_evaluable": false,
+      "require_positive_avg_r": true
+     }
+    },
+    "handoff": {
+     "attempts": 1,
+     "family": "strategy:未配備指標@1h@USDJPY",
+     "outcomes": {
+      "not_submitted": 1
+     }
+    },
+    "hypothesis": {
+     "backlog_id": null,
+     "idea": "idea for cand"
+    },
+    "tried": {
+     "indicators": [],
+     "kind": "strategy",
+     "origin": "new",
+     "plugin": "cand"
+    }
+   }
+  }
+ }
+}

@@ -49,7 +49,7 @@ from agentic_fx.setup.pending_text import (STEP_PARAMS, PendingStep, is_ident,
                                            parse_observed_at, render_pending_step)
 
 from . import base_view, change_limits, keys, redactor
-from .contracts import Principal
+from .contracts import IMPROVE_RUNS_DEFAULT_LIMIT, IMPROVE_RUNS_MAX_LIMIT, Principal
 from .events import EventCursor, EventPage
 from .tail import ACTIVITY_CATEGORIES
 from .trade_events import DROP_REASONS
@@ -1096,6 +1096,8 @@ def parse(tokens: list[str]) -> Op:
         return Op("ask", [" ".join(args)])
     if cmd == "improve" and n == 0:
         return Op("improve", [])
+    if cmd == "improve" and n >= 1 and args[0] == "runs":
+        return Op("improve_runs", _parse_improve_runs(args[1:]))
     if cmd == "improve" and n >= 2 and args[0] == "add":
         if any(_is_improve_flag(token) for token in args[1:]):
             # 旧 `improve add` と繰り返しの option は併用できない。
@@ -1198,6 +1200,22 @@ def _parse_events(args: list[str]) -> list:
     if not 1 <= limit <= 500:
         raise ClientError(RC_USAGE, _usage())
     return [after, limit, follow]
+
+
+def _parse_improve_runs(args: list[str]) -> list:
+    limit = IMPROVE_RUNS_DEFAULT_LIMIT
+    rest = list(args)
+    seen_limit = False
+    while rest:
+        flag = rest.pop(0)
+        if flag == "--limit" and rest and not seen_limit:
+            seen_limit = True
+            limit = _int_arg(rest.pop(0))
+        else:
+            raise ClientError(RC_USAGE, _usage())
+    if not 1 <= limit <= IMPROVE_RUNS_MAX_LIMIT:
+        raise ClientError(RC_USAGE, _usage())
+    return [limit]
 
 
 def _parse_backlog_list(args: list[str]) -> list:
@@ -1477,6 +1495,40 @@ class Runner:
                 self.say("  " + _backlog_display(row.get("last_result")))
         if data.get("has_more") is True:
             self.say("… 他にもあります (--limit N で増やすか --all)")
+        return RC_OK
+
+    def _op_improve_runs(self, limit: int, *, terminal) -> int:
+        data = self._get("/v1/improve/runs", limit=limit)
+        tz = _tz_of(data)
+        rows = data.get("runs") if isinstance(data.get("runs"), list) else []
+        if not rows:
+            self.say("improve: 0 件")
+            return RC_OK
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            result = _safe_cell(row.get("result_code"), 40)
+            reason = row.get("reason_code")
+            if isinstance(reason, str) and reason:
+                result += f"/{_safe_cell(reason, 60)}"
+            parts = [f"#{_ident(row.get('id'))}",
+                     _when(row.get("finished_at"), tz, limit=200, redact=True),
+                     _safe_cell(row.get("trigger"), 20), result]
+            if isinstance(row.get("plugin"), str):
+                parts.append(_safe_cell(row.get("plugin"), 80))
+            conditions = row.get("failed_conditions")
+            stage = row.get("failed_stage")
+            if isinstance(stage, str):
+                shown = ",".join(_safe_cell(c, 40) for c in conditions) \
+                    if isinstance(conditions, list) else ""
+                parts.append(f"床未達 {_safe_cell(stage, 20)}"
+                             + (f" [{shown}]" if shown else "")
+                             + f" {_ident(row.get('failed_pair_count'))} pair")
+            if type(row.get("approval_id")) is int:
+                parts.append(f"承認 #{row['approval_id']}")
+            self.say(" ".join(parts))
+        if data.get("has_more") is True:
+            self.say("… 他にもあります (--limit N で増やす)")
         return RC_OK
 
     def _op_backlog_transition(self, action: str, bid: int, *, terminal) -> int:

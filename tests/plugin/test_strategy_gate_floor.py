@@ -14,7 +14,7 @@ from agentic_fx.plugin.strategy_gate import (
     _check_profitability_floor,
     AGENT_BLOCKED_NOTICE,
     FLOOR_CONDITION_KINDS,
-    _floor_fail_items,
+    floor_fail_items,
     floor_settings_kv,
     trades_per_eval_bar,
 )
@@ -237,7 +237,7 @@ def test_frequency_boundary_invalid_measurements_and_holdout_are_skipped():
 
 def test_pf_and_drawdown_both_return_kind_but_agent_detail_hides_new_kind():
     metrics = {"USDJPY": _m2(50, 0.5, -0.1, max_drawdown=0.99, eval_bars=1)}
-    items = _floor_fail_items(metrics, settings=SETTINGS, scope="in_sample")
+    items = floor_fail_items(metrics, settings=SETTINGS, scope="in_sample")
     assert [item.kind for item in items] == ["pf", "drawdown_too_deep", "too_frequent"]
     label, detail = _check_profitability_floor(
         metrics, settings=SETTINGS, scope="in_sample", audience="agent")
@@ -316,12 +316,12 @@ def test_floor_settings_kv_matches_snapshot_order_and_format():
 
 
 # ---- [profitability-floor-fix] G2: 落ちた pair を構造化して取り出す -----
-# `_floor_fail_items` は `_check_profitability_floor` の文字列組み立てと
+# `floor_fail_items` は `_check_profitability_floor` の文字列組み立てと
 # 同じ判定条件を再利用する内部 helper (二重実装しない)。改善ループの
 # レポート本文 (G2) が「落ちた pair」のリストをここから取る。
 
 def test_floor_fail_items_returns_failing_pairs_only():
-    items = _floor_fail_items(
+    items = floor_fail_items(
         {"USDJPY": _m(50, 0.5, 0.1), "EURUSD": _m(50, 1.5, 0.1)},
         settings=SETTINGS, scope="in_sample")
     assert [item.pair for item in items] == ["USDJPY"]
@@ -331,7 +331,7 @@ def test_floor_fail_items_agrees_with_check_profitability_floor_string():
     per_pair = {"USDJPY": _m(50, 0.5, 0.1), "EURUSD": _m(50, 1.5, -1.0)}
     label, detail = _check_profitability_floor(
         per_pair, settings=SETTINGS, scope="in_sample")
-    items = _floor_fail_items(per_pair, settings=SETTINGS, scope="in_sample")
+    items = floor_fail_items(per_pair, settings=SETTINGS, scope="in_sample")
     assert label == "unprofitable"
     for item in items:
         assert item.pair in detail
@@ -342,17 +342,17 @@ def test_non_int_trades_skip_only_frequency_and_still_judge_pf_dd():
     for trades in (False, 0.0):
         failing_dd = {"USDJPY": _m2(trades, 1.5, 0.1, max_drawdown=0.99,
                                     eval_bars=100)}
-        items = _floor_fail_items(failing_dd, settings=SETTINGS,
+        items = floor_fail_items(failing_dd, settings=SETTINGS,
                                   scope="in_sample")
         assert [i.kind for i in items] == ["drawdown_too_deep"]
         failing_pf = {"USDJPY": _m2(trades, 0.5, -0.1, eval_bars=100)}
-        items = _floor_fail_items(failing_pf, settings=SETTINGS,
+        items = floor_fail_items(failing_pf, settings=SETTINGS,
                                   scope="in_sample")
         assert [i.kind for i in items] == ["pf"]
         assert _check_profitability_floor(
             failing_dd, settings=SETTINGS, scope="in_sample")[0] \
             == "unprofitable"
-    assert _floor_fail_items(
+    assert floor_fail_items(
         {"USDJPY": _m2(0, 0.5, -0.1, max_drawdown=0.99, eval_bars=100)},
         settings=SETTINGS, scope="in_sample") == []
 
@@ -395,6 +395,6 @@ def test_trades_per_eval_bar_is_the_single_validity_rule():
 
 def test_condition_kinds_are_the_gate_kinds():
     metrics = {"USDJPY": _m2(99, 1.5, 0.1, max_drawdown=0.99, eval_bars=100)}
-    kinds = tuple(i.kind for i in _floor_fail_items(
+    kinds = tuple(i.kind for i in floor_fail_items(
         metrics, settings=SETTINGS, scope="in_sample"))
     assert kinds == FLOOR_CONDITION_KINDS

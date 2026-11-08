@@ -48,7 +48,7 @@ def _write_candidate(staging_dir, name: str) -> None:
 
 
 def _floor_metrics(pf: float) -> dict:
-    """§4.2 フロア判定 (`_floor_fail_items`) が読む 8 指標をすべて埋める
+    """§4.2 フロア判定 (`floor_fail_items`) が読む 8 指標をすべて埋める
     (`trades`/`pf`/`win_rate`/`avg_r`/`max_drawdown`/`total_pnl`/
     `kill_switch_latches`/`evaluable`)。`pf < min_pf` (既定 1.2 相当) で
     不合格になるよう `trades>0`/`evaluable=True` にしておく。"""

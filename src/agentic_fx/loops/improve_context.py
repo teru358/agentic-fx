@@ -461,6 +461,57 @@ def render_family_attempts(section: FamilyAttemptSection) -> str:
     return "\n\n".join(blocks) if blocks else "(なし)"
 
 
+def project_attempt(record: dict, *, allowed_pairs: "set[str]",
+                    deployed_indicators: "frozenset[str] | set[str]"
+                    ) -> tuple[str | None, PublicOutcome, str | None,
+                               list[tuple[str, str]]]:
+    """台帳の 1 行を、族別試行結果が数える 1 件に投影する。戻り値は
+    (表示 key、公開の結末、試行の年月、配備済みとの relation)。族を読めない
+    行の表示 key は None。族別試行結果と終端時の申し送りが同じ投影を通る。"""
+    parsed = parse_family_key(record["family_key"],
+                              allowed_pairs=allowed_pairs)
+    outcome = project_outcome(record["outcome_class"])
+    month = _attempt_month(record["created_at"])
+    relations = project_relations(
+        record.get("relation"), deployed_indicators)
+    if parsed is None:
+        return None, outcome, month, relations
+    return (project_family_label(parsed, deployed_indicators), outcome, month,
+            relations)
+
+
+class FamilyTally(TypedDict):
+    family_key: str
+    attempts: int
+    outcomes: dict[str, int]
+
+
+def family_tally(conn: "sqlite3.Connection", *, allowed_pairs: "set[str]",
+                 families: list[dict], family_key: str) -> FamilyTally:
+    """`family_key` の族が、いまの台帳と配備の集合で族別試行結果にどう見えるか
+    (表示 key、試行行数、公開の結末の内訳)。台帳を 1 行ずつ
+    `project_attempt` で投影して数えるので、同じ入力なら族別試行結果の
+    同じ表示 key の行と同じ値になる (表示件数の打ち切りは掛けない)。"""
+    deployed_indicators = _deployed_view(families, allowed_pairs)[3]
+    parsed = parse_family_key(family_key, allowed_pairs=allowed_pairs)
+    wanted = (project_family_label(parsed, deployed_indicators)
+              if parsed is not None else None)
+    outcomes: dict[str, int] = {}
+    attempts = 0
+    for record in family_attempt_projection(conn):
+        label, outcome, _month, _relations = project_attempt(
+            record, allowed_pairs=allowed_pairs,
+            deployed_indicators=deployed_indicators)
+        if label != wanted:
+            continue
+        attempts += 1
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+    return {"family_key": wanted if wanted is not None else UNKNOWN_FAMILY_LABEL,
+            "attempts": attempts,
+            "outcomes": {o: outcomes[o] for o in PUBLIC_OUTCOMES
+                         if outcomes.get(o)}}
+
+
 def _family_attempts(conn: "sqlite3.Connection", settings: "Settings",
                      families: list[dict]) -> FamilyAttemptSection:
     allowed_pairs = set(settings.pairs)
@@ -482,16 +533,12 @@ def _family_attempts(conn: "sqlite3.Connection", settings: "Settings",
             group["month"] = month
 
     for record in family_attempt_projection(conn):
-        parsed = parse_family_key(record["family_key"],
-                                  allowed_pairs=allowed_pairs)
-        outcome = project_outcome(record["outcome_class"])
-        month = _attempt_month(record["created_at"])
-        relations = project_relations(
-            record.get("relation"), deployed_indicators)
-        if parsed is None:
+        label, outcome, month, relations = project_attempt(
+            record, allowed_pairs=allowed_pairs,
+            deployed_indicators=deployed_indicators)
+        if label is None:
             _count(unknown, outcome, month, relations)
             continue
-        label = project_family_label(parsed, deployed_indicators)
         _count(groups.setdefault(
             label, {"attempts": 0, "outcomes": {}, "month": None,
                     "relations": {}}),

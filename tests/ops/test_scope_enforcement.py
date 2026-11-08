@@ -89,6 +89,7 @@ def _every_endpoint(service):
         "approval_detail": lambda p: service.approval_detail(p, 9999),
         "approval_change": lambda p: service.approval_change(p, 9999),
         "improve_run": lambda p: service.improve_run(p, 9999),
+        "improve_runs": lambda p: service.improve_runs(p),
         "approval_list": lambda p: service.approval_list(p),
         "plugin_list": lambda p: service.plugin_list(p),
         "plugin_detail": lambda p: service.plugin_detail(p, "missing"),

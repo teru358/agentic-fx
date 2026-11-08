@@ -45,7 +45,8 @@ from agentic_fx.policy_projection import (POLICY_TEXT_LIMIT, MigrationRecordUnkn
 from . import base_view, redactor
 from .activity import SuppressedActivity
 from .audit import AcceptedRequest, AuditStore, IdempotencyReplay
-from .contracts import (ACTOR_PRINCIPALS, PRINCIPAL_SCOPES, Caller, ErrorCode, OpsError,
+from .contracts import (ACTOR_PRINCIPALS, IMPROVE_RUNS_DEFAULT_LIMIT,
+                        IMPROVE_RUNS_MAX_LIMIT, PRINCIPAL_SCOPES, Caller, ErrorCode, OpsError,
                         Principal, Scope, ShellCaller, assert_authorized,
                         validate_asserted_actor)
 from .events import EventSchemaError, EventStore
@@ -98,6 +99,7 @@ ENDPOINTS: dict[str, Endpoint] = {e.code: e for e in (
     Endpoint("plugin_list", "GET /v1/plugins", Scope.APPROVALS_LIST, False),
     Endpoint("plugin_detail", "GET /v1/plugins/{name}", Scope.APPROVALS_DETAIL, False),
     Endpoint("improve_run", "GET /v1/improve/runs/{id}", Scope.APPROVALS_DETAIL, False),
+    Endpoint("improve_runs", "GET /v1/improve/runs", Scope.APPROVALS_LIST, False),
     Endpoint("reflection_status", "GET /v1/reflections/{order_id}", Scope.STATUS_READ, False),
     Endpoint("whoami", "GET /v1/whoami", Scope.STATUS_READ, False),
     Endpoint("job_get", "GET /v1/jobs/{id}", Scope.JOBS_OWN, False),
@@ -1216,6 +1218,10 @@ class OpsService:
                 approval = self._conn.execute(
                     "SELECT id,kind,payload_json FROM approval_requests WHERE id=?",
                     (notice["approval_id"],)).fetchone()
+            summary_row = self._conn.execute(
+                "SELECT summary_version,state,summary_json "
+                "FROM improve_run_summaries WHERE mission_id=?",
+                (mission_id,)).fetchone()
             report_state = run["report_state"] if run is not None else "none"
             floor = None
             if (notice is not None and run is not None
@@ -1223,6 +1229,7 @@ class OpsService:
                     == ("gate_failed", "unprofitable")):
                 floor = self._floor_of(mission_id, report_state, run["report_path"])
         from agentic_fx.loops.approval_facts import display_text
+        from agentic_fx.loops.improve_run_summary import dto_of
         snapshot = None
         if notice is not None:
             snapshot = {
@@ -1236,11 +1243,45 @@ class OpsService:
                 "snapshot": snapshot,
                 "report_state": report_state,
                 "approval": _approval_of(notice, approval),
-                "floor": floor}
+                "floor": floor,
+                "summary": dto_of(summary_row)}
         comparison = _comparison_of(notice, approval)
         if comparison is not None:
             data["comparison"] = comparison
         return data
+
+    def improve_runs(self, principal: Caller, *, limit: int = IMPROVE_RUNS_DEFAULT_LIMIT,
+                     deadline: float | None = None) -> dict:
+        """終端した改善 mission の一覧 (新しい順)。各行は終端 snapshot に、保存した
+        要約から取れる plugin 名と落ちた段・条件・該当 pair 数を足したもの。
+        要約が無い・`ok` でない mission はそれらを空で返す。監査行は書かない。"""
+        _authorize(principal, "improve_runs")
+        if type(limit) is not int or not 1 <= limit <= IMPROVE_RUNS_MAX_LIMIT:
+            raise OpsError(ErrorCode.INVALID_ARGUMENT)
+        with self._ops_lane(self._deadline(deadline)):
+            rows = self._conn.execute(
+                "SELECT n.mission_id,n.trigger,n.result_code,n.reason_code,"
+                "n.approval_id,n.created_at,m.started_at,"
+                "s.summary_version,s.state,s.summary_json "
+                "FROM improve_run_notices n JOIN missions m ON m.id=n.mission_id "
+                "LEFT JOIN improve_run_summaries s ON s.mission_id=n.mission_id "
+                "ORDER BY n.mission_id DESC LIMIT ?", (limit + 1,)).fetchall()
+        from agentic_fx.loops.improve_run_summary import dto_of
+        runs = []
+        for row in rows[:limit]:
+            dto = dto_of(row if row["state"] is not None else None)
+            items = dto["items"] if dto is not None else {}
+            floor = items.get("floor") or {}
+            runs.append({
+                "id": row["mission_id"], "started_at": row["started_at"],
+                "finished_at": row["created_at"], "trigger": row["trigger"],
+                "result_code": row["result_code"], "reason_code": row["reason_code"],
+                "plugin": (items.get("tried") or {}).get("plugin"),
+                "failed_stage": floor.get("failed_stage"),
+                "failed_conditions": list(floor.get("failed_conditions") or []),
+                "failed_pair_count": floor.get("failed_pair_count"),
+                "approval_id": row["approval_id"]})
+        return {"runs": runs, "has_more": len(rows) > limit}
 
     def _floor_of(self, mission_id: int, report_state: str,
                   report_path: object) -> dict | None:

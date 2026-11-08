@@ -847,6 +847,16 @@ def _agent_surfaces(app, root, loop, ctx) -> dict[str, str]:
                           ensure_ascii=False, default=str)
 
     rpc = app.ops.improve_run(Principal.OPERATOR, ctx.mission_id)
+    # `summary.items` の床 (`floor`) と比較 (`comparison`) は、API / web の読者が床との差を
+    # 読むための数値で、段ごとの判定値を持つ。この 2 欄だけは別の面に分けて数値の種類を
+    # 確かめる。ほかの欄 (仮説・説明・申し送り・観察文など) と応答の残りは、従来どおり
+    # 厳密に見る。
+    summary_numbers = {}
+    if isinstance(rpc.get("summary"), dict):
+        items = dict(rpc["summary"].get("items", {}))
+        summary_numbers = {key: items.pop(key) for key in ("floor", "comparison")
+                           if key in items}
+        rpc = {**rpc, "summary": {**rpc["summary"], "items": items}}
     index = root / "plugins" / "_archive" / "INDEX.md"
     return {
         "generated_prompt": next_mission.prompt,
@@ -858,6 +868,8 @@ def _agent_surfaces(app, root, loop, ctx) -> dict[str, str]:
         "rendered_prompt": loop._render_improve_mission_prompt(
             ctx_data, ctx=next_ctx),
         "rpc_improve_run": json.dumps(rpc, ensure_ascii=False, default=str),
+        "rpc_summary_numbers": json.dumps(summary_numbers, ensure_ascii=False,
+                                          default=str),
         "mission_output": dump("SELECT * FROM missions"),
         "backlog_last_result": dump("SELECT * FROM improvement_backlog"),
         "improvement_runs": dump("SELECT * FROM improvement_runs"),
@@ -892,6 +904,23 @@ def _notice_holdout_strings(kind: str) -> set[str]:
     return out
 
 
+SUMMARY_NUMBER_KEYS = ("trades", "pf", "avg_r", "max_drawdown")
+
+
+def _summary_number_strings() -> set[str]:
+    """要約の床と比較が持ってよい数値: 判定に使う 4 項目だけ (win_rate・total_pnl など
+    ほかの指標は含めない)。"""
+    out = set()
+    for metrics in CANARY_METRICS.values():
+        for key in SUMMARY_NUMBER_KEYS:
+            value = metrics[key]
+            out.add(str(value))
+            if isinstance(value, float):
+                out.update({f"{value:.2f}", f"{value:.3f}", f"{value:.4f}",
+                            f"{value:.6f}".rstrip("0")})
+    return out
+
+
 @pytest.mark.parametrize("kind,mode", [
     ("not_improved", "enforce"), ("not_improved", "shadow"),
     ("improved", "shadow"), ("improved", "enforce"),
@@ -908,8 +937,9 @@ def test_holdout_metrics_do_not_reach_agent_or_notice_surfaces(
                  "notices", "activity"):
         assert surfaces[name], f"{name} is empty; the surface was not exercised"
     for name, text in surfaces.items():
-        allowed = (_notice_holdout_strings(kind)
-                   if name == "rpc_improve_run" else set())
+        allowed = (_notice_holdout_strings(kind) if name == "rpc_improve_run"
+                   else _summary_number_strings() if name == "rpc_summary_numbers"
+                   else set())
         for canary in canaries - allowed:
             assert canary not in text, f"{canary} leaked to {name}"
     report = _report_text(root)

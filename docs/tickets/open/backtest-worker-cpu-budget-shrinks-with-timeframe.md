@@ -4,7 +4,7 @@ status: 設計待ち
 priority: 中
 opened: 2026-09-20
 closed: null
-related: [product-vision-grown-by-its-user]
+related: [product-vision-grown-by-its-user, improve-runner-choice]
 backfilled: true
 source_section: 未完了
 kind: 不具合
@@ -25,3 +25,4 @@ kind: 不具合
 - 2026-11-08: 優先: 高 — 2026-11-08 再観測: 手動の改善 #3370〜3373 のうち 3 回が worker_cpu_limit (120 秒) で評価できずに終わった。11-01 以降 12 回で、ほぼすべて参照系列 (EURUSD・XAUUSD・US500 など) を使う strategy。通常の依存 2 本の strategy は 15〜25 秒で、参照系列のものだけ 5〜10 倍遅い (activity の backtest_cpu)。参照系列の処理の効率を先に実測で調べる。優先を中から高へ
 - 2026-11-08: 状態: 実装中 — 原因 (2026-11-08 実測、tmp/inv-refcpu/report.md): worker の _align_indicator_to_main (plugin/worker.py:166) が strategy の窓の行ごとに align_reference を呼び、毎回参照系列の sort と終了時刻の計算をやり直す (1 回約 90 µs、O(N))。1 eval の worker CPU が参照なしの 3〜6 倍 (#3372 全期間 72.2 秒が本番 71.95 秒と一致)。処置 (利用者承認): 並べ替えと終了時刻の計算を 1 回にし searchsorted で一括に引く。旧関数との突き合わせ test で意味を固定。worker の張り替え (恒久策) は別に残す
 - 2026-11-08: 状態: 設計待ち、優先: 中 — 参照系列の整列をベクトル化した (worker の _align_indicator_to_main → reference.align_reference_rows、align_reference はその wrapper)。#3372 の候補の全期間の worker CPU は 72.2 → 11.6 秒、#3373 相当は約 138 → 15.4 秒で、上限 120 秒に収まる。新旧の突き合わせ test と変異で意味を固定。レビュー codex 1 周目・/code-review high・閉鎖確認。残り: worker の張り替え (恒久策) と 15m・依存 3 本の症状は未着手。優先を高から中へ
+- 2026-11-08: 関連: [product-vision-grown-by-its-user, improve-runner-choice] — 2026-11-08 利用者の観測: CPU 上限は主に手動の改善で起きる (週次は 1 回だけ)。改善モデルを luna から terra にしてから頻発 (terra は参照系列を使う重い strategy を作りやすい)。参照系列の整列の是正を配備した後、利用者が同じ文言で手動の改善を試して様子を見る

@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agentic_fx.store.improve_run_summaries import EMPTY_SUMMARY
 from agentic_fx import improve_notice_codes as codes
 from agentic_fx.core import improve_supervisor as sup_mod
 from agentic_fx.core.improve_supervisor import ImproveSupervisor
@@ -84,7 +85,7 @@ class FakeLoop:
         conn = self._conn()
         try:
             missions.finish_improve_mission(
-                conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
+                conn, summary=EMPTY_SUMMARY, mission_id=ctx.mission_id, run_id=ctx.run_id,
                 slot_key=ctx.slot_key if slot else None, mission_status=status,
                 run_result=None, backlog_transition=None, now=NOW, notice=notice,
                 tool_calls=tool_calls)

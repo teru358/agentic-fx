@@ -115,7 +115,7 @@ def trades_per_eval_bar(trades: object, eval_bars: object) -> float | None:
     return None
 
 
-def _floor_fail_items(
+def floor_fail_items(
         per_pair: dict, *, settings: "Settings",
         scope: str) -> list[FloorFailItem]:
     """[profitability-floor-fix] G2 (2026-09-13): `_check_profitability_
@@ -182,9 +182,9 @@ def _check_profitability_floor(
     pair ごとに判定し、**1 pair でも不合格なら候補全体を落とす**
     (pf は pair 間で算術合成できないため合計ではなく pair ごとに見る)。
 
-    判定条件そのものは `_floor_fail_items` に委譲する (二重実装しない)。
+    判定条件そのものは `floor_fail_items` に委譲する (二重実装しない)。
     """
-    items = _floor_fail_items(per_pair, settings=settings, scope=scope)
+    items = floor_fail_items(per_pair, settings=settings, scope=scope)
     if items:
         if audience == "agent":
             items = [item for item in items if item.kind in ("pf", "avg_r")]

@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from agentic_fx.store.improve_run_summaries import EMPTY_SUMMARY
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx import improve_notice_codes as codes
 from agentic_fx.core.improve_supervisor import ImproveSupervisor
@@ -762,7 +763,7 @@ def test_pre_ready_failure_keeps_slot_reserved_through_real_commit(conn):
             self.committed.append((mission_id, slot_terminalize))
             conn.execute("BEGIN IMMEDIATE")
             missions_store.finish_improve_mission(
-                conn, mission_id=mission_id, run_id=run_id,
+                conn, summary=EMPTY_SUMMARY, mission_id=mission_id, run_id=run_id,
                 slot_key=slot_key if slot_terminalize else None,
                 mission_status="failed", run_result=None, now=now,
                 backlog_transition=None, commit=False,
@@ -1469,7 +1470,7 @@ class _Round2FakeImproveLoop:
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             missions_store.finish_improve_mission(
-                self._conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
+                self._conn, summary=EMPTY_SUMMARY, mission_id=ctx.mission_id, run_id=ctx.run_id,
                 slot_key=ctx.slot_key, mission_status="failed",
                 run_result=None, backlog_transition=None, now=now,
                 commit=False,

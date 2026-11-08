@@ -751,6 +751,18 @@ CREATE TRIGGER IF NOT EXISTS improve_run_notices_no_update
 BEFORE UPDATE ON improve_run_notices BEGIN SELECT RAISE(ABORT, 'improve_run_notices is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS improve_run_notices_no_delete
 BEFORE DELETE ON improve_run_notices BEGIN SELECT RAISE(ABORT, 'improve_run_notices is append-only'); END;
+
+CREATE TABLE IF NOT EXISTS improve_run_summaries (
+  mission_id INTEGER PRIMARY KEY REFERENCES missions(id),
+  summary_version INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('ok','empty','build_failed')),
+  summary_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS improve_run_summaries_no_update
+BEFORE UPDATE ON improve_run_summaries BEGIN SELECT RAISE(ABORT, 'improve_run_summaries is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS improve_run_summaries_no_delete
+BEFORE DELETE ON improve_run_summaries BEGIN SELECT RAISE(ABORT, 'improve_run_summaries is append-only'); END;
 """
 
 TABLE_NAMES = frozenset({
@@ -763,7 +775,7 @@ TABLE_NAMES = frozenset({
     "cron_cursor", "mission_decision_bars",
     "ops_requests", "ops_idempotency", "ops_events", "ops_policies",
     "plugin_deploy_ops", "plugin_deploy_op_signals", "improve_run_notices",
-    "signal_decisions", "signal_shadow", "ohlcv_slice_sets", "ohlcv_slices",
+    "improve_run_summaries", "signal_decisions", "signal_shadow", "ohlcv_slice_sets", "ohlcv_slices",
     "ohlcv_slice_generations", "econ_reaction_keys", "econ_reaction_values",
 })
 

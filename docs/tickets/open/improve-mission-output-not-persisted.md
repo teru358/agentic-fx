@@ -27,3 +27,5 @@ improvement_runs 69 件に対して missions.output_json は 0 件、transcript_
 - 2026-10-18: 起票。
 - 2026-10-23: 関連: [improve-objective-filtered-signal-quality, improve-backlog-self-feedback-duplicates-work, mission-output-not-persisted] — 重複チケット mission-output-not-persisted を本件に統合 (2026-10-23 棚卸し)
 - 2026-10-25: 種別: 不具合 — 種別を付与
+- 2026-11-08: 状態: 実装中 — output_json の配線を improve-run-summary-for-humans の束で行う (transcript は保存しない、別途)
+- 2026-11-08: 状態: 設計待ち — output の側は improve-run-summary-for-humans の束で是正: missions.output_json に agent の元の出力を保存する (文字列の葉と key に safe_text、秘密名の欄は伏せる、64 KiB 超は truncated の印、出力の無い経路は NULL)。残りは transcript だけ。transcript は秘密を含みうるため保存していない (今のまま []) — 保存するなら置き場・無害化・保持期間を設計する

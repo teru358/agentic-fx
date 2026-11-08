@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from agentic_fx.backtest.metrics import EVALUABLE_MIN_TRADES
-from agentic_fx.plugin.strategy_gate import _floor_fail_items, trades_per_eval_bar
+from agentic_fx.plugin.strategy_gate import floor_fail_items, trades_per_eval_bar
 
 RECENT_DAYS = 60
 REJECTED_REFERENCE_APPROVAL = 84
@@ -111,7 +111,7 @@ def _is_deep_drawdown_candidate(per_pair: dict, *, settings) -> bool:
     trades = [m["trades"] for m in per_pair.values()]
     if any(type(t) is not int for t in trades) or sum(trades) < EVALUABLE_MIN_TRADES:
         return False
-    kinds = {item.kind for item in _floor_fail_items(
+    kinds = {item.kind for item in floor_fail_items(
         per_pair, settings=settings, scope="in_sample")}
     return kinds == {"drawdown_too_deep"}
 

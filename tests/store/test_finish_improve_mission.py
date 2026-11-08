@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from agentic_fx.store.improve_run_summaries import EMPTY_SUMMARY
 from agentic_fx.store import backlog, improve_runs, improve_waves, missions
 from agentic_fx import improve_notice_codes as codes
 from agentic_fx.store.db import connect, init_db
@@ -66,7 +67,7 @@ def test_finish_improve_mission_success_path_updates_all_four(tmp_path):
     improve_runs.bind_backlog(c, rid, bid)
 
     missions.finish_improve_mission(
-        c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
+        c, summary=EMPTY_SUMMARY, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
         mission_status="completed", run_result="report",
         backlog_transition={"backlog_id": bid, "status": "done",
                             "last_result": "report:reports/x.md"},
@@ -91,7 +92,7 @@ def test_finish_improve_mission_approval_path_persists_approval_id(tmp_path):
     improve_runs.bind_backlog(c, rid, bid)
 
     missions.finish_improve_mission(
-        c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
+        c, summary=EMPTY_SUMMARY, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
         mission_status="completed", run_result="approval",
         backlog_transition={"backlog_id": bid, "status": "done",
                             "last_result": "approval:42"},
@@ -112,7 +113,7 @@ def test_finish_improve_mission_non_completed_marks_slot_failed(tmp_path, missio
     mid, rid = _prepare_scheduler_mission(c)
     improve_waves.mark_running(c, period_key="2026-W34", k=0, now=NOW)
     missions.finish_improve_mission(
-        c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
+        c, summary=EMPTY_SUMMARY, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
         mission_status=mission_status, run_result=None,
         backlog_transition=None, now=NOW, output=None, transcript=[],
         notice=codes.NOTICE_COMMIT_CRASHED, tool_calls=None)
@@ -130,7 +131,7 @@ def test_finish_improve_mission_output_invalid_treated_as_failed(tmp_path):
     mid, rid = _prepare_scheduler_mission(c)
     improve_waves.mark_running(c, period_key="2026-W34", k=0, now=NOW)
     missions.finish_improve_mission(
-        c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
+        c, summary=EMPTY_SUMMARY, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
         mission_status="failed", run_result=None, backlog_transition=None,
         now=NOW, output=None, transcript=[],
         notice=codes.NOTICE_COMMIT_CRASHED, tool_calls=None)
@@ -143,7 +144,7 @@ def test_finish_improve_mission_shutdown_path_same_helper(tmp_path):
     mid, rid = _prepare_scheduler_mission(c)
     improve_waves.mark_running(c, period_key="2026-W34", k=0, now=NOW)
     missions.finish_improve_mission(
-        c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
+        c, summary=EMPTY_SUMMARY, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
         mission_status="timeout", run_result=None, backlog_transition=None,
         now=NOW, output=None, transcript=[],
         notice=codes.NOTICE_COMMIT_CRASHED, tool_calls=None)
@@ -157,7 +158,7 @@ def test_finish_improve_mission_manual_one_shot_slot_key_none(tmp_path):
     rid = improve_runs.start(c, None, now=NOW, mission_id=mid, commit=False)
     c.commit()
     missions.finish_improve_mission(
-        c, mission_id=mid, run_id=rid, slot_key=None,
+        c, summary=EMPTY_SUMMARY, mission_id=mid, run_id=rid, slot_key=None,
         mission_status="completed", run_result=None, backlog_transition=None,
         now=NOW, output=None, transcript=[],
         notice=codes.NOTICE_OBSERVATION, tool_calls=None)
@@ -174,7 +175,7 @@ def test_finish_improve_mission_cas_zero_rowcount_raises_and_rolls_back(tmp_path
     backlog.select_for_mission(c, bid, now=NOW)
     improve_runs.bind_backlog(c, rid, bid)
     missions.finish_improve_mission(
-        c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
+        c, summary=EMPTY_SUMMARY, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
         mission_status="completed", run_result="report",
         backlog_transition={"backlog_id": bid, "status": "done",
                             "last_result": "x"},
@@ -182,7 +183,7 @@ def test_finish_improve_mission_cas_zero_rowcount_raises_and_rolls_back(tmp_path
         notice=codes.NOTICE_REPORT_PUBLISHED, tool_calls=None)
     with pytest.raises(Exception):
         missions.finish_improve_mission(
-            c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
+            c, summary=EMPTY_SUMMARY, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
             mission_status="failed", run_result=None, backlog_transition=None,
             now=NOW, output=None, transcript=[],
             notice=codes.NOTICE_COMMIT_CRASHED, tool_calls=None)
@@ -211,7 +212,7 @@ def test_finish_improve_mission_mid_call_exception_rolls_back_all_four_rows(
 
     with pytest.raises(RuntimeError, match="mark_terminal boom"):
         missions.finish_improve_mission(
-            c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
+            c, summary=EMPTY_SUMMARY, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
             mission_status="completed", run_result="report",
             backlog_transition={"backlog_id": bid, "status": "done",
                                 "last_result": "x"},
@@ -256,7 +257,7 @@ def test_run_lifecycle_created_bound_finished_no_dangling(tmp_path):
     assert run["finished_at"] is None  # まだ FINISHED でない (CREATED/BOUND)
     improve_waves.mark_running(c, period_key="2026-W34", k=0, now=NOW)
     missions.finish_improve_mission(
-        c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
+        c, summary=EMPTY_SUMMARY, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
         mission_status="completed", run_result=None, backlog_transition=None,
         now=NOW, output=None, transcript=[],
         notice=codes.NOTICE_OBSERVATION, tool_calls=None)

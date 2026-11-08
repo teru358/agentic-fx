@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from urllib.parse import quote
 
 from agentic_fx.config import ImproveGateSettings
-from agentic_fx.plugin.strategy_gate import _floor_fail_items
+from agentic_fx.plugin.strategy_gate import floor_fail_items
 
 
 MIN_TRADES = 30
@@ -103,8 +103,8 @@ def _strategy(payload: dict) -> str:
 
 
 def _verdict(in_sample: dict, holdout: dict, *, settings) -> str:
-    in_items = _floor_fail_items(in_sample, settings=settings, scope="in_sample")
-    holdout_items = _floor_fail_items(holdout, settings=settings, scope="holdout")
+    in_items = floor_fail_items(in_sample, settings=settings, scope="in_sample")
+    holdout_items = floor_fail_items(holdout, settings=settings, scope="holdout")
     kinds = {item.kind for item in (*in_items, *holdout_items)}
     profit_failed = bool(kinds & {"pf", "avg_r"})
     holdout_unavailable = "holdout_not_evaluable" in kinds

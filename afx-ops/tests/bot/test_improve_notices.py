@@ -761,3 +761,83 @@ def test_a_send_failure_leaves_no_body_in_the_bot_or_its_exception(make_bot):
 
     held = "\n".join(_reachable_strings(bot.adapter)) + repr(bot.adapter)
     assert CANARY not in held and "canary.example" not in held
+
+
+# ------------------------------------------------------------ 要約 (summary) から組む本文
+
+def _real_summary_dtos() -> dict:
+    import json
+    path = Path(__file__).resolve().parents[1] / "fixtures" / "improve_run_summary_dtos.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _finished_for(event_id: int, dto: dict) -> dict:
+    snap = dto["snapshot"]
+    return _improve(event_id, dto["id"], result=snap["result_code"], reason=snap["reason_code"],
+                    tool=snap["tool_calls"], trigger=snap["trigger"])
+
+
+def test_a_real_summary_reaches_the_post_through_the_bot_and_nothing_the_notice_forbids_does(
+        make_bot):
+    dtos = _real_summary_dtos()
+    names = ["unprofitable_holdout", "unprofitable_in_sample", "submitted_improved", "observation"]
+    events = []
+    runs = {}
+    for number, name in enumerate(names, start=1):
+        dto = {**dtos[name], "id": 100 + number}
+        events.append(_finished_for(number, dto))
+        runs[dto["id"]] = _ok(dto)
+    bot = make_bot(_page(events), runs=runs, mention_role_id=ROLE, mention_user_ids=(USER,))
+
+    bot.poll()
+
+    assert len(bot.texts) == 4
+    holdout, in_sample, improved, observation = bot.texts
+    assert "試したもの: strategy cand (新設)" in holdout
+    assert "holdout: USDJPY pf 0.62 avg_r -0.04 取引 53" in holdout
+    assert "in-sample: USDJPY pf 0.30 avg_r -0.10 取引 60" in in_sample
+    assert "holdout: 未実施" in in_sample
+    assert "USDJPY 候補: pf 1.40 avg_r +0.15 取引 40" in improved
+    assert "agent の申告: session" in observation
+    for content, allowed in bot.channel.sent:
+        assert allowed == discord.AllowedMentions.none().to_dict()
+        assert str(ROLE) not in content and str(USER) not in content
+        assert "@everyone" not in content and "<@123456>" not in content
+        assert len(content) <= 2000
+        for hidden in ("win_rate", "max_drawdown", "total_pnl", "min_pf", "idea for", "rationale"):
+            assert hidden not in content
+
+
+def test_a_daemon_that_does_not_know_the_summary_gets_the_unchanged_notice_through_the_bot(
+        make_bot):
+    dtos = _real_summary_dtos()
+    old = {key: value for key, value in dtos["unprofitable_holdout_thin"].items()
+           if key != "summary"}
+    new = dtos["unprofitable_holdout_thin"]
+    bot = make_bot(_page([_finished_for(1, old), _finished_for(2, {**new, "id": new["id"] + 1})]),
+                   runs={old["id"]: _ok(old), new["id"] + 1: _ok({**new, "id": new["id"] + 1})})
+
+    bot.poll()
+
+    old_text, new_text = bot.texts
+    assert old_text == ("[改善] 床未達で見送り #1 (unprofitable)\n"
+                        "落ちた段: holdout\n"
+                        "holdout: USDJPY pf 1.85 avg_r +0.30 取引 13 (評価不能)\n"
+                        "所要 0分00秒 / tool -")
+    assert new_text.splitlines()[:4] == old_text.replace("#1", "#2").splitlines()[:1] + [
+        "試したもの: strategy cand (新設)", "落ちた段: holdout",
+        "holdout: USDJPY pf 1.85 avg_r +0.30 取引 13 (評価不能)"]
+
+
+def test_a_summary_that_is_not_ok_leaves_the_bot_posting_the_current_notice(make_bot):
+    dtos = _real_summary_dtos()
+    broken = {**dtos["unprofitable_holdout_thin"],
+              "summary": {"version": 1, "state": "build_failed", "items": {}}}
+    bot = make_bot(_page([_finished_for(1, broken)]), runs={broken["id"]: _ok(broken)})
+
+    bot.poll()
+
+    assert bot.texts == ["[改善] 床未達で見送り #1 (unprofitable)\n"
+                         "落ちた段: holdout\n"
+                         "holdout: USDJPY pf 1.85 avg_r +0.30 取引 13 (評価不能)\n"
+                         "所要 0分00秒 / tool -"]
