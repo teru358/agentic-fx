@@ -132,12 +132,25 @@ def _approved_hashes_by_name(conn: sqlite3.Connection) -> dict[str, set[str]]:
     が str でない行の warning + skip) はそのまま維持する。
     """
     rows = conn.execute(
-        "SELECT id, payload_json, status FROM approval_requests "
+        "SELECT id, payload_json, status, decided_at FROM approval_requests "
         "WHERE kind=? AND status IN ('approved','rejected') "
         "AND decided_at IS NOT NULL "
         "ORDER BY decided_at, id", (APPROVAL_KIND,)).fetchall()
+    return approved_hashes_from_rows(rows)
+
+
+def approved_hashes_from_rows(rows) -> dict[str, set[str]]:
+    """承認行 (`id` / `status` / `decided_at` / `payload_json` を持つ) から、
+    (name, content_hash) ごとの最新決定が approved のものを name 別に集める。
+    DB を読む `_approved_hashes_by_name` と、入力を受け取る read model が
+    同じ規則を使う。`expired` / `invalidated` と `decided_at` の無い行は決定として
+    数えず、`decided_at, id` の昇順で後の決定が前の決定を上書きする。"""
+    ordered = sorted(
+        (row for row in rows
+         if row["status"] in ("approved", "rejected") and row["decided_at"] is not None),
+        key=lambda row: (row["decided_at"], row["id"]))
     latest_status: dict[tuple[str, str], str] = {}
-    for row in rows:
+    for row in ordered:
         try:
             payload = json.loads(row["payload_json"])
         except (json.JSONDecodeError, TypeError) as exc:

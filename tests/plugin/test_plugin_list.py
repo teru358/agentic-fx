@@ -190,7 +190,7 @@ def test_plugin_list_any_per_plugin_failure_is_a_broken_row(tmp_path, capsys, mo
     assert [line.split()[0] for line in lines[4:]] == ["alpha", "boom"]
 
 
-def test_plugin_list_orders_by_name_then_kind_and_keeps_same_name_kinds_apart(tmp_path, capsys):
+def test_plugin_list_has_one_row_per_name_ordered_by_name(tmp_path, capsys):
     _write_plugin(tmp_path, "zeta", "indicator")
     _write_plugin(tmp_path, "beta")
     db, conn = _new_db(tmp_path)
@@ -202,11 +202,10 @@ def test_plugin_list_orders_by_name_then_kind_and_keeps_same_name_kinds_apart(tm
     plugin_list(tmp_path)
 
     rows = [line.split()[:2] for line in _lines(capsys)[4:]]
-    assert rows == [["alpha", "strategy"], ["beta", "indicator"], ["beta", "strategy"],
-                    ["zeta", "indicator"]]
+    assert rows == [["alpha", "strategy"], ["beta", "strategy"], ["zeta", "indicator"]]
 
 
-def test_plugin_list_pending_with_other_kind_than_live_gets_its_own_row(tmp_path, capsys):
+def test_plugin_list_pending_with_other_kind_than_live_is_flagged_on_the_live_row(tmp_path, capsys):
     _write_plugin(tmp_path, "beta")
     db, conn = _new_db(tmp_path)
     _pending(conn, {"name": "beta", "content_hash": H_PENDING, "kind": "indicator"})
@@ -216,13 +215,11 @@ def test_plugin_list_pending_with_other_kind_than_live_gets_its_own_row(tmp_path
     assert plugin_list(tmp_path) == 1
 
     rows = [line.split() for line in _lines(capsys)[4:]]
-    assert [row[:2] for row in rows] == [["beta", "indicator"], ["beta", "strategy"]]
+    assert [row[:2] for row in rows] == [["beta", "strategy"]]
     assert rows[0][3] == H_PENDING[:12] and rows[0][-1] == "kind_mismatch"
-    assert H_PENDING[:12] not in rows[1] and "kind_mismatch" not in rows[1]
 
-    assert plugin_list(tmp_path, kind="indicator") == 1
-    rows = [line.split() for line in _lines(capsys)[4:]]
-    assert [row[:2] for row in rows] == [["beta", "indicator"]] and rows[0][3] == H_PENDING[:12]
+    assert plugin_list(tmp_path, kind="indicator") == 0
+    assert _lines(capsys)[4:] == []
 
 
 def test_plugin_list_pending_without_kind_is_kind_missing_and_survives_the_kind_filter(tmp_path, capsys):

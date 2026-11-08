@@ -947,7 +947,11 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
     # lock を作りうる初期化確認を通さない (DB が無ければ自身で案内して終わる)。
     read_only_view = args.command == "plugin" and args.plugin_command in {"versions", "list"}
     if args.command == "plugin" and args.plugin_command == "list":
-        return plugin_deploy_cli.plugin_list(root, kind=args.kind)
+        try:
+            settings = load_settings(root / "config" / "settings.yaml")
+        except ConfigError:
+            settings = None
+        return plugin_deploy_cli.plugin_list(root, kind=args.kind, settings=settings)
     if not read_only_view:
         ensure_initialized(root)
     # 設定の検証は環境を変えないので、.env はこの CLI の入口で明示的に読む。

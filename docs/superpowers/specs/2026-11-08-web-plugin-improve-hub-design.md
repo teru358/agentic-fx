@@ -1,7 +1,7 @@
-# 同梱 web の「plugin と改善」画面群 (web-plugin-improve-hub) 設計 C2.2
+# 同梱 web の「plugin と改善」画面群 (web-plugin-improve-hub) 設計 C2.3
 
 **チケット:** `web-plugin-improve-hub` (起票予定、高、機能)。段 B2 (TLS) と段 C (モデル選択) は別チケットにできる。関連: `improve-run-summary-for-humans` (要約の API を読む)、`web-ui-charts-equity-indicators` (チャートは後)
-**状態:** C2.2 (2026-11-08)、§3 は利用者が決定。sol 1 周目・opus 2 周目・sol 3 周目と利用者の裁定 (書込みは loopback か TLS) を反映
+**状態:** C2.3 (2026-11-08)、§3 は利用者が決定。sol 1 周目・opus 2 周目・sol 3 周目と利用者の裁定 (書込みは loopback か TLS) を反映
 
 ## 0. 何が起きているか
 
@@ -126,6 +126,12 @@ JS と Node.js の使用は許可された (2026-11-08)。11-01 の方針とし�
   6. afx と web を起動し直す。もともと afx が止まっていたなら、afx は起動しない (今の enable と同じ扱い)。
   - 途中で止まったら、記録した stage から再開する。鍵を変えた後・設定を書く前に止まっても、再実行で目標の状態に収束する。
   - 隔離側の `PRINCIPALS`・`read_api_token`・`client_for` は、同じ検証済みの write から同じ principal を選ぶ。
+- `afx ops web reconfigure` (port・password などの変更) との関係:
+  - reconfigure は今の `write` を保持する。設定を作り直しても `write` を落とさない。
+  - `write` の変更要求は、何かを書き換える前に拒否し、`enable --write` / `--no-write` へ案内する。
+  - 鍵の照合は、今の検証済みの `write` に対応する principal で行う。
+  - 書込みが有効な間に、非 loopback や `auth = none` へ変えようとしたら、secret と設定を書き換える前に拒否する。
+- 書込みを有効にするときは、password の変更を勧める (LAN の平文で読んでいた間の password は盗聴されえたため)。
 - 鍵の manifest の互換: afx-ops の `keys.py` を、自分の entry だけを検証し、知らない principal を無視する形に直す。これを先に配備する (古い afx-ops が新しい manifest で `ready_invalid` にならないよう、配備の順を運用手順に書く)。
 - 残る危険: 書込みを有効にした web が侵害されると、承認の権限も渡る。元の境界「web が侵害されても決定権に届かない」は、書込みを有効にした構成では成り立たない。
 
@@ -144,7 +150,8 @@ JS と Node.js の使用は許可された (2026-11-08)。11-01 の方針とし�
 - 承認者は 1 人の扱い (Basic の資格情報を共有する人は区別できない)。監査上の制約として了解したうえで使う (§3 の裁定 2)。
 
 **確認の 2 段:**
-- 「承認」「却下」「改善を実行」の POST (1 回目) で、web が確認 record を作り、確認画面を返す。1 回目の POST にも、下の要求の検査 1〜3・5 を掛ける。
+- 「承認」「却下」「改善を実行」の POST (1 回目) で、web が確認 record を作り、確認画面を返す。
+- token は CSPRNG で作る (`secrets.token_urlsafe(32)`)。冪等 key は token そのものではなく、固定の prefix + token の SHA-256 にする (daemon は冪等 key を永続化するため)。token は確認画面の hidden field 以外 (URL・ログ・永続記録) に出さない。1 回目の POST にも、下の要求の検査 1〜3・5 を掛ける。
 - record に結び付けるもの:
   - 認証済みのユーザー
   - action (approve / reject / improve)
@@ -218,6 +225,17 @@ JS と Node.js の使用は許可された (2026-11-08)。11-01 の方針とし�
 - 選んだ候補の名前は、改善の要約に残す。要約の設計に「使った候補」の欄を足す (要約の version を上げる。要約の束の変更として扱う)。
 - settings.yaml を web から書き換えない。候補を足すのは、利用者が settings を編集して行う。
 
+### 段 B1 の実装の順序
+
+途中の commit で安全の性質が崩れないよう、次の順に進める。
+
+1. afx-ops の鍵の manifest の互換 (知らない principal を無視する) を先に入れる。書込みは無効のまま。
+2. web 側: 起動時の検査、Host・Basic・Origin、確認 record の状態機械、厳密な POST の入力処理。有効化のコマンドはまだ公開しない。
+3. daemon 側: principal・scope・actor の表と、書込み用の client。
+4. 実際の隔離で疎通を揃えてから、鍵と設定の切替 (`enable --write`) と書込みの有効化を公開する。
+
+検証は、要求の検査の単体 test (各拒否条件で daemon の呼出しがゼロ)、daemon の権限と所有者の test、切替の中断と再開の test、実際の隔離 → 実際の UDS の結合 test に分ける。
+
 ## 2. JS とビルド
 
 - 段 A・B は、server 側で HTML を組み立て、form の POST で操作する。JS が無くても全部使える。
@@ -278,9 +296,15 @@ JS と Node.js の使用は許可された (2026-11-08)。11-01 の方針とし�
     - `IMPROVE_RUN` は改善の開始だけを許し、operator・approver も持つ。改善 job の閲覧・取消は自分の job に限る。
     - 多重起動は `improve_running`。autopilot 中の制限が効く。
     - 同じ `Idempotency-Key` の replay で job id を取り戻せる。
-12. 実際に隔離した web から、実際の UDS を通して daemon に承認できる。pidfd の検証ができない相手は拒否する。
+12. 実際に隔離した web から、実際の UDS を通して、承認・却下・改善の開始・job の閲覧と取消・応答を失った後の回復ができる。pidfd の検証ができない相手は拒否する。
+12b. reconfigure: 書込みが有効な間に port・password を変えても `write` と principal が保たれる。`write` の変更や、非 loopback・`auth = none` への変更は拒否され、設定・secret・鍵・stage が変わらない。
+12c. token は CSPRNG で作られ、冪等 key は token の一方向 hash。token が URL・ログ・永続記録に出ない。
 13. web から入れた却下理由が、改善の prompt に流れない (固定文言 `rejected_by_human` のまま)。
-14. daemon 側の固定 test を更新する範囲を明記して直す: `validate_principal_scopes` の表、AC-56 の表と「operator・approver 以外の行」の規則、ops-api 設計 §3.1 の表、actor の表。
+14. 固定 test を更新する範囲を明記して直す。
+    - daemon 側: `validate_principal_scopes` の表、AC-56 の表と「operator・approver 以外の行」の規則、ops-api 設計 §3.1 の表、actor の表。
+    - afx-ops 側: 機能と principal の対応 (`tests/isolation/test_startup_keys_and_ready.py`)、起動引数 (`test_startup_plan.py`)、route 表 (`tests/web/test_routes.py`)、変更要求の拒否 (`tests/web/test_request.py`)、鍵の canary (`tests/isolation/test_canary.py`)。
+    - `write` の両方の状態で確かめる。拒否の test は一律に緩めず、`write = false` と対象外の method・path の拒否を残す。
+    - 鍵の canary で、読取の web から書込みの鍵へ、書込みの web から読取の鍵へ、届かないことを確かめる。
 
 段 B2:
 15. 実際に隔離した TLS の web と handshake でき、書込みまで通る。handshake の期限は接続の期限以下。
@@ -309,11 +333,13 @@ JS と Node.js の使用は許可された (2026-11-08)。11-01 の方針とし�
 - 却下の digest の照合は、直前に取り直した時点までの変化だけを検出する (Discord と同じ水準)。
 - 自己署名の HTTPS では、初回にブラウザの警告を利用者が通す (段 B2)。
 - 書込みを有効にするとき、afx が一度止まる (鍵の enroll のため)。
+- Basic の資格情報が漏れると、loopback でも書き込める (同じ機械の別 process が Host と Origin を作れる)。LAN の平文で読んでいた間の password もこれに当たる。書込みを有効にするときに password を変える。
 
 ## 変更履歴
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-11-08 | C2.3 | reconfigure は `write` を保持し、`write` の変更は enable へ案内する。有効化のときに password の変更を勧める。token の作り方と冪等 key (token の SHA-256)。B1 の実装の順序と検証の粒度。受入 12 を却下・改善・job・回復まで広げ、reconfigure と token の受入、afx-ops 側の固定 test の範囲。資格情報の流出の残余 | B1 の実装前レビュー (sol、Important 1 / Minor 2) | — |
 | 2026-11-08 | C2.2 | §3 を利用者の裁定で確定 (承認者は Basic のユーザー名で 1 人扱い、段 A は表だけ、A を今始め B1 は実装前にもう 1 周、B2・C は別チケット) | 利用者の裁定 | — |
 | 2026-11-08 | C2.1 | 鍵の切替を状態機械に合わせる (未登録 enroll・active 照合・revoked rotate、目標を stage に記録、中断から再開、止まっていた afx は起動しない)。確認 record に状態 (未使用・実行中・結果判明・結果不明) と結果の回復の口、消費済みの保持、満杯時の 4xx。改善の候補を API → job → supervisor → `_execute_mission` → `prepare` へ運び、週次は default、繰り返しは同じ snapshot、実行専用の Settings を admission と handshake へ。TLS の handshake も接続枠に数える。却下の digest 照合は直前時点までと明記。CLI と API の一致、CLI は DB を作らない | sol 3 周目 (Important 4 / Minor 1) | — |
 | 2026-11-08 | C2 | 段 B を B1 (loopback) と B2 (TLS) に分ける。`ops.toml` は `write`・`tls` の真偽値だけ、TLS の鍵と証明書は secret dir の固定名、SSLContext は隔離の前に作る、seccomp の再 trace、`check_web_access` で書込み × auth × 経路を落とす。1 process 1 鍵 (書込みが有効なら ops-web-write の鍵だけ)、`afx ops web enable --write` の手順、manifest の互換。確認 record は memory だけ・32 件・1 回目の POST にも検査、却下は web が直前に digest を照合、改善は token 由来の冪等 key で job id を取り戻す、web から retry は出さない。`IMPROVE_RUN` は改善の開始だけで operator・approver も持つ。actor の規則を principal ごとの表に。Origin を必須にして Referer を見ない。依存は例外を投げない列挙関数、read model は純関数で CLI と共有、kind 4 種。有用性は strategy の新規提出に限り再評価を除く、依頼単位、配備成功は journal の decided。read model の memo。段 C は候補ごとの起動時検査、opencode は候補ごとの検証まで default のみ、snapshot は ctx に載せる、`runner_choice` に改名、候補一覧の API、要約に候補名。却下理由の遮断、reverse proxy の残余、daemon 側の固定 test の範囲 | opus 2 周目 (Important 9 / Minor 9) | — |
