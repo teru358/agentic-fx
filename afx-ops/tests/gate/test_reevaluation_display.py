@@ -236,3 +236,11 @@ def test_the_comparison_cells_round_like_the_card_numbers():
     assert (reevaluation_text._cells(rough)
             == "pf=1.017 trades=40 avg_r=- max_drawdown=0.1497")
     assert reevaluation_text._cells({"trades": True}) == "pf=- trades=- avg_r=- max_drawdown=-"
+
+
+def test_a_huge_integer_cell_is_cut_instead_of_raising():
+    from afx_ops import reevaluation_text
+
+    cell = reevaluation_text._cells({"trades": 10 ** 309})
+
+    assert cell.startswith("pf=- trades=1000") and cell.endswith("…(省略) avg_r=- max_drawdown=-")

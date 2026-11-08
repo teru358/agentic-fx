@@ -295,6 +295,7 @@ def test_a_decided_reevaluation_shows_the_same_unchanged_diff_as_a_pending_one(f
 
     decided = ops_env.service().approval_change(OPERATOR, fx.approval_id)["diff"]
 
+    assert pending["files"]
     assert [(f["path"], f["status"]) for f in decided["files"]] == [
         (f["path"], f["status"]) for f in pending["files"]]
     assert all(f["status"] == "unchanged" for f in decided["files"])
@@ -307,7 +308,7 @@ def test_a_decided_ordinary_approval_without_a_journal_stays_unknown(ops_env):
 
     change = ops_env.service().approval_detail(OPERATOR, approval_id)["change"]
 
-    assert change["classification"] != L.CLASS_SAME
+    assert change["classification"] == L.CLASS_UNKNOWN
 
 
 def test_the_approval_detail_refuses_a_locator_that_is_not_the_canonical_path(fx, ops_env):
