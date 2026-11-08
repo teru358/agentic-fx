@@ -50,13 +50,17 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #f6f8fa; paddi
 dd.danger { font-weight: 700; background: #ffebe9; }
 .warn { color: #9a6700; }
 dd.warn { font-weight: 700; background: #fff8c5; }
+table { border-collapse: collapse; }
+th, td { border: 1px solid #d0d7de; padding: 0.25rem 0.5rem; text-align: left; }
 """
 
-_NAV_LABELS = {"/": "Status", "/approvals": "Approvals", "/logs": "Log", "/activity": "Activity"}
-# 静的な route (詳細は一覧の各項目から辿る)
-_NAV = "<nav>" + "".join(
-    f'<a href="{route.path}">{_NAV_LABELS[route.path]}</a>'
-    for route in ROUTE_TABLE if "{" not in route.path) + "</nav>"
+# nav に出す静的な route (表示順)。/approvals は /plugins から辿り、詳細は一覧の各項目から辿る
+_NAV_LABELS = {"/": "Status", "/plugins": "Plugins", "/logs": "Log", "/activity": "Activity"}
+_STATIC_ROUTES = frozenset(route.path for route in ROUTE_TABLE if "{" not in route.path)
+if not set(_NAV_LABELS) <= _STATIC_ROUTES:
+    raise RuntimeError("nav label without a route")
+_NAV = "<nav>" + "".join(f'<a href="{path}">{label}</a>'
+                         for path, label in _NAV_LABELS.items()) + "</nav>"
 # 真のとき強調する status の field と class
 _EMPHASIS = {"kill_switch": "danger", "autopilot": "warn"}
 

@@ -132,7 +132,12 @@ def live_signature(plugins_root: Path) -> tuple:
 
 
 def _file_stamps(entry: Path) -> tuple:
-    stamps = []
+    """必須 3 ファイルの stat と、loader が直下で検査する entry の名前の構成。"""
+    try:
+        listing = tuple(sorted(child.name for child in entry.iterdir()))
+    except OSError:
+        listing = None
+    stamps: list = [("entries", listing)]
     for name in loader.REQUIRED_FILES:
         try:
             info = (entry / name).stat()

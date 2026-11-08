@@ -430,3 +430,18 @@ def test_plugin_list_pending_with_an_unhashable_or_unknown_kind_is_kind_missing(
 
     rows = [line.split() for line in _lines(capsys)[4:]]
     assert len(rows) == 1 and rows[0][-1] == "kind_missing"
+
+
+def test_plugin_list_kind_filter_finds_a_name_that_only_has_requests(tmp_path, capsys):
+    db, conn = _new_db(tmp_path)
+    _pending(conn, {"name": "old", "content_hash": H_TARGET, "kind": "strategy"})
+    conn.execute("UPDATE approval_requests SET status='rejected'")
+    _pending(conn, {"name": "old", "content_hash": H_PENDING, "kind": "indicator"})
+    _pending(conn, {"name": "only_strategy", "content_hash": H_PENDING, "kind": "strategy"})
+    conn.commit()
+    conn.close()
+
+    assert plugin_list(tmp_path, kind="indicator") == 0
+
+    rows = [line.split()[:2] for line in _lines(capsys)[4:]]
+    assert rows == [["old", "indicator"]]

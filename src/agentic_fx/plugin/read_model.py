@@ -215,6 +215,7 @@ class PluginRow:
     dependents: tuple[Dependent, ...]
     usefulness: Usefulness | None
     history: tuple[HistoryItem, ...]
+    history_total: int
     versions: tuple[VersionItem, ...]
 
 
@@ -274,7 +275,7 @@ def _parse_request(row: ApprovalRow) -> _Request:
         _text(payload.get("name")),
         kind if kind in PLUGIN_KINDS else None,
         _text(payload.get("content_hash")), _text(payload.get("artifact_hash")),
-        origin if origin in KNOWN_ORIGINS else None,
+        origin if isinstance(origin, str) and origin in KNOWN_ORIGINS else None,
         mission if type(mission) is int else None)
 
 
@@ -453,8 +454,8 @@ def _build_row(name, entries, requests, scan, approved, phase1_keys, dependency,
     if meta is not None:
         kind = meta.kind if meta.kind in PLUGIN_KINDS else KIND_UNKNOWN
     else:
-        seen = {request.kind for request in requests if request.kind is not None}
-        kind = next(iter(seen)) if len(seen) == 1 else KIND_UNKNOWN
+        newest = max(requests, key=lambda request: request.id, default=None)
+        kind = newest.kind if newest is not None and newest.kind is not None else KIND_UNKNOWN
 
     if readable:
         first = readable[0]
@@ -505,12 +506,13 @@ def _build_row(name, entries, requests, scan, approved, phase1_keys, dependency,
     if useful is None and kind == KIND_INDICATOR:
         useful = Usefulness()
 
-    history = tuple(sorted(
+    history_all = tuple(sorted(
         (HistoryItem(request.id, request.status, request.kind, request.content_hash,
                      request.artifact_hash, request.origin, request.mission_id,
                      request.decided_at, request.created_at)
          for request in requests if request.payload is not None),
-        key=lambda item: -item.id))[:HISTORY_LIMIT]
+        key=lambda item: -item.id))
+    history = history_all[:HISTORY_LIMIT]
 
     live_artifact = entity.artifact_hash if entity.state == ENTITY_SYMLINK else None
     latest_by_artifact: dict[str, _Request] = {}
@@ -531,7 +533,7 @@ def _build_row(name, entries, requests, scan, approved, phase1_keys, dependency,
         pending=tuple(pending), open_ops=tuple(open_ops), issues=tuple(sorted(issues)),
         deps=aliases, deps_set_state=set_state,
         dependents=tuple(dependents.get(name, ())), usefulness=useful,
-        history=history, versions=versions)
+        history=history, history_total=len(history_all), versions=versions)
 
 
 # ---------------------------------------------------------------- DTO
@@ -592,6 +594,7 @@ def row_to_dto(row: PluginRow, *, detail: bool = False) -> dict:
              "artifact_hash": _artifact(item.artifact_hash), "origin": item.origin,
              "mission_id": item.mission_id, "decided_at": item.decided_at,
              "created_at": item.created_at} for item in row.history]
+        dto["history_total"] = row.history_total
         dto["versions"] = [
             {"artifact_hash": _artifact(item.artifact_hash), "is_live": item.is_live,
              "approval_id": item.approval_id, "status": item.status,

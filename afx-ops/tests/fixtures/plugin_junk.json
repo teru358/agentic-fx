@@ -1,0 +1,38 @@
+{
+ "display_timezone": "Asia/Tokyo",
+ "plugin": {
+  "admission": {
+   "alias": null,
+   "detail": null,
+   "reason": null,
+   "state": "none"
+  },
+  "dependencies": [],
+  "dependencies_set_state": null,
+  "dependents": [],
+  "entity": {
+   "artifact_hash": null,
+   "content_hash": null,
+   "reason": "missing_files",
+   "state": "unreadable"
+  },
+  "history": [],
+  "history_total": 0,
+  "issues": [
+   "broken:invalid_manifest"
+  ],
+  "kind": "unknown",
+  "name": "junk",
+  "open_ops": [],
+  "pending": [],
+  "pending_count": 0,
+  "usefulness": null,
+  "versions": []
+ },
+ "sources": {
+  "journal": "ok",
+  "live": "ok",
+  "pending": "ok"
+ },
+ "unknown_submissions": 1
+}

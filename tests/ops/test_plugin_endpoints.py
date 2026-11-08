@@ -174,6 +174,31 @@ def test_each_kind_of_deployment_change_rebuilds_once(ops_env, world, hash_calls
     assert svc._plugin_views.builds == base + 1
 
 
+@pytest.mark.parametrize("plain", [False, True])
+def test_an_extra_py_file_in_the_plugin_folder_flips_the_cached_verdict(ops_env, world, plain):
+    meta = world.deploy("rsi", plain=plain)
+    world.request(meta, status="approved")
+    svc = service(ops_env)
+
+    def state():
+        [row] = svc.plugin_list(Principal.OPERATOR)["plugins"]
+        return row["entity"]["state"], row["admission"]["state"]
+
+    before = state()
+    assert before[0] in ("symlink", "plain") and before[1] == "loaded"
+    base = svc._plugin_views.builds
+    folder = meta.path.resolve()
+    folder.chmod(0o755)
+    extra = folder / "conftest.py"
+    extra.write_text("# collected by pytest\n")
+    during = state()
+    assert during != before
+    assert svc._plugin_views.builds == base + 1
+    extra.unlink()
+    assert state() == before
+    assert svc._plugin_views.builds == base + 2
+
+
 def test_a_phase_change_of_an_open_journal_is_seen(ops_env, world):
     meta = world.deploy("rsi")
     approval = world.request(meta, status="approved")
@@ -186,6 +211,21 @@ def test_a_phase_change_of_an_open_journal_is_seen(ops_env, world):
     world.conn.commit()
     [row] = svc.plugin_list(Principal.OPERATOR)["plugins"]
     assert row["open_ops"] == []
+
+
+def test_requests_with_wrongly_typed_fields_do_not_break_the_list_the_cli_or_the_detail(
+        ops_env, world):
+    rsi = world.deploy("rsi")
+    world.request(rsi, status="approved")
+    base = {"name": "mix", "content_hash": "a" * 64, "artifact_hash": "b" * 64}
+    world.raw_request({**base, "kind": "strategy", "candidate_origin": ["staging"]})
+    world.raw_request({**base, "kind": {"x": 1}, "candidate_origin": {"y": 2}})
+    svc = service(ops_env)
+    names = {row["name"] for row in svc.plugin_list(Principal.OPERATOR)["plugins"]}
+    assert names == {"rsi", "mix"}
+    detail = svc.plugin_detail(Principal.OPERATOR, "mix")
+    assert [item["origin"] for item in detail["plugin"]["history"]] == [None, None]
+    assert {row[0] for row in _cli_rows(ops_env.root)} == {"rsi", "mix"}
 
 
 # ---- CLI との一致 ----

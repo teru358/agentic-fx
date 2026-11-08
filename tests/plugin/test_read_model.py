@@ -97,6 +97,54 @@ def test_kind_has_four_values_and_signal_is_not_folded_into_unknown(world):
     assert set(read_model.KINDS) == {"strategy", "indicator", "signal", "unknown"}
 
 
+def _ghost(world, kind, status="pending", name="ghost"):
+    return world.raw_request({"name": name, "kind": kind, "content_hash": "a" * 64},
+                             status=status)
+
+
+def test_without_a_readable_live_the_kind_is_the_newest_request_kind(world):
+    _ghost(world, "strategy", "rejected")
+    _ghost(world, "indicator", "pending")
+    assert by_name(model_of(world), "ghost").kind == "indicator"
+    _ghost(world, "signal", "approved")
+    assert by_name(model_of(world), "ghost").kind == "signal"
+
+
+def test_the_newest_request_decides_even_when_it_is_not_pending(world):
+    _ghost(world, "indicator", "pending")
+    _ghost(world, "strategy", "expired")
+    assert by_name(model_of(world), "ghost").kind == "strategy"
+
+
+def test_the_kind_is_unknown_when_the_newest_request_has_no_readable_kind(world):
+    _ghost(world, "indicator", "approved")
+    world.raw_request({"name": "ghost", "content_hash": "a" * 64})
+    assert by_name(model_of(world), "ghost").kind == "unknown"
+    world.raw_request({"name": "ghost", "kind": "indicatorx", "content_hash": "a" * 64})
+    assert by_name(model_of(world), "ghost").kind == "unknown"
+
+
+def test_a_name_with_no_request_and_no_live_is_unknown(world):
+    world.version_only("rsi")
+    assert by_name(model_of(world), "rsi").kind == "unknown"
+
+
+def test_an_unreadable_live_takes_the_newest_request_kind(world):
+    (world.plugins / "rsi").mkdir()
+    (world.plugins / "rsi" / "config.yaml").write_text("kind: [oops")
+    _ghost(world, "strategy", "rejected", "rsi")
+    _ghost(world, "indicator", "pending", "rsi")
+    row = by_name(model_of(world), "rsi")
+    assert row.entity.state == ENTITY_UNREADABLE and row.kind == "indicator"
+
+
+def test_a_readable_live_keeps_the_loader_kind_over_any_request(world):
+    world.deploy("rsi", "indicator")
+    _ghost(world, "strategy", "pending", "rsi")
+    row = by_name(model_of(world), "rsi")
+    assert row.kind == "indicator" and "kind_mismatch" in row.issues
+
+
 # ---------------------------------------------------------------- 配備実体
 
 def test_entity_symlink_plain_absent_and_unreadable(world):
@@ -364,8 +412,40 @@ def test_the_dto_has_allowlisted_closed_fields(world):
         "issues", "dependencies", "dependencies_set_state", "dependents", "usefulness"}
     detail = detail_to_dto(model_of(world), "rsi")
     assert set(detail) == {"sources", "plugin", "unknown_submissions"}
-    assert {"history", "versions"} <= set(detail["plugin"])
+    assert {"history", "history_total", "versions"} <= set(detail["plugin"])
     assert detail_to_dto(model_of(world), "nothing") is None
+
+
+@pytest.mark.parametrize("bad", [["staging"], {"a": 1}, 7, True])
+def test_a_payload_field_of_the_wrong_type_is_dropped_not_fatal(world, bad):
+    rsi = world.deploy("rsi")
+    world.request(rsi, status="approved")
+    base = {"name": "mix", "content_hash": "a" * 64, "artifact_hash": "b" * 64}
+    world.raw_request({**base, "kind": "strategy", "candidate_origin": bad})
+    world.raw_request({**base, "kind": bad, "candidate_origin": "human"})
+    world.raw_request({**base, "kind": "strategy", "candidate_origin": "human",
+                       "mission_id": bad})
+    model = model_of(world)
+    row = by_name(model, "mix")
+    assert [(item.origin, item.kind) for item in sorted(row.history, key=lambda i: i.id)] == [
+        (None, "strategy"), ("human", None), ("human", "strategy")]
+    assert by_name(model, "rsi") is not None
+    dto = detail_to_dto(model, "mix")
+    assert dto["plugin"]["history"][0]["origin"] == "human"
+
+
+def test_the_history_is_cut_to_the_limit_and_the_dto_says_how_many_there_are(world):
+    rsi = world.deploy("rsi")
+    for _ in range(read_model.HISTORY_LIMIT + 7):
+        world.request(rsi)
+    model = model_of(world)
+    row = by_name(model, "rsi")
+    assert len(row.history) == read_model.HISTORY_LIMIT
+    assert row.history_total == read_model.HISTORY_LIMIT + 7
+    detail = detail_to_dto(model, "rsi")["plugin"]
+    assert len(detail["history"]) == read_model.HISTORY_LIMIT
+    assert detail["history_total"] == read_model.HISTORY_LIMIT + 7
+    assert "history_total" not in model_to_dto(model)["plugins"][0]
 
 
 def test_a_name_with_control_characters_is_cleaned_in_the_dto(world):

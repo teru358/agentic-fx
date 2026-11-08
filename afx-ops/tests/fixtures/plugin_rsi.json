@@ -1,0 +1,96 @@
+{
+ "display_timezone": "Asia/Tokyo",
+ "plugin": {
+  "admission": {
+   "alias": null,
+   "detail": null,
+   "reason": null,
+   "state": "loaded"
+  },
+  "dependencies": [],
+  "dependencies_set_state": null,
+  "dependents": [
+   {
+    "alias": "a",
+    "pin": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "state": "pin_mismatch",
+    "strategy": "brk"
+   },
+   {
+    "alias": "fast",
+    "pin": "5bf58e23cba8727a080f31023a0a02a5397e2029f61eb6ac4ff3a04d085a67e5",
+    "state": "match",
+    "strategy": "mom"
+   }
+  ],
+  "entity": {
+   "artifact_hash": "4f6687e789c24a117f40d1d42a67cde09288965c0a7833e12894f26bbc23df3c",
+   "content_hash": "5bf58e23cba8727a080f31023a0a02a5397e2029f61eb6ac4ff3a04d085a67e5",
+   "reason": null,
+   "state": "symlink"
+  },
+  "history": [
+   {
+    "artifact_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "content_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "created_at": "2026-11-01T00:00:09+00:00",
+    "decided_at": null,
+    "id": 4,
+    "kind": "indicator",
+    "mission_id": 9,
+    "origin": "staging",
+    "status": "pending"
+   },
+   {
+    "artifact_hash": "4f6687e789c24a117f40d1d42a67cde09288965c0a7833e12894f26bbc23df3c",
+    "content_hash": "5bf58e23cba8727a080f31023a0a02a5397e2029f61eb6ac4ff3a04d085a67e5",
+    "created_at": "2026-11-01T00:00:01+00:00",
+    "decided_at": "2026-11-01T00:00:02+00:00",
+    "id": 1,
+    "kind": "indicator",
+    "mission_id": null,
+    "origin": "human",
+    "status": "approved"
+   }
+  ],
+  "history_total": 2,
+  "issues": [],
+  "kind": "indicator",
+  "name": "rsi",
+  "open_ops": [],
+  "pending": [
+   {
+    "content_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "id": 4,
+    "kind": "indicator"
+   }
+  ],
+  "pending_count": 1,
+  "usefulness": {
+   "by_pin": [
+    {
+     "content_hash": "5bf58e23cba8727a080f31023a0a02a5397e2029f61eb6ac4ff3a04d085a67e5",
+     "deployed": 2,
+     "submitted": 2
+    }
+   ],
+   "deployed": 2,
+   "submitted": 2
+  },
+  "versions": [
+   {
+    "approval_id": 1,
+    "artifact_hash": "4f6687e789c24a117f40d1d42a67cde09288965c0a7833e12894f26bbc23df3c",
+    "content_hash": "5bf58e23cba8727a080f31023a0a02a5397e2029f61eb6ac4ff3a04d085a67e5",
+    "is_live": true,
+    "status": "approved"
+   }
+  ]
+ },
+ "sources": {
+  "journal": "ok",
+  "live": "ok",
+  "pending": "ok"
+ },
+ "unknown_submissions": 1
+}
