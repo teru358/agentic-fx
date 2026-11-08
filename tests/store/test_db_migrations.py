@@ -98,7 +98,7 @@ def test_table_names_include_candidate_archives():
             "cron_cursor", "mission_decision_bars",
             "ops_requests", "ops_idempotency", "ops_events", "ops_policies",
             "plugin_deploy_ops", "plugin_deploy_op_signals", "improve_run_notices",
-            "signal_decisions", "signal_shadow", "ohlcv_slice_sets", "ohlcv_slices",
+            "improve_run_summaries", "signal_decisions", "signal_shadow", "ohlcv_slice_sets", "ohlcv_slices",
             "ohlcv_slice_generations", "econ_reaction_keys", "econ_reaction_values",
         })
 

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone, tzinfo
 
 import pytest
 
+from agentic_fx.store.improve_run_summaries import EMPTY_SUMMARY
 from agentic_fx import improve_notice_codes as codes
 from agentic_fx.store import backlog, improve_runs, improve_waves, missions
 from agentic_fx.store.db import connect, init_db
@@ -32,7 +33,7 @@ def _start(c, *, trigger=None, slot=None, commit=True):
 def _finish(c, mid, rid, notice=codes.NOTICE_COMMIT_CRASHED, **kw):
     kw.setdefault("tool_calls", None)
     missions.finish_improve_mission(
-        c, mission_id=mid, run_id=rid, slot_key=None, mission_status="failed",
+        c, summary=EMPTY_SUMMARY, mission_id=mid, run_id=rid, slot_key=None, mission_status="failed",
         run_result=None, backlog_transition=None, now=LATER, notice=notice, **kw)
 
 
@@ -88,7 +89,7 @@ def test_snapshot_carries_approval_id(conn):
         "VALUES ('plugin','{}','pending',?)", (NOW.isoformat(),))
     aid = conn.execute("SELECT id FROM approval_requests").fetchone()["id"]
     missions.finish_improve_mission(
-        conn, mission_id=mid, run_id=rid, slot_key=None,
+        conn, summary=EMPTY_SUMMARY, mission_id=mid, run_id=rid, slot_key=None,
         mission_status="completed", run_result="approval",
         backlog_transition=None, now=LATER, approval_id=aid,
         notice=codes.NOTICE_SUBMITTED, tool_calls=3)
@@ -192,7 +193,7 @@ def test_later_backlog_rewrite_does_not_change_snapshot(conn):
     mid, rid = _start(conn)
     conn.execute("BEGIN IMMEDIATE")
     missions.finish_improve_mission(
-        conn, mission_id=mid, run_id=rid, slot_key=None,
+        conn, summary=EMPTY_SUMMARY, mission_id=mid, run_id=rid, slot_key=None,
         mission_status="completed", run_result=None, now=LATER,
         backlog_transition={"backlog_id": bid, "status": "observation",
                             "last_result": "observation:first"},
@@ -376,7 +377,7 @@ JST = timezone(timedelta(hours=9))
 
 def _finish_at(c, mid, rid, now):
     missions.finish_improve_mission(
-        c, mission_id=mid, run_id=rid, slot_key=None, mission_status="failed",
+        c, summary=EMPTY_SUMMARY, mission_id=mid, run_id=rid, slot_key=None, mission_status="failed",
         run_result=None, backlog_transition=None, now=now,
         notice=codes.NOTICE_COMMIT_CRASHED, tool_calls=None)
 

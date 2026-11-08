@@ -42,11 +42,12 @@ from agentic_fx.backtest import holdout  # precheck 2026-08-22 wave2: 型6#5 —
 from agentic_fx.loops.improve_context import (
     mission_template,
     NOT_SUBMITTED_LAST_RESULT, NOT_SUBMITTED_ORIGINS, build_improve_context,
-    family_redirect_last_result, family_redirect_reason,
-    render_family_attempts)
+    deployed_families, family_redirect_last_result, family_redirect_reason,
+    family_tally, render_family_attempts)
 from agentic_fx.core.improve_repeat import render_oneoff_section
 from agentic_fx.core.history_epoch import history_epoch
 from agentic_fx.loops.improve_run_context import ImproveRunContext
+from agentic_fx.loops import improve_run_summary as run_summary
 from agentic_fx.loops import approval_facts
 from agentic_fx.loops import improve_quality
 from agentic_fx.improve_notice_codes import (
@@ -94,6 +95,7 @@ from agentic_fx.tools.plugin_loader import approved_plugins
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import backlog as backlog_store
 from agentic_fx.store import improve_runs as improve_runs_store
+from agentic_fx.store import improve_run_summaries as summaries_store
 from agentic_fx.store import improve_waves
 from agentic_fx.store import missions as missions_store
 from agentic_fx.symbols import readable_symbols
@@ -1037,6 +1039,66 @@ class ImproveLoop:
             conn.close()
         return mission, ctx, runner
 
+    def _prepare_summary(self, ctx, plan: "run_summary.SummaryPlan"
+                         ) -> "run_summary.PreparedSummary":
+        """終端 tx の前に、経路ごとの `plan` が許す要約の項目を整える。"""
+        return run_summary.prepare(
+            getattr(ctx, "summary_material", None) or run_summary.SummaryMaterial(),
+            plan, allowed_pairs=self._settings.pairs)
+
+    def _close_summary(self, conn, ctx, prepared: "run_summary.PreparedSummary",
+                       *, plan: "run_summary.SummaryPlan",
+                       candidate: "_FinalCandidate | None" = None,
+                       archive_id: int | None = None
+                       ) -> summaries_store.SummaryRecord:
+        """終端 tx の中、archive の settle の後に呼ぶ。申し送りを数えて最終の
+        直列化をする。申し送りは判定した候補の行が台帳にあるときだけ。"""
+        if (plan.handoff and candidate is not None
+                and getattr(ctx, "inventory", None) is not None
+                and candidate.family_key is not None
+                and archive_id is not None and not prepared.failed):
+            prepared = run_summary.with_handoff(
+                prepared, self._count_handoff(conn, ctx, candidate.family_key))
+        return run_summary.serialize(prepared)
+
+    def _record_floor_material(self, ctx, verdict, rows) -> None:
+        """gate の判定値から床との差・比較の材料を書く。verdict が成績を
+        持たない (評価不能・履歴なし) ときは、候補の計測行だけを参考値にする。
+        材料づくりの失敗で commit を止めない。"""
+        try:
+            material = ctx.summary_material
+            if verdict is None:
+                material.floor = run_summary.floor_material(
+                    self._settings, in_sample=None, holdout=None, rows=rows)
+                return
+            material.floor = run_summary.floor_material(
+                self._settings, in_sample=verdict.candidate_metrics,
+                holdout=verdict.holdout_metrics, rows=rows)
+            material.comparison = run_summary.comparison_material(
+                verdict.comparison)
+        except Exception:  # noqa: BLE001
+            _log.warning("floor material failed for mission_id=%s",
+                         ctx.mission_id, exc_info=True)
+
+    def _count_handoff(self, conn, ctx, family_key: str) -> dict | None:
+        """この候補の族が次の mission の族別試行結果でどう見えるかを、
+        SAVEPOINT の中で数える。数えられなければ戻して None (欄が無いだけで
+        終端は続く)。戻すこと自体の失敗は外へ伝える。"""
+        conn.execute("SAVEPOINT summary_handoff")
+        try:
+            tally = family_tally(
+                conn, allowed_pairs=set(self._settings.pairs),
+                families=deployed_families(list(ctx.inventory.inventory.metas)),
+                family_key=family_key)
+        except Exception as exc:
+            conn.execute("ROLLBACK TO summary_handoff")
+            conn.execute("RELEASE summary_handoff")
+            _log.warning("handoff tally failed for mission_id=%s: %s",
+                         ctx.mission_id, type(exc).__name__)
+            return None
+        conn.execute("RELEASE summary_handoff")
+        return tally
+
     def _compensate_prepare_failure(self, conn, *, mission_id, run_id,
                                     slot_key, now, notice: NoticeCode,
                                     tool_calls: int | None = None) -> None:
@@ -1054,7 +1116,7 @@ class ImproveLoop:
                     slot_key=slot_key, mission_status="failed",
                     run_result=None, backlog_transition=None, now=now,
                     notice=notice, tool_calls=tool_calls, observation_text=None,
-                    commit=False)
+                    summary=summaries_store.EMPTY_SUMMARY, commit=False)
                 conn.commit()
             except BaseException:
                 conn.rollback()
@@ -1161,6 +1223,7 @@ class ImproveLoop:
             state = ctx.ledger.state()
             if state == "DISCARDED":
                 return
+            prepared = self._prepare_summary(ctx, run_summary.PLAN_COMMIT_CRASH)
             conn.execute("BEGIN IMMEDIATE")
             ledger_ids = [] if state == "PERSISTED" else None
             try:
@@ -1195,7 +1258,11 @@ class ImproveLoop:
                         mission_status="failed", run_result=None, now=now,
                         backlog_transition=None,
                         notice=NOTICE_COMMIT_CRASHED, tool_calls=tool_calls,
-                        observation_text=None, commit=False)
+                        observation_text=None, output=prepared.output,
+                        summary=self._close_summary(
+                            conn, ctx, prepared,
+                            plan=run_summary.PLAN_COMMIT_CRASH),
+                        commit=False)
                 conn.commit()
             except BaseException:
                 conn.rollback()
@@ -3119,6 +3186,7 @@ class ImproveLoop:
                                 backlog_id, slot_key, now,
                                 tool_calls: int | None = None) -> None:
         """10.10 Step 3: Tx-2 失敗時の補償 tx。"""
+        prepared = self._prepare_summary(ctx, run_summary.PLAN_NONE)
         conn.execute("BEGIN IMMEDIATE")
         ledger_ids = None
         try:
@@ -3133,7 +3201,10 @@ class ImproveLoop:
                      "last_result": "commit_failed"}
                     if backlog_id is not None else None),
                 notice=NOTICE_APPROVAL_TX_FAILED, tool_calls=tool_calls,
-                observation_text=None, commit=False)
+                observation_text=None, output=prepared.output,
+                summary=self._close_summary(
+                    conn, ctx, prepared, plan=run_summary.PLAN_NONE),
+                commit=False)
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -3443,6 +3514,8 @@ class ImproveLoop:
                         f"deploy_guard_unavailable:{type(exc).__name__}",
                         code="comparison_base_unavailable")
                 file_population = self._load_quality_population(ctx)
+            prepared = self._prepare_summary(
+                persist_ctx, run_summary.PLAN_SUBMITTED)
             try:
                 conn.execute("BEGIN IMMEDIATE")
             except BaseException:
@@ -3541,7 +3614,12 @@ class ImproveLoop:
                         "backlog_id": backlog_id, "status": "selected",
                         "last_result": f"approval_pending:{approval_id}"},
                     notice=NOTICE_SUBMITTED, tool_calls=tool_calls,
-                    observation_text=None, commit=False)
+                    observation_text=None, output=prepared.output,
+                    summary=self._close_summary(
+                        conn, persist_ctx, prepared,
+                        plan=run_summary.PLAN_SUBMITTED, candidate=submitted,
+                        archive_id=candidate_archive_id),
+                    commit=False)
                 conn.commit()
             except BaseException:
                 conn.rollback()
@@ -3652,6 +3730,10 @@ class ImproveLoop:
                     f"backend={self._settings.runner.improve.backend} "
                     f"{stderr_fatal}")
 
+            raw_output = getattr(result, "output", None)
+            if isinstance(raw_output, dict):
+                ctx.summary_material.output = raw_output
+
             if result.status != "completed":
                 self._finalize_failed_mission(
                     conn, ctx=ctx, result=result, now=now,
@@ -3672,6 +3754,8 @@ class ImproveLoop:
                     tool_calls=tool_calls)
                 return
 
+            if output.get("artifact", {}).get("type") == "plugin":
+                ctx.summary_material.plugin_name = output["artifact"]["name"]
             selection = self._select_and_bind(conn, output, ctx, now=now)  # 手順2
             if not selection.won:
                 self._finalize_loser(
@@ -3712,6 +3796,8 @@ class ImproveLoop:
                     "type": "observation",
                     "reason": f"title={title} — resume 回収経由のため降格",
                 }
+                ctx.summary_material.parent_reason = (
+                    NOTICE_DEMOTED_RECOVERED.reason_code)
                 self._activity.write(
                     Category.IMPROVE, "report_demoted_recovered",
                     f"mission={ctx.mission_id} title={title}")
@@ -3723,7 +3809,8 @@ class ImproveLoop:
                     choice=dataclass_replace(
                         _select_observation(recovered_artifact),
                         observation_text=None,
-                        notice=NOTICE_DEMOTED_RECOVERED))
+                        notice=NOTICE_DEMOTED_RECOVERED),
+                    summary_plan=run_summary.PLAN_DEMOTED)
                 return
 
             if atype == "plugin":
@@ -3783,6 +3870,10 @@ class ImproveLoop:
                 from agentic_fx.plugin import loader as plugin_loader
                 candidate_meta = plugin_loader._discover_one(
                     candidate_dir, artifact["name"])
+                if candidate_meta is not None:
+                    ctx.summary_material.candidate = run_summary.candidate_meta(
+                        candidate_meta, deployed_names=[
+                            m.name for m in ctx.inventory.inventory.metas])
                 if candidate_meta is None:
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
@@ -3883,6 +3974,7 @@ class ImproveLoop:
                     except holdout.NoHistoryError as exc:
                         # Missing market history is an expected gate verdict;
                         # unrelated ValueErrors still abort the commit.
+                        self._record_floor_material(ctx, None, gate_rows)
                         self._finalize_gate_failed(
                             conn, ctx=ctx, backlog_id=selection.backlog_id,
                             reason=("gate_failed:backtest_data_unavailable:"
@@ -3912,6 +4004,8 @@ class ImproveLoop:
                             notice=NOTICE_SAME_NAME_CONTRACT_CHANGED)
                         return
                     candidate_rows = tuple(gate_rows)
+                    self._record_floor_material(
+                        ctx, strategy_verdict, candidate_rows)
                     gate_rows.extend(strategy_verdict.baseline_rows)
                     comparison = strategy_verdict.comparison
                     if comparison is not None:
@@ -4074,6 +4168,8 @@ class ImproveLoop:
                         "quality_demoted",
                         f"mission={ctx.mission_id} outcome={demotion.outcome} "
                         f"{demotion.detail}", ctx.mission_id)
+                    ctx.summary_material.parent_reason = notice_for_quality(
+                        demotion.code).reason_code
                     self._finalize_report_or_observation(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
                         report_path=None,
@@ -4088,7 +4184,8 @@ class ImproveLoop:
                         choice=_ObservationChoice(
                             demotion.last_result
                             or f"observation:{demotion.reason}",
-                            None, notice_for_quality(demotion.code)))
+                            None, notice_for_quality(demotion.code)),
+                        summary_plan=run_summary.PLAN_DEMOTED)
             else:
                 self._finalize_report_or_observation(
                     conn, ctx=ctx, backlog_id=selection.backlog_id,
@@ -4150,6 +4247,7 @@ class ImproveLoop:
             part_path = self._write_report_part(
                 reports_dir, mission_id=ctx.mission_id, body_md=body_md)
         except OSError as exc:
+            prepared = self._prepare_summary(ctx, run_summary.PLAN_REPORT)
             conn.execute("BEGIN IMMEDIATE")
             ledger_ids = None
             try:
@@ -4167,7 +4265,10 @@ class ImproveLoop:
                              f"report_failed:{safe_error_text(exc)}"}
                         if backlog_id is not None else None),
                     notice=NOTICE_REPORT_WRITE_FAILED, tool_calls=tool_calls,
-                    observation_text=None, commit=False)
+                    observation_text=None, output=prepared.output,
+                    summary=self._close_summary(
+                        conn, ctx, prepared, plan=run_summary.PLAN_REPORT),
+                    commit=False)
                 conn.commit()
             except BaseException:
                 conn.rollback()
@@ -4195,6 +4296,8 @@ class ImproveLoop:
                                         tool_calls: int | None = None,
                                         candidate: _FinalCandidate | None = None,
                                         candidate_outcome: str = "gate_failed",
+                                        summary_plan: "run_summary.SummaryPlan"
+                                        = run_summary.PLAN_REPORT,
                                         ) -> None:
         """承認申請を出さない経路の Tx-2 + finish。
 
@@ -4226,6 +4329,8 @@ class ImproveLoop:
         observation_last_result = choice.last_result
         observation_text = choice.observation_text
         outcome = "report" if report_path is not None else "observation"
+        ctx.summary_material.observation_text = observation_text
+        prepared = self._prepare_summary(ctx, summary_plan)
         conn.execute("BEGIN IMMEDIATE")
         ledger_ids = None
         try:
@@ -4234,7 +4339,7 @@ class ImproveLoop:
             self._persist_gate_rows(
                 conn, gate_rows=gate_rows, now=now, mission_id=ctx.mission_id,
                 mission_outcome=outcome)
-            self._settle_candidate_in_tx(
+            archive_id = self._settle_candidate_in_tx(
                 conn, ctx=ctx, candidate=candidate,
                 outcome=candidate_outcome, now=now)
             missions_store.finish_improve_mission(
@@ -4252,7 +4357,11 @@ class ImproveLoop:
                           "last_result": "reported"}
                           if backlog_id is not None else None)),
                 notice=choice.notice, tool_calls=tool_calls,
-                observation_text=observation_text, commit=False)
+                observation_text=observation_text, output=prepared.output,
+                summary=self._close_summary(
+                    conn, ctx, prepared, plan=summary_plan,
+                    candidate=candidate, archive_id=archive_id),
+                commit=False)
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -4359,6 +4468,7 @@ class ImproveLoop:
             f"{_tool_calls_suffix(getattr(result, 'tool_calls', None))}")
         failed_class = _classify_failed_mission(result.status, result.reason)
         self._delete_staging(ctx)
+        prepared = self._prepare_summary(ctx, run_summary.PLAN_CLAIMS)
         conn.execute("BEGIN IMMEDIATE")
         ledger_ids = None
         try:
@@ -4410,7 +4520,10 @@ class ImproveLoop:
                 run_result=None, now=now, backlog_transition=None,
                 notice=failed_class.notice,
                 tool_calls=getattr(result, "tool_calls", None),
-                observation_text=None, commit=False)
+                observation_text=None, output=prepared.output,
+                summary=self._close_summary(
+                    conn, ctx, prepared, plan=run_summary.PLAN_CLAIMS),
+                commit=False)
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -4439,6 +4552,7 @@ class ImproveLoop:
             f"reason=gate_worker_sandbox_unavailable"
             f"{f' sandbox_reason={sandbox_reason}' if sandbox_reason else ''}"
             f"{_tool_calls_suffix(tool_calls)}")
+        prepared = self._prepare_summary(ctx, run_summary.PLAN_CLAIMS)
         conn.execute("BEGIN IMMEDIATE")
         ledger_ids = None
         try:
@@ -4453,7 +4567,10 @@ class ImproveLoop:
                     {"backlog_id": backlog_id, "status": "open", "last_result": None}
                     if backlog_id is not None else None),
                 notice=NOTICE_SANDBOX_UNAVAILABLE, tool_calls=tool_calls,
-                observation_text=None, commit=False)
+                observation_text=None, output=prepared.output,
+                summary=self._close_summary(
+                    conn, ctx, prepared, plan=run_summary.PLAN_CLAIMS),
+                commit=False)
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -4476,6 +4593,7 @@ class ImproveLoop:
             Category.IMPROVE, "output_invalid",
             f"mission={ctx.mission_id} reason={reason}"
             f"{_tool_calls_suffix(tool_calls)}")
+        prepared = self._prepare_summary(ctx, run_summary.PLAN_NONE)
         conn.execute("BEGIN IMMEDIATE")
         ledger_ids = None
         try:
@@ -4501,7 +4619,10 @@ class ImproveLoop:
                 slot_key=ctx.slot_key, mission_status="failed",
                 run_result=None, now=now, backlog_transition=None,
                 notice=NOTICE_OUTPUT_INVALID, tool_calls=tool_calls,
-                observation_text=None, commit=False)
+                observation_text=None, output=prepared.output,
+                summary=self._close_summary(
+                    conn, ctx, prepared, plan=run_summary.PLAN_NONE),
+                commit=False)
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -4536,6 +4657,7 @@ class ImproveLoop:
             part_path = self._write_report_part(
                 reports_dir, mission_id=ctx.mission_id, body_md=body_md)
         except OSError:
+            prepared = self._prepare_summary(ctx, run_summary.PLAN_LOSER)
             conn.execute("BEGIN IMMEDIATE")
             ledger_ids = None
             try:
@@ -4548,7 +4670,10 @@ class ImproveLoop:
                     report_state="failed",
                     backlog_transition=None,
                     notice=NOTICE_REPORT_WRITE_FAILED, tool_calls=tool_calls,
-                    observation_text=None, commit=False)
+                    observation_text=None, output=prepared.output,
+                    summary=self._close_summary(
+                        conn, ctx, prepared, plan=run_summary.PLAN_LOSER),
+                    commit=False)
                 conn.commit()
             except BaseException:
                 conn.rollback()
@@ -4559,6 +4684,7 @@ class ImproveLoop:
         final_path = self._final_report_path(
             reports_dir, mission_id=ctx.mission_id, now=now)
 
+        prepared = self._prepare_summary(ctx, run_summary.PLAN_LOSER)
         conn.execute("BEGIN IMMEDIATE")
         ledger_ids = None
         try:
@@ -4571,7 +4697,10 @@ class ImproveLoop:
                 report_path=str(final_path), report_state="prepared",
                 backlog_transition=None,
                 notice=NOTICE_DUPLICATE_SKIPPED, tool_calls=tool_calls,
-                observation_text=None, commit=False)
+                observation_text=None, output=prepared.output,
+                summary=self._close_summary(
+                    conn, ctx, prepared, plan=run_summary.PLAN_LOSER),
+                commit=False)
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -4831,6 +4960,8 @@ class ImproveLoop:
             part_path = self._write_report_part(
                 reports_dir, mission_id=ctx.mission_id, body_md=body_md)
         except OSError as exc:
+            prepared = self._prepare_summary(
+                ctx, run_summary.PLAN_GATE_FAILED)
             conn.execute("BEGIN IMMEDIATE")
             ledger_ids = None
             try:
@@ -4839,7 +4970,7 @@ class ImproveLoop:
                 self._persist_gate_rows(
                     conn, gate_rows=gate_rows, now=now,
                     mission_id=ctx.mission_id, mission_outcome="report_failed")
-                self._settle_candidate_in_tx(
+                archive_id = self._settle_candidate_in_tx(
                     conn, ctx=ctx, candidate=candidate,
                     outcome=candidate_outcome, now=now)
                 missions_store.finish_improve_mission(
@@ -4853,7 +4984,11 @@ class ImproveLoop:
                              f"report_failed:{safe_error_text(exc)}"}
                         if backlog_id is not None else None),
                     notice=notice, tool_calls=tool_calls,
-                    observation_text=None, commit=False)
+                    observation_text=None, output=prepared.output,
+                    summary=self._close_summary(
+                        conn, ctx, prepared, plan=run_summary.PLAN_GATE_FAILED,
+                        candidate=candidate, archive_id=archive_id),
+                    commit=False)
                 conn.commit()
             except BaseException:
                 conn.rollback()
@@ -4868,6 +5003,7 @@ class ImproveLoop:
         # branch-local に 1 つ決めて gate 行・ledger 行・settle の 3 箇所
         # 全てへ同じ値を渡す (分裂させない)。
         outcome = mission_outcome
+        prepared = self._prepare_summary(ctx, run_summary.PLAN_GATE_FAILED)
         conn.execute("BEGIN IMMEDIATE")
         ledger_ids = None
         try:
@@ -4876,7 +5012,7 @@ class ImproveLoop:
             self._persist_gate_rows(
                 conn, gate_rows=gate_rows, now=now,
                 mission_id=ctx.mission_id, mission_outcome=outcome)
-            self._settle_candidate_in_tx(
+            archive_id = self._settle_candidate_in_tx(
                 conn, ctx=ctx, candidate=candidate,
                 outcome=candidate_outcome, now=now)
             # [unprofitable-note-hygiene] 設計書 v2.0 §2-2/§3: フロア不合格
@@ -4907,7 +5043,11 @@ class ImproveLoop:
                                      else (last_result or reason))}
                     if backlog_id is not None else None),
                 notice=notice, tool_calls=tool_calls,
-                observation_text=None, commit=False)
+                observation_text=None, output=prepared.output,
+                summary=self._close_summary(
+                    conn, ctx, prepared, plan=run_summary.PLAN_GATE_FAILED,
+                    candidate=candidate, archive_id=archive_id),
+                commit=False)
             conn.commit()
         except BaseException:
             conn.rollback()

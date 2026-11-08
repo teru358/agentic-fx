@@ -847,6 +847,11 @@ def _agent_surfaces(app, root, loop, ctx) -> dict[str, str]:
                           ensure_ascii=False, default=str)
 
     rpc = app.ops.improve_run(Principal.OPERATOR, ctx.mission_id)
+    # 要約 (`summary`) は API / web の読者が人間のために読む親の記録で、段ごとの
+    # 判定値を持つ。agent が読む面ではないので、ここで見る面は従来の項目だけにする。
+    # agent の面に流れないことは、ほかの面 (prompt・context・台帳) の検査と
+    # 要約専用の経路 test が確かめる。
+    rpc = {key: value for key, value in rpc.items() if key != "summary"}
     index = root / "plugins" / "_archive" / "INDEX.md"
     return {
         "generated_prompt": next_mission.prompt,

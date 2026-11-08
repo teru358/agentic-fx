@@ -349,7 +349,8 @@ def test_a_mission_without_a_comparison_serializes_exactly_as_before(ops_env):
         "snapshot": {"trigger": "scheduled", "result_code": "gate_failed",
                      "reason_code": "not_improved", "tool_calls": 10,
                      "observation_text": None},
-        "report_state": "none", "approval": None, "floor": None}, sort_keys=True)
+        "report_state": "none", "approval": None, "floor": None,
+        "summary": {"version": 1, "state": "empty", "items": {}}}, sort_keys=True)
     improved = _submitted(ops_env, {"base_content_hash": "b" * 64, "comparison": _comparison()})
     assert "comparison" in _run(ops_env, improved)
 

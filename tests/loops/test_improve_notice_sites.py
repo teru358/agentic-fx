@@ -127,6 +127,56 @@ def test_every_finish_call_passes_notice_tool_calls_and_observation_text():
             assert _kw(call, key) is not None, (_func_of(call), key)
 
 
+# 要約 (`summary=`) と `output=` を渡す式。prepare の補償だけは材料が無いので
+# 空の要約、ほかは tx の中で `_close_summary` を通して作る。
+EXPECTED_SUMMARY_SITES = sorted([
+    ("_compensate_prepare_failure", "summaries_store.EMPTY_SUMMARY"),
+    ("_compensate_tx2_failure", "self._close_summary"),
+    ("_finalize_report_or_observation", "self._close_summary"),
+    ("_finalize_failed_mission", "self._close_summary"),
+    ("_finalize_gate_sandbox_unavailable", "self._close_summary"),
+    ("_finalize_output_invalid", "self._close_summary"),
+    ("_finalize_loser", "self._close_summary"),
+    ("_finalize_loser", "self._close_summary"),
+    ("_finalize_gate_failed", "self._close_summary"),
+    ("_finalize_gate_failed", "self._close_summary"),
+    ("_finalize_success", "self._close_summary"),
+    ("compensate_commit_failure", "self._close_summary"),
+    ("_prepare_report_if_applicable", "self._close_summary"),
+])
+
+
+def test_every_finish_call_passes_a_summary():
+    calls = _calls("finish_improve_mission")
+    assert len(calls) == 13
+    actual = []
+    for call in calls:
+        value = _kw(call, "summary")
+        assert value is not None, _func_of(call)
+        text = ast.unparse(value.func if isinstance(value, ast.Call) else value)
+        actual.append((_func_of(call), text))
+    assert sorted(actual) == EXPECTED_SUMMARY_SITES
+
+
+def test_every_finish_call_that_has_a_context_passes_the_stored_output():
+    for call in _calls("finish_improve_mission"):
+        output = _kw(call, "output")
+        if _func_of(call) == "_compensate_prepare_failure":
+            assert output is None  # 出力を知る前の補償
+            continue
+        assert output is not None and ast.unparse(output) == "prepared.output", \
+            _func_of(call)
+
+
+def test_summary_has_no_default_in_the_helper():
+    path = SRC / "store" / "missions.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    func = next(n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef)
+                and n.name == "finish_improve_mission")
+    assert not _param_has_default(func, "summary")
+
+
 def test_observation_text_is_non_null_only_through_the_report_or_observation_helper():
     for call in _calls("finish_improve_mission"):
         value = ast.unparse(_kw(call, "observation_text"))

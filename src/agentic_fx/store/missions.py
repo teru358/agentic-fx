@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from agentic_fx._safe_error import safe_text
 from agentic_fx.core import time_cutover
 from agentic_fx import improve_notice_codes as notice_codes
+from agentic_fx.store import improve_run_summaries as summaries_store
 from agentic_fx.store.signals import requeue_outcome, utc_iso
 
 if TYPE_CHECKING:
@@ -88,6 +89,7 @@ def finish_improve_mission(
         now: datetime,
         notice: notice_codes.NoticeCode,
         tool_calls: int | None,
+        summary: summaries_store.SummaryRecord,
         observation_text: str | None = None,
         approval_id: int | None = None,
         report_path: str | None = None,
@@ -107,7 +109,12 @@ def finish_improve_mission(
     書く。違反は `ValueError` (呼び出し元がロールバック)。`tool_calls` は
     記録が無ければ None。`observation_text` は `safe_text` を通して 2,000
     字に切り詰めて保存する (拒否はしない)。`trigger` は同じ tx で
-    `improvement_runs.trigger` から読み、NULL は `manual`。"""
+    `improvement_runs.trigger` から読み、NULL は `manual`。
+
+    `summary` (既定値なし) は組み立て済みの要約 1 件で、CAS が成功した後に
+    同じ tx で `improve_run_summaries` へ 1 行書く。書込みの失敗は例外として
+    外へ伝え、呼び出し元が tx ごとロールバックする。`output` は agent の
+    元の出力 (`output_json` 用)。"""
     from agentic_fx.store import backlog as backlog_mod
     from agentic_fx.store import improve_runs as improve_runs_mod
     from agentic_fx.store import improve_waves as improve_waves_mod
@@ -123,6 +130,7 @@ def finish_improve_mission(
         conn, mission_id=mission_id, run_id=run_id, notice=notice,
         tool_calls=tool_calls, observation_text=observation_text,
         approval_id=approval_id, now=now)
+    summaries_store.insert(conn, mission_id, summary, now=now)
     run_ok = improve_runs_mod.finish(
         conn, run_id, result=run_result, now=now,
         approval_id=approval_id, report_path=report_path,
@@ -278,6 +286,9 @@ def recover_interrupted(conn: sqlite3.Connection, *, now: datetime,
                     observation_text=None, approval_id=None, now=now,
                     trigger=(trigger_by_mission.get(mid)
                              or notice_codes.TRIGGER_MANUAL),
+                    ignore_existing=True)
+                summaries_store.insert(
+                    conn, mid, summaries_store.EMPTY_SUMMARY, now=now,
                     ignore_existing=True)
             for run_row in run_rows:
                 conn.execute(

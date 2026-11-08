@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Callable
 
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+from agentic_fx.loops.improve_run_summary import SummaryMaterial
 from agentic_fx.plugin.resolve import ApprovedInventory, InventoryBuildResult
 
 
@@ -47,3 +48,7 @@ class ImproveRunContext:
     baseline_replay_wall_clock_max_sec: float = 300.0
     # indicator の単調変換の扱い。mission 開始時の settings を写す。
     indicator_duplicate_mode: str = "warn"
+    # 終端の要約の材料入れ。frozen な ctx の中で唯一の可変の値で、mission ごとに
+    # 新しく作る (ctx の間で共有しない)。commit の各段が書き足し、commit の外の
+    # 補償 (`compensate_commit_failure`) も同じ ctx から読む。
+    summary_material: SummaryMaterial = field(default_factory=SummaryMaterial)
