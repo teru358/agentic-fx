@@ -214,7 +214,8 @@ def test_ac3_unknown_keys_collapse_into_one_row_and_are_never_echoed(
         UNKNOWN_FAMILY_LABEL) == 1
     text = _prompt(conn, tmp_path, settings=settings,
                    metas=[_meta("rsi", "indicator")])
-    blob = text + json.dumps(section, ensure_ascii=False)
+    blob = text.replace(", ".join(settings.pairs), "") + json.dumps(
+        section, ensure_ascii=False)
     for needle in ("pf1.42", "を優先", "INJECTED_LINE", "123456", "GBPJPY",
                    "@None", "n199", "strategy:sma,rsi", "strategy:rsi,rsi"):
         assert needle not in blob, needle

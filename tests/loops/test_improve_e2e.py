@@ -1558,7 +1558,8 @@ def test_floor_report_detail_holdout_fail_two_pairs_full_metrics(improve_env):
     result = MissionResult(status="completed", output=output, transcript=[])
 
     loop = ImproveLoop(
-        root=root, settings=app.settings, clock=FixedClock(NOW),
+        root=root, settings=app.settings.model_copy(
+            update={"pairs": ["USDJPY", "EURUSD"]}), clock=FixedClock(NOW),
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
         db_readonly_conn_factory=lambda: connect_readonly(
             root / "data" / "agentic.db"),

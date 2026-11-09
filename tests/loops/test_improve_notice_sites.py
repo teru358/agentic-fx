@@ -329,13 +329,13 @@ def test_plugin_gate_failures_carry_a_distinct_fixed_code_per_semantic_branch():
                  and _call_name(c) == "notice_for_plugin_gate"]
     assert sorted(ast.unparse(c.args[0]) for c in validated) == [
         "report.code", "static.code"]
-    # 不合格 return のうち literal の語は 13 か所 (既存 10 + 契約 3)、意味分岐ごとに別の語
+    # 不合格 return のうち literal の語は 14 か所 (既存 10 + 契約 4)、意味分岐ごとに別の語
     indicator_words = {
         "symbol_in_name", "param_price_unit", "fixture_run_failed",
         "output_not_finite", "output_constant", "indicator_duplicate",
         "indicator_monotone_duplicate"}
     assert sorted(seen) == sorted(codes.PLUGIN_GATE_CODES - indicator_words)
-    assert len(seen) == 13
+    assert len(seen) == 14
 
 
 def test_plugin_gate_wrappers_take_code_without_a_default():

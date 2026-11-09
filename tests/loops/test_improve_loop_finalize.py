@@ -239,7 +239,7 @@ def test_commit_strategy_missing_history_becomes_gate_failed(
     # candidate_meta)` に一本化され `candidate_meta.kind` を読むように
     # なった。実物の `_discover_one` は必ず `PluginMeta` を返すので
     # double にも `kind`/`outputs` を持たせる。
-    meta = SimpleNamespace(max_bars=100, indicators=(),
+    meta = SimpleNamespace(max_bars=100, indicators=(), pairs=(),
                            kind="strategy", outputs=None)
     monkeypatch.setattr(
         loop_full, "_run_plugin_gate", lambda *a, **kw: gate_verdict)
@@ -524,7 +524,7 @@ def test_commit_real_strategy_gate_missing_history_becomes_gate_failed(
         passed=True, content_hash="c" * 64, artifact_hash="a" * 64)
     meta = SimpleNamespace(
         name="myst", kind="strategy", timeframe="1h",
-        content_hash="c" * 64, pairs=("EURUSD",), max_bars=100,
+        content_hash="c" * 64, pairs=tuple(loop_full._settings.pairs), max_bars=100,
         indicators=())
     monkeypatch.setattr(
         loop_full, "_run_plugin_gate", lambda *a, **kw: gate_verdict)
@@ -577,7 +577,7 @@ def test_commit_strategy_other_valueerror_still_propagates(
     # candidate_meta)` に一本化され `candidate_meta.kind` を読むように
     # なった。実物の `_discover_one` は必ず `PluginMeta` を返すので
     # double にも `kind`/`outputs` を持たせる。
-    meta = SimpleNamespace(max_bars=100, indicators=(),
+    meta = SimpleNamespace(max_bars=100, indicators=(), pairs=(),
                            kind="strategy", outputs=None)
     monkeypatch.setattr(
         loop_full, "_run_plugin_gate", lambda *a, **kw: gate_verdict)

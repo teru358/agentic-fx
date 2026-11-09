@@ -647,6 +647,33 @@ def test_unresolved_backtest_counts_errors_and_streak_via_the_registry(tmp_path)
     assert counters.backtest_calls["cand"] == 0      # 予約は戻っている
 
 
+def test_pair_not_tradable_response_passes_the_child_checks_and_returns_the_reservation(
+        tmp_path):
+    """settings.pairs 外の pair の応答 (実 handler と同じ形) は、禁止キーの
+    除去を通って hint まで届き、候補枠を消費せず、errors に計上される。"""
+    from agentic_fx.tools.registry import ToolRegistry
+    reply = {"started": False, "error": "pair_not_tradable",
+             "message": "pair 'EURUSD' is not a tradable pair",
+             "hint": "Tradable pairs are: USDJPY. Other symbols can be used "
+                     "only as references (symbol:) in indicators."}
+    counters = MissionToolCounters(budget=_budget())
+    defs = _rpc_tooldefs(tmp_path, counters=counters,
+                         run_backtest_handler=lambda args: dict(reply))
+    registry = ToolRegistry(on_execute=counters.record_call,
+                            on_result=counters.record_tool_result)
+    registry.register_all(defs)
+
+    text = registry.execute("run_backtest", {"name": "cand", "pair": "EURUSD"},
+                            allowed=registry.names())
+
+    assert "pair_not_tradable" in text
+    assert reply["hint"] in text
+    assert counters.backtest_calls["cand"] == 0
+    assert counters.errors == 1
+    assert counters.recoverable_refusal_streak[
+        ("run_backtest", "tool_error:pair_not_tradable")] == 1
+
+
 def test_response_without_started_key_keeps_the_reservation(tmp_path):
     """F4: `started` キーが無い応答 (旧形式・RPC 失敗) では解放しない
     (fail closed — 予算は消費されたまま)。"""

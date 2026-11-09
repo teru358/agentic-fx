@@ -1409,6 +1409,7 @@ class ImproveLoop:
                 f"`{name}`" for name in allowed_to_conversions()),
             "sandbox_denied_names": ", ".join(
                 f"`{name}`" for name in denied_names()),
+            "tradable_pairs": ", ".join(self._settings.pairs),
             # [profitability-floor] T2 Step 2-2 (2026-09-13、codex I8):
             # 文言は settings からレンダする (ハードコードすると設定変更後
             # にゲートと説明が食い違う)。
@@ -1665,6 +1666,20 @@ class ImproveLoop:
                 return {"started": False, "error": "invalid_candidate_name",
                         "hint": "name は [a-z][a-z0-9_]{0,63} の形だけです。"
                                 "list_staging で確認してください"}
+            # 取引できない pair (`settings.pairs` 外) は executor がすべての
+            # open を `not_tradable_symbol` で却下し、backtest は黙って 0 取引に
+            # なる。走らせる前に理由つきで返す (未開始なので子が予約を戻す)。
+            if args.get("pair") not in self._settings.pairs:
+                tradable = ", ".join(self._settings.pairs)
+                return {
+                    "started": False, "error": "pair_not_tradable",
+                    "message": (f"pair {args.get('pair')!r} is not a tradable "
+                                "pair, so every open intent would be rejected "
+                                "and the backtest would produce no trades"),
+                    "hint": (f"Tradable pairs are: {tradable}. Other symbols "
+                             "can be used only as references (symbol:) in "
+                             "indicators."),
+                }
             candidate_dir = staging_dir / args["name"]
             meta = plugin_loader._discover_one(candidate_dir, args["name"])
             if meta is None or meta.kind != "strategy":
@@ -2230,6 +2245,9 @@ class ImproveLoop:
             if violation_code == "kind_unsupported":
                 return _failed_before_pytest(
                     violation_reason, code="kind_unsupported")
+            if violation_code == "pair_not_tradable":
+                return _failed_before_pytest(
+                    violation_reason, code="pair_not_tradable")
             return _failed_before_pytest(
                 violation_reason, code="outputs_required")
 
@@ -2339,7 +2357,7 @@ class ImproveLoop:
             artifact_hash=artifact_hash_before)
 
     def _contract_violation(self, meta) -> tuple[str, str] | None:
-        """max_bars 上限・kind・outputs 宣言の契約検査。違反は (固定語, last_result
+        """max_bars 上限・kind・取引できる pair・outputs 宣言の契約検査。違反は (固定語, last_result
         用の理由) で、plugin gate の前段と commit の再判定が同じこの関数を通る。理由は
         固定文言 (max_bars の超過量と kind 名だけを含み、`last_result` にそのまま流れる)。"""
         from agentic_fx.plugin import approval
@@ -2349,6 +2367,9 @@ class ImproveLoop:
             return "max_bars_limit", f"max_bars_limit:{exc}"
         if meta.kind not in {"indicator", "strategy"}:
             return "kind_unsupported", f"kind_unsupported:{meta.kind}"
+        if (meta.kind == "strategy"
+                and not set(meta.pairs) <= set(self._settings.pairs)):
+            return "pair_not_tradable", "pair_not_tradable"
         if approval.outputs_required_violation(meta):
             return "outputs_required", "outputs_required"
         return None

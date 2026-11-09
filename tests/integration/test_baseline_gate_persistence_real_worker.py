@@ -81,9 +81,15 @@ def test_a_contract_change_wins_over_a_floor_failure_and_runs_no_backtest(
         bw.candidate_files(py=bw.strategy_py(min_close=151.6), config=config),
         mode=mode)
     assert snap.status == "completed"
-    assert snap.notice == ("gate_failed", SAME_NAME)
     assert snap.rows == []                      # 候補の backtest も 0 行
     assert snap.approvals == []
+    if change == "pair_superset":
+        # 足した EURUSD は取引できない pair (settings.pairs は USDJPY だけ) なので、
+        # 同名の契約の検査より前に、取引できない pair の契約違反で止まる
+        assert snap.notice == ("gate_failed", "pair_not_tradable")
+        assert not any("\tbacktest_cpu\t" in l for l in snap.activity)
+        return
+    assert snap.notice == ("gate_failed", SAME_NAME)
     assert snap.backlog == [{"last_result": "observation:not_submitted",
                              "origin_outcome": "not_submitted"}]
     assert any(l.endswith(f"mission={snap.mission_id} reason={SAME_NAME}\t-")

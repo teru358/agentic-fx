@@ -115,10 +115,11 @@ def all_nan(df: pd.DataFrame) -> Outputs:
 
 def meta_for(name: str, directory: Path, *, content_hash: str,
              max_bars: int = 200, outputs: tuple[str, ...] = ("value",),
-             kind: str = "indicator") -> PluginMeta:
+             kind: str = "indicator",
+             pairs: tuple[str, ...] = ()) -> PluginMeta:
     return PluginMeta(
         name=name, kind=kind, path=directory, params={}, timeframe="1h",
-        pairs=(), max_bars=max_bars, content_hash=content_hash,
+        pairs=pairs, max_bars=max_bars, content_hash=content_hash,
         outputs=outputs)
 
 
