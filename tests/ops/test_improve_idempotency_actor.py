@@ -103,3 +103,21 @@ def test_the_audit_store_checks_the_actor_for_the_bot_too(ops_env):
     assert _code(lambda: accept(D2, {})) is ErrorCode.FORBIDDEN
     assert _code(lambda: accept(D2, {"max_runs": 2})) is ErrorCode.FORBIDDEN
     assert _code(lambda: accept(D1, {"max_runs": 2})) is ErrorCode.IDEMPOTENCY_MISMATCH
+
+
+def test_a_refused_replay_clears_the_comment(ops_env, gate, monkeypatch):
+    import agentic_fx.core.improve_repeat as ir
+    svc = _svc(ops_env, gate)
+    svc.improve(WEB, "k", max_runs=2, asserted_actor=ALICE)
+    created = []
+    real = ir.CommentHolder
+
+    class Spy(real):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            created.append(self)
+
+    monkeypatch.setattr(ir, "CommentHolder", Spy)
+    assert _code(lambda: svc.improve(WEB, "k", max_runs=2, comment="secret note",
+                                     asserted_actor=BOB)) is ErrorCode.FORBIDDEN
+    assert created and all(h.get() is None for h in created)

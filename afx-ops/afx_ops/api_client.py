@@ -136,10 +136,10 @@ class Actor:
 
     def __eq__(self, other: object) -> bool:
         return (isinstance(other, Actor) and other._value == self._value
-                and other._principal == self._principal)
+                and other.principal == self.principal)
 
     def __hash__(self) -> int:
-        return hash((self._value, self._principal))
+        return hash((self._value, self.principal))
 
     def __repr__(self) -> str:
         return f"Actor({self._value!r})"

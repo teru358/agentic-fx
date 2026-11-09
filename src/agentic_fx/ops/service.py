@@ -1790,9 +1790,14 @@ class OpsService:
         del comment
         with self._ops_lane(deadline):
             self._ensure_accepting()
-            accepted = self._accept(principal, endpoint, body, "improve",
-                                    key=idempotency_key, job_id=job_id,
-                                    asserted_actor=actor)
+            try:
+                accepted = self._accept(principal, endpoint, body, "improve",
+                                        key=idempotency_key, job_id=job_id,
+                                        asserted_actor=actor)
+            except BaseException:
+                if holder is not None:
+                    holder.clear()
+                raise
             if isinstance(accepted, IdempotencyReplay):
                 if holder is not None:
                     holder.clear()
