@@ -349,3 +349,34 @@ def test_web_without_a_port_source_stops_at_the_listener_before_isolation(tmp_pa
         startup.isolate(plan, config, plan_check=check_feature_only)
     assert info.value.reason == "listener_invalid"
     assert "no port source until web config" in str(info.value)
+
+
+def test_the_boundaries_do_not_depend_on_write():
+    # 書込みの有無は鍵の選択と runtime の配線だけを変え、Landlock の領域・secret・seccomp の
+    # 入力 (plan) には入らない
+    assert "write" not in {f.name for f in dataclasses.fields(StartupPlan)}
+    assert "write" not in inspect.signature(StartupPlan.for_feature).parameters
+    assert "write" not in inspect.signature(startup.landlock_plan).parameters
+    assert "write" not in inspect.signature(startup.feature_filter).parameters
+    plan = StartupPlan.for_feature("web", web_port=1, web_auth="basic")
+    assert plan.connect_ports == () and PLANS["web"].listener
+    assert plan.secret_files == (startup.WEB_PASSWORD,)
+
+
+@pytest.mark.parametrize(("auth", "bind", "reason"), [
+    ("none", "127.0.0.1", "write_requires_auth"),
+    ("basic", "192.0.2.10", "write_requires_loopback"),
+])
+def test_an_unsafe_write_config_stops_before_any_key_is_read(auth, bind, reason, tmp_path,
+                                                             monkeypatch):
+    read = []
+    monkeypatch.setattr(startup, "check_preconditions", lambda plan, proc: None)
+    monkeypatch.setattr(startup, "read_api_token", lambda *a, **k: read.append((a, k)))
+    plan = test_plan("web", config_dir=tmp_path / "c", state_dir=tmp_path / "s", web_port=1,
+                     web_bind=bind, web_auth=auth)
+    config = OpsConfig(instance_root=tmp_path / "root", key_dir=tmp_path / "keys",
+                       config_dir_fd=None, auth=auth, bind=bind, write=True)
+    with pytest.raises(startup.StartupError) as info:
+        startup.isolate(plan, config, plan_check=check_feature_only)
+    assert info.value.reason == reason
+    assert read == []

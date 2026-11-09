@@ -567,7 +567,7 @@ class WebClient(_Client):
 
 class WebWriteClient(WebClient):
     """``ops-web-write``。読取は ``WebClient`` と同じ。書込みは呼出しごとに ``web:<user>`` の
-    actor を受けて形式を検査し、決定と改善の開始にだけ付ける。actor を保持せず、任意の
+    actor を受けて形式を検査し、決定・改善の開始・job の閲覧と取消にだけ付ける。actor を保持せず、任意の
     header を足す口も持たない。"""
 
     principal = "ops-web-write"
@@ -584,6 +584,15 @@ class WebWriteClient(WebClient):
         if type(idempotency_key) is not str:
             raise ApiError("invalid_idempotency_key")
         return self._write(actor, "/v1/improve/runs", body, idempotency_key=idempotency_key)
+
+    def job(self, actor: str, job_id: str) -> Reply:
+        """job 1 件の状態。daemon は job を作った actor と同じ actor にだけ見せる。"""
+        checked = Actor(actor, self.principal)
+        return self._send(_build(self._token, "GET", f"/v1/jobs/{_job_id(job_id)}", None,
+                                 None, checked))
+
+    def cancel_job(self, actor: str, job_id: str) -> Reply:
+        return self._write(actor, f"/v1/jobs/{_job_id(job_id)}/cancel", {})
 
     def _write(self, actor: str, path: str, body: dict, *,
                idempotency_key: str | None = None) -> Reply:
@@ -629,6 +638,12 @@ _PLUGIN_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
 def _plugin_name(value: str) -> str:
     if type(value) is not str or _PLUGIN_NAME.fullmatch(value) is None:
         raise ValueError("plugin name")
+    return value
+
+
+def _job_id(value: str) -> str:
+    if type(value) is not str or _JOB_ID.fullmatch(value) is None:
+        raise ValueError("job id")
     return value
 
 

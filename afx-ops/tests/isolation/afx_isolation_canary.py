@@ -38,6 +38,7 @@ spec:
   web_auth: web の auth (none | basic)。basic は plan の必須 secret が `web.password` になり、
          設定の auth も basic になる (secret dir に安全な password を置く)
   web_user: Basic 認証のユーザー名 (省略時は設定の既定 `afx`)
+  web_write: 真なら設定の write を真にする (loopback と basic が要る。鍵は ops-web-write)
   foreign_owner: 真なら ops.toml の所有者として期待する uid を実 uid と別の値にする
          (他 uid の file を実 process で作れないための再現)
   fake_ip: interface 列挙に使う実行 file の path を差し替える
@@ -637,6 +638,8 @@ def op_web_runtime(p, iso):
     new_modules = sorted(set(sys.modules) - before)
     after = [OPS[step["op"]](step.get("params", {}), iso) for step in p.get("after", [])]
     return {"rc": rc, "new_modules": new_modules, "after": after}
+
+
 def op_bot_runtime(p, iso):
     """bot の業務処理を loopback の偽 Discord (試験 CA、試験用の名前解決) へ向けて回す。
 
@@ -689,7 +692,7 @@ def _plan(spec: dict) -> tuple[startup.StartupPlan, object]:
     """
     root = Path(spec["root"])
     feature = spec["feature"]
-    own_key = f"{PRINCIPAL[feature]}.token"
+    own_key = f"{'ops-web-write' if spec.get('web_write') and feature == 'web' else PRINCIPAL[feature]}.token"
 
     plan_kind = spec.get("plan", "test")
     if plan_kind != "test":
@@ -740,6 +743,8 @@ def _config(spec: dict) -> OpsConfig:
             extra["auth"] = spec["web_auth"]
         if "web_user" in spec:
             extra["user"] = spec["web_user"]
+        if spec.get("web_write"):
+            extra["write"] = True
         if "web_allow" in spec:
             import ipaddress
             extra["allow"] = tuple(ipaddress.IPv4Network(item) for item in spec["web_allow"])
