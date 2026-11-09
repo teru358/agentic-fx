@@ -1,4 +1,8 @@
-"""有界 HTTP 入力を read-only DTO 表示へ写す transport 非依存 adapter。"""
+"""有界 HTTP 入力を DTO 表示へ写す transport 非依存 adapter。
+
+既定は読取り専用。書込みが有効なとき (`write_context` を渡されたとき) だけ、承認・却下・改善の
+開始の 2 段の POST を受ける。
+"""
 from __future__ import annotations
 
 import functools
@@ -9,7 +13,7 @@ from dataclasses import dataclass
 from urllib.parse import parse_qsl
 
 from afx_ops.api_client import ApiError, with_detail
-from afx_ops.web import auth, plugin_pages, render
+from afx_ops.web import auth, plugin_pages, render, write, write_pages
 from afx_ops.web.headers import response_headers
 from afx_ops.web.routes import RouteMatch, resolve_route
 
@@ -337,12 +341,16 @@ def _validate_request(request: Request) -> None:
         raise _Reject(413)
 
 
-def _response(status: int, body: bytes, *, head: bool = False, extra: dict[str, str] | None = None) -> Response:
-    return Response(status, response_headers(length=len(body), extra=extra), b"" if head else body)
+def _response(status: int, body: bytes, *, head: bool = False, extra: dict[str, str] | None = None,
+              writable: bool = False) -> Response:
+    return Response(status, response_headers(length=len(body), extra=extra, writable=writable),
+                    b"" if head else body)
 
 
-def _error(status: int, *, head: bool = False, extra: dict[str, str] | None = None) -> Response:
-    return _response(status, render.render_error(status), head=head, extra=extra)
+def _error(status: int, *, head: bool = False, extra: dict[str, str] | None = None,
+           writable: bool = False) -> Response:
+    return _response(status, render.render_error(status), head=head, extra=extra,
+                     writable=writable)
 
 
 def wire_authorization_values(head: bytes) -> list[str]:
@@ -371,7 +379,8 @@ def handle_request(request: Request | bytes, client, *,
                    authenticator: auth.BasicAuthenticator | None = None,
                    peer: str | None = None,
                    authorization: list[str] | None = None,
-                   report_upstream: Callable[[], bool] | None = None) -> Response:
+                   report_upstream: Callable[[], bool] | None = None,
+                   write_context: write.WriteContext | None = None) -> Response:
     """入力から response を作る唯一の adapter。client は read-only fake でもよい。
 
     拒否の順は 有界 parse → Host → 認証 → route → daemon。daemon との通信の失敗と期待
@@ -382,8 +391,16 @@ def handle_request(request: Request | bytes, client, *,
     `authorization` は OWS の正規化前の field-value で、transport が wire から取った値を渡す。
     省略すると bytes 入力はその header block から、組み立て済みの Request は header から取る。
     `report_upstream` は 502 の理由行を出す直前に呼ぶ。False を返すと行を出さない (省略は常に出す)。
+
+    `write_context` を渡したときだけ書込みの route が生き、GET / HEAD 以外が 405 でなくなる。
+    渡すには Host の照合と Basic 認証が要る (無ければ `ValueError`)。省略 (既定) は今までどおりの
+    読取り専用で、POST は 405。書込みは確認の 2 段で、拒否の順は 有界 parse → Host → 認証 →
+    route → method → 経路 → Origin → Content-Type・body → (2 回目) token → daemon。
     """
+    if write_context is not None and (host_policy is None or authenticator is None):
+        raise ValueError("write requires host and auth")
     head = _is_head(request)
+    writable = write_context is not None
     try:
         if isinstance(request, bytes):
             if authorization is None:
@@ -402,36 +419,97 @@ def handle_request(request: Request | bytes, client, *,
                 value for name, value in request.headers if name.lower() == "authorization"]
             decision = authenticator.authenticate(values, peer)
             if decision.outcome == auth.UNAUTHORIZED:
-                return _error(401, head=head, extra={"WWW-Authenticate": auth.REALM_HEADER})
+                return _error(401, head=head, extra={"WWW-Authenticate": auth.REALM_HEADER},
+                              writable=writable)
             if decision.outcome == auth.LIMITED:
-                return _error(429, head=head, extra={"Retry-After": str(decision.retry_after)})
+                return _error(429, head=head, extra={"Retry-After": str(decision.retry_after)},
+                              writable=writable)
         if any(name.lower() == "x-afx-asserted-actor" for name, _value in request.headers):
             raise _Reject(400)
         match = resolve_route(request.path)
+        if write_context is not None and match is None:
+            write_match = write.resolve_write_route(request.path)
+            if write_match is not None:
+                return _write_response(write_context, write_match, request, head)
         if match is None:
-            return _error(404, head=head)
+            return _error(404, head=head, writable=writable)
         if request.method not in {"GET", "HEAD"}:
-            return _error(405, head=head, extra={"Allow": "GET, HEAD"})
+            return _error(405, head=head, extra={"Allow": "GET, HEAD"}, writable=writable)
         if request.body:
             raise _Reject(400)
         report = _Reporter(match.route.client_method, report_upstream)
         reply, renderer = _invoke(match, request.query, client, report)
         if (match.route.client_method == "plugin" and getattr(reply, "status", None) == 404
                 and getattr(reply, "code", None) == "not_found"):
-            return _error(404, head=head)
+            return _error(404, head=head, writable=writable)
         if getattr(reply, "status", None) != 200 or getattr(reply, "code", None) is not None or type(getattr(reply, "data", None)) is not dict:
             _report_bad_reply(reply, report)
-            return _error(502, head=head)
+            return _error(502, head=head, writable=writable)
         try:
             _check_reply_shape(match.route.client_method, reply.data)
         except _Upstream:
             report("shape=invalid")
             raise
         body = renderer(reply.data)
-        return _response(200, body, head=head)
+        if writable and match.route.client_method == "approval":
+            body = _with_decision_forms(body, reply.data)
+        return _response(200, body, head=head, writable=writable)
     except _Reject as reject:
-        return _error(reject.status, head=head)
+        return _error(reject.status, head=head, writable=writable)
     except _Upstream:
-        return _error(502, head=head)
+        return _error(502, head=head, writable=writable)
     except Exception:
-        return _error(500, head=head)
+        return _error(500, head=head, writable=writable)
+
+
+def _with_decision_forms(body: bytes, data: dict) -> bytes:
+    """承認詳細が決定待ちの plugin のときだけ、承認・却下の form を足す。"""
+    digest = data.get("payload_sha256")
+    approval_id = data.get("id")
+    if (data.get("status") != "pending" or data.get("kind") != "plugin"
+            or type(digest) is not str or write.DIGEST.fullmatch(digest) is None
+            or type(approval_id) is not int):
+        return body
+    return write_pages.inject_forms(body, write_pages.approval_forms(approval_id, digest))
+
+
+def _host_values(request: Request) -> list[str]:
+    return [value for name, value in request.headers if name.lower() == "host"]
+
+
+def _write_response(context: write.WriteContext, match: write.WriteMatch, request: Request,
+                    head: bool) -> Response:
+    """書込みの route 1 本。拒否は `WriteReject` の 4xx で、daemon を 1 回も呼ばずに返す。"""
+    if request.method not in match.methods:
+        return _error(405, head=head, extra={"Allow": ", ".join(match.methods)}, writable=True)
+    try:
+        if match.kind == "improve_form":
+            if not context.transport_ok:
+                raise write.WriteReject(403)
+            return _response(200, write_pages.improve_form_page(), head=head, writable=True)
+        status, body = _post(context, match, request)
+    except write.WriteReject as reject:
+        return _error(reject.status, head=head, writable=True)
+    return _response(status, body, head=head, writable=True)
+
+
+def _post(context: write.WriteContext, match: write.WriteMatch,
+          request: Request) -> tuple[int, bytes]:
+    if not context.transport_ok:
+        raise write.WriteReject(403)
+    write.check_origin(context, request.headers, _host_values(request))
+    form = write.parse_form(request.headers, request.body, write.FORM_FIELDS[match.kind])
+    if match.kind in (write.APPROVE, write.REJECT):
+        intent = write.decision_intent(match.kind, match.approval_id, form)
+        return 200, write_pages.confirm_page(intent, context.store.create(context.user, intent))
+    if match.kind == write.IMPROVE:
+        intent = write.improve_intent(form)
+        return 200, write_pages.confirm_page(intent, context.store.create(context.user, intent))
+    token = form["token"]
+    if match.kind == "confirm":
+        snapshot = write.execute(context, context.store.consume(token, context.user), token)
+    else:
+        snapshot = context.store.check(token, context.user)
+        if snapshot.state == write.UNKNOWN and snapshot.intent.action == write.IMPROVE:
+            snapshot = write.execute(context, snapshot, token)
+    return write_pages.result_status(snapshot), write_pages.result_page(snapshot, token)

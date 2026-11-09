@@ -225,7 +225,8 @@ def test_new_files_have_the_documented_modes(root, xdg):
 # --- AC-12 の 4 入口目: 本体 reader ------------------------------------------------------------
 
 def _rows():
-    return json.loads(MATRIX.read_text(encoding="utf-8"))
+    rows = json.loads(MATRIX.read_text(encoding="utf-8"))
+    return [row for row in rows if not row.get("afx_ops_only")]
 
 
 def _lookup_for(state: str, local: str):

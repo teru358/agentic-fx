@@ -33,7 +33,7 @@ _FEATURE_KEYS = MappingProxyType({
 _OPTIONAL_FEATURE_KEYS = MappingProxyType({
     "bot": ("mention_role_id", "trade_notices", "trade_amounts", "ops_notices",
             "improve_notices"),
-    "web": ("bind", "allow", "auth", "user"),
+    "web": ("bind", "allow", "auth", "user", "write"),
     "notify": ("deliver_trade_events", "deliver_improve_events"),
 })
 # 取引通知の出し方。key が無い旧 ops.toml は既定値で起動する
@@ -87,6 +87,8 @@ class OpsConfig:
     allow: tuple[ipaddress.IPv4Network, ...] | None = None
     auth: str = "none"
     user: str = WEB_USER_DEFAULT
+    # web が承認・却下・改善の開始を受けてよいか (既定は読取専用)
+    write: bool = False
 
     def without_config_dir_fd(self) -> "OpsConfig":
         """config dir の fd の所有を手放した写し (fd は閉じない)。"""
@@ -388,7 +390,8 @@ def read_config(feature: str, *, preserve_config_dir_error: bool = False) -> Ops
                 bind=_web_bind(parsed["bind"]) if "bind" in parsed else None,
                 allow=_web_allow(parsed["allow"]) if "allow" in parsed else None,
                 auth=_web_auth(parsed["auth"]) if "auth" in parsed else "none",
-                user=_web_user(parsed["user"]) if "user" in parsed else WEB_USER_DEFAULT)
+                user=_web_user(parsed["user"]) if "user" in parsed else WEB_USER_DEFAULT,
+                write=_boolean(parsed, "write", False))
         if feature == "bot":
             return OpsConfig(instance_root=instance_root, key_dir=key_dir,
                              config_dir_fd=config_dir_fd,

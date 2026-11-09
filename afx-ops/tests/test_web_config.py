@@ -266,3 +266,27 @@ def test_user_outside_the_grammar_is_config_invalid(monkeypatch, tmp_path, value
 
 def test_the_user_is_validated_even_when_auth_is_none(monkeypatch, tmp_path):
     assert _reason(monkeypatch, tmp_path, 'port = 8080\nuser = "Afx"\n') == "config_invalid"
+
+
+# --- write ---------------------------------------------------------------------------------
+
+@pytest.mark.parametrize(("extra", "expected"), [
+    ("", False), ("write = false\n", False), ("write = true\n", True)])
+def test_write_defaults_to_false_and_reads_a_boolean(monkeypatch, tmp_path, extra, expected):
+    assert _read(monkeypatch, tmp_path, "port = 8080\n" + extra).write is expected
+
+
+@pytest.mark.parametrize("value", ['"true"', "1", "0", '["true"]', '""'])
+def test_a_non_boolean_write_is_config_invalid(monkeypatch, tmp_path, value):
+    assert _reason(monkeypatch, tmp_path, f"port = 8080\nwrite = {value}\n") == "config_invalid"
+
+
+def test_write_is_a_web_only_key(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    for feature in ("bot", "notify"):
+        path = tmp_path / "cfg" / "agentic-fx" / "ops" / feature / "config" / "ops.toml"
+        path.parent.mkdir(parents=True, mode=0o700)
+        path.write_text(BASE + "write = true\n", encoding="utf-8")
+        path.chmod(0o600)
+        with pytest.raises(ConfigError):
+            read_config(feature)

@@ -142,9 +142,10 @@ def _zone_line(tz: str | None) -> str:
     return "<p>" + html.escape(display_time.display_header(tz), quote=True) + "</p>"
 
 
-def _document(title: str, body: str, tz: str | None = None) -> bytes:
+def _document(title: str, body: str, tz: str | None = None, *, refresh: bool = True) -> bytes:
+    reload = f'<meta http-equiv="refresh" content="{REFRESH_SECONDS}">' if refresh else ""
     return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
-            + f'<meta http-equiv="refresh" content="{REFRESH_SECONDS}"><title>'
+            + reload + '<title>'
             + html.escape(title, quote=True) + "</title><style>" + STYLE + "</style></head><body>"
             + _NAV + "<h1>" + html.escape(title, quote=True) + "</h1>" + _zone_line(tz) + body
             + "</body></html>").encode("utf-8")
@@ -883,7 +884,8 @@ def render_activity(data: Mapping[str, object]) -> bytes:
 
 
 def render_error(status: int) -> bytes:
-    labels = {400: "Bad request", 401: "Authentication required", 404: "Not found",
-              405: "Method not allowed", 413: "Request too large", 429: "Too many attempts",
-              502: "Service unavailable"}
+    labels = {400: "Bad request", 401: "Authentication required", 403: "Forbidden",
+              404: "Not found", 405: "Method not allowed", 409: "Already used",
+              410: "Expired", 413: "Request too large", 415: "Unsupported media type",
+              429: "Too many attempts", 502: "Service unavailable"}
     return _page(labels.get(status, "Error"), "")

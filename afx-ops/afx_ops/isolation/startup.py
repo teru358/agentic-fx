@@ -97,6 +97,8 @@ REASONS = (
     "notify_failed",
     "startup_internal_error",
     "body_failed",
+    "write_requires_auth",
+    "write_requires_loopback",
     "allow_required",
     "interface_lookup_failed",
     "bind_not_local",
@@ -836,11 +838,17 @@ def check_web_access(plan: StartupPlan, config: OpsConfig, *,
                      lookup: Callable[[], Iterable[object]] | None = None) -> None:
     """web の公開範囲の組み合わせを固定の順序で検査する。最初に外れた 1 reason だけを返す。
 
-    allow の必須 → 非 loopback bind が up の interface に実在すること → secret dir の安全性
-    → auth に対する secret の欠落 / 余剰。production の起動と `afx-ops probe web` が
-    同じ関数を使う。loopback は interface を列挙しない。
+    書込み (`write`) は auth が basic で bind が loopback のときだけ (TLS は未実装なので
+    常に不可) → allow の必須 → 非 loopback bind が up の interface に実在すること → secret
+    dir の安全性 → auth に対する secret の欠落 / 余剰。production の起動と `afx-ops probe web`
+    が同じ関数を使う。loopback は interface を列挙しない。
     """
     loopback = config.web_loopback
+    if config.write:
+        if config.auth != "basic":
+            raise StartupError("write_requires_auth")
+        if not loopback:
+            raise StartupError("write_requires_loopback")
     if not loopback and config.allow is None:
         raise StartupError("allow_required")
     if not loopback:
