@@ -103,6 +103,14 @@ indicator は銘柄を持たないので、名前・param・説明に銘柄名�
    最低 1 回 `run_backtest` で確認してから提出してください** (候補は
    1 pair の不合格で全体が落ちます)。**候補の `pairs` に書けるのは取引できる pair (`{tradable_pairs}`) だけです。
    ほかの symbol は参照 (indicator の `symbol:`) としてのみ使えます。** {profitability_floor_rule}
+
+   `skipped_bars_by_reason` の意味:
+   - `missing`: 参照 symbol が読み取れない、または判断時刻までに閉じた参照足を選べない場合です。
+   - `age_exceeded`: 選んだ参照足が `max_age` より古い場合です。原因の例は参照市場の休場・早期クローズ・欠損です。
+   - `indicator_unavailable`: worker が `indicator_unavailable` または `reference_unavailable` を返した場合です。原因の例は履歴先頭の warmup です。strategy の呼出し後の失敗も含みます。
+   - `reference_window_exceeded_at_runtime`: 参照の窓が実行時の上限を超えた場合です。
+
+   除外された判断からは取引の提案を採用しません。0 取引や取引が少ないときは、除外・提案が出ていない・発注の前提を満たさない・未決済を区別して調べてください。
 5. **`not_submitted` の課題・note は、その mission の候補が提出されなかったことを示します。**
    理由非公開。同一候補を再提出しない。再挑戦は別の仮説として扱ってください。
 6. 出力は必ず下の「最終出力」の形式 (`discoveries` / `selected` /

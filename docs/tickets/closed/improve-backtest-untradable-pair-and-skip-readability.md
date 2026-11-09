@@ -1,16 +1,16 @@
 ---
 id: improve-backtest-untradable-pair-and-skip-readability
 title: 改善の backtest が取引できない pair を黙って 0 取引にし、参照の除外の読み方も伝わらない
-status: 設計待ち
+status: 是正済
 priority: 高
 kind: 不具合
 opened: 2026-11-08
-closed: null
+closed: 2026-11-09
 related: [backtest-worker-cpu-budget-shrinks-with-timeframe, improve-run-summary-for-humans]
 ---
 # [improve-backtest-untradable-pair-and-skip-readability] 改善の backtest が取引できない pair を黙って 0 取引にし、参照の除外の読み方も伝わらない
 
-**状態**: 設計待ち / **優先**: 高 / **種別**: 不具合
+**状態**: 是正済 / **優先**: 高 / **種別**: 不具合
 
 ## 現象
 
@@ -27,8 +27,12 @@ related: [backtest-worker-cpu-budget-shrinks-with-timeframe, improve-run-summary
 
 ## 修正内容
 
+- 2026-11-09: A (取引できない pair を run_backtest の入口と gate の前で pair_not_tradable で止め、prompt に取引 pair を明記) と B1 (prompt に skipped_bars_by_reason の 4 語の判定条件と、除外・提案なし・前提不足・未決済を区別する一文を足し、段落を test で固定) を入れた。B2 (却下件数の公開) は評価回数のカウンタになり境界の探索に使えるため見送り、B3 (足数・割合を出さない) を維持、C (評価区間の始点) は improve-eval-window-reference-availability に分けた。設計 spec 2026-11-09-improve-backtest-skip-readability-design.md (C1、sol 1 周)、実装レビュー sol 1 周 (Important 1・Minor 1 是正)、判定 tests/loops ほか 2613 緑
+
 ## 経緯
 
 - 2026-11-08: 起票。
 - 2026-11-09: 状態: 実装中 — 部分 A に着手 (処置案に記載)
 - 2026-11-09: 状態: 設計待ち — 部分 A を main に merge: run_backtest の入口で settings.pairs 外の pair を pair_not_tradable と hint で返す (backtest を走らせない)、宣言した pairs に取引できない pair を含む strategy の候補を契約違反 pair_not_tradable で gate の評価の前に落とす (通知の理由語を 1 つ足した)、prompt に取引 pair を明記。レビュー codex sol 2 周 (Important 1 是正、Minor 2 是正)。残り: B (応答で除外の読み方を伝える) と C (評価区間の始点を参照系列の履歴に合わせる) は様子を見てから設計
+- 2026-11-09: 状態: 実装中 — B・C の設計 C1 (spec 2026-11-09-improve-backtest-skip-readability-design.md、sol 1 周、利用者承認): B1 (prompt に除外の 4 語の判定条件と共通の一文) を実装、B2 (却下件数を応答に出す) は評価回数のカウンタになり境界の探索に使えるため見送り、B3 (足数・割合を出さない) を維持、C は improve-eval-window-reference-availability に分ける
+- 2026-11-09: 是正内容 — A (取引できない pair を run_backtest の入口と gate の前で pair_not_tradable で止め、prompt に取引 pair を明記) と B1 (prompt に skipped_bars_by_reason の 4 語の判定条件と、除外・提案なし・前提不足・未決済を区別する一文を足し、段落を test で固定) を入れた。B2 (却下件数の公開) は評価回数のカウンタになり境界の探索に使えるため見送り、B3 (足数・割合を出さない) を維持、C (評価区間の始点) は improve-eval-window-reference-availability に分けた。設計 spec 2026-11-09-improve-backtest-skip-readability-design.md (C1、sol 1 周)、実装レビュー sol 1 周 (Important 1・Minor 1 是正)、判定 tests/loops ほか 2613 緑
