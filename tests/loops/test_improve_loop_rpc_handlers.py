@@ -610,8 +610,16 @@ def test_run_backtest_handler_returns_error_dict_and_closes_conn_on_failure(
     assert not archive_root.exists() or not any(archive_root.rglob(".tmp-*"))
 
 
+def _allow_pair(loop, pair):
+    """設定の取引 pair に `pair` を足す (取引できない pair は backtest の前で
+    止まるため、履歴不在の経路を踏むテストは pair を取引対象にしておく)。"""
+    loop._settings = loop._settings.model_copy(update={
+        "pairs": [*loop._settings.pairs, pair]})
+
+
 def test_run_backtest_handler_reports_missing_history_with_available_pairs(
         loop_min, tmp_path, monkeypatch):
+    _allow_pair(loop_min, "EURUSD")
     _patch_strategy_lookup(monkeypatch)
     monkeypatch.setattr(
         "agentic_fx.loops.improve_loop.holdout.run_in_sample",
@@ -650,6 +658,7 @@ def test_run_backtest_handler_maps_real_holdout_missing_history_contract(
         loop_no_seam, tmp_path, monkeypatch):
     """実 DB の空履歴から出る holdout の文言を handler 契約まで pin する。"""
     loop, _ = loop_no_seam
+    _allow_pair(loop, "EURUSD")
     _patch_strategy_lookup(monkeypatch)
     staging_dir = tmp_path / "staging"
     (staging_dir / "myst").mkdir(parents=True)
@@ -675,6 +684,7 @@ def test_run_backtest_handler_missing_history_hint_lists_pairs_with_data(
     conn の loop_min seam では検証できない — 本番同型の loop_no_seam
     (毎回新規接続) を使う。"""
     loop, db_path = loop_no_seam
+    _allow_pair(loop, "EURUSD")
     loop._settings = loop._settings.model_copy(update={
         "backtest": loop._settings.backtest.model_copy(
             update={"eval_source": "mt5"})})
@@ -715,6 +725,7 @@ def test_run_backtest_handler_missing_history_hint_uses_dataset_base_interval(
     symbol を取りこぼす (hint が「no pair has local backtest history」に
     後退する)。"""
     loop, db_path = loop_no_seam
+    _allow_pair(loop, "EURUSD")
     loop._settings = loop._settings.model_copy(update={
         "backtest": loop._settings.backtest.model_copy(
             update={"eval_source": "mt5", "base_interval": "5m"})})
@@ -741,6 +752,59 @@ def test_run_backtest_handler_missing_history_hint_uses_dataset_base_interval(
     assert result["error"] == "no_history_for_symbol"
     assert "No 5m history for EURUSD" in result["hint"]
     assert "Pairs with local backtest history: USDJPY." in result["hint"]
+
+
+def test_run_backtest_handler_refuses_pair_outside_settings_pairs(
+        loop_min, tmp_path, monkeypatch):
+    """`settings.pairs` 外の pair は backtest を走らせず、理由つきで返す。"""
+    _patch_strategy_lookup(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        "agentic_fx.loops.improve_loop.holdout.run_in_sample",
+        lambda *a, **kw: calls.append("run_in_sample"))
+    monkeypatch.setattr(
+        "agentic_fx.loops.improve_loop.holdout.require_reference_history",
+        lambda *a, **kw: calls.append("require_reference_history"))
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_adapter.build_intent_source",
+        lambda *a, **kw: calls.append("build_intent_source"))
+    staging_dir = tmp_path / "staging"
+    (staging_dir / "myst").mkdir(parents=True)
+    handlers = loop_min._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}), staging_dir=staging_dir)
+    assert "EURUSD" not in loop_min._settings.pairs
+
+    result = handlers["run_backtest"]({"name": "myst", "pair": "EURUSD"})
+
+    assert result["started"] is False
+    assert result["error"] == "pair_not_tradable"
+    assert result["hint"] == (
+        f"Tradable pairs are: {', '.join(loop_min._settings.pairs)}. Other "
+        "symbols can be used only as references (symbol:) in indicators.")
+    assert "EURUSD" in result["message"]
+    assert calls == []
+
+
+def test_run_backtest_handler_runs_pair_in_settings_pairs(
+        loop_min, tmp_path, monkeypatch):
+    _patch_strategy_lookup(monkeypatch)
+    calls = []
+
+    def fake(*a, record_fn=None, **kw):
+        calls.append("run_in_sample")
+        record_fn(dict(_SAVE_KWARGS))
+        return dict(_SAVE_KWARGS["metrics"])
+    monkeypatch.setattr(
+        "agentic_fx.loops.improve_loop.holdout.run_in_sample", fake)
+    staging_dir = tmp_path / "staging"
+    (staging_dir / "myst").mkdir(parents=True)
+    handlers = loop_min._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}), staging_dir=staging_dir)
+
+    result = handlers["run_backtest"]({"name": "myst", "pair": "USDJPY"})
+
+    assert calls == ["run_in_sample"]
+    assert result.get("error") != "pair_not_tradable"
 
 
 def test_run_backtest_handler_reports_pair_not_declared(

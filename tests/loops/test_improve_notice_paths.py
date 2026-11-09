@@ -563,6 +563,31 @@ def test_gate_kind_unsupported(improve_env):
               lambda *a, **k: None)]) == ("gate_failed", "kind_unsupported")
 
 
+def test_gate_pair_not_tradable_stops_before_the_backtest(improve_env):
+    app, root = improve_env
+    assert "NZDCHF" not in app.settings.pairs
+    config = _strategy()[2].replace(
+        "pairs: [USDJPY]", "pairs: [USDJPY, NZDCHF]")
+    calls = []
+
+    def spy(*a, **k):
+        calls.append(1)
+        raise AssertionError("the gate must not evaluate")
+
+    loop, ctx, _ = _run(
+        app, root, _plugin_artifact("cand", kind="strategy"),
+        files=("cand", _strategy()[1], config, _strategy()[3]),
+        extra=[patch.object(ImproveLoop, "_run_strategy_gate", spy)])
+    row = _snap(app.conn_core, ctx.mission_id)
+    assert (row["result_code"], row["reason_code"]) == (
+        "gate_failed", "pair_not_tradable")
+    assert "NZDCHF" not in _all_text(row)
+    assert calls == []
+    assert app.conn_core.execute(
+        "SELECT COUNT(*) FROM approval_requests WHERE kind='plugin'"
+    ).fetchone()[0] == 0
+
+
 def test_gate_outputs_required(improve_env):
     assert _gate_case(improve_env, extra=[
         patch("agentic_fx.plugin.approval.outputs_required_violation",

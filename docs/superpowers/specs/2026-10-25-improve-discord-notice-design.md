@@ -257,6 +257,7 @@ bot ──escape・切詰め──▶ Discord に投稿。本文は worker の�
 | 候補の同一性が取れない (`logic_hash is None`。質検査より前に終端する。質検査側の防御枝 `candidate_identity_unavailable` に届いた場合も同じ語に引く) | `gate_failed` | `unverified` |
 | `assert_max_bars_within_limit` の ValueError | `gate_failed` | `max_bars_limit` |
 | `kind` が indicator / strategy 以外 | `gate_failed` | `kind_unsupported` |
+| strategy の宣言 pairs が `settings.pairs` の部分集合でない | `gate_failed` | `pair_not_tradable` |
 | `outputs_required` | `gate_failed` | `outputs_required` |
 | `IndicatorResolutionError` | `gate_failed` | `indicator_unresolved` |
 | runner の status が `timeout` / `max_turns` | `failed` | `timeout` / `max_turns` |

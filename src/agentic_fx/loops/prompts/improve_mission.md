@@ -101,7 +101,8 @@ indicator は銘柄を持たないので、名前・param・説明に銘柄名�
    それまでの backtest 結果は保存されません。応答の `remaining_budget` で
    残り枠が分かります。**`config.yaml` の `pairs` に宣言した全 pair を
    最低 1 回 `run_backtest` で確認してから提出してください** (候補は
-   1 pair の不合格で全体が落ちます)。{profitability_floor_rule}
+   1 pair の不合格で全体が落ちます)。**候補の `pairs` に書けるのは取引できる pair (`{tradable_pairs}`) だけです。
+   ほかの symbol は参照 (indicator の `symbol:`) としてのみ使えます。** {profitability_floor_rule}
 5. **`not_submitted` の課題・note は、その mission の候補が提出されなかったことを示します。**
    理由非公開。同一候補を再提出しない。再挑戦は別の仮説として扱ってください。
 6. 出力は必ず下の「最終出力」の形式 (`discoveries` / `selected` /

@@ -70,20 +70,29 @@ def test_a_candidate_failing_only_the_holdout_floor_never_replays_either(
 # --- 契約が床より優先 ------------------------------------------------------------
 
 @pytest.mark.parametrize("mode", ["shadow", "enforce"])
-@pytest.mark.parametrize("change", ["timeframe", "pair_superset"])
+@pytest.mark.parametrize("change", ["timeframe", "pair_superset", "untradable_pair"])
 def test_a_contract_change_wins_over_a_floor_failure_and_runs_no_backtest(
         tmp_path, mode, change):
     config = (bw.CONFIG.replace("timeframe: 1h", "timeframe: 4h")
               if change == "timeframe"
               else bw.CONFIG.replace("[USDJPY]", "[USDJPY, EURUSD]"))
+    # pair_superset は EURUSD も取引できる設定で、同名の契約の変更だけを起こす。
+    # untradable_pair は EURUSD が取引できない (既定の settings.pairs)。
     snap, _deployed, _ = bw.run_scenario(
         tmp_path / "w",
         bw.candidate_files(py=bw.strategy_py(min_close=151.6), config=config),
-        mode=mode)
+        mode=mode,
+        pairs=(["USDJPY", "EURUSD"] if change == "pair_superset" else None))
     assert snap.status == "completed"
-    assert snap.notice == ("gate_failed", SAME_NAME)
     assert snap.rows == []                      # 候補の backtest も 0 行
     assert snap.approvals == []
+    if change == "untradable_pair":
+        # 足した EURUSD は取引できない pair (settings.pairs は USDJPY だけ) なので、
+        # 同名の契約の検査より前に、取引できない pair の契約違反で止まる
+        assert snap.notice == ("gate_failed", "pair_not_tradable")
+        assert not any("\tbacktest_cpu\t" in l for l in snap.activity)
+        return
+    assert snap.notice == ("gate_failed", SAME_NAME)
     assert snap.backlog == [{"last_result": "observation:not_submitted",
                              "origin_outcome": "not_submitted"}]
     assert any(l.endswith(f"mission={snap.mission_id} reason={SAME_NAME}\t-")

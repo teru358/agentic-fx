@@ -89,7 +89,8 @@ def _install_floor_strategy_gate(monkeypatch, loop, *, holdout_metrics):
         # は必ず `kind`/`outputs` を持つ `PluginMeta` を返すので、この
         # double にも両方を持たせる (退化した fake が実物より緩かった)。
         lambda *a, **kw: SimpleNamespace(max_bars=100, indicators=(),
-                                         kind="strategy", outputs=None))
+                                         kind="strategy", outputs=None,
+                                         pairs=("USDJPY",)))
 
     def fake_strategy_gate(*a, **kw):
         kw["record_fn"](_gate_row(scope="in_sample", pf=0.5))

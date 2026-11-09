@@ -457,3 +457,13 @@ def test_the_numbers_reach_the_parent_only_report_and_no_agent_surface(
             assert number not in text
     assert last == "observation:gate_failed:indicator_monotone_duplicate" or \
         last == "indicator_monotone_duplicate"
+
+
+def test_the_contract_classifier_rejects_a_strategy_declaring_an_untradable_pair(loop_min):
+    tradable = tuple(loop_min._settings.pairs)
+    meta = fakes.meta_for("c", Path("."), content_hash="c" * 64, kind="strategy",
+                          outputs=("value",), pairs=tradable + ("NZDCHF",))
+    assert loop_min._contract_violation(meta) == (
+        "pair_not_tradable", "pair_not_tradable")
+    assert loop_min._contract_violation(
+        dataclasses.replace(meta, pairs=tradable)) is None

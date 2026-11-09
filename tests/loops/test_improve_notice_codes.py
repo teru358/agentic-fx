@@ -46,6 +46,7 @@ EXPECTED = [
     ("NOTICE_UNVERIFIED", "gate_failed", "unverified"),
     ("NOTICE_MAX_BARS_LIMIT", "gate_failed", "max_bars_limit"),
     ("NOTICE_KIND_UNSUPPORTED", "gate_failed", "kind_unsupported"),
+    ("NOTICE_PAIR_NOT_TRADABLE", "gate_failed", "pair_not_tradable"),
     ("NOTICE_OUTPUTS_REQUIRED", "gate_failed", "outputs_required"),
     ("NOTICE_INDICATOR_UNRESOLVED", "gate_failed", "indicator_unresolved"),
     ("NOTICE_SYMBOL_IN_NAME", "gate_failed", "symbol_in_name"),
@@ -131,6 +132,7 @@ PLUGIN_GATE = {
     "sandbox_unavailable": "NOTICE_GATE_SANDBOX_UNAVAILABLE",
     "max_bars_limit": "NOTICE_MAX_BARS_LIMIT",
     "kind_unsupported": "NOTICE_KIND_UNSUPPORTED",
+    "pair_not_tradable": "NOTICE_PAIR_NOT_TRADABLE",
     "outputs_required": "NOTICE_OUTPUTS_REQUIRED",
 }
 INDICATOR_GATE = {

@@ -95,3 +95,11 @@ def test_the_template_body_is_rendered_once_even_with_a_comment(tmp_path, monkey
     monkeypatch.setattr(il, "mission_template", lambda: Counting(template))
     _render(tmp_path, oneoff_comment="x")
     assert sum(formatted) <= len(template)
+
+
+def test_prompt_limits_candidate_pairs_to_tradable_pairs(tmp_path):
+    text = _render(tmp_path)
+    tradable = ", ".join(SETTINGS.pairs)
+    assert (f"候補の `pairs` に書けるのは取引できる pair (`{tradable}`) だけです"
+            in text)
+    assert "ほかの symbol は参照 (indicator の `symbol:`) としてのみ使えます" in text
