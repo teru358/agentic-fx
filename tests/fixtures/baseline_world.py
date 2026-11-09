@@ -111,8 +111,10 @@ class World:
 def open_world(root: Path, *, mode: str = "enforce",
                wall_clock_max_sec: float | None = None,
                plugin_updates: dict | None = None,
-               gate_updates: dict | None = None):
-    """合成履歴を入れた app と、実 loop / 実 supervisor を返す。"""
+               gate_updates: dict | None = None,
+               pairs: list[str] | None = None):
+    """合成履歴を入れた app と、実 loop / 実 supervisor を返す。`pairs` を渡すと
+    取引できる pair (`settings.pairs`) をそれに替える。"""
     root.mkdir(parents=True, exist_ok=True)
     _install(root)
     with _no_real_network():
@@ -124,6 +126,8 @@ def open_world(root: Path, *, mode: str = "enforce",
             s.backtest.eval_source = fx.SOURCE
             s.backtest.base_interval = fx.BASE_INTERVAL
             s.improve.baseline_gate = mode
+            if pairs is not None:
+                s.pairs = list(pairs)
             if wall_clock_max_sec is not None:
                 s.improve.baseline_replay_wall_clock_max_sec = wall_clock_max_sec
             for key, value in (plugin_updates or {}).items():
@@ -330,7 +334,8 @@ def run_scenario(root: Path, files, *, deployed_py: str | None = None,
                  wall_clock_max_sec: float | None = None,
                  plugin_updates: dict | None = None,
                  gate_updates: dict | None = None, wrap=None,
-                 after_stage=None, expect_error=None):
+                 after_stage=None, expect_error=None,
+                 pairs: list[str] | None = None):
     """新しい world に配備済みの版を置き、手動 mission を 1 本通して観測を返す。
 
     `wrap(deployed_hash)` は mission の間だけ有効な context manager を返す
@@ -340,7 +345,7 @@ def run_scenario(root: Path, files, *, deployed_py: str | None = None,
     import contextlib
     with open_world(root, mode=mode, wall_clock_max_sec=wall_clock_max_sec,
                     plugin_updates=plugin_updates,
-                    gate_updates=gate_updates) as world:
+                    gate_updates=gate_updates, pairs=pairs) as world:
         deployed = deploy(world, py=deployed_py, config=deployed_config)
         error = None
         before = {r[0] for r in world.conn.execute("SELECT id FROM missions")}

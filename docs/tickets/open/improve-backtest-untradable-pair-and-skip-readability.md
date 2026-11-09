@@ -1,7 +1,7 @@
 ---
 id: improve-backtest-untradable-pair-and-skip-readability
 title: 改善の backtest が取引できない pair を黙って 0 取引にし、参照の除外の読み方も伝わらない
-status: 実装中
+status: 設計待ち
 priority: 高
 kind: 不具合
 opened: 2026-11-08
@@ -10,7 +10,7 @@ related: [backtest-worker-cpu-budget-shrinks-with-timeframe, improve-run-summary
 ---
 # [improve-backtest-untradable-pair-and-skip-readability] 改善の backtest が取引できない pair を黙って 0 取引にし、参照の除外の読み方も伝わらない
 
-**状態**: 実装中 / **優先**: 高 / **種別**: 不具合
+**状態**: 設計待ち / **優先**: 高 / **種別**: 不具合
 
 ## 現象
 
@@ -31,3 +31,4 @@ related: [backtest-worker-cpu-budget-shrinks-with-timeframe, improve-run-summary
 
 - 2026-11-08: 起票。
 - 2026-11-09: 状態: 実装中 — 部分 A に着手 (処置案に記載)
+- 2026-11-09: 状態: 設計待ち — 部分 A を main に merge: run_backtest の入口で settings.pairs 外の pair を pair_not_tradable と hint で返す (backtest を走らせない)、宣言した pairs に取引できない pair を含む strategy の候補を契約違反 pair_not_tradable で gate の評価の前に落とす (通知の理由語を 1 つ足した)、prompt に取引 pair を明記。レビュー codex sol 2 周 (Important 1 是正、Minor 2 是正)。残り: B (応答で除外の読み方を伝える) と C (評価区間の始点を参照系列の履歴に合わせる) は様子を見てから設計
