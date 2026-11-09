@@ -19,9 +19,10 @@ PASSWORD = b"A" * 22
 LAN = "192.168.1.10"
 
 
-def _config(bind: str | None = None, allow=None, auth: str = "none") -> OpsConfig:
+def _config(bind: str | None = None, allow=None, auth: str = "none",
+            write: bool = False) -> OpsConfig:
     return OpsConfig(instance_root=Path("/srv/afx"), key_dir=Path("/srv/keys"),
-                     config_dir_fd=None, port=18080, bind=bind, auth=auth,
+                     config_dir_fd=None, port=18080, bind=bind, auth=auth, write=write,
                      allow=None if allow is None else tuple(NET(item) for item in allow))
 
 
@@ -366,3 +367,35 @@ def test_check_plan_accepts_both_required_sets_and_rejects_anything_else():
 
 def test_the_unrestricted_marker_is_the_zero_network():
     assert str(WEB_UNRESTRICTED) == "0.0.0.0/0"
+
+
+# --- write ---------------------------------------------------------------------------------
+
+def test_write_with_auth_none_is_write_requires_auth_before_any_lookup(tmp_path):
+    lookup = Lookup(fail=True)
+    assert _check(tmp_path, _config(write=True), lookup) == "write_requires_auth"
+    assert _check(tmp_path, _config(bind=LAN, allow=["10.0.0.0/8"], write=True),
+                  lookup) == "write_requires_auth"
+    assert lookup.calls == 0
+
+
+def test_write_on_a_non_loopback_bind_is_write_requires_loopback_even_with_basic(tmp_path):
+    lookup = Lookup(LAN)
+    config = _config(bind=LAN, allow=["10.0.0.0/8"], auth="basic", write=True)
+    assert _check(tmp_path, config, lookup) == "write_requires_loopback"
+    assert lookup.calls == 0
+    # allow 省略の非 loopback も、allow_required より先に write の理由で落ちる
+    assert _check(tmp_path, _config(bind=LAN, auth="basic", write=True),
+                  lookup) == "write_requires_loopback"
+
+
+def test_write_on_loopback_with_basic_starts(tmp_path):
+    _password(_secret_dir(tmp_path))
+    assert _check(tmp_path, _config(auth="basic", write=True), Lookup(fail=True)) is None
+    assert _check(tmp_path, _config(bind="127.0.0.2", auth="basic", write=True),
+                  Lookup(fail=True)) is None
+
+
+def test_write_false_keeps_the_existing_combinations(tmp_path):
+    assert _check(tmp_path, _config(write=False)) is None
+    assert _check(tmp_path, _config(bind=LAN, allow=["10.0.0.0/8"], write=False)) is None

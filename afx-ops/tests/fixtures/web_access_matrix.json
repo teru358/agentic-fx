@@ -868,6 +868,66 @@
   "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nuser = \"afx\"\n"
  },
  {
+  "afx_ops_only": true,
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G9-write-string",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nwrite = \"true\"\n"
+ },
+ {
+  "afx_ops_only": true,
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G9-write-int",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nwrite = 1\n"
+ },
+ {
+  "afx_ops_only": true,
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G9-write-zero",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nwrite = 0\n"
+ },
+ {
+  "afx_ops_only": true,
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G9-write-list",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nwrite = [true]\n"
+ },
+ {
+  "afx_ops_only": true,
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G9-write-empty",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nwrite = \"\"\n"
+ },
+ {
+  "afx_ops_only": true,
+  "bind": "loopback",
+  "expected": null,
+  "group": "G",
+  "id": "G9-write-false-accepted",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nwrite = false\n"
+ },
+ {
   "allow": "omitted",
   "auth": "none",
   "bind": "loopback",
@@ -2098,5 +2158,101 @@
   "secret": "payload",
   "secret_bytes": 128,
   "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nbind = \"127.0.0.1\"\nauth = \"basic\"\n"
+ },
+ {
+  "afx_ops_only": true,
+  "allow": "limited",
+  "auth": "none",
+  "bind": "loopback",
+  "expected": "write_requires_auth",
+  "group": "W",
+  "id": "W-loopback-none",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nwrite = true\n"
+ },
+ {
+  "afx_ops_only": true,
+  "allow": "limited",
+  "auth": "basic",
+  "bind": "loopback",
+  "expected": null,
+  "group": "W",
+  "id": "W-loopback-basic",
+  "interfaces": "na",
+  "secret": "safe",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nbind = \"127.0.0.1\"\nauth = \"basic\"\nwrite = true\n"
+ },
+ {
+  "afx_ops_only": true,
+  "allow": "limited",
+  "auth": "none",
+  "bind": "local",
+  "expected": "write_requires_auth",
+  "group": "W",
+  "id": "W-local-none",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nbind = \"{BIND}\"\nallow = [\"192.168.1.0/24\"]\nwrite = true\n"
+ },
+ {
+  "afx_ops_only": true,
+  "allow": "limited",
+  "auth": "basic",
+  "bind": "local",
+  "expected": "write_requires_loopback",
+  "group": "W",
+  "id": "W-local-basic",
+  "interfaces": "na",
+  "secret": "safe",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nbind = \"{BIND}\"\nallow = [\"192.168.1.0/24\"]\nauth = \"basic\"\nwrite = true\n"
+ },
+ {
+  "afx_ops_only": true,
+  "allow": "limited",
+  "auth": "none",
+  "bind": "absent",
+  "expected": "write_requires_auth",
+  "group": "W",
+  "id": "W-absent-none",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nbind = \"{BIND}\"\nallow = [\"192.168.1.0/24\"]\nwrite = true\n"
+ },
+ {
+  "afx_ops_only": true,
+  "allow": "limited",
+  "auth": "basic",
+  "bind": "absent",
+  "expected": "write_requires_loopback",
+  "group": "W",
+  "id": "W-absent-basic",
+  "interfaces": "na",
+  "secret": "safe",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nbind = \"{BIND}\"\nallow = [\"192.168.1.0/24\"]\nauth = \"basic\"\nwrite = true\n"
+ },
+ {
+  "afx_ops_only": true,
+  "allow": "limited",
+  "auth": "none",
+  "bind": "failed",
+  "expected": "write_requires_auth",
+  "group": "W",
+  "id": "W-failed-none",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nbind = \"{BIND}\"\nallow = [\"192.168.1.0/24\"]\nwrite = true\n"
+ },
+ {
+  "afx_ops_only": true,
+  "allow": "limited",
+  "auth": "basic",
+  "bind": "failed",
+  "expected": "write_requires_loopback",
+  "group": "W",
+  "id": "W-failed-basic",
+  "interfaces": "na",
+  "secret": "safe",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nbind = \"{BIND}\"\nallow = [\"192.168.1.0/24\"]\nauth = \"basic\"\nwrite = true\n"
  }
 ]

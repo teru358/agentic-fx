@@ -147,6 +147,16 @@ def _unknown_principal(directory: Path) -> None:
                                           "sha256": digest(token_for("x"))})
 
 
+def _unknown_principal_malformed(directory: Path) -> None:
+    _set_entry(directory, "ops-web-write", {"generation": 1, "state": "active",
+                                            "sha256": "not-a-digest"})
+
+
+def _unknown_principal_bad_name(directory: Path) -> None:
+    _set_entry(directory, "Ops Web/../x", {"generation": 1, "state": "active",
+                                           "sha256": digest(token_for("x"))})
+
+
 def _v1_with_ops_entry(directory: Path) -> None:
     ready = json.loads((FIXTURES / "ready_v1.json").read_text())
     ready["principals"]["ops-web"] = {"generation": 1, "state": "active",
@@ -166,7 +176,8 @@ STATES = {
     "v2_unregistered": (_unregistered, "not_enrolled", True),
     "v2_preparing": (_preparing, "ready_not_committed", True),
     "v2_revoked": (_revoked, "revoked", True),
-    "v2_unknown_principal": (_unknown_principal, "ready_invalid", True),
+    "v2_unknown_principal_malformed": (_unknown_principal_malformed, "ready_invalid", True),
+    "v2_unknown_principal_bad_name": (_unknown_principal_bad_name, "ready_invalid", True),
     "ready_mode_0644": (_ready_mode_0644, "ready_invalid", True),
     "ready_missing": (_not_initialized, "not_initialized", True),
     "dir_mode_0755": (_dir_mode_0755, "key_dir_invalid", True),
@@ -192,3 +203,10 @@ def test_manifest_states_fail_closed(tmp_path, state):
 def test_manifest_states_cover_the_brief(tmp_path):
     assert {"v1_manifest_has_no_ops_principal", "v2_unregistered", "v2_preparing",
             "v2_revoked", "digest_mismatch", "key_mode_0644", "key_is_symlink"} <= set(STATES)
+
+
+def test_a_well_formed_entry_of_a_newer_principal_is_ignored(tmp_path):
+    """本体が新しい principal を足した manifest でも、自分の鍵は読める (配備の順に依らない)。"""
+    directory = build_key_dir(tmp_path / "keys")
+    _unknown_principal(directory)
+    assert _read(directory, "ops-web") == token_for("ops-web")

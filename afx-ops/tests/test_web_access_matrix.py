@@ -138,7 +138,7 @@ def test_the_checked_in_fixture_is_the_generated_one():
 def test_the_generator_covers_every_grammar_class_and_the_full_cross_product():
     ids = _ids(ROWS)
     assert len(ids) == len(set(ids))
-    for prefix in ("G1", "G2", "G3-", "G3a", "G3b", "G4", "G5", "G6", "G7", "G8", "S-password"):
+    for prefix in ("G1", "G2", "G3-", "G3a", "G3b", "G4", "G5", "G6", "G7", "G8", "G9", "S-password", "W-"):
         assert any(i.startswith(prefix) for i in ids), prefix
     c = [row for row in ROWS if row["group"] == "C"]
     assert len(c) == 4 * 3 * 2 * 4
@@ -180,6 +180,19 @@ def test_the_user_and_password_boundary_rows_follow_the_spec_table():
         assert by_id[f"S-password-{size}-basic"]["expected"] == basic
         assert by_id[f"S-password-{size}-none"]["expected"] == none
         assert by_id[f"S-password-{size}-basic"]["secret_bytes"] == size
+
+
+def test_the_write_rows_follow_the_write_table():
+    w = [row for row in ROWS if row["group"] == "W"]
+    assert len(w) == len(matrix.BINDS) * len(matrix.AUTHS)
+    by_id = {row["id"]: row["expected"] for row in w}
+    for bind in matrix.BINDS:
+        assert by_id[f"W-{bind}-none"] == "write_requires_auth"
+    assert by_id["W-loopback-basic"] is None
+    for bind in ("local", "absent", "failed"):
+        assert by_id[f"W-{bind}-basic"] == "write_requires_loopback"
+    assert all(row["text"].endswith("write = true\n") and row["afx_ops_only"] for row in w)
+    assert all(row["interfaces"] == "na" for row in w)
 
 
 def test_each_row_has_exactly_one_expected_final_result():

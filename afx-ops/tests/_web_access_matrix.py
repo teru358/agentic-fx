@@ -3,6 +3,7 @@
 期待値は仕様の 2 表を行の順に書き下した関数 (`g_*` と `c_expected`) だけから導く。
 実装の関数は使わない。生成物は `fixtures/web_access_matrix.json` に置き、afx-ops の
 3 入口 (config・probe・production) と本体の reader の 4 入口が、`expected` の 1 列を読む。
+`afx_ops_only` の行 (`write` を含む設定) は afx-ops の 3 入口だけが読む。
 
     python tests/_web_access_matrix.py --write   # fixture を更新する
 """
@@ -111,6 +112,10 @@ def g_rows() -> list[dict]:
         add(f"G8-user-{name}-accepted", None, _toml(f'auth = "basic"\nuser = "{value}"\n'),
             secret="safe")
     add("G8-user-with-auth-none-accepted", None, _toml('user = "afx"\n'))
+    for name, value in (("string", '"true"'), ("int", "1"), ("zero", "0"), ("list", "[true]"),
+                        ("empty", '""')):
+        add(f"G9-write-{name}", "config_invalid", _toml(f"write = {value}\n"), afx_ops_only=True)
+    add("G9-write-false-accepted", None, _toml("write = false\n"), afx_ops_only=True)
     return rows
 
 
@@ -166,6 +171,27 @@ def c_rows() -> list[dict]:
     return rows
 
 
+def w_expected(bind: str, auth: str) -> str | None:
+    """書込み (`write = true`) の W1〜W3。allow・interface・secret の検査より先に判定する。"""
+    if auth == "none":
+        return "write_requires_auth"                                     # W1
+    if bind != "loopback":
+        return "write_requires_loopback"                                 # W2
+    return None                                                          # W3
+
+
+def w_rows() -> list[dict]:
+    """`write = true` の bind × auth。secret は auth に合わせる (basic は安全な password)。"""
+    rows = []
+    for bind, auth in itertools.product(BINDS, AUTHS):
+        text = _c_text(bind, "omitted" if bind == "loopback" else "limited", auth)
+        rows.append(_row(f"W-{bind}-{auth}", "W", w_expected(bind, auth),
+                         text=text + "write = true\n", bind=bind, allow="limited", auth=auth,
+                         secret="safe" if auth == "basic" else "none", afx_ops_only=True,
+                         interfaces="na"))
+    return rows
+
+
 PASSWORD_SIZES = (0, 1, 7, 8, 22, 32, 33, 128)
 
 
@@ -188,7 +214,7 @@ def s_rows() -> list[dict]:
 
 
 def rows() -> list[dict]:
-    return g_rows() + c_rows() + s_rows()
+    return g_rows() + c_rows() + s_rows() + w_rows()
 
 
 def render() -> str:
