@@ -71,7 +71,6 @@
 |---|---|---|---|
 | [gate-pytest-dev-writable-and-ldso-exec](open/gate-pytest-dev-writable-and-ldso-exec.md) | 高 | 2026-10-03 | gate の pytest は /dev 全体が書き込み可で ld.so 経由で任意の ELF を起動できる |
 | [ops-bot-exits-not-lock-holder](open/ops-bot-exits-not-lock-holder.md) | 高 | 2026-10-22 | afx-ops bot が稼働中に not_lock_holder で終了し systemd が再起動する |
-| [improve-backtest-untradable-pair-and-skip-readability](open/improve-backtest-untradable-pair-and-skip-readability.md) | 高 | 2026-11-08 | 改善の backtest が取引できない pair を黙って 0 取引にし、参照の除外の読み方も伝わらない |
 | [human-corridor-gate-rows-null-outcome](open/human-corridor-gate-rows-null-outcome.md) | 中 | 2026-09-12 | 人間回廊 (`submit_candidate` / `bless_candidate` → `_run_full_g… |
 | [backtest-worker-cpu-budget-shrinks-with-timeframe](open/backtest-worker-cpu-budget-shrinks-with-timeframe.md) | 中 | 2026-09-20 | strategy の backtest は plugin worker 1 プロセスを再生全体で使い回すので、`plu… |
 | [backtest-rpc-timeout-does-not-stop-parent-work](open/backtest-rpc-timeout-does-not-stop-parent-work.md) | 中 | 2026-09-21 | backtest の待ち時間超過後も親の処理と worker が走り続ける |
@@ -99,6 +98,7 @@
 | [ohlcv-cache-retention-cutoff-fixed-at-start](open/ohlcv-cache-retention-cutoff-fixed-at-start.md) | 中 | 2026-11-03 | cache の保持期間 cutoff が起動時刻で固定され再起動まで進まない |
 | [verify-backend-counts-preexisting-descendants](open/verify-backend-counts-preexisting-descendants.md) | 中 | 2026-11-06 | verify_backend が実行前から居た子孫プロセスも未回収と数えて失敗する |
 | [plugin-inherited-filter-test-hits-fingerprint-selftest-first](open/plugin-inherited-filter-test-hits-fingerprint-selftest-first.md) | 中 | 2026-11-07 | 継承 seccomp filter の拒否 test が fingerprint 自己試験の失敗を先に返す |
+| [improve-eval-window-reference-availability](open/improve-eval-window-reference-availability.md) | 中 | 2026-11-09 | 参照系列を宣言した候補の評価区間に、参照の履歴が無い先頭の足が入る |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
 | [tier-a-directive-ignored](open/tier-a-directive-ignored.md) | 中 |  | 自己テストの連続失敗の警告が無視され続け、止める仕組みが無い |
