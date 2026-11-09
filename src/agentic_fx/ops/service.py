@@ -117,7 +117,7 @@ ENDPOINTS: dict[str, Endpoint] = {e.code: e for e in (
     Endpoint("killswitch_reconcile", "POST /v1/killswitch/reconcile", Scope.LOCAL_GUARD, True),
     Endpoint("reflection_retry", "POST /v1/reflections/{order_id}/retry", Scope.OPERATE, True,
              idempotent=True, autopilot_restricted=True),
-    Endpoint("improve", "POST /v1/improve/runs", Scope.OPERATE, True, idempotent=True,
+    Endpoint("improve", "POST /v1/improve/runs", Scope.IMPROVE_RUN, True, idempotent=True,
              autopilot_restricted=True),
     Endpoint("backlog_add", "POST /v1/backlog", Scope.OPERATE, True, idempotent=True,
              autopilot_restricted=True),
@@ -1751,8 +1751,9 @@ class OpsService:
 
     def improve(self, principal: Caller, idempotency_key: str, *,
                 deadline: float | None = None, duration_sec=_UNSET, max_runs=_UNSET,
-                comment=_UNSET, **unknown) -> dict:
+                comment=_UNSET, asserted_actor: str | None = None, **unknown) -> dict:
         _authorize(principal, "improve")
+        actor = _actor(principal, asserted_actor, required=True)
         endpoint = ENDPOINTS["improve"]
         # 受理前の検査。違反は監査行を作らずに断る。渡されなかった key は本文に入れない。
         if unknown:
@@ -1790,7 +1791,8 @@ class OpsService:
         with self._ops_lane(deadline):
             self._ensure_accepting()
             accepted = self._accept(principal, endpoint, body, "improve",
-                                    key=idempotency_key, job_id=job_id)
+                                    key=idempotency_key, job_id=job_id,
+                                    asserted_actor=actor)
             if isinstance(accepted, IdempotencyReplay):
                 if holder is not None:
                     holder.clear()
@@ -1804,12 +1806,12 @@ class OpsService:
                 if self._restricted(principal, endpoint, deadline):
                     raise OpsError(ErrorCode.AUTOPILOT_RESTRICTED)
                 if repeat:
-                    job = self._enqueue_repeat(principal, job_id, accepted.audit_id,
+                    job = self._enqueue_repeat(principal, actor, job_id, accepted.audit_id,
                                                duration_sec, max_runs, holder,
                                                started_mono, started_wall)
                 else:
                     job = self.jobs.enqueue_single(
-                        principal, None, "improve", self._improve_action(holder),
+                        principal, actor, "improve", self._improve_action(holder),
                         deadline_seconds=self.limits.improve_start_deadline_seconds,
                         busy_code=ErrorCode.IMPROVE_RUNNING, job_id=job_id,
                         audit_id=accepted.audit_id)
@@ -1834,7 +1836,7 @@ class OpsService:
                 raise
             return {"job_id": job.id, "state": job.state.value}
 
-    def _enqueue_repeat(self, principal: Caller, job_id: str, audit_id: int,
+    def _enqueue_repeat(self, principal: Caller, actor: str | None, job_id: str, audit_id: int,
                         duration_sec: int | None, max_runs: int | None,
                         holder: "ir.CommentHolder | None", started_mono: float,
                         started_wall: datetime) -> Job:
@@ -1852,7 +1854,7 @@ class OpsService:
                    "deadline_at": deadline_at, "phase": "waiting_slot",
                    "stop_requested": False}
         return self.jobs.enqueue_single(
-            principal, None, "improve",
+            principal, actor, "improve",
             self._repeat_action(holder, duration_sec, max_runs, deadline_mono, deadline_at),
             deadline_seconds=self.limits.improve_start_deadline_seconds,
             busy_code=ErrorCode.IMPROVE_RUNNING, job_id=job_id, audit_id=audit_id,

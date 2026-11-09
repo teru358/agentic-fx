@@ -1,4 +1,4 @@
-"""ops-bot / ops-web / ops-notify の scope と ``X-Afx-Asserted-Actor`` の wire 契約。
+"""ops-bot / ops-web / ops-web-write / ops-notify の scope と ``X-Afx-Asserted-Actor`` の wire 契約。
 
 実 UDS + 実 server thread。期待する scope 集合は spec §3.1 の表をここに書き写したもので、
 実装の認可表から作らない (表そのものの誤りを検出するため)。
@@ -17,21 +17,26 @@ from .conftest import digest_of, hold_plugin_lock
 
 OPERATOR, APPROVER = Principal.OPERATOR, Principal.APPROVER
 OPS_BOT, OPS_WEB, OPS_NOTIFY = Principal.OPS_BOT, Principal.OPS_WEB, Principal.OPS_NOTIFY
+OPS_WEB_WRITE = Principal.OPS_WEB_WRITE
 
 SPEC_SCOPES = {
     "operator": {"status.read", "events.read", "approvals.list", "approvals.detail",
-                 "logs.read", "jobs.own", "operate", "guidance.read"},
+                 "logs.read", "jobs.own", "operate", "guidance.read", "improve.run"},
     "approver": {"status.read", "events.read", "approvals.list", "approvals.detail",
                  "logs.read", "jobs.own", "operate", "decide", "local_guard",
-                 "guidance.read"},
+                 "guidance.read", "improve.run"},
     "ops-bot": {"status.read", "events.read", "approvals.list", "approvals.detail",
                 "jobs.own", "decide"},
     "ops-web": {"status.read", "events.read", "approvals.list", "approvals.detail",
                 "logs.read"},
+    "ops-web-write": {"status.read", "events.read", "approvals.list", "approvals.detail",
+                      "logs.read", "decide", "improve.run", "jobs.own"},
     "ops-notify": {"events.read"},
 }
 
 ACTOR = "discord:123456789012345678"
+WEB_ACTOR = "web:alice"
+ACTORS = {Principal.OPS_BOT: ACTOR, Principal.OPS_WEB_WRITE: WEB_ACTOR}
 OTHER_ACTOR = "discord:876543210987654321"
 H = "X-Afx-Asserted-Actor"
 
@@ -74,11 +79,11 @@ def test_ac56_authorization_table_matches_the_spec_for_every_principal():
     assert {p.value for p in Principal} == set(SPEC_SCOPES)
 
 
-@pytest.mark.parametrize("principal", [OPS_BOT, OPS_WEB, OPS_NOTIFY])
+@pytest.mark.parametrize("principal", [OPS_BOT, OPS_WEB, OPS_WEB_WRITE, OPS_NOTIFY])
 def test_ac56_every_route_is_allowed_only_by_the_spec_scope(api5, principal):
     env = api5.env
     client = api5.client(principal)
-    headers = {H: ACTOR} if principal is OPS_BOT else {}
+    headers = {H: ACTORS[principal]} if principal in ACTORS else {}
     allowed = SPEC_SCOPES[principal.value]
     for route in ROUTES:
         path = route.pattern.pattern.strip("^$")
@@ -87,8 +92,10 @@ def test_ac56_every_route_is_allowed_only_by_the_spec_scope(api5, principal):
         body = {"payload_sha256": "0" * 64, "expected_generation": 0, "question": "q",
                 "idea": "i", "text": "t", "acknowledge": True, "expected_attempts": 0,
                 "expected_last_attempt_at": None}
+        # improve は未知の key を断るので、空の本文 (既定の 1 回の改善) を送る
         response = client.request(route.method, path,
-                                  json=body if route.method == "POST" else None,
+                                  json=({} if route.handler == "improve" else body)
+                                  if route.method == "POST" else None,
                                   headers={"Idempotency-Key": f"k-{route.handler}", **headers})
         code = response.json().get("error", {}).get("code")
         if route.scope.value in allowed:
@@ -100,11 +107,12 @@ def test_ac56_every_route_is_allowed_only_by_the_spec_scope(api5, principal):
     rows = env.conn.execute(
         "SELECT authenticated_principal,endpoint FROM ops_requests "
         "WHERE authenticated_principal NOT IN ('operator','approver')").fetchall()
-    # 変更の受理まで進めるのは ops-bot の決定と自分の job の取消だけ
-    assert all(r["authenticated_principal"] == "ops-bot" for r in rows)
+    # 変更の受理まで進めるのは bot・web-write の決定・自分の job の取消と web-write の改善の開始だけ
+    assert all(r["authenticated_principal"] in ("ops-bot", "ops-web-write") for r in rows)
     assert {r["endpoint"] for r in rows} <= {
         "POST /v1/approvals/{id}/approve", "POST /v1/approvals/{id}/reject",
-        "POST /v1/approvals/{id}/retry", "POST /v1/jobs/{id}/cancel"}
+        "POST /v1/approvals/{id}/retry", "POST /v1/jobs/{id}/cancel",
+        "POST /v1/improve/runs"}
 
 
 def test_ac56_bot_cannot_operate_or_guard_and_web_notify_cannot_change(api5):
@@ -167,7 +175,7 @@ def test_policy_endpoints_follow_their_scopes(api5, principal, allowed):
 @pytest.mark.parametrize("principal", list(Principal))
 def test_ac56_autopilot_on_orders_and_stop_stay_unreachable(api5, principal):
     client = api5.client(principal)
-    headers = {H: ACTOR} if principal is OPS_BOT else {}
+    headers = {H: ACTORS[principal]} if principal in ACTORS else {}
     for path in ("/v1/autopilot", "/v1/autopilot/on", "/v1/orders", "/v1/orders/1/close",
                  "/v1/stop", "/v1/mode", "/v1/shutdown", "/v1/killswitch/disable"):
         response = client.post(path, json={"on": True}, headers=headers)

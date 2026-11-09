@@ -34,7 +34,7 @@ def _post(api, body, key="k"):
 def test_the_endpoint_table_is_unchanged():
     endpoint = ENDPOINTS["improve"]
     assert (endpoint.route, endpoint.scope.value, endpoint.idempotent) == (
-        "POST /v1/improve/runs", "operate", True)
+        "POST /v1/improve/runs", "improve.run", True)
     assert len(ENDPOINTS) == 33
 
 

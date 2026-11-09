@@ -76,9 +76,11 @@ class AuditStore:
             raise OpsError(ErrorCode.INVALID_ARGUMENT)
         digest = _digest(body)
         row = self._conn.execute(
-            "SELECT body_sha256,state,response_json,expires_at,accepted_request_id "
-            "FROM ops_idempotency "
-            "WHERE authenticated_principal=? AND endpoint=? AND idempotency_key=?",
+            "SELECT i.body_sha256,i.state,i.response_json,i.expires_at,i.accepted_request_id,"
+            "r.asserted_actor AS accepted_actor "
+            "FROM ops_idempotency i LEFT JOIN ops_requests r "
+            "ON r.request_id=i.accepted_request_id "
+            "WHERE i.authenticated_principal=? AND i.endpoint=? AND i.idempotency_key=?",
             (principal.value, endpoint, key)).fetchone()
         if row is not None and datetime.fromisoformat(row["expires_at"]) <= self._wall_clock():
             self._conn.execute(
@@ -87,6 +89,9 @@ class AuditStore:
             self._conn.commit()
             row = None
         if row is not None:
+            # 受理した actor 以外には、本文の照合や応答の再生より前に何も返さない。
+            if row["accepted_actor"] != asserted_actor:
+                raise OpsError(ErrorCode.FORBIDDEN)
             if row["body_sha256"] != digest:
                 raise OpsError(ErrorCode.IDEMPOTENCY_MISMATCH)
             if row["state"] == "accepted":
