@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 161 件。完了分は closed/。
+未完了: 162 件。完了分は closed/。
 
 ## 実装中 (1)
 
@@ -63,7 +63,7 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (142)
+## 設計待ち (143)
 
 ### 不具合 (77)
 
@@ -194,10 +194,11 @@
 | [legacy-e2e-model](open/legacy-e2e-model.md) | 低 |  | backend を切り替えるたびにモデル名の手編集が要る |
 | [legacy-oc-qwen3-8-toolcall](open/legacy-oc-qwen3-8-toolcall.md) | 低 |  | モデルが壊れた引数でツールを連打し予算を焼く |
 
-### 保守 (23)
+### 保守 (24)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
+| [tests-preexisting-red-acceptance-sandbox-analysis](open/tests-preexisting-red-acceptance-sandbox-analysis.md) | 中 | 2026-11-10 | 素の main でも落ちる test が 3 群 5 件ある |
 | [gate-admission-helper](open/gate-admission-helper.md) | 低 | 2026-09-06 | gate 検査が 3 経路で重複し drift する |
 | [fake-run-context-consolidation](open/fake-run-context-consolidation.md) | 低 | 2026-09-17 | テストのフェイク RunContext が散在し追随漏れで壊れやすい |
 | [iw-r3-unverified-residuals](open/iw-r3-unverified-residuals.md) | 低 | 2026-09-19 | iw 3 周目で未検証のまま残った 3 点 |
