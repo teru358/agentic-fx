@@ -27,7 +27,7 @@ from agentic_fx.ops_setup.web_setup import (SECRET_GUIDANCE_TEMPLATE, WRITE_CHAN
                                             cleanup_temporaries, generated_password_line, options_problem, plan_for_input,
                                             read_config_file, read_password_file, target_from_config_file, write_problem)
 from agentic_fx.ops_setup.web_wizard import FULL, Session
-from agentic_fx.ops_setup.web_write import retained_write
+from agentic_fx.ops_setup.write_key import Inconsistent, check_write_key_consistency
 
 FEATURE = "web"
 RERUN = "afx ops web reconfigure を再実行する"
@@ -82,16 +82,12 @@ def _check_others(setup: OpsSetup) -> None:
         raise Refusal("invalid_state", RECOVER)
 
 
-LIVE_GUIDANCE = "live の ops.toml を読める状態に直してから再実行する (afx ops web status で reason を見る)"
-
-
-def current_write(root: Path, directory: Path) -> bool:
-    """reconfigure が保持すべき write。判定は `retained_write` (生の ops.toml と書込みの鍵の状態) に従う。"""
-    try:
-        return retained_write(root)
-    except InvalidState as error:
-        guidance = LIVE_GUIDANCE if error.reason.startswith("config_dir") else error.detail
-        raise Refusal(error.reason, guidance) from None
+def current_write(root: Path) -> bool:
+    """reconfigure が保持すべき write。判定は `check_write_key_consistency` に従い、不整合なら拒否する。"""
+    verdict = check_write_key_consistency(root, mode="enabled", strict_config=True)
+    if isinstance(verdict, Inconsistent):
+        raise Refusal(verdict.reason, verdict.guidance)
+    return verdict.write
 
 
 def _check_principal(setup: OpsSetup, write: bool) -> None:
@@ -167,7 +163,7 @@ def run_ops_reconfigure(root: Path, feature: str, *, options: WebOptions | None 
                 setup.paths = resolve_ops_exec(setup.paths)
             except OpsExecNotFound:
                 raise Refusal("ops_exec_not_found") from None
-            write = current_write(root, key_dir(root))
+            write = current_write(root)
             _check_principal(setup, write)
             _check_units(setup)
             if options.flagless and not io.isatty():

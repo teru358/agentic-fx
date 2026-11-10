@@ -17,11 +17,13 @@ from agentic_fx.ops.contracts import Principal
 from agentic_fx.ops.keys import (KeySetError, enroll, enrolled_key_matches, key_dir, principal_entry,
                                  revoke, rotate)
 from agentic_fx.ops_setup.feature_config import (_WEB_ACCESS, is_loopback, web_access_check, web_live_config,
-                                                 web_retained_write, write_web_config)
+                                                 write_web_config)
 from agentic_fx.ops_setup.stages import (_AFX_RUNNING, _ENABLE_TERMINAL, _KEY_MISMATCH_CODES, _WRITE_PRINCIPALS,
                                          InvalidState, OpsSetup, StageResult, _remove_marker, _describe,
                                          _write_stage, read_marker, read_stage)
 from agentic_fx.ops_setup.systemd import SystemdError
+from agentic_fx.ops_setup.write_key import (CONFIG_PATH, RECOVERY, Consistent, Inconsistent,
+                                            check_write_key_consistency, stage_mode)
 
 WRITE_PRINCIPAL = Principal.OPS_WEB_WRITE
 READ_PRINCIPAL = Principal.OPS_WEB
@@ -29,16 +31,7 @@ NOT_ENABLED_GUIDANCE = "afx ops web enable で web を有効にしてから実�
 CONFIG_GUIDANCE = ("loopback の bind と Basic 認証にする: afx ops web reconfigure --non-interactive "
                    "--config-file <port と auth = \"basic\" だけの TOML> --secret-action install "
                    "--password-file <file>")
-CONFIG_PATH = "$XDG_CONFIG_HOME/agentic-fx/ops/web/config/ops.toml (XDG_CONFIG_HOME が無ければ ~/.config/agentic-fx/ops/web/config/ops.toml)"
-_RECOVERY = ("手で直す: 書込みの有無を決める key は `write = true` か `write = false` (真偽値)。"
-             "TOML の構文・未知の key・型を直して設定を構文と schema の上で有効に戻し、"
-             "afx ops web enable --write で整合を回復する。読取専用にするなら、その後に afx ops web enable --no-write を実行する")
-UNDECIDED_GUIDANCE = f"書込みの鍵があるのに ops.toml の write が決められない。対象は {CONFIG_PATH}。{_RECOVERY}"
-UNREADABLE_GUIDANCE = f"ops.toml が構文か schema の検査を通らない。対象は {CONFIG_PATH}。{_RECOVERY}"
-FRESH_UNDECIDED_GUIDANCE = (
-    f"書込みの鍵が残っているのに ops.toml の write が true と読めない。手で直す: 対象は {CONFIG_PATH}。"
-    "`write = true` (真偽値) にし、TOML の構文・未知の key・型を直してから afx ops web enable を再実行する"
-    "(書込みの有無は write で保たれる)。読取専用にするなら、有効化の後に afx ops web enable --no-write を実行する")
+UNREADABLE_GUIDANCE = f"ops.toml が構文か schema の検査を通らない。対象は {CONFIG_PATH}。{RECOVERY}"
 _MAX_KEY_PASSES = 4
 _AFX_DOWN = frozenset({"inactive", "failed"})
 
@@ -48,48 +41,6 @@ def _mismatch(setup: OpsSetup, state: dict[str, Any], principal: Principal, code
               "afx ops web enable --write (又は --no-write) を再実行する")
     setup._failure(state, "principal_key_mismatch", detail)
     return InvalidState("principal_key_mismatch", detail)
-
-
-def retained_write(root, *, fresh: bool = False) -> bool:
-    """enable・reconfigure が保持すべき write。設定全体の検査とは別に、生の ops.toml と書込みの鍵の状態から決める。
-
-    書込みの鍵が active・preparing なのに write が true と読めない (false・読めない・真偽値でない) ときは、
-    false と推測せず InvalidState で何も変えずに拒否する。鍵が未登録・revoked のときは読めない write を false
-    (読取専用) として扱う。`fresh` (有効化の入口) では、write が true なのに書込みの鍵が active で照合できなければ
-    拒否し、設定の file や鍵 dir がまだ無いことは false として扱う。
-    """
-    directory = key_dir(root)
-    retained = web_retained_write(root)
-    if isinstance(retained, str):
-        if not fresh:
-            raise InvalidState(retained)
-        retained = None
-    try:
-        entry = principal_entry(directory, WRITE_PRINCIPAL)
-    except KeySetError as error:
-        if not fresh or error.code != "not_initialized":
-            raise InvalidState("invalid_state") from None
-        entry = None
-    except OSError:
-        raise InvalidState("invalid_state") from None
-    live_key = entry is not None and entry[0] in ("active", "preparing")
-    if live_key and retained is not True:
-        raise InvalidState("write_state_undecided", FRESH_UNDECIDED_GUIDANCE if fresh else UNDECIDED_GUIDANCE)
-    if fresh and retained is True:
-        try:
-            matches = entry is not None and entry[0] == "active" and enrolled_key_matches(directory, WRITE_PRINCIPAL)
-        except KeySetError as error:
-            if error.code in _KEY_MISMATCH_CODES:
-                raise InvalidState("principal_key_mismatch",
-                                   f"afx を止めて afx keys rotate {WRITE_PRINCIPAL.value} を実行し、"
-                                   "afx ops web enable を再実行する") from None
-            raise InvalidState("invalid_state") from None
-        except OSError:
-            raise InvalidState("invalid_state") from None
-        if not matches:
-            raise InvalidState("invalid_state", f"write = true なのに {WRITE_PRINCIPAL.value} の鍵が active でない。"
-                               f"{CONFIG_PATH} の write = true を消して再実行する")
-    return retained is True
 
 
 def _active_and_matching(setup: OpsSetup, state: dict[str, Any], principal: Principal) -> bool:
@@ -107,14 +58,14 @@ def _complete(setup: OpsSetup, principal: Principal, op: str) -> None:
     {"enroll": enroll, "rotate": rotate, "revoke": revoke}[op](directory, principal)
 
 
-def align_keys(setup: OpsSetup, state: dict[str, Any], target: bool) -> None:
+def align_keys(setup: OpsSetup, state: dict[str, Any], target: bool, *, require_read: bool = True) -> None:
     """鍵を目標に合わせる。どの途中状態からでも収束する (停止中・instance lock 保持中に呼ぶ)。
 
     有効: `ops-web-write` が未登録なら enroll、active なら照合、revoked なら rotate。
     無効: `ops-web` が active であることを確かめてから `ops-web-write` を revoke する (未登録は何もしない)。
     """
     directory = key_dir(setup.root)
-    if not target:
+    if not target and require_read:
         if not _active_and_matching(setup, state, READ_PRINCIPAL):
             setup._failure(state, "principal_key_mismatch", f"{READ_PRINCIPAL.value} の鍵が active でない")
             raise InvalidState("principal_key_mismatch",
@@ -152,6 +103,64 @@ def target_problem(root, live: dict[str, Any]) -> str | None:
     return web_access_check(root).reason
 
 
+def _check_target(root, live: dict[str, Any]) -> None:
+    problem = target_problem(root, live)
+    if problem is not None:
+        raise InvalidState(problem, CONFIG_GUIDANCE if problem.startswith("write_requires") else "")
+
+
+def _recover_idle(setup: OpsSetup, saved: dict[str, Any] | None, target: bool,
+                  confirm: Callable[[], bool] | None) -> StageResult:
+    """有効でない web (一度も enable していない・disabled) の write と鍵の不整合を、停止と lock の下で整合させる。
+
+    stage file は作らない。途中で止まっても鍵・設定の操作は冪等なので、同じコマンドの再実行で収束する。
+    整合しているなら何もせず not_enabled。afx が動いていたなら最後に afx を起こす (web は有効でないので起きない)。
+    """
+    root = setup.root
+    setup._unfinished("web", "enable", switching_write=True)
+    setup._check_marker_owner("web")
+    verdict = check_write_key_consistency(root, mode="idle")
+    if isinstance(verdict, Consistent):
+        raise InvalidState("not_enabled", NOT_ENABLED_GUIDANCE)
+    live = web_live_config(root)
+    if isinstance(live, str):
+        if target or live != "config_dir_missing":
+            raise InvalidState(live, UNREADABLE_GUIDANCE)
+        live = None
+    if target:
+        _check_target(root, live)
+        if verdict.reason == "principal_key_mismatch":
+            raise InvalidState(verdict.reason, verdict.guidance)
+    afx_now = setup.systemd.show(setup.paths.afx_unit, "ActiveState")["ActiveState"]
+    if afx_now in _AFX_RUNNING and confirm is not None and not confirm():
+        raise InvalidState("setup_aborted")
+    state: dict[str, Any] = {"feature": "web", "operation": "disable", "stage": "disabled",
+                             "afx_before_stop": afx_now, "unrecorded": True}
+    lock = None
+    try:
+        setup._check_key_dir()
+        lock = setup._quiesce_afx(state, reset_stage=False)
+        setup._before("keys")
+        align_keys(setup, state, target, require_read=saved is not None)
+        setup._after("keys")
+        if live is not None:
+            setup._before("config")
+            values = {name: live[name] for name in ("port", *_WEB_ACCESS) if name in live and name != "write"}
+            if target:
+                values["write"] = True
+            write_web_config(root, values)
+            setup._after("config")
+        lock.close()
+        lock = None
+        _unmark(setup, state)
+        if afx_now in _AFX_RUNNING:
+            setup.systemd.start(setup.paths.afx_unit)
+        return StageResult("web", "recover", "disabled")
+    finally:
+        if lock is not None:
+            lock.close()
+
+
 def _set_step(setup: OpsSetup, state: dict[str, Any], step: str) -> None:
     setup.hook(f"before_stage_write_{step}")
     state["write_step"] = step
@@ -173,8 +182,8 @@ def _switch(setup: OpsSetup, target: bool, confirm: Callable[[], bool] | None) -
     root = setup.root
     done = StageResult("web", "enable", _ENABLE_TERMINAL)
     saved = read_stage(root, "web", missing_ok=True)
-    if saved is None or (saved["operation"] == "disable" and saved["stage"] == "disabled"):
-        raise InvalidState("not_enabled", NOT_ENABLED_GUIDANCE)
+    if stage_mode(saved) == "idle":
+        return _recover_idle(setup, saved, target, confirm)
     if not (saved["operation"] == "enable" and saved["stage"] == _ENABLE_TERMINAL):
         raise InvalidState("invalid_state")
     setup._unfinished("web", "enable", switching_write=True)
@@ -183,12 +192,13 @@ def _switch(setup: OpsSetup, target: bool, confirm: Callable[[], bool] | None) -
     if isinstance(live, str):
         raise InvalidState(live, UNREADABLE_GUIDANCE)
     pending = "write_target" in saved
-    if not pending and live.get("write", False) == target and not (not target and _write_key_live(root)):
-        return done
     if target:
-        problem = target_problem(root, live)
-        if problem is not None:
-            raise InvalidState(problem, CONFIG_GUIDANCE if problem.startswith("write_requires") else "")
+        _check_target(root, live)
+    verdict = check_write_key_consistency(root, mode="enabled")
+    if target and isinstance(verdict, Inconsistent) and verdict.reason == "principal_key_mismatch":
+        raise InvalidState(verdict.reason, verdict.guidance)
+    if not pending and verdict == Consistent(target):
+        return done
     state = saved
     setup._current = state
     afx_now = setup.systemd.show(setup.paths.afx_unit, "ActiveState")["ActiveState"]
@@ -239,15 +249,6 @@ def _switch(setup: OpsSetup, target: bool, confirm: Callable[[], bool] | None) -
     finally:
         if lock is not None:
             lock.close()
-
-
-def _write_key_live(root) -> bool:
-    """書込みの鍵が active か preparing か。読めないときは真 (整合を確かめられないので何もしないとは言えない)。"""
-    try:
-        entry = principal_entry(key_dir(root), WRITE_PRINCIPAL)
-    except (KeySetError, OSError):
-        return True
-    return entry is not None and entry[0] in ("active", "preparing")
 
 
 def _settled(setup: OpsSetup, state: dict[str, Any], target: bool) -> bool:

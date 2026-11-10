@@ -730,7 +730,8 @@ def test_a_read_only_web_with_a_damaged_live_file_is_repaired_unless_a_write_key
     rc, _ = _reconf_to_9000(bundle, tmp_path)
     err = capsys.readouterr().err
     if key in ("active", "preparing"):
-        assert rc == 1 and err.startswith("afx ops: write_state_undecided"), err
+        expected = "write_key_preparing" if key == "preparing" else "write_state_undecided"
+        assert rc == 1 and err.startswith(f"afx ops: {expected}"), err
         assert "enable --write" in err and "--no-write" in err
         assert world(bundle) == before
         assert _mutations(bundle) == []
@@ -920,11 +921,12 @@ def _disabled_while_writing(tmp_path, monkeypatch):
     return bundle
 
 
-def _reenable(bundle, mode, tmp_path):
+def _reenable(bundle, mode, tmp_path, *, writing=True):
+    """writing が偽 (読取専用) の設定では、認証の質問が 1 つ増える。"""
     options, answers = {
         "keep": (WebOptions(), [""]),
-        "change": (WebOptions(), ["2", "", "", "1"]),
-        "ask": (WebOptions(ask=True), ["", "", "1"]),
+        "change": (WebOptions(), ["2", "", "", "1"] if writing else ["2", "", "", "", "1"]),
+        "ask": (WebOptions(ask=True), ["", "", "1"] if writing else ["", "", "", "1"]),
         "non-interactive": (WebOptions(non_interactive=True, secret_action="keep",
                                        config_file=_config(tmp_path, 'port = 9000\nauth = "basic"\n')), []),
     }[mode]
@@ -1030,3 +1032,216 @@ def test_disabling_a_feature_that_was_never_enabled_is_still_refused_while_a_swi
         bundle.setup.disable("notify")
     assert caught.value.reason == "write_switch_pending"
     assert world(bundle) == before
+
+
+# --- 入口 × 状態の表: web の write と書込みの鍵の整合 -------------------------------------------------------
+
+STATES = ["ro_clean", "rw_clean", "ro_key_active", "undecided", "prep_true", "prep_false",
+          "rw_unregistered", "rw_revoked", "rw_mismatch"]
+CONSISTENT = {"ro_clean": False, "rw_clean": True}
+
+
+def apply_state(bundle, state):
+    """鍵と ops.toml を直接 (systemd と stage に触れずに) 指定の状態にする。書込みの鍵が未登録の土台から。"""
+    from agentic_fx.ops.keys import enroll, revoke
+    from agentic_fx.ops_setup.feature_config import write_web_config
+    directory = key_dir(bundle.root)
+    write = state in ("rw_clean", "prep_true", "rw_unregistered", "rw_revoked", "rw_mismatch")
+    if state in ("rw_clean", "ro_key_active", "undecided", "rw_revoked", "rw_mismatch"):
+        enroll(directory, WRITE)
+    if state == "rw_revoked":
+        revoke(directory, WRITE)
+    if state in ("prep_true", "prep_false"):
+        def stop_after_manifest(step):
+            if step == "preparing:renamed":
+                raise Crash(step)
+
+        with pytest.raises(Crash):
+            enroll(directory, WRITE, hook=stop_after_manifest)
+    if state == "rw_mismatch":
+        (directory / key_file_name(WRITE)).write_text("1" * 64 + "\n")
+        (directory / key_file_name(WRITE)).chmod(0o600)
+    write_web_config(bundle.root, {**BASIC, **({"write": True} if write else {})})
+    if state == "undecided":
+        path = bundle.xdg / "config" / "ops.toml"
+        path.write_text(path.read_text() + 'write = "yes"\n')
+
+
+def _enabled_base(tmp_path, monkeypatch):
+    return make(tmp_path, monkeypatch)
+
+
+def _idle_base(kind):
+    def build(tmp_path, monkeypatch):
+        if kind == "disabled":
+            bundle = make(tmp_path, monkeypatch)
+            assert bundle.setup.disable("web").stage == "disabled"
+        else:
+            bundle = make_bundle(tmp_path, monkeypatch, enable_web=False, web_values=BASIC)
+            apply_secret(bundle.root, SecretPlan("install", PW))
+        bundle.systemd.calls.clear()
+        return bundle
+    return build
+
+
+def _enable_resume_base(stage):
+    def build(tmp_path, monkeypatch):
+        bundle = make_bundle(tmp_path, monkeypatch, enable_web=False, web_values=BASIC)
+        apply_secret(bundle.root, SecretPlan("install", PW))
+        bundle.setup.hook = lambda name: (_ for _ in ()).throw(Crash(name)) if name == f"after_stage_{stage}" else None
+        with pytest.raises(Crash):
+            bundle.setup.enable("web")
+        bundle.setup.hook = lambda _name: None
+        return bundle
+    return build
+
+
+def _disable_resume_base(tmp_path, monkeypatch):
+    bundle = make(tmp_path, monkeypatch)
+    bundle.setup.hook = lambda name: (_ for _ in ()).throw(Crash(name)) if name == "after_stage_stopping-ops" else None
+    with pytest.raises(Crash):
+        bundle.setup.disable("web")
+    bundle.setup.hook = lambda _name: None
+    return bundle
+
+
+def _switch_resume_base(target):
+    def build(tmp_path, monkeypatch):
+        bundle = make(tmp_path, monkeypatch)
+        saved = json.loads(bundle.stage_file.read_text())
+        saved.update(write_target=target, write_principal="ops-web-write" if target else "ops-web",
+                     write_step="staged", afx_before_stop="active")
+        bundle.stage_file.write_text(json.dumps(saved))
+        return bundle
+    return build
+
+
+def _interactive(bundle, tmp_path, mode, state):
+    return _reenable(bundle, mode, tmp_path, writing=CONSISTENT.get(state, True))[0].rc
+
+
+def _reconf_ni(bundle, tmp_path, state):
+    return _reconf_to_9000(bundle, tmp_path)[0]
+
+
+def _reconf_ia(bundle, tmp_path, state):
+    answers = ["", "", "1"] if CONSISTENT.get(state) else ["", "", "", "1"]
+    return _reconf(bundle, WebOptions(), io=ScriptIO(answers=answers))[0]
+
+
+def _disable(bundle, tmp_path, state):
+    try:
+        return 0 if bundle.setup.disable("web").stage == "disabled" else 1
+    except InvalidState:
+        return 1
+
+
+def _enable_plain(bundle, tmp_path, state):
+    return interactive_enable(bundle.root, "web", io=ScriptIO(answers=[]), setup_factory=lambda _r: bundle.setup,
+                              probe_runner=lambda _f: (0, ""), candidates=lambda: CANDIDATES).rc
+
+
+def _switch(target):
+    return lambda bundle, tmp_path, state: run(bundle, target)[0].rc
+
+
+# entry -> (base builder, driver, kind)。kind は期待の規則: gate / switch_enabled / switch_idle / switch_resume
+ENTRIES = {
+    "fresh-keep": (_idle_base("disabled"), lambda b, t, s: _interactive(b, t, "keep", s), "gate"),
+    "fresh-change": (_idle_base("disabled"), lambda b, t, s: _interactive(b, t, "change", s), "gate"),
+    "fresh-ask": (_idle_base("disabled"), lambda b, t, s: _interactive(b, t, "ask", s), "gate"),
+    "fresh-non-interactive": (_idle_base("disabled"), lambda b, t, s: _interactive(b, t, "non-interactive", s), "gate"),
+    "fresh-never-enabled": (_idle_base("never"), lambda b, t, s: _interactive(b, t, "keep", s), "gate"),
+    "enabled-recheck": (_enabled_base, _enable_plain, "gate"),
+    "resume-stopped": (_enable_resume_base("stopped"), _enable_plain, "gate"),
+    "resume-installed": (_enable_resume_base("installed"), _enable_plain, "gate"),
+    "resume-checked": (_enable_resume_base("checked"), _enable_plain, "gate"),
+    "reconfigure-non-interactive": (_enabled_base, _reconf_ni, "gate"),
+    "reconfigure-interactive": (_enabled_base, _reconf_ia, "gate"),
+    "disable": (_enabled_base, _disable, "gate"),
+    "disable-resume": (_disable_resume_base, _disable, "gate"),
+    "disable-idle": (_idle_base("disabled"), _disable, "gate"),
+    "disable-never-enabled": (_idle_base("never"), _disable, "gate"),
+    "write": (_enabled_base, _switch(True), "switch_enabled"),
+    "no-write": (_enabled_base, _switch(False), "switch_enabled"),
+    "write-idle": (_idle_base("disabled"), _switch(True), "switch_idle"),
+    "no-write-idle": (_idle_base("disabled"), _switch(False), "switch_idle"),
+    "write-never-enabled": (_idle_base("never"), _switch(True), "switch_idle"),
+    "write-resume": (_switch_resume_base(True), _switch(True), "switch_resume"),
+    "no-write-resume": (_switch_resume_base(False), _switch(False), "switch_resume"),
+}
+
+
+def _target_of(entry):
+    return not entry.startswith("no-write")
+
+
+def expected(entry, state):
+    """各セルの期待: ok (成功・整合のまま) / refuse (拒否。何も変えない) / converge (切替で整合へ収束)。"""
+    kind = ENTRIES[entry][2]
+    if kind == "gate":
+        return "ok" if state in CONSISTENT else "refuse"
+    target = _target_of(entry)
+    if state == "undecided":
+        return "refuse"
+    if state == "rw_mismatch" and target:
+        return "refuse"
+    if kind == "switch_idle":
+        return "refuse" if state in CONSISTENT else "converge"
+    if kind == "switch_enabled" and state in CONSISTENT:
+        return "ok" if CONSISTENT[state] is target else "converge"
+    return "converge"
+
+
+def _mode_of(entry):
+    idle = entry.startswith(("fresh", "disable-idle", "disable-never")) or entry.endswith(("-idle", "never-enabled"))
+    return "idle" if idle else "enabled"
+
+
+@pytest.mark.parametrize("state", STATES)
+@pytest.mark.parametrize("entry", list(ENTRIES))
+def test_every_entry_keeps_the_write_and_the_write_key_consistent(tmp_path, monkeypatch, entry, state):
+    from agentic_fx.ops_setup.write_key import Consistent, check_write_key_consistency
+    build, drive, kind = ENTRIES[entry]
+    bundle = build(tmp_path, monkeypatch)
+    apply_state(bundle, state)
+    bundle.systemd.calls.clear()
+    before = world(bundle)
+    tmp_before = sorted(p.name for p in bundle.xdg.rglob(".*.tmp"))
+    rc = drive(bundle, tmp_path, state)
+    want = expected(entry, state)
+    if want == "refuse":
+        assert rc != 0, (entry, state)
+        assert world(bundle) == before, (entry, state)
+        assert sorted(p.name for p in bundle.xdg.rglob(".*.tmp")) == tmp_before
+        assert _mutations(bundle) == [], (entry, state)
+        return
+    assert rc == 0, (entry, state)
+    mode = _mode_of(entry)
+    verdict = check_write_key_consistency(bundle.root, mode=mode)
+    if kind == "gate":
+        assert verdict == Consistent(CONSISTENT[state]), (entry, state, verdict)
+    elif want == "converge":
+        assert verdict == Consistent(_target_of(entry)), (entry, state, verdict)
+        assert read_marker(bundle.root) is None
+        if mode == "enabled":
+            assert "write_step" not in read_stage(bundle.root, "web")
+    else:
+        assert world(bundle) == before
+
+
+def test_the_preparing_guidance_does_not_loop(tmp_path, monkeypatch):
+    """preparing の案内 (enable --write / --no-write の再実行) を実行すると preparing が消え、次の案内は要らない。"""
+    from agentic_fx.ops_setup.write_key import Consistent, check_write_key_consistency
+    for base, mode in ((_enabled_base, "enabled"), (_idle_base("disabled"), "idle")):
+        for state, target in (("prep_true", True), ("prep_false", False)):
+            sub = tmp_path / f"{mode}{state}"
+            sub.mkdir()
+            bundle = base(sub, monkeypatch)
+            apply_state(bundle, state)
+            verdict = check_write_key_consistency(bundle.root, mode=mode)
+            assert verdict.reason == "write_key_preparing"
+            assert "enable --write" in verdict.guidance and "write = true を消" not in verdict.guidance
+            assert run(bundle, target)[0].rc == 0
+            assert entry(bundle)[0] in ("active", "revoked")
+            assert check_write_key_consistency(bundle.root, mode=mode) == Consistent(target)
