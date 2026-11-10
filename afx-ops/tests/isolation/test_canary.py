@@ -14,10 +14,12 @@ from _afx_isolation_support import (
     FEATURES,
     PRINCIPAL,
     Interactive,
+    install_web_password,
     make_root,
     needs_landlock,
     needs_strace,
     needs_x86_64,
+    principal_of,
     run_canary,
 )
 from afx_ops.isolation import profiles as P
@@ -93,8 +95,13 @@ def servers(tmp_path):
         echo.close()
 
 
-def _spec(root: Path, feature: str, op: str, **params) -> dict:
-    return {"feature": feature, "root": str(root), "op": op, "params": params}
+def _spec(root: Path, feature: str, op: str, *, write: bool = False, **params) -> dict:
+    spec = {"feature": feature, "root": str(root), "op": op, "params": params}
+    if write:
+        # 書込みの web は basic の認証と web.password が要る
+        install_web_password(root)
+        spec.update(web_auth="basic", web_write=True)
+    return spec
 
 
 def _errno_of(feature: str, name: str, *args: int) -> int:
@@ -153,28 +160,73 @@ _WEB_ONLY = {
                           lambda f: [-1, _errno_of(f, "socket", 2, 2)]),
 }
 
-DENIED = [(f, a) for f in FEATURES for a in _ATTACKS] + [("web", a) for a in _WEB_ONLY]
+DENIED = ([(f, a, False) for f in FEATURES for a in _ATTACKS]
+          + [("web", a, False) for a in _WEB_ONLY]
+          + [("web", a, True) for a in {**_ATTACKS, **_WEB_ONLY}])
+# 隔離の後は、どの principal の鍵も (自分の鍵も) 開けない
+ALL_PRINCIPALS = ("operator", "approver", "ops-bot", "ops-web", "ops-web-write", "ops-notify")
 
 
-@pytest.mark.parametrize(("feature", "attack"), DENIED, ids=[f"{f}-{a}" for f, a in DENIED])
-def test_canary_denied(feature, attack, root, child_env, sibling):
+@pytest.mark.parametrize(("feature", "attack", "write"), DENIED,
+                         ids=[f"{f}{'-write' if w else ''}-{a}" for f, a, w in DENIED])
+def test_canary_denied(feature, attack, write, root, child_env, sibling):
     op, params_of, expect_of = {**_ATTACKS, **_WEB_ONLY}[attack]
-    others = [p for f, p in (("bot", "ops-bot"), ("web", "ops-web"), ("notify", "ops-notify"))
-              if f != feature]
-    other_key = root / "keys" / f"{others[0]}.token"
-    own = {"bot": "ops-bot", "web": "ops-web", "notify": "ops-notify"}[feature]
+    own = principal_of(feature, write)
+    # 渡す他 principal の鍵は、書込みの web なら読取りの鍵、それ以外は別の機能の鍵
+    other = "ops-web" if write else next(
+        p for f, p in (("bot", "ops-bot"), ("web", "ops-web"), ("notify", "ops-notify"))
+        if f != feature)
+    other_key = root / "keys" / f"{other}.token"
     # 他 principal の鍵を CLOEXEC なしで開いて渡す (隔離の fd 閉鎖で閉じられること)
     leaked = os.open(other_key, os.O_RDONLY)
     try:
         ctx = {"sibling": sibling, "inherited_fd": leaked, "other_key": str(other_key),
                "own_key": str(root / "keys" / f"{own}.token")}
-        spec = _spec(root, feature, op, **params_of(ctx))
+        spec = _spec(root, feature, op, write=write, **params_of(ctx))
         got = run_canary(spec, child_env, pass_fds=(leaked,))
     finally:
         os.close(leaked)
     assert got.rc == 0, got.stderr[-2000:]
     assert got.isolated
     assert got.result == expect_of(feature)
+
+
+@pytest.mark.parametrize("target", ALL_PRINCIPALS)
+@pytest.mark.parametrize("write", [False, True])
+def test_web_cannot_open_any_key_file_after_isolation(write, target, root, child_env):
+    # 読取りの web から書込みの鍵へ、書込みの web から読取りの鍵へ (ほかの鍵・自分の鍵も)
+    spec = _spec(root, "web", "read_file", write=write,
+                 path=str(root / "keys" / f"{target}.token"))
+    got = run_canary(spec, child_env)
+    assert got.rc == 0, got.stderr[-2000:]
+    assert got.isolated
+    assert got.result == [-1, EACCES]
+
+
+@pytest.mark.parametrize("write", [False, True])
+def test_web_cannot_read_the_manifest_or_list_the_key_dir_after_isolation(write, root,
+                                                                           child_env):
+    for op, path in (("read_file", root / "keys" / ".ready"), ("listdir", root / "keys")):
+        spec = _spec(root, "web", op, write=write, path=str(path))
+        got = run_canary(spec, child_env)
+        assert got.rc == 0 and got.isolated, got.stderr[-2000:]
+        assert got.result == [-1, EACCES], (path, got.result)
+
+
+@pytest.mark.parametrize("write", [False, True])
+def test_web_inherits_no_fd_of_the_other_principals_key(write, root, child_env):
+    # 開いたまま渡された読取り / 書込みの両方の鍵 fd は、隔離の fd 閉鎖で閉じられる
+    fds = [os.open(root / "keys" / f"{name}.token", os.O_RDONLY)
+           for name in ("ops-web", "ops-web-write")]
+    try:
+        for fd in fds:
+            spec = _spec(root, "web", "fstat_fd", write=write, fd=fd)
+            got = run_canary(spec, child_env, pass_fds=tuple(fds))
+            assert got.rc == 0 and got.isolated, got.stderr[-2000:]
+            assert got.result == [-1, EBADF]
+    finally:
+        for fd in fds:
+            os.close(fd)
 
 
 # 隔離が無ければ同じ攻撃は kernel まで届いて別の結果になる (canary の観測が隔離の効果であること)
@@ -252,6 +304,32 @@ def test_canary_allowed(feature, op, root, child_env, servers, tmp_path):
     else:
         raise AssertionError(op)
     got = run_canary(spec, child_env)
+    assert got.rc == 0, got.stderr[-2000:]
+    assert got.isolated
+    assert expect(got.result), got.result
+
+
+@pytest.mark.parametrize("op", ("clone3_enosys", "thread", "futex", "prctl_dumpable0",
+                                "unix_connect", "proc_locks", "random"))
+def test_canary_allowed_for_the_write_web(op, root, child_env, servers, tmp_path):
+    """書込みの web が必要とする操作 (daemon への UDS・server 認証の /proc/locks・乱数) は
+    読取りの web と同じように通る。許可の表は write で変わらない。"""
+    cases = {
+        "clone3_enosys": ("clone3", {}, lambda r: r == [-1, errno.ENOSYS]),
+        "thread": ("thread", {}, lambda r: r == [1, 0]),
+        "futex": ("futex", {}, lambda r: r == [0, 0]),
+        "prctl_dumpable0": ("prctl_dumpable", {"value": 0}, lambda r: r == [0, 0]),
+        "proc_locks": ("read_file", {"path": "/proc/locks"},
+                       lambda r: r[0] >= 0 and r[1] == 0),
+        "random": ("random", {}, lambda r: r == [20, 0]),
+    }
+    if op == "unix_connect":
+        path = tmp_path / "nss.sock"
+        servers(socket.AF_UNIX, socket.SOCK_STREAM, str(path))
+        name, params, expect = "unix_connect", {"path": str(path)}, lambda r: r == [2, 0]
+    else:
+        name, params, expect = cases[op]
+    got = run_canary(_spec(root, "web", name, write=True, **params), child_env)
     assert got.rc == 0, got.stderr[-2000:]
     assert got.isolated
     assert expect(got.result), got.result

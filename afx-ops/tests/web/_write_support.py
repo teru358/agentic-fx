@@ -39,6 +39,10 @@ class FakeClient:
         self.approve_reply: object = Reply(200, {"job_id": JOB}, None)
         self.reject_reply: object = Reply(200, {"job_id": JOB}, None)
         self.improve_reply: object = Reply(200, {"job_id": JOB}, None)
+        self.job_reply: object = Reply(200, {"id": JOB, "kind": "improve", "state": "running",
+                                             "result": {}, "result_code": None}, None)
+        self.cancel_reply: object = Reply(200, {"id": JOB, "state": "running",
+                                                "stop_requested": True}, None)
         self.fail: dict[str, BaseException] = {}
 
     def _go(self, name: str, *args, reply):
@@ -60,6 +64,12 @@ class FakeClient:
     def improve_run(self, actor, body, *, idempotency_key):
         return self._go("improve_run", actor, dict(body), idempotency_key,
                         reply=self.improve_reply)
+
+    def job(self, actor, job_id):
+        return self._go("job", actor, job_id, reply=self.job_reply)
+
+    def cancel_job(self, actor, job_id):
+        return self._go("cancel_job", actor, job_id, reply=self.cancel_reply)
 
     # 読取りの adapter が使う口 (書込みの試験では使わない)
     def status(self):

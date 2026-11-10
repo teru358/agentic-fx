@@ -91,6 +91,45 @@ def test_improve_run_sends_the_body_the_actor_and_the_idempotency_key(tmp_path):
     assert json.loads(_parse(got[1])[2]) == {}
 
 
+def test_job_view_and_cancel_send_the_actor_and_a_validated_job_id(tmp_path):
+    layout, client = _setup(tmp_path)
+    with daemon(layout, "answer_job"):
+        client.job(ALICE, JOB_ID)
+        client.cancel_job(ALICE, JOB_ID)
+        got = layout.received_at_least(2)
+    parsed = [_parse(chunk) for chunk in got]
+    assert [p[0] for p in parsed] == [f"GET /v1/jobs/{JOB_ID} HTTP/1.1",
+                                      f"POST /v1/jobs/{JOB_ID}/cancel HTTP/1.1"]
+    for _, headers, _ in parsed:
+        assert headers["x-afx-asserted-actor"] == ALICE
+        assert headers["authorization"] == "Bearer " + token_for("ops-web-write")
+        assert "idempotency-key" not in headers
+    assert json.loads(parsed[1][2]) == {}
+
+
+@pytest.mark.parametrize("job_id", ["", "abc", "A" * 32, JOB_ID + "0", JOB_ID + "/cancel",
+                                    "../" + JOB_ID, None, 5])
+def test_a_malformed_job_id_is_not_sent(tmp_path, job_id):
+    layout, client = _setup(tmp_path)
+    with daemon(layout, "answer_job"):
+        for call in (lambda: client.job(ALICE, job_id), lambda: client.cancel_job(ALICE, job_id)):
+            with pytest.raises(ValueError):
+                call()
+        assert layout.received(expect_any=False) == []
+
+
+@pytest.mark.parametrize("value", ["", "web:", "web:A", "alice", None, 5],
+                         ids=lambda v: repr(v)[:30])
+def test_a_malformed_actor_is_not_sent_by_the_job_calls(tmp_path, value):
+    layout, client = _setup(tmp_path)
+    with daemon(layout, "answer_job"):
+        for call in (lambda: client.job(value, JOB_ID), lambda: client.cancel_job(value, JOB_ID)):
+            with pytest.raises(ApiError) as info:
+                call()
+            assert info.value.reason == "invalid_actor" and info.value.token_sent is False
+        assert layout.received(expect_any=False) == []
+
+
 def test_reads_use_the_same_key_and_carry_no_actor(tmp_path):
     layout, client = _setup(tmp_path)
     with daemon(layout, "answer_job"):
@@ -191,7 +230,7 @@ def test_the_write_actor_pattern_is_the_web_user_pattern():
 # ------------------------------------------------ 公開の形
 
 def test_write_client_satisfies_the_write_client_protocol():
-    for name in ("approval", "approve", "reject", "improve_run"):
+    for name in ("approval", "approve", "reject", "improve_run", "job", "cancel_job"):
         mine = inspect.signature(getattr(WebWriteClient, name))
         spec = inspect.signature(getattr(WriteClient, name))
         assert list(mine.parameters) == list(spec.parameters), name
@@ -199,12 +238,12 @@ def test_write_client_satisfies_the_write_client_protocol():
             assert mine.parameters[key].kind == param.kind, (name, key)
 
 
-def test_write_client_public_methods_are_the_read_set_plus_three_writes():
+def test_write_client_public_methods_are_the_read_set_plus_the_writes_and_job_calls():
     reads = {name for name, member in WebClient.__dict__.items()
              if not name.startswith("_") and inspect.isfunction(member)}
     own = {name for name, member in WebWriteClient.__dict__.items()
            if not name.startswith("_") and inspect.isfunction(member)}
-    assert own == {"approve", "reject", "improve_run"}
+    assert own == {"approve", "reject", "improve_run", "job", "cancel_job"}
     assert WebWriteClient.principal == "ops-web-write"
     assert reads <= {name for name in dir(WebWriteClient)}
     # retry・job の追跡と取消・actor を足す口は持たない
@@ -212,11 +251,12 @@ def test_write_client_public_methods_are_the_read_set_plus_three_writes():
         assert not hasattr(WebWriteClient, name), name
 
 
-def test_actor_is_never_stored_and_only_the_three_writes_accept_one():
+def test_actor_is_never_stored_and_only_the_writes_and_job_calls_accept_one():
     for name, member in inspect.getmembers(WebWriteClient, inspect.isfunction):
         params = inspect.signature(member).parameters
         has_actor = any("actor" in p.lower() for p in params)
-        assert has_actor is (name in {"approve", "reject", "improve_run", "_write"}), name
+        assert has_actor is (name in {"approve", "reject", "improve_run", "job", "cancel_job",
+                                      "_write"}), name
     assert "actor" not in inspect.signature(api_client._Client._call).parameters
     assert not any("actor" in slot for slot in getattr(WebWriteClient, "__slots__", ()))
     assert "actor" not in WebWriteClient.from_token.__func__.__code__.co_varnames

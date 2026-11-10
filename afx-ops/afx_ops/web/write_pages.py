@@ -3,11 +3,11 @@ from __future__ import annotations
 
 from afx_ops.web import render
 from afx_ops.web.write import (
-    APPLIED, APPROVE, DONE, IMPROVE, NOT_EXECUTED, REJECT, UNKNOWN, UNUSED_TTL,
+    APPLIED, APPROVE, CANCEL, DONE, IMPROVE, NOT_EXECUTED, REJECT, UNKNOWN, UNUSED_TTL,
     Intent, Snapshot, escape,
 )
 
-_ACTION_LABELS = {APPROVE: "承認", REJECT: "却下", IMPROVE: "改善を実行"}
+_ACTION_LABELS = {APPROVE: "承認", REJECT: "却下", IMPROVE: "改善を実行", CANCEL: "job の取消"}
 _NOT_EXECUTED_TEXT = {
     "digest_changed": "承認の内容が確認した後に変わったため、却下していません",
     "verify_failed": "承認の内容を取り直せなかったため、却下していません",
@@ -55,7 +55,9 @@ def improve_form_page() -> bytes:
 
 def _intent_rows(intent: Intent) -> str:
     rows = [("操作", _ACTION_LABELS[intent.action])]
-    if intent.action in (APPROVE, REJECT):
+    if intent.action == CANCEL:
+        rows.append(("job", intent.job_id))
+    elif intent.action in (APPROVE, REJECT):
         rows.append(("承認", f"#{intent.approval_id}"))
         rows.append(("payload_sha256", intent.payload_sha256[:12]))
         if intent.action == REJECT:
@@ -83,7 +85,8 @@ def _outcome_text(snapshot: Snapshot) -> str:
     if snapshot.state == UNKNOWN or outcome is None:
         return "daemon の応答を受け取れず、結果が分かりません。"
     if outcome.kind == APPLIED:
-        job = f" (job {escape(outcome.job_id)})" if outcome.job_id else ""
+        job = (f' (job <a href="/jobs/{escape(outcome.job_id)}">{escape(outcome.job_id)}</a>)'
+               if outcome.job_id else "")
         return "受け付けました" + job + "。"
     if outcome.kind == NOT_EXECUTED:
         text = _NOT_EXECUTED_TEXT.get(outcome.code or "")
@@ -97,13 +100,18 @@ def result_page(snapshot: Snapshot, token: str) -> bytes:
     """結果の画面。結果不明のときだけ、確かめる form を (token 付きで) 出す。"""
     body = "<section>" + _intent_rows(snapshot.intent) + "<p>" + _outcome_text(snapshot) + "</p>"
     if snapshot.state == UNKNOWN:
-        if snapshot.intent.action == IMPROVE:
+        if snapshot.intent.action == CANCEL:
+            body += (f'<p><a href="/jobs/{escape(snapshot.intent.job_id)}">'
+                     "job の状態で結果を確かめてください</a></p>")
+        elif snapshot.intent.action == IMPROVE:
             body += ('<form method="post" action="/confirm/check">'
                      f'<input type="hidden" name="token" value="{escape(token)}">'
                      '<button type="submit">結果を確かめる</button></form>')
         else:
             body += (f'<p><a href="/approvals/{int(snapshot.intent.approval_id)}">'
                      "承認の状態で結果を確かめてください</a></p>")
+    elif snapshot.intent.action == CANCEL:
+        body += f'<p><a href="/jobs/{escape(snapshot.intent.job_id)}">job の状態へ</a></p>'
     elif snapshot.intent.approval_id is not None:
         body += f'<p><a href="/approvals/{int(snapshot.intent.approval_id)}">承認の詳細へ</a></p>'
     return _page("結果", body + "</section>")
@@ -116,3 +124,43 @@ def result_status(snapshot: Snapshot) -> int:
     if snapshot.state == DONE and snapshot.outcome is not None and snapshot.outcome.kind == APPLIED:
         return 200
     return 409
+
+
+_JOB_STATES = {"queued": "待機中", "running": "実行中", "done": "完了", "failed": "失敗",
+               "cancelled": "取消済み", "shutdown": "停止"}
+_JOB_KINDS = {"improve": "改善", "ask": "質問"}
+_JOB_REFUSALS = {403: "この job は、この画面の主体の job ではないため見られません",
+                 404: "job が見つかりません"}
+_CANCELLABLE = frozenset({"queued", "running"})
+
+
+def job_page(job_id: str, data: dict) -> bytes | None:
+    """job の画面。daemon の語は固定の表に載るものだけを出し、載らなければ None (502 にする)。"""
+    state = data.get("state")
+    kind = data.get("kind")
+    if data.get("id") != job_id or type(state) is not str or state not in _JOB_STATES:
+        return None
+    result = data.get("result")
+    stop_requested = type(result) is dict and result.get("stop_requested") is True
+    rows = [("job", job_id), ("種類", _JOB_KINDS.get(kind, "その他") if type(kind) is str
+                              else "その他"),
+            ("状態", _JOB_STATES[state]),
+            ("停止の要求", "あり (走行中の分は完走します)" if stop_requested else "なし")]
+    body = ("<section><dl>" + "".join(f"<dt>{escape(label)}</dt><dd>{escape(value)}</dd>"
+                                      for label, value in rows) + "</dl>")
+    if state in _CANCELLABLE and not stop_requested:
+        body += (f'<form method="post" action="/jobs/{escape(job_id)}/cancel">'
+                 '<button type="submit">取消へ進む</button></form>')
+    return _page("job", body + "</section>")
+
+
+def job_refused_page(status: int) -> bytes:
+    return _page("job", f"<section><p>{escape(_JOB_REFUSALS[status])}。</p></section>")
+
+
+def job_refused_status(reply: object) -> int | None:
+    """daemon が job を拒否した応答 (403 / 404) ならその status。それ以外は None。"""
+    status = getattr(reply, "status", None)
+    if type(status) is int and status in _JOB_REFUSALS:
+        return status
+    return None

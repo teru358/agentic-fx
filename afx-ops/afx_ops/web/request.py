@@ -487,10 +487,36 @@ def _write_response(context: write.WriteContext, match: write.WriteMatch, reques
             if not context.transport_ok:
                 raise write.WriteReject(403)
             return _response(200, write_pages.improve_form_page(), head=head, writable=True)
+        if match.kind == "job_view":
+            if not context.transport_ok:
+                raise write.WriteReject(403)
+            if request.query or request.body:
+                raise write.WriteReject(400)
+            status, body = _job_view(context, match.job_id)
+            return _response(status, body, head=head, writable=True)
         status, body = _post(context, match, request)
     except write.WriteReject as reject:
         return _error(reject.status, head=head, writable=True)
     return _response(status, body, head=head, writable=True)
+
+
+def _job_view(context: write.WriteContext, job_id: str) -> tuple[int, bytes]:
+    """job の状態。actor は設定のユーザーから作り、daemon が job の持ち主と照合する。"""
+    try:
+        reply = context.client.job(context.actor, job_id)
+    except Exception:  # noqa: BLE001 — 原因の文は外へ出さない
+        raise _Upstream from None
+    refused = write_pages.job_refused_status(reply)
+    if refused is not None:
+        return refused, write_pages.job_refused_page(refused)
+    data = getattr(reply, "data", None)
+    page = None
+    if getattr(reply, "status", None) == 200 and getattr(reply, "code", None) is None \
+            and type(data) is dict:
+        page = write_pages.job_page(job_id, data)
+    if page is None:
+        raise _Upstream
+    return 200, page
 
 
 def _post(context: write.WriteContext, match: write.WriteMatch,
@@ -504,6 +530,9 @@ def _post(context: write.WriteContext, match: write.WriteMatch,
         return 200, write_pages.confirm_page(intent, context.store.create(context.user, intent))
     if match.kind == write.IMPROVE:
         intent = write.improve_intent(form)
+        return 200, write_pages.confirm_page(intent, context.store.create(context.user, intent))
+    if match.kind == write.CANCEL:
+        intent = write.cancel_intent(match.job_id)
         return 200, write_pages.confirm_page(intent, context.store.create(context.user, intent))
     token = form["token"]
     if match.kind == "confirm":

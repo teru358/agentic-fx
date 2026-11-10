@@ -20,6 +20,7 @@ import json, sys
 sys.path.insert(0, sys.argv[1])
 from afx_ops import api_client, keys
 from afx_ops.api_client import ApiError
+from afx_ops.web import write as web_write
 case = json.load(sys.stdin)
 def accepts(principal, value):
     try:
@@ -32,6 +33,8 @@ print(json.dumps({
   "verdicts": {p: [accepts(p, v) for v in case["values"]] for p in case["principals"]},
   "known": sorted(keys.KNOWN_PRINCIPALS),
   "ops": sorted(keys.OPS_PRINCIPALS),
+  "codes": sorted(web_write.KNOWN_DAEMON_CODES),
+  "unrecognized": web_write.UNRECOGNIZED_CODE,
 }))
 """
 
@@ -82,3 +85,9 @@ def test_principal_lists_agree_across_packages():
     assert set(other["known"]) == {p.value for p in Principal}
     assert set(other["ops"]) == {p.value for p in Principal
                                  if p not in contracts.INITIAL_PRINCIPALS}
+
+
+def test_result_codes_the_web_may_show_are_exactly_the_daemon_error_codes():
+    other = _other_package_view()
+    assert other["codes"] == sorted(code.value for code in contracts.ErrorCode)
+    assert other["unrecognized"] not in other["codes"]
