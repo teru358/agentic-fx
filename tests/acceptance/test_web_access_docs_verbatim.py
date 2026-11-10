@@ -61,8 +61,8 @@ def test_the_literals_taken_from_the_implementation_are_the_expected_shapes() ->
     assert _summary_templates() == ["web: 待受 <bind>:<port> / 公開 <範囲> / 認証 none",
                                     "web: 待受 <bind>:<port> / 公開 <範囲> / 認証 basic (<user>)"]
     assert _exposures() == ["自機のみ", "到達できる全 IPv4", "許可範囲 <N> 件"]
-    assert _status_lines()["restricted"] == "web-access: bind=192.0.2.10:8788 allow=restricted auth=basic user=afx"
-    assert _status_lines()["restricted-none"] == "web-access: bind=192.0.2.10:8788 allow=restricted auth=none"
+    assert _status_lines()["restricted"] == "web-access: bind=192.0.2.10:8788 allow=restricted auth=basic user=afx write=off"
+    assert _status_lines()["restricted-none"] == "web-access: bind=192.0.2.10:8788 allow=restricted auth=none write=off"
     assert web_setup.access_line(Path("/nonexistent"), None) == "web-access: unavailable reason=not_configured"
 
 

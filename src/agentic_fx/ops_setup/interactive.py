@@ -18,9 +18,11 @@ from agentic_fx.ops_setup.feature_config import (InputError, collect, unsafe_rea
 from agentic_fx.ops_setup.probe import run_probe
 from agentic_fx.ops_setup.setup_lease import (SetupLease, SetupLeaseBusy, SetupLeaseUnsafe,
                                               acquire_setup_lock)
-from agentic_fx.ops_setup.stages import InvalidState, OpsSetup, read_stage
+from agentic_fx.ops_setup.stages import InvalidState, OpsSetup, check_write_switch_idle, read_stage
 from agentic_fx.ops_setup.systemd import SystemdError
 from agentic_fx.ops_setup.units import resolve_ops_exec
+from agentic_fx.ops_setup.web_write import switch_write
+from agentic_fx.ops_setup.write_key import Inconsistent, check_write_key_consistency
 from agentic_fx.ops_setup.web_setup import (SECRET_GUIDANCE_TEMPLATE, SecretPlan, WebOptions, WebSetupError, cleanup_temporaries,
                                             generated_password_line, options_problem, plan_for_input, read_config_file,
                                             read_password_file, summary_line, target_from_config_file)
@@ -100,8 +102,10 @@ REASON_CODES = frozenset({
     "ready_not_committed", "key_missing", "digest_mismatch", "key_file_invalid", "not_enrolled",
     "allow_required", "unrestricted_not_supported", "auth_not_supported", "interface_lookup_failed",
     "bind_not_local", "secret_invalid", "secret_missing", "secret_unexpected", "listener_invalid",
-    "not_enabled", "already_enabled", "reset-failed",
+    "not_enabled", "already_enabled", "reset-failed", "write_requires_auth", "write_requires_loopback",
+    "write_change_refused", "write_switch_pending", "write_state_undecided", "write_key_preparing",
 })
+_GUIDED_REASONS = frozenset({"invalid_state", "write_state_undecided", "write_key_preparing", "principal_key_mismatch"})
 _COMPONENT_REASON = re.compile(r"feature_config_unsafe:[a-z_]{1,32}\Z")
 _PROBE_FAILURE_REASON = re.compile(r"feature_probe_failed:[a-z_]{1,32}\Z")
 
@@ -216,11 +220,16 @@ def _prepare_web(root: Path, io: IO, options: WebOptions, probe_runner: Callable
             return _fail(io, 1, "precheck", "invalid_state")
         return _fail(io, 1, "precheck", "already_enabled", ENABLED_GUIDANCE)
 
+    verdict = check_write_key_consistency(root, mode="idle")
+    if isinstance(verdict, Inconsistent):
+        return _fail(io, 1, "precheck", verdict.reason, verdict.guidance)
+    write = verdict.write
     try:
         cleanup_temporaries(root, hook=hook)
         interactive_tty = io.isatty()
         addresses = lambda: [item.address for item in candidates()]  # noqa: E731
-        session = Session(root, io, lambda: probe_runner("web"), candidates, hook=hook, token_bytes=token_bytes)
+        session = Session(root, io, lambda: probe_runner("web"), candidates, hook=hook, token_bytes=token_bytes,
+                          write=write)
 
         def show_password(password: str, user: str) -> None:
             io.stdout(generated_password_line(user, password))
@@ -265,6 +274,43 @@ def _prepare_web(root: Path, io: IO, options: WebOptions, probe_runner: Callable
     return None
 
 
+WRITE_PAUSE_NOTICE = "afx を一時的に止めます (ペーパー運用が数十秒止まります)。"
+WRITE_PASSWORD_ADVICE = ("書込みを有効にしました。LAN の平文 HTTP で web を使っていた間の password は盗聴されえたため、"
+                         "afx ops web reconfigure で変えることを勧めます。")
+
+
+def _switch_write(root: Path, io: IO, options: WebOptions,
+                  setup_factory: Callable[[Path], OpsSetup]) -> EnableResult:
+    """`afx ops web enable --write` / `--no-write`。"""
+    problem = options_problem(options, reconfigure=False)
+    if problem:
+        return _fail(io, 2, "config", problem)
+    target = bool(options.write)
+    setup = setup_factory(root)
+
+    def confirm() -> bool:
+        io.stdout(WRITE_PAUSE_NOTICE)
+        if not io.isatty():
+            raise InvalidState("setup_input_required")
+        return (io.ask("続けるには yes と入力してください") or "").strip() == "yes"
+
+    try:
+        result = switch_write(setup, target, confirm=confirm)
+    except InvalidState as error:
+        rc = 2 if error.reason == "setup_input_required" else 1
+        return _fail(io, rc, "enable", error.reason, error.detail)
+    except SystemdError as error:
+        return _fail(io, 1, "enable", error.reason)
+    if result.operation == "recover":
+        io.stdout(f"web: 書込みの鍵と設定を {'書込みあり' if target else '読取専用'} に揃えました "
+                  "(web はまだ有効ではありません。afx ops web enable で有効にします)")
+        return EnableResult(0, result.stage, "ok")
+    io.stdout(f"web: write {'on' if target else 'off'}")
+    if target:
+        io.stdout(WRITE_PASSWORD_ADVICE)
+    return EnableResult(0, result.stage, "ok")
+
+
 def _fail_quiet(failure: tuple[int, str]) -> EnableResult:
     """probe の失敗。固定 reason の 1 行は周回の中で出し済み。"""
     return EnableResult(failure[0], "probe", failure[1])
@@ -297,6 +343,9 @@ def interactive_enable(root: Path, feature: str, *, lease: SetupLease | None = N
             io.stderr(f"afx ops: {result.reason_code}")
             return result
     try:
+        if feature == "web" and options.write is not None:
+            return _switch_write(root, io, options, setup_factory)
+        check_write_switch_idle(root)
         if feature == "web":
             early = _prepare_web(root, io, options, probe_runner,
                                  candidates if candidates is not None else default_candidates(root),
@@ -331,7 +380,8 @@ def interactive_enable(root: Path, feature: str, *, lease: SetupLease | None = N
         io.stderr(f"afx ops: {result.reason_code}")
         return result
     except (SystemdError, InvalidState) as error:
-        guidance = getattr(error, "detail", "") if isinstance(error, InvalidState) and error.reason == "invalid_state" else ""
+        guided = isinstance(error, InvalidState) and error.reason in _GUIDED_REASONS
+        guidance = getattr(error, "detail", "") if guided else ""
         result = EnableResult(1, "enable", error.reason)
         io.stderr(f"afx ops: {result.reason_code}" + (f" ({guidance})" if guidance else ""))
         return result

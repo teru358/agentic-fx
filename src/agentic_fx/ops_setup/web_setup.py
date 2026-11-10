@@ -22,6 +22,7 @@ from typing import Any
 
 from agentic_fx.ops_setup.feature_config import (
     DEFAULT_USER,
+    WEB_PASSWORD_TEMP,
     PASSWORD_MAX,
     PASSWORD_MIN,
     UNRESTRICTED,
@@ -44,7 +45,7 @@ SECRET_GUIDANCE_TEMPLATE = ("secret の所有者・mode・型を直すか、停�
                             + OLD_PASSWORD_RECOVERY)
 SECRET_ACTIONS = ("remove", "keep", "install", "absent")
 CONFIG_FILE_MAX = 65536
-_TEMP_PASSWORD = re.compile(r"\.web\.password\.[0-9a-f]{32}\.tmp\Z")
+_TEMP_PASSWORD = WEB_PASSWORD_TEMP
 _TEMP_CONFIG = re.compile(r"\.ops\.toml\.[0-9a-f]{32}\.tmp\Z")
 Hook = Callable[[str], None]
 
@@ -69,6 +70,8 @@ class WebOptions:
     password_file: str | None = None
     secret_action: str | None = None
     duplicated: bool = False
+    # `--write` は True、`--no-write` は False、どちらも無ければ None。書込みの切替だけを行う
+    write: bool | None = None
 
     @property
     def flagless(self) -> bool:
@@ -79,6 +82,11 @@ def options_problem(options: WebOptions, *, reconfigure: bool) -> str | None:
     """表外の組み合わせなら固定 reason `setup_input_required`、許されるなら None。"""
     if options.duplicated:
         return "setup_input_required"
+    if options.write is not None:
+        if reconfigure or options.ask or options.non_interactive or (
+                options.config_file, options.password_file, options.secret_action) != (None, None, None):
+            return "setup_input_required"
+        return None
     if options.ask and (reconfigure or options.non_interactive or options.config_file is not None
                         or options.password_file is not None or options.secret_action is not None):
         return "setup_input_required"
@@ -178,6 +186,21 @@ def target_from_config_file(parsed: dict[str, Any]) -> dict[str, Any]:
     if not is_loopback(values) and "allow" not in values:
         raise WebSetupError("setup_input_invalid", 2)
     return values
+
+
+WRITE_KEPT_GUIDANCE = ("書込みが有効な間は、loopback の bind と Basic 認証にしか変えられない "
+                       "(対話では公開範囲に自機のみを選び、認証に Basic 認証を選ぶ。--non-interactive --config-file でも指定できる)。"
+                       "書込みを無効にするなら afx ops web enable --no-write")
+WRITE_CHANGE_GUIDANCE = "書込みの有効化・無効化は afx ops web enable --write / --no-write を使う"
+
+
+def write_problem(values: dict[str, Any]) -> str | None:
+    """書込みが有効な web の目標として許されない構成の固定 reason。起動時の検査と同じ順。"""
+    if auth_of(values) != "basic":
+        return "write_requires_auth"
+    if not is_loopback(values):
+        return "write_requires_loopback"
+    return None
 
 
 # --- 目標と secret の計画 ----------------------------------------------------------------------
@@ -386,7 +409,9 @@ def access_line(root: Path, saved_stage: dict[str, Any] | None, *,
         kind = "restricted"
     auth = auth_of(values)
     shown = f"basic user={values.get('user', DEFAULT_USER)}" if auth == "basic" else auth
-    return f"web-access: bind={values.get('bind', '127.0.0.1')}:{values['port']} allow={kind} auth={shown}"
+    write = "on" if values.get("write", False) else "off"
+    return (f"web-access: bind={values.get('bind', '127.0.0.1')}:{values['port']} allow={kind} auth={shown}"
+            f" write={write}")
 
 
 __all__ = [
