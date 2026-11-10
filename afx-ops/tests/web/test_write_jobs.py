@@ -57,7 +57,7 @@ def test_the_view_asks_the_daemon_with_the_configured_user_as_the_actor():
     assert response.status == 200
     assert rig.client.calls == [("job", "web:afx", JOB)]
     body = response.body.decode("utf-8")
-    assert JOB in body and "実行中" in body and f'action="{CANCEL}"' in body
+    assert JOB in body and "実行中" in body and f'action="{CANCEL}"' not in body
     assert 'name="token"' not in body
 
 
@@ -82,13 +82,18 @@ def test_head_has_no_body_and_a_non_loopback_context_refuses_the_view():
     assert lan.client.calls == []
 
 
-@pytest.mark.parametrize("state,button", [("queued", True), ("running", True), ("done", False),
-                                          ("failed", False), ("cancelled", False),
-                                          ("shutdown", False)])
-def test_only_a_job_that_can_still_stop_offers_the_cancel_form(state, button):
+@pytest.mark.parametrize("state,result,button", [
+    ("queued", None, True), ("queued", {"stop_requested": False}, True),
+    ("running", {"stop_requested": False}, True),
+    ("running", None, False), ("running", {}, False), ("running", {"runs": 1}, False),
+    ("running", {"stop_requested": "no"}, False),
+    ("done", {"stop_requested": False}, False), ("failed", None, False),
+    ("cancelled", None, False), ("shutdown", None, False)])
+def test_only_a_job_the_daemon_can_still_cancel_offers_the_cancel_form(state, result, button):
+    """daemon が取り消せるのは、待機中の job と、停止を要求できる繰り返しの実行中の job だけ。"""
     rig = _rig()
     rig.client.job_reply = Reply(200, {"id": JOB, "kind": "improve", "state": state,
-                                       "result": None, "result_code": None}, None)
+                                       "result": result, "result_code": None}, None)
     body = rig.send(rig.request("GET", VIEW)).body.decode("utf-8")
     assert (f'action="{CANCEL}"' in body) is button
 
@@ -122,15 +127,49 @@ def test_a_reply_that_does_not_match_the_job_is_a_502(data):
     assert rig.send(rig.request("GET", VIEW)).status == 502
 
 
-@pytest.mark.parametrize("status,code,text", [(403, "forbidden", "主体"),
-                                             (404, "not_found", "見つかりません")])
+@pytest.mark.parametrize("status,code,text", [(403, "forbidden", "許可しませんでした"),
+                                             (404, "not_found", "見つかりません"),
+                                             (403, "scope_denied", "見せませんでした"),
+                                             (404, None, "見せませんでした")])
 def test_a_job_the_daemon_refuses_is_a_fixed_screen_without_the_daemon_words(status, code, text):
     rig = _rig()
     rig.client.job_reply = Reply(status, None, code)
     response = rig.send(rig.request("GET", VIEW))
     assert response.status == status
     body = response.body.decode("utf-8")
-    assert text in body and code not in body and "web:" not in body
+    assert text in body and "scope_denied" not in body and "forbidden" not in body and "web:" not in body
+
+
+def test_a_403_is_not_worded_as_only_somebody_elses_job():
+    """daemon は持ち主の不一致も権限の不足も 403 forbidden で返す。文は原因を 1 つに決めつけない。"""
+    rig = _rig()
+    rig.client.job_reply = Reply(403, None, "forbidden")
+    body = rig.send(rig.request("GET", VIEW)).body.decode("utf-8")
+    assert "権限" in body and "主体" in body
+
+
+def test_a_failed_job_view_reports_one_fixed_line_unless_the_call_was_abandoned(capsys):
+    from afx_ops.web.request import handle_request
+
+    def send(rig, live):
+        request = rig.request("GET", VIEW)
+        return handle_request(request, rig.client, host_policy=rig.host_policy,
+                              authenticator=rig.authenticator, peer="127.0.0.1",
+                              write_context=rig.context, report_upstream=lambda: live)
+
+    cases = [({"fail": api_error("timeout")}, "afx-ops: web_upstream reason=timeout route=job\n"),
+             ({"reply": Reply(500, None, "internal")}, "afx-ops: web_upstream status=500 code=internal route=job\n"),
+             ({"reply": Reply(200, {"id": OTHER_JOB, "kind": "improve", "state": "running"}, None)},
+              "afx-ops: web_upstream shape=invalid route=job\n")]
+    for setup, line in cases:
+        for live, expected in ((True, line), (False, "")):
+            rig = _rig()
+            if "fail" in setup:
+                rig.client.fail["job"] = setup["fail"]
+            else:
+                rig.client.job_reply = setup["reply"]
+            assert send(rig, live).status == 502
+            assert capsys.readouterr().err == expected
 
 
 def test_other_daemon_failures_on_the_view_are_502():

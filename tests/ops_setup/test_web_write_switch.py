@@ -16,7 +16,7 @@ from agentic_fx.ops.keys import enrolled_key_matches, key_dir, key_file_name, pr
 from agentic_fx.ops_setup.feature_config import web_access_check, web_live_config
 from agentic_fx.ops_setup.interactive import interactive_enable
 from agentic_fx.ops_setup.reconfigure import run_ops_reconfigure
-from agentic_fx.ops_setup.stages import InvalidState, read_marker, read_stage
+from agentic_fx.ops_setup.stages import InvalidState, read_marker, read_stage, run_ops_command
 from agentic_fx.ops_setup.web_setup import SecretPlan, WebOptions, access_line, apply_secret
 from web_support import (ACCESS_Q, AUTH_Q, CANDIDATES, KEEP_BASIC_Q, LAN, PASSWORD_Q, SCOPE_Q, USER_Q, ScriptIO,
                          make_bundle, tree)
@@ -1158,10 +1158,10 @@ ENTRIES = {
     "resume-checked": (_enable_resume_base("checked"), _enable_plain, "gate"),
     "reconfigure-non-interactive": (_enabled_base, _reconf_ni, "gate"),
     "reconfigure-interactive": (_enabled_base, _reconf_ia, "gate"),
-    "disable": (_enabled_base, _disable, "gate"),
-    "disable-resume": (_disable_resume_base, _disable, "gate"),
-    "disable-idle": (_idle_base("disabled"), _disable, "gate"),
-    "disable-never-enabled": (_idle_base("never"), _disable, "gate"),
+    "disable": (_enabled_base, _disable, "stop"),
+    "disable-resume": (_disable_resume_base, _disable, "stop"),
+    "disable-idle": (_idle_base("disabled"), _disable, "stop"),
+    "disable-never-enabled": (_idle_base("never"), _disable, "stop"),
     "write": (_enabled_base, _switch(True), "switch_enabled"),
     "no-write": (_enabled_base, _switch(False), "switch_enabled"),
     "write-idle": (_idle_base("disabled"), _switch(True), "switch_idle"),
@@ -1179,6 +1179,8 @@ def _target_of(entry):
 def expected(entry, state):
     """各セルの期待: ok (成功・整合のまま) / refuse (拒否。何も変えない) / converge (切替で整合へ収束)。"""
     kind = ENTRIES[entry][2]
+    if kind == "stop":
+        return "stop"
     if kind == "gate":
         return "ok" if state in CONSISTENT else "refuse"
     target = _target_of(entry)
@@ -1201,7 +1203,7 @@ def _mode_of(entry):
 @pytest.mark.parametrize("state", STATES)
 @pytest.mark.parametrize("entry", list(ENTRIES))
 def test_every_entry_keeps_the_write_and_the_write_key_consistent(tmp_path, monkeypatch, entry, state):
-    from agentic_fx.ops_setup.write_key import Consistent, check_write_key_consistency
+    from agentic_fx.ops_setup.write_key import Consistent, Inconsistent, check_write_key_consistency
     build, drive, kind = ENTRIES[entry]
     bundle = build(tmp_path, monkeypatch)
     apply_state(bundle, state)
@@ -1210,6 +1212,16 @@ def test_every_entry_keeps_the_write_and_the_write_key_consistent(tmp_path, monk
     tmp_before = sorted(p.name for p in bundle.xdg.rglob(".*.tmp"))
     rc = drive(bundle, tmp_path, state)
     want = expected(entry, state)
+    if want == "stop":
+        # 止める操作は食い違いでは拒否しない。web は disabled になり、次の enable が判定で止める。
+        assert rc == 0, (entry, state)
+        saved = read_stage(bundle.root, "web", missing_ok=True)
+        assert saved is None or (saved["operation"], saved["stage"]) == ("disable", "disabled"), (entry, state)
+        if isinstance(check_write_key_consistency(bundle.root, mode="idle"), Inconsistent):
+            keep = world(bundle)
+            assert _enable_plain(bundle, tmp_path, state) != 0, (entry, state)
+            assert world(bundle) == keep, (entry, state)
+        return
     if want == "refuse":
         assert rc != 0, (entry, state)
         assert world(bundle) == before, (entry, state)
@@ -1228,6 +1240,154 @@ def test_every_entry_keeps_the_write_and_the_write_key_consistent(tmp_path, monk
             assert "write_step" not in read_stage(bundle.root, "web")
     else:
         assert world(bundle) == before
+
+
+def _broken_world(bundle, how):
+    """disable が拒否しない 3 種の壊れ方: 鍵 dir の消失、manifest の破損、ops.toml の読取不能。"""
+    import shutil
+    if how == "key_dir_gone":
+        shutil.rmtree(key_dir(bundle.root))
+    elif how == "manifest_corrupt":
+        (key_dir(bundle.root) / ".ready").write_text("{broken")
+    else:
+        (bundle.xdg / "config" / "ops.toml").chmod(0o666)
+
+
+@pytest.mark.parametrize("how", ["key_dir_gone", "manifest_corrupt", "ops_toml_unreadable"])
+def test_disable_stops_the_web_even_when_the_keys_or_the_config_cannot_be_read(tmp_path, monkeypatch, capsys, how):
+    bundle = make(tmp_path, monkeypatch)
+    assert run(bundle, True)[0].rc == 0
+    _broken_world(bundle, how)
+    monkeypatch.setattr("agentic_fx.ops_setup.stages.OpsSetup", lambda _root: bundle.setup)
+    rc = run_ops_command(bundle.root, "disable", "web")
+    captured = capsys.readouterr()
+    assert rc == 0 and captured.out.strip() == "web: disabled", captured
+    assert read_stage(bundle.root, "web")["stage"] == "disabled"
+    assert any(c[0] == "stop" for c in bundle.systemd.calls)
+    warnings = [line for line in captured.err.splitlines() if "warning" in line]
+    assert len(warnings) == 1 and "次の afx ops web enable" in warnings[0]
+    # 既に disabled で食い違いが残っていても成功し、もう一度警告を出す。次の enable は止まる。
+    rc = run_ops_command(bundle.root, "disable", "web")
+    again = capsys.readouterr()
+    assert rc == 0 and again.out.strip() == "web: disabled" and again.err.count("warning") == 1
+    result = _enable_plain(bundle, tmp_path, "x")
+    assert result != 0 and read_stage(bundle.root, "web")["stage"] == "disabled"
+
+
+def test_disable_of_a_consistent_web_prints_no_warning(tmp_path, monkeypatch, capsys):
+    bundle = make(tmp_path, monkeypatch)
+    monkeypatch.setattr("agentic_fx.ops_setup.stages.OpsSetup", lambda _root: bundle.setup)
+    assert run_ops_command(bundle.root, "disable", "web") == 0
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("base, mode", [(_enabled_base, "enabled"), (_idle_base("disabled"), "idle")])
+@pytest.mark.parametrize("state, target", [("prep_true", True), ("prep_false", False)])
+def test_finishing_an_interrupted_key_operation_fires_the_key_hooks(tmp_path, monkeypatch, base, mode, state, target):
+    from agentic_fx.ops_setup.write_key import Consistent, check_write_key_consistency
+    bundle = base(tmp_path, monkeypatch)
+    apply_state(bundle, state)
+    seen: list[str] = []
+
+    def hook(name):
+        seen.append(name)
+        if name.startswith("key:"):
+            raise Crash(name)
+
+    with pytest.raises(Crash):
+        run(bundle, target, hook=hook)
+    assert any(name.startswith("key:") for name in seen)
+    bundle.setup.hook = lambda _name: None
+    assert run(bundle, target)[0].rc == 0
+    assert check_write_key_consistency(bundle.root, mode=mode) == Consistent(target)
+
+
+def _revoke_read_key(bundle):
+    from agentic_fx.ops.keys import revoke
+    revoke(key_dir(bundle.root), READ)
+
+
+def test_no_write_with_a_bad_read_key_stops_before_touching_afx_on_a_web_that_is_on(tmp_path, monkeypatch):
+    bundle = make(tmp_path, monkeypatch)
+    assert run(bundle, True)[0].rc == 0
+    _revoke_read_key(bundle)
+    bundle.systemd.calls.clear()
+    before = world(bundle)
+    result, _ = run(bundle, False)
+    assert (result.rc, result.reason_code) == (1, "principal_key_mismatch")
+    assert afx_calls(bundle, "stop") == [] and read_marker(bundle.root) is None
+    assert entry(bundle) == ("active", None)
+    assert {k: v for k, v in world(bundle).items() if "stage" not in k} == \
+        {k: v for k, v in before.items() if "stage" not in k}
+
+
+def test_no_write_with_a_bad_read_key_stops_before_touching_afx_on_a_web_that_is_off(tmp_path, monkeypatch):
+    bundle = _idle_base("disabled")(tmp_path, monkeypatch)
+    apply_state(bundle, "ro_key_active")
+    _revoke_read_key(bundle)
+    bundle.systemd.calls.clear()
+    before = world(bundle)
+    result, _ = run(bundle, False)
+    assert (result.rc, result.reason_code) == (1, "principal_key_mismatch")
+    assert afx_calls(bundle, "stop") == [] and read_marker(bundle.root) is None
+    assert world(bundle) == before
+
+
+def _pending_switch(tmp_path, monkeypatch):
+    bundle = make(tmp_path, monkeypatch)
+    _crash_at(bundle, "after_stage_write_stopped")
+    return bundle
+
+
+def test_the_pending_switch_guidance_reaches_the_user_on_every_entry(tmp_path, monkeypatch, capsys):
+    bundle = _pending_switch(tmp_path, monkeypatch)
+    before = world(bundle)
+    for feature, options in (("bot", WebOptions()), ("web", WebOptions()), ("web", WebOptions(ask=True))):
+        io = ScriptIO(answers=[])
+        result = interactive_enable(bundle.root, feature, io=io, options=options,
+                                    setup_factory=lambda _r: bundle.setup, probe_runner=lambda _f: (0, ""),
+                                    candidates=lambda: CANDIDATES)
+        text = "".join(io.err)
+        assert (result.rc, result.reason_code) == (1, "write_switch_pending"), feature
+        assert "enable --write" in text and "--no-write" in text, (feature, text)
+    rc, _ = _reconf_to_9000(bundle, tmp_path)
+    assert rc == 1 and "enable --write" in capsys.readouterr().err
+    monkeypatch.setattr("agentic_fx.ops_setup.stages.OpsSetup", lambda _root: bundle.setup)
+    assert run_ops_command(bundle.root, "disable", "web") == 1
+    assert "enable --write" in capsys.readouterr().err
+    assert world(bundle) == before
+
+
+@pytest.mark.parametrize("how", ["unreadable_mode"])
+def test_the_config_guidance_reaches_the_user_when_enable_cannot_read_the_live_file(writing, how):
+    bundle = writing
+    _damage_live(bundle, how)
+    io = ScriptIO(answers=[])
+    result = interactive_enable(bundle.root, "web", io=io, options=WebOptions(),
+                                setup_factory=lambda _r: bundle.setup, probe_runner=lambda _f: (0, ""),
+                                candidates=lambda: CANDIDATES)
+    text = "".join(io.err)
+    assert result.rc == 1 and result.reason_code.startswith("config_dir_"), result
+    assert "ops.toml" in text and "afx ops web status" in text, text
+
+
+@pytest.mark.parametrize("write, name", [(False, "ops-web"), (True, "ops-web-write")])
+def test_the_key_mismatch_guidance_names_exactly_the_principal_in_question(tmp_path, monkeypatch, write, name):
+    from agentic_fx.ops_setup import reconfigure
+    from agentic_fx.ops_setup.reconfigure import Refusal
+    bundle = make(tmp_path, monkeypatch)
+    if write:
+        assert run(bundle, True)[0].rc == 0
+    principal = WRITE if write else READ
+    path = key_dir(bundle.root) / key_file_name(principal)
+    path.write_text("1" * 64 + "\n")
+    path.chmod(0o600)
+    with pytest.raises(Refusal) as caught:
+        reconfigure._check_principal(bundle.setup, write)
+    assert caught.value.reason == "principal_key_mismatch"
+    assert caught.value.guidance == reconfigure.KEYS_TEMPLATE.format(principal=name)
+    assert f"afx keys rotate {name} を実行" in caught.value.guidance
+    assert "-write-write" not in caught.value.guidance
 
 
 def test_the_preparing_guidance_does_not_loop(tmp_path, monkeypatch):

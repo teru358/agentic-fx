@@ -55,22 +55,30 @@ def _active_and_matching(setup: OpsSetup, state: dict[str, Any], principal: Prin
 
 def _complete(setup: OpsSetup, principal: Principal, op: str) -> None:
     directory = key_dir(setup.root)
-    {"enroll": enroll, "rotate": rotate, "revoke": revoke}[op](directory, principal)
+    {"enroll": enroll, "rotate": rotate, "revoke": revoke}[op](directory, principal, hook=setup.hook)
 
 
-def align_keys(setup: OpsSetup, state: dict[str, Any], target: bool, *, require_read: bool = True) -> None:
+def check_read_key(setup: OpsSetup, state: dict[str, Any], target: bool, *, required: bool = True) -> None:
+    """読取専用へ戻す (`target` 偽) ときに、`ops-web` の鍵が active で一致することを確かめる。
+
+    afx を止める前に呼ぶ。合わなければ何にも触れず止まる。
+    """
+    if target or not required:
+        return
+    if not _active_and_matching(setup, state, READ_PRINCIPAL):
+        setup._failure(state, "principal_key_mismatch", f"{READ_PRINCIPAL.value} の鍵が active でない")
+        raise InvalidState("principal_key_mismatch",
+                           f"{READ_PRINCIPAL.value} の鍵が active でない。afx keys enroll / rotate "
+                           f"{READ_PRINCIPAL.value} で直してから再実行する")
+
+
+def align_keys(setup: OpsSetup, state: dict[str, Any], target: bool) -> None:
     """鍵を目標に合わせる。どの途中状態からでも収束する (停止中・instance lock 保持中に呼ぶ)。
 
     有効: `ops-web-write` が未登録なら enroll、active なら照合、revoked なら rotate。
-    無効: `ops-web` が active であることを確かめてから `ops-web-write` を revoke する (未登録は何もしない)。
+    無効: `ops-web-write` を revoke する (未登録は何もしない。`ops-web` の検査は `check_read_key`)。
     """
     directory = key_dir(setup.root)
-    if not target and require_read:
-        if not _active_and_matching(setup, state, READ_PRINCIPAL):
-            setup._failure(state, "principal_key_mismatch", f"{READ_PRINCIPAL.value} の鍵が active でない")
-            raise InvalidState("principal_key_mismatch",
-                               f"{READ_PRINCIPAL.value} の鍵が active でない。afx keys enroll / rotate "
-                               f"{READ_PRINCIPAL.value} で直してから再実行する")
     for _ in range(_MAX_KEY_PASSES):
         entry = principal_entry(directory, WRITE_PRINCIPAL)
         if entry is None:
@@ -109,6 +117,14 @@ def _check_target(root, live: dict[str, Any]) -> None:
         raise InvalidState(problem, CONFIG_GUIDANCE if problem.startswith("write_requires") else "")
 
 
+def _write_target_config(root, live: dict[str, Any], target: bool) -> None:
+    """live の設定から port と公開範囲の key を引き継ぎ、write を目標にして書く。"""
+    values = {name: live[name] for name in ("port", *_WEB_ACCESS) if name in live and name != "write"}
+    if target:
+        values["write"] = True
+    write_web_config(root, values)
+
+
 def _recover_idle(setup: OpsSetup, saved: dict[str, Any] | None, target: bool,
                   confirm: Callable[[], bool] | None) -> StageResult:
     """有効でない web (一度も enable していない・disabled) の write と鍵の不整合を、停止と lock の下で整合させる。
@@ -139,16 +155,14 @@ def _recover_idle(setup: OpsSetup, saved: dict[str, Any] | None, target: bool,
     lock = None
     try:
         setup._check_key_dir()
+        check_read_key(setup, state, target, required=saved is not None)
         lock = setup._quiesce_afx(state, reset_stage=False)
         setup._before("keys")
-        align_keys(setup, state, target, require_read=saved is not None)
+        align_keys(setup, state, target)
         setup._after("keys")
         if live is not None:
             setup._before("config")
-            values = {name: live[name] for name in ("port", *_WEB_ACCESS) if name in live and name != "write"}
-            if target:
-                values["write"] = True
-            write_web_config(root, values)
+            _write_target_config(root, live, target)
             setup._after("config")
         lock.close()
         lock = None
@@ -217,6 +231,7 @@ def _switch(setup: OpsSetup, target: bool, confirm: Callable[[], bool] | None) -
     try:
         if state["write_step"] in ("staged", "stopped", "keyed"):
             setup._check_key_dir()
+            check_read_key(setup, state, target)
             lock = setup._quiesce_afx(state, reset_stage=False)
             if state["write_step"] == "staged":
                 _set_step(setup, state, "stopped")
@@ -226,10 +241,7 @@ def _switch(setup: OpsSetup, target: bool, confirm: Callable[[], bool] | None) -
             if state["write_step"] == "stopped":
                 _set_step(setup, state, "keyed")
             setup._before("config")
-            values = {name: live[name] for name in ("port", *_WEB_ACCESS) if name in live and name != "write"}
-            if target:
-                values["write"] = True
-            write_web_config(root, values)
+            _write_target_config(root, live, target)
             setup._after("config")
             _set_step(setup, state, "configured")
             lock.close()

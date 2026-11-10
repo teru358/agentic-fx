@@ -33,7 +33,8 @@ FEATURE = "web"
 RERUN = "afx ops web reconfigure を再実行する"
 RECOVER = "afx ops web enable で状態を回復してから再実行する"
 RELOAD = "systemctl --user daemon-reload の後に再実行する"
-KEYS = "afx を止めて afx keys rotate ops-web を実行し、afx を起動してから afx ops web reconfigure を再実行する"
+KEYS_TEMPLATE = "afx を止めて afx keys rotate {principal} を実行し、afx を起動してから afx ops web reconfigure を再実行する"
+KEYS = KEYS_TEMPLATE.format(principal="ops-web")
 SECRET_GUIDANCE = SECRET_GUIDANCE_TEMPLATE.format(verb="reconfigure")
 _AFX_RUNNING = frozenset({"active", "activating", "reloading"})
 _AFX_DOWN = frozenset({"inactive", "failed"})
@@ -96,7 +97,7 @@ def _check_principal(setup: OpsSetup, write: bool) -> None:
         matches = enrolled_key_matches(key_dir(setup.root), principal)
     except KeySetError as error:
         if error.code in _KEY_MISMATCH_CODES:
-            raise Refusal("principal_key_mismatch", KEYS.replace("ops-web", principal.value)) from None
+            raise Refusal("principal_key_mismatch", KEYS_TEMPLATE.format(principal=principal.value)) from None
         raise Refusal("invalid_state") from None
     except OSError:
         raise Refusal("invalid_state") from None

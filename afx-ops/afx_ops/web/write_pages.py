@@ -129,9 +129,13 @@ def result_status(snapshot: Snapshot) -> int:
 _JOB_STATES = {"queued": "待機中", "running": "実行中", "done": "完了", "failed": "失敗",
                "cancelled": "取消済み", "shutdown": "停止"}
 _JOB_KINDS = {"improve": "改善", "ask": "質問"}
-_JOB_REFUSALS = {403: "この job は、この画面の主体の job ではないため見られません",
-                 404: "job が見つかりません"}
-_CANCELLABLE = frozenset({"queued", "running"})
+# (status, daemon の code) ごとの固定文。daemon は持ち主の不一致と権限の不足をどちらも
+# 403 forbidden で返すので、この組は原因を決めつけない。表に無い組は汎用の文にする。
+_JOB_REFUSALS = {(403, "forbidden"): "daemon がこの job の閲覧を許可しませんでした "
+                                     "(この画面の主体の job でないか、権限が足りません)",
+                 (404, "not_found"): "job が見つかりません"}
+_JOB_REFUSED_GENERIC = "daemon がこの job を見せませんでした"
+_JOB_REFUSED_STATUSES = frozenset({403, 404})
 
 
 def job_page(job_id: str, data: dict) -> bytes | None:
@@ -148,19 +152,31 @@ def job_page(job_id: str, data: dict) -> bytes | None:
             ("停止の要求", "あり (走行中の分は完走します)" if stop_requested else "なし")]
     body = ("<section><dl>" + "".join(f"<dt>{escape(label)}</dt><dd>{escape(value)}</dd>"
                                       for label, value in rows) + "</dl>")
-    if state in _CANCELLABLE and not stop_requested:
+    if _can_cancel(state, result):
         body += (f'<form method="post" action="/jobs/{escape(job_id)}/cancel">'
                  '<button type="submit">取消へ進む</button></form>')
     return _page("job", body + "</section>")
 
 
-def job_refused_page(status: int) -> bytes:
-    return _page("job", f"<section><p>{escape(_JOB_REFUSALS[status])}。</p></section>")
+def _can_cancel(state: str, result: object) -> bool:
+    """daemon が取り消せる job か。待機中は取り消せる。実行中は、繰り返しの job (結果に
+    停止の要求の真偽値がある) で、まだ停止を要求していないものだけ。1 回だけの実行中の job は取り消せない。"""
+    if state == "queued":
+        return True
+    if state != "running" or type(result) is not dict:
+        return False
+    return result.get("stop_requested") is False
+
+
+def job_refused_page(reply: object) -> bytes:
+    text = _JOB_REFUSALS.get((getattr(reply, "status", None), getattr(reply, "code", None)),
+                             _JOB_REFUSED_GENERIC)
+    return _page("job", f"<section><p>{escape(text)}。</p></section>")
 
 
 def job_refused_status(reply: object) -> int | None:
     """daemon が job を拒否した応答 (403 / 404) ならその status。それ以外は None。"""
     status = getattr(reply, "status", None)
-    if type(status) is int and status in _JOB_REFUSALS:
+    if type(status) is int and status in _JOB_REFUSED_STATUSES:
         return status
     return None

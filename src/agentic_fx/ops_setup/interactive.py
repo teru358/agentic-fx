@@ -105,7 +105,8 @@ REASON_CODES = frozenset({
     "not_enabled", "already_enabled", "reset-failed", "write_requires_auth", "write_requires_loopback",
     "write_change_refused", "write_switch_pending", "write_state_undecided", "write_key_preparing",
 })
-_GUIDED_REASONS = frozenset({"invalid_state", "write_state_undecided", "write_key_preparing", "principal_key_mismatch"})
+_GUIDED_REASONS = frozenset({"invalid_state", "write_state_undecided", "write_key_preparing", "principal_key_mismatch",
+                             "write_switch_pending", "config_dir_missing", "config_dir_invalid"})
 _COMPONENT_REASON = re.compile(r"feature_config_unsafe:[a-z_]{1,32}\Z")
 _PROBE_FAILURE_REASON = re.compile(r"feature_probe_failed:[a-z_]{1,32}\Z")
 

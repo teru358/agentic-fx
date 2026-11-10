@@ -214,6 +214,8 @@ class OpsSetup:
         self._recorded: BaseException | None = None
         # 直近の enable が保持する write (書込みの鍵 ops-web-write を使う web か)。
         self._write_on = False
+        # 成功した操作が利用者へ伝える警告 (1 行ずつ)。
+        self.notices: list[str] = []
 
     def _interface_addresses(self) -> list[str]:
         try:
@@ -518,6 +520,22 @@ class OpsSetup:
             raise InvalidState(verdict.reason, verdict.guidance)
         self._write_on = verdict.write
 
+    def _warn_web_write(self, feature: str, saved: dict[str, Any] | None) -> None:
+        """disable は止める側の操作なので、write と鍵の食い違いでは拒否せず警告を `notices` に残す。
+
+        止めても権限は広がらず、食い違いは次の enable の判定が止める。
+        """
+        if feature != "web":
+            return
+        try:
+            verdict = check_write_key_consistency(self.root, mode=stage_mode(saved))
+        except (KeySetError, OSError):
+            verdict = Inconsistent("invalid_state")
+        if isinstance(verdict, Inconsistent):
+            self.notices.append(f"warning: web の write と書込みの鍵が整合していない ({verdict.reason})。"
+                                "web は止めた。次の afx ops web enable は整合を確かめて止まる"
+                                + (f" ({verdict.guidance})" if verdict.guidance else ""))
+
     def _enable(self, feature: str) -> StageResult:
         saved = read_stage(self.root, feature, missing_ok=True)
         self._unfinished(feature, "enable")
@@ -638,11 +656,12 @@ class OpsSetup:
         return self._guarded(lambda: self._disable(feature))
 
     def _disable(self, feature: str) -> StageResult:
+        self.notices.clear()
         check_write_switch_idle(self.root)
         saved = read_stage(self.root, feature, missing_ok=True)
         if saved is not None and saved["operation"] == "enable" and saved["stage"] != _ENABLE_TERMINAL:
             raise InvalidState("invalid_state")
-        self._check_web_write(feature, saved)
+        self._warn_web_write(feature, saved)
         if saved is None:
             # 一度も enable していない。照合する記録が無い。
             return StageResult(feature, "disable", _DISABLE_TERMINAL)
@@ -791,4 +810,6 @@ def run_ops_command(root: Path, action: str, feature: str) -> int:
             print(f"配備操作が未完了: {open_ops} 件 (afx plugin versions <name>)")
     else:
         print(f"{feature}: {result.stage}")
+        for notice in setup.notices:
+            print(f"afx ops: {notice}", file=sys.stderr)
     return 0
