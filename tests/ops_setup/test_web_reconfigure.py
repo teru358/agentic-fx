@@ -21,7 +21,7 @@ from agentic_fx.ops_setup.setup_lease import acquire_setup_lease
 from agentic_fx.ops_setup.systemd import SystemdError
 from agentic_fx.ops_setup.web_setup import SecretPlan, WebOptions, apply_target
 from agentic_fx.store.enroll_marker import enroll_marker_path
-from web_support import (ACCESS_Q, CANDIDATES, IFNAME, KEEP_BASIC_Q, LAN, ONE_CANDIDATE, SCOPE_Q, ScriptIO,
+from web_support import (ACCESS_Q, AUTH_Q, CANDIDATES, IFNAME, KEEP_BASIC_Q, LAN, ONE_CANDIDATE, SCOPE_Q, ScriptIO,
                          make_bundle, stage_file, tree)
 
 PW = "AAECAwQFBgcICQoLDA0ODw"
@@ -481,7 +481,7 @@ def test_an_os_error_while_collecting_the_input_is_a_fixed_reason_without_a_trac
 
     monkeypatch.setattr(reconfigure, target, fail)
     before = tree(bundle.xdg)
-    out = reconf(bundle, capsys, WebOptions(), ScriptIO())
+    out = reconf(bundle, capsys, WebOptions(), ScriptIO(answers=["", "", ""]))
     assert out.rc == 1 and out.err == "afx ops: material_write_failed\n"
     assert "stop" not in out.names() and tree(bundle.xdg) == before and out.probes == []
 
@@ -502,18 +502,18 @@ def test_the_secret_state_is_read_once_for_the_interactive_flow(bundle, capsys, 
     calls = []
     real = reconfigure.web_secret_state
 
-    def counting(root):
+    def counting(root, **kwargs):
         calls.append(root)
-        return real(root)
+        return real(root, **kwargs)
 
     monkeypatch.setattr(reconfigure, "web_secret_state", counting)
-    out = reconf(bundle, capsys, WebOptions(), ScriptIO(answers=[""] * 2))
+    out = reconf(bundle, capsys, WebOptions(), ScriptIO(answers=[""] * 3))
     assert out.rc == 0 and len(calls) == 1
 
 
 def test_a_non_default_loopback_bind_survives_a_port_only_change(bundle, capsys):
     write_inputs(bundle.root, "web", {"port": 9100, "bind": "127.0.0.2"})
-    out = reconf(bundle, capsys, WebOptions(), ScriptIO(answers=["9200", ""]))
+    out = reconf(bundle, capsys, WebOptions(), ScriptIO(answers=["9200", "", ""]))
     assert out.rc == 0
     text = (bundle.xdg / "config" / "ops.toml").read_text()
     assert 'bind = "127.0.0.2"' in text and "port = 9200" in text
@@ -521,7 +521,7 @@ def test_a_non_default_loopback_bind_survives_a_port_only_change(bundle, capsys)
 
 def test_the_default_loopback_bind_is_still_left_out(bundle, capsys):
     write_inputs(bundle.root, "web", {"port": 9100, "bind": "127.0.0.1"})
-    out = reconf(bundle, capsys, WebOptions(), ScriptIO(answers=["9200", ""]))
+    out = reconf(bundle, capsys, WebOptions(), ScriptIO(answers=["9200", "", ""]))
     assert out.rc == 0
     lines = (bundle.xdg / "config" / "ops.toml").read_text().splitlines()
     assert not any(line.startswith("bind") for line in lines)
@@ -595,9 +595,9 @@ def _interactive_basic_answers():
 
 
 def test_the_interactive_flow_asks_everything_with_existing_values_and_never_the_one_question(bundle, capsys):
-    io = ScriptIO(answers=[""] * 2)
+    io = ScriptIO(answers=[""] * 3)
     out = reconf(bundle, capsys, WebOptions(), io)
-    assert out.rc == 0 and io.asked == ["port", SCOPE_Q] and io.defaults[0] == ("port", "8788")
+    assert out.rc == 0 and io.asked == ["port", SCOPE_Q, AUTH_Q] and io.defaults[0] == ("port", "8788")
     assert "この設定で有効化します" not in io.text()
 
 
@@ -653,13 +653,33 @@ def test_the_basic_keep_or_reset_question_is_asked_for_an_existing_password(bund
     assert [text for text in io.out if "E" * 22 in text] == []
 
 
-def test_invalid_keys_in_the_live_config_are_not_offered_as_defaults(bundle, capsys):
+def test_moving_a_basic_lan_web_to_local_only_keeps_basic_as_the_auth_default(bundle, capsys):
+    write_inputs(bundle.root, "web", {"port": 8788, "bind": LAN, "allow": ["10.0.0.0/8"], "auth": "basic",
+                                       "user": "ops-web"})
+    (bundle.xdg / "secret").mkdir(exist_ok=True)
+    (bundle.xdg / "secret" / "web.password").write_text("E" * 22)
+    (bundle.xdg / "secret" / "web.password").chmod(0o600)
+    io = ScriptIO(answers=["", "1", "", "1"])
+    out = reconf(bundle, capsys, WebOptions(), io)
+    assert out.rc == 0
+    assert io.asked == ["port", SCOPE_Q, AUTH_Q, KEEP_BASIC_Q]
+    assert dict(io.defaults)[AUTH_Q] == "2"
+    text = (bundle.xdg / "config" / "ops.toml").read_text()
+    assert 'auth = "basic"' in text and 'user = "ops-web"' in text and "bind" not in text and "allow" not in text
+    assert (bundle.xdg / "secret" / "web.password").read_text() == "E" * 22
+
+
+def test_a_live_config_that_does_not_pass_the_grammar_is_asked_afresh_and_repaired(bundle, capsys):
     config = bundle.xdg / "config" / "ops.toml"
     text = config.read_text().splitlines()[:2]
     config.write_text("\n".join(text + ['port = "oops"', 'bind = "localhost"', 'auth = "Basic"']) + "\n")
-    io = ScriptIO(answers=["9000", ""])
+    io = ScriptIO(answers=["9000", "", ""])
     out = reconf(bundle, capsys, WebOptions(), io)
-    assert out.rc == 0 and io.defaults[0] == ("port", "8788") and io.defaults[1][0] == SCOPE_Q
+    assert out.rc == 0, out.err
+    assert io.asked[:2] == ["port", SCOPE_Q]
+    assert dict(io.defaults)["port"] == "8788" and dict(io.defaults)[SCOPE_Q] == "1"
+    written = (bundle.xdg / "config" / "ops.toml").read_text()
+    assert "port = 9000" in written and "oops" not in written and "Basic" not in written and "localhost" not in written
 
 
 def test_an_existing_lan_config_is_offered_as_the_defaults_of_every_question(bundle, capsys):
@@ -703,7 +723,7 @@ def test_the_interactive_flow_reasks_at_most_three_times_and_reports_the_last_re
 
 
 def test_an_interactive_retry_then_success_restarts(bundle, capsys):
-    io = ScriptIO(answers=["", "", "9001"])
+    io = ScriptIO(answers=["", "", "", "9001"])
     out = reconf(bundle, capsys, WebOptions(), io, probe=lambda n: (73, "probe_bind_failed") if n == 1 else (0, ""))
     assert out.rc == 0 and out.stdout == ["web: reconfigured"] and len(out.probes) == 2
 
@@ -716,7 +736,7 @@ def test_eof_during_the_questions_changes_nothing_and_never_stops_ops_web(bundle
 
 
 def test_eof_while_reasking_after_a_probe_failure_is_aborted_and_keeps_the_target(bundle, capsys):
-    io = ScriptIO(answers=["9000", ""], eof_after=2)
+    io = ScriptIO(answers=["9000", "", ""], eof_after=3)
     out = reconf(bundle, capsys, WebOptions(), io, probe=lambda n: (73, "probe_bind_failed"))
     assert out.rc == 1 and out.err.endswith("afx ops: setup_aborted\n")
     assert b"port = 9000" in (bundle.xdg / "config" / "ops.toml").read_bytes() and "start" not in out.names()

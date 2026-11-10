@@ -26,6 +26,7 @@ from .units import (OpsExecNotFound, UnitPaths, atomic_write, install_units, rem
 from .web_setup import access_line
 
 
+WRITE_SWITCH_GUIDANCE = "afx ops web enable --write (又は --no-write) を再実行して書込みの切替を完了させる"
 _FEATURE_PRINCIPALS = {
     "bot": Principal.OPS_BOT,
     "web": Principal.OPS_WEB,
@@ -96,8 +97,13 @@ def read_stage(root: Path, feature: str, *, missing_ok: bool = False) -> dict[st
 _STAGE_FIELD_TYPES: dict[str, type] = {
     "principal": str, "registered": bool, "ops_active": bool, "committed": bool,
     "afx_before_stop": str, "failure": str, "failure_detail": str, "warn": str,
+    "write_target": bool, "write_principal": str, "write_step": str,
 }
 _STAGE_LIST_FIELDS = ("artifacts", "wants")
+# 書込みの切替の途中状態。3 つは揃って在るか、揃って無い。
+WRITE_STEPS = ("staged", "stopped", "keyed", "configured")
+_WRITE_PRINCIPALS = {True: Principal.OPS_WEB_WRITE.value, False: Principal.OPS_WEB.value}
+_WRITE_FIELDS = ("write_target", "write_principal", "write_step")
 
 
 def _stage_problem(data: object, feature: str) -> str:
@@ -119,6 +125,11 @@ def _stage_problem(data: object, feature: str) -> str:
         if key in data and (not isinstance(data[key], list)
                             or not all(isinstance(item, str) for item in data[key])):
             return f"{key} が文字列の list でない"
+    if any(key in data for key in _WRITE_FIELDS):
+        if feature != "web" or not all(key in data for key in _WRITE_FIELDS):
+            return "write の切替の key が揃っていない"
+        if data["write_step"] not in WRITE_STEPS or data["write_principal"] != _WRITE_PRINCIPALS[data["write_target"]]:
+            return "write の切替の key の値が不正"
     return ""
 
 
@@ -171,6 +182,14 @@ def _noop(_name: str) -> None:
 def _config_complete(root: Path, feature: str) -> bool:
     """feature 専用の config / secret が、起動時に読まれる規則で揃っているか。"""
     return collect(root, feature).complete
+
+
+def check_write_switch_idle(root: Path) -> None:
+    """書込みの切替が途中なら write_switch_pending で拒否する。stage file を読むだけで何も書かない。"""
+    for feature in _FEATURE_PRINCIPALS:
+        saved = read_stage(root, feature, missing_ok=True)
+        if saved is not None and "write_target" in saved:
+            raise InvalidState("write_switch_pending", WRITE_SWITCH_GUIDANCE)
 
 
 class OpsSetup:
@@ -231,11 +250,14 @@ class OpsSetup:
     def _unit_name(self, feature: str) -> str:
         return self.paths.feature_unit(feature)
 
-    def _unfinished(self, feature: str, operation: str) -> None:
+    def _unfinished(self, feature: str, operation: str, *, switching_write: bool = False) -> None:
         for other in _FEATURE_PRINCIPALS:
             saved = read_stage(self.root, other, missing_ok=True)
             if saved is None:
                 continue
+            if "write_target" in saved and not (switching_write and other == feature):
+                # write の切替が途中の間は、その記録と起動の阻止 (marker) を他の操作に壊させない。
+                raise InvalidState("write_switch_pending", WRITE_SWITCH_GUIDANCE)
             terminal = _ENABLE_TERMINAL if saved["operation"] == "enable" else _DISABLE_TERMINAL
             if saved["stage"] != terminal and (other != feature or saved["operation"] != operation):
                 raise InvalidState("invalid_state")
@@ -438,10 +460,10 @@ class OpsSetup:
         raw = (json.dumps({"feature": feature, "started_at": started}, sort_keys=True) + "\n").encode()
         atomic_write(enroll_marker_path(self.root), raw, 0o600)
 
-    def _quiesce_afx(self, state: dict[str, Any]):
+    def _quiesce_afx(self, state: dict[str, Any], *, reset_stage: bool = True):
         """marker を置き、afx を止めて止まったことを manager で確かめ、instance flock を取る。
 
-        失敗したら staged に戻す。marker は残し、同じ enable の再実行が回収する。
+        失敗したら (reset_stage なら) staged に戻す。marker は残し、同じ操作の再実行が回収する。
         """
         try:
             if "afx_before_stop" not in state:
@@ -465,7 +487,8 @@ class OpsSetup:
             self._before("lock")
             lock = self._lock()
         except SystemdError as error:
-            state["stage"] = "staged"
+            if reset_stage:
+                state["stage"] = "staged"
             self._failure(state, error.reason, error.detail)
             raise
         try:
@@ -484,6 +507,8 @@ class OpsSetup:
         saved = read_stage(self.root, feature, missing_ok=True)
         self._unfinished(feature, "enable")
         self._check_marker_owner(feature)
+        if saved is not None and "write_target" in saved:
+            raise InvalidState("write_switch_pending", WRITE_SWITCH_GUIDANCE)
         fresh = saved is None or saved["stage"] == _DISABLE_TERMINAL
         state = self._new_state(feature, "enable", "staged") if fresh else saved
         self._current = state
@@ -597,6 +622,7 @@ class OpsSetup:
         return self._guarded(lambda: self._disable(feature))
 
     def _disable(self, feature: str) -> StageResult:
+        check_write_switch_idle(self.root)
         saved = read_stage(self.root, feature, missing_ok=True)
         if saved is None:
             # 一度も enable していない。照合する記録が無い。
@@ -708,7 +734,10 @@ class OpsSetup:
         if saved and saved.get("operation") == "enable" and not self._afx_was_running(saved):
             waiting = f" afx_before_enable={saved.get('afx_before_stop') or 'unknown'} ops=starts_with_afx"
         warn = f" warn={saved['warn']}" if saved and saved.get("warn") else ""
-        return f"{feature}: {result.operation} {result.stage}{failure} {observed}{waiting}{warn}{left}"
+        switch = ""
+        if saved and "write_target" in saved:
+            switch = f" write_switch={saved['write_step']} target={'on' if saved['write_target'] else 'off'}"
+        return f"{feature}: {result.operation} {result.stage}{failure} {observed}{waiting}{warn}{switch}{left}"
 
     def web_access_line(self) -> str:
         """`afx ops web status` の公開範囲 1 行。stage を先に読み、共有 reader の最終 reason をそのまま出す。"""

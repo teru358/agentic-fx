@@ -50,6 +50,10 @@ def _add_web_setup_options(parser: argparse.ArgumentParser) -> None:
                         help="password を読む file (mode 0600、--secret-action install のときだけ)")
     parser.add_argument("--secret-action", action="append", metavar="ACTION", dest="secret_action",
                         help="remove | keep | install | absent")
+    parser.add_argument("--write", action="count", default=0,
+                        help="書込み (承認・却下・改善の開始) を有効にする (enable のみ。loopback + Basic 認証が条件)")
+    parser.add_argument("--no-write", action="count", default=0, dest="no_write",
+                        help="書込みを無効にして読取専用に戻す (enable のみ)")
 
 
 def _web_options(args: argparse.Namespace):
@@ -60,7 +64,9 @@ def _web_options(args: argparse.Namespace):
         config_file=lists["config_file"][0] if lists["config_file"] else None,
         password_file=lists["password_file"][0] if lists["password_file"] else None,
         secret_action=lists["secret_action"][0] if lists["secret_action"] else None,
-        duplicated=args.ask > 1 or args.non_interactive > 1 or any(len(v) > 1 for v in lists.values()))
+        write=(args.write == 1) if (args.write, args.no_write) in ((1, 0), (0, 1)) else None,
+        duplicated=args.ask > 1 or args.non_interactive > 1 or any(len(v) > 1 for v in lists.values())
+        or args.write > 1 or args.no_write > 1 or (args.write > 0 and args.no_write > 0))
 
 
 def _reconfigurable_features() -> frozenset[str]:

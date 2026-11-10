@@ -17,6 +17,7 @@ from agentic_fx.ops_setup.feature_config import (DEFAULT_USER, UNRESTRICTED, USE
                                                  InterfaceLookupFailed, is_loopback, validate)
 from agentic_fx.ops_setup.interfaces import Candidate, display_name
 from agentic_fx.ops_setup.web_setup import (
+    WRITE_KEPT_GUIDANCE,
     SecretPlan,
     WebSetupError,
     apply_target,
@@ -24,6 +25,7 @@ from agentic_fx.ops_setup.web_setup import (
     check_password,
     generate_password,
     web_secret_state,
+    write_problem,
 )
 
 DEFAULT_PORT = 8788
@@ -35,6 +37,8 @@ KEEP_LABEL = "現在の Basic 認証を"
 KEEP_OPTIONS = ("維持する", "再設定する")
 ACCESS_LABEL = "アクセス制限"
 ACCESS_OPTIONS = ("許可 IP", "Basic 認証", "両方", "なし (到達できる全 IPv4)")
+LOCAL_AUTH_LABEL = "認証"
+LOCAL_AUTH_OPTIONS = ("なし", "Basic 認証")
 USER_LABEL = "ユーザー名"
 PASSWORD_LABEL = "パスワード (空 Enter で自動生成)"
 CONFIRM_LABEL = "もう一度"
@@ -86,6 +90,8 @@ class Session:
     token_bytes: Callable[[int], bytes] = secrets.token_bytes
     before_probe: Callable[[], None] | None = None
     echo_each: bool = True
+    # 保持する書込みの有効 (reconfigure だけが真にする)。目標に `write` を載せ、許されない構成は書く前に止める
+    write: bool = False
     probes: int = field(default=0, init=False)
 
     # --- 質問 -----------------------------------------------------------------------------
@@ -188,6 +194,34 @@ class Session:
             return SecretPlan("remove") if choice == 1 else None
         return SecretPlan("absent")
 
+    def _ask_keep(self, live: str) -> SecretPlan | None:
+        """安全な既存 password があれば維持か再設定かを聞く。維持なら keep の計画、それ以外は None。"""
+        if live == "safe" and self._choose(KEEP_LABEL, KEEP_OPTIONS, None) == 1:
+            return SecretPlan("keep")
+        return None
+
+    def _ask_local_auth(self, cur: dict[str, Any], live: str) -> SecretPlan:
+        """自機のみの認証。書込みが有効な間は Basic に固定し、なしを出さない。"""
+        while True:
+            if self.write:
+                basic = True
+            else:
+                default = 2 if auth_of(cur) == "basic" else 1
+                basic = self._choose(LOCAL_AUTH_LABEL, LOCAL_AUTH_OPTIONS, default) == 2
+            if basic:
+                plan = self._ask_keep(live)
+                if plan is None:
+                    cur["user"], plan = self._ask_credentials(cur.get("user", DEFAULT_USER))
+                cur["auth"] = "basic"
+                cur.setdefault("user", DEFAULT_USER)
+                return plan
+            plan = self._ask_secret("none", live)
+            if plan is None:
+                continue
+            cur.pop("auth", None)
+            cur.pop("user", None)
+            return plan
+
     def _ask_who(self, cur: dict[str, Any], live: str) -> SecretPlan:
         allow, auth = cur.get("allow"), auth_of(cur)
         if allow == [UNRESTRICTED]:
@@ -201,9 +235,8 @@ class Session:
             new_auth = "basic" if who in (2, 3) else "none"
             plan: SecretPlan | None = None
             user = cur.get("user", DEFAULT_USER)
-            if new_auth == "basic" and live == "safe":
-                if self._choose(KEEP_LABEL, KEEP_OPTIONS, None) == 1:
-                    plan = SecretPlan("keep")
+            if new_auth == "basic":
+                plan = self._ask_keep(live)
             if who in (1, 3):
                 limited = allow if allow and allow != [UNRESTRICTED] else None
                 chosen = self._ask_allow(limited)
@@ -226,9 +259,6 @@ class Session:
     def collect(self, defaults: dict[str, Any], live: str, steps: frozenset[str]) -> tuple[dict[str, Any], SecretPlan]:
         """目標の web 5 key と secret の計画を質問で決める。defaults は live の単独の文法を通る値。"""
         cur = dict(defaults)
-        if WHO in steps and is_loopback(cur):
-            # 自機のみの設定では認証を選べない。公開範囲から聞き直す。
-            steps = steps | {SCOPE}
         if PORT in steps or not isinstance(cur.get("port"), int):
             port = cur.get("port")
             cur["port"] = self._ask_port(port if isinstance(port, int) else DEFAULT_PORT)
@@ -237,7 +267,7 @@ class Session:
             if SCOPE in steps:
                 chosen = self._choose("公開範囲", ["自機のみ", "LAN"], 2 if lan else 1) == 2
                 if not chosen:
-                    for name in ("allow", "auth") if not lan else ("bind", "allow", "auth"):
+                    for name in ("allow",) if not lan else ("bind", "allow"):
                         cur.pop(name, None)
                 elif not lan:
                     cur.pop("bind", None)
@@ -249,10 +279,7 @@ class Session:
                 plan = self._ask_who(cur, live)
             elif not lan and (SCOPE in steps or WHO in steps):
                 cur.pop("allow", None)
-                cur.pop("auth", None)
-                plan = self._ask_secret("none", live)
-                if plan is None:
-                    continue
+                plan = self._ask_local_auth(cur, live)
             return self._normalize(cur), plan if plan is not None else self._carry(cur, live)
 
     @staticmethod
@@ -270,6 +297,8 @@ class Session:
         if is_loopback(cur):
             if cur.get("bind", "127.0.0.1") != "127.0.0.1":
                 result["bind"] = cur["bind"]
+            if auth_of(cur) == "basic":
+                result.update({"auth": "basic", "user": cur.get("user", DEFAULT_USER)})
             return result
         if "bind" not in cur or "allow" not in cur:
             raise WebSetupError("setup_input_required", 2)
@@ -288,6 +317,11 @@ class Session:
         再質問は変わった項目だけ (a) / (b) をやり直す。反映済みの password や削除は再実行しない。
         """
         while True:
+            if self.write:
+                problem = write_problem(values)
+                if problem is not None:
+                    raise WebSetupError(problem, 1, WRITE_KEPT_GUIDANCE)
+                values = {**values, "write": True}
             apply_target(self.root, values, plan, hook=self.hook, show_password=show_password, clean=False)
             if self.before_probe is not None:
                 self.before_probe()
