@@ -1,16 +1,16 @@
 ---
 id: tests-preexisting-red-acceptance-sandbox-analysis
 title: 素の main でも落ちる test が 3 群 5 件ある
-status: 設計待ち
+status: 是正済
 priority: 中
 kind: 保守
 opened: 2026-11-10
-closed: null
+closed: 2026-11-11
 related: []
 ---
 # [tests-preexisting-red-acceptance-sandbox-analysis] 素の main でも落ちる test が 3 群 5 件ある
 
-**状態**: 設計待ち / **優先**: 中 / **種別**: 保守
+**状態**: 是正済 / **優先**: 中 / **種別**: 保守
 
 ## 現象
 
@@ -22,6 +22,9 @@ related: []
 
 ## 修正内容
 
+- 2026-11-11: 受入手順書に段 3 (参照銘柄) の手順を足した。plugin worker protocol の test は admission を許可済みに固定し (autouse fixture と継承 filter の子 script)、手元の fingerprint が登録集合の外でも結果が変わらないようにした (2026-11-11 に two_stage_startup も同じ原因で落ちていた)。mission_worker の test は履歴分析の request を現行 schema (rolling_corr_summary、window 60) に直した。
+
 ## 経緯
 
 - 2026-11-10: 起票。
+- 2026-11-11: 是正内容 — 受入手順書に段 3 (参照銘柄) の手順を足した。plugin worker protocol の test は admission を許可済みに固定し (autouse fixture と継承 filter の子 script)、手元の fingerprint が登録集合の外でも結果が変わらないようにした (2026-11-11 に two_stage_startup も同じ原因で落ちていた)。mission_worker の test は履歴分析の request を現行 schema (rolling_corr_summary、window 60) に直した。

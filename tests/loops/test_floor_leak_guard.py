@@ -61,7 +61,7 @@ class _FakeRunContext:
 def _sample_ctx_data(recent_runs):
     return {
         "performance_report": {
-            "window_days": [30, 90], "win_rate": 0.5, "profit_factor": 1.2,
+            "window_days": 90, "win_rate": 0.5, "profit_factor": 1.2,
             "by_pair": {"USDJPY": 0.4}, "by_hour": {"9": 0.3},
             "reject_breakdown": {"spread": 2}, "hold_rate": 0.1},
         "improvement_history": {

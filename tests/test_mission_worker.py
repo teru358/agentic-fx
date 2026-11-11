@@ -1562,7 +1562,8 @@ def test_every_improve_rpc_crosses_child_frame_and_parent_wrapper(monkeypatch, t
         settings=settings, workdir=tmp_path, staging_dir=staging,
         source_snapshot_dir=tmp_path / "source", rpc_client=fake_rpc_client)
     names = list(registry.names())
-    request = {"pairs": ["USDJPY", "EURUSD"], "window": 90}
+    request = {"kind": "rolling_corr_summary", "a": "USDJPY", "b": "EURUSD",
+               "timeframe": "1h", "window": 60}
     out = _json.loads(registry.execute("analyze_corr", {"request": request}, names))
     assert "error" not in out, out
     # run_backtest も子 registry 経由で (loader が通る strategy 候補を staging に置く)

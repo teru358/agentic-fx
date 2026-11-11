@@ -108,9 +108,8 @@ def test_performance_report_has_win_rate_and_pf_keys(tmp_path):
 
 
 def test_performance_report_window_is_90_days_not_30(tmp_path):
-    """M16 (段 0 Minor): 集計窓 `timedelta(days=90)` を `days=30` にする
-    変異が red になる pin — §3.2 の `window_days: [30, 90]` 表示は
-    30/90 の両方を対応窓として謳うが、実集計窓は 90 日。60 日前 (30 日
+    """集計窓 `timedelta(days=90)` を `days=30` にする変異が red になる pin。
+    `window_days` は 90 で、実集計窓も 90 日。60 日前 (30 日
     窓なら圏外、90 日窓なら圏内) の closed order を仕込み、by_pair の
     件数がそれを拾うことを見る。"""
     c = connect(tmp_path / "t.db"); init_db(c)
@@ -126,6 +125,7 @@ def test_performance_report_window_is_90_days_not_30(tmp_path):
     ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
                                 allowed_backlog_ids=None)
     assert ctx["performance_report"]["by_pair"]["USDJPY"]["count"] == 2
+    assert ctx["performance_report"]["window_days"] == 90
 
 
 def test_performance_report_window_boundary_narrows_to_90_days_not_61(tmp_path):
@@ -148,6 +148,7 @@ def test_performance_report_window_boundary_narrows_to_90_days_not_61(tmp_path):
     ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
                                 allowed_backlog_ids=None)
     assert ctx["performance_report"]["by_pair"]["USDJPY"]["count"] == 2
+    assert ctx["performance_report"]["window_days"] == 90
 
 
 def test_inventory_view_overrides_the_live_plugins_dir(tmp_path):

@@ -129,8 +129,7 @@ def project_last_result(value: str | None, *,
 
 
 def _performance_report(conn: "sqlite3.Connection", now: datetime) -> dict:
-    # precheck 2026-08-22: T8-m7 -- 未使用の `timezone` import / `since_30`
-    # ローカル変数を削除 (window_days=[30, 90] の表示のみで実集計は 90 日窓)。
+    # 集計は直近 90 日の窓だけ。
     since_90 = (now - timedelta(days=90)).isoformat()
     # 専用の signal 採否 mission の intent は裁量判断ではないので hold 率の母集団に
     # 入れない。mission を持たない intent は裁量側に数える。指標回避帯の却下
@@ -172,7 +171,7 @@ def _performance_report(conn: "sqlite3.Connection", now: datetime) -> dict:
             reject_breakdown[r["reject_category"]] = (
                 reject_breakdown.get(r["reject_category"], 0) + 1)
     return {
-        "window_days": [30, 90],
+        "window_days": 90,
         "win_rate": (wins / total) if total else None,
         "profit_factor": (gross_profit / gross_loss) if gross_loss else None,
         "by_pair": by_pair,

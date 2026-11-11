@@ -60,6 +60,14 @@ def _meta(base: Path, name: str, plugin_py: str, kind: str = "indicator") -> Plu
                       max_bars=200, content_hash=content_hash(d))
 
 
+@pytest.fixture(autouse=True)
+def admitted_runtime(monkeypatch):
+    """手元の fingerprint が登録集合の外でも代表自己試験 (Popen) に入らないよう、許可済みに固定する。
+    admission そのものを試す test は自分で `_ADMISSION_RESULT` を差し替える。"""
+    monkeypatch.setattr(sandbox, "_ADMISSION_RESULT",
+                        sandbox.AdmissionResult(True, None, None, sandbox.host_preflight()[1], True))
+
+
 def _df(n: int = 30) -> pd.DataFrame:
     idx = pd.date_range("2026-01-05", periods=n, freq="1h", tz="UTC")
     close = [100.0 + i for i in range(n)]
@@ -422,6 +430,8 @@ _FILTERED_PARENT = textwrap.dedent("""
     from agentic_fx.plugin import sandbox
     from agentic_fx.plugin.loader import PluginMeta, content_hash
 
+    # 手元の fingerprint が登録集合の外でも代表自己試験 (Popen) に入らないよう、許可済みに固定する
+    sandbox._ADMISSION_RESULT = sandbox.AdmissionResult(True, None, None, sandbox.host_preflight()[1], True)
     seccomp.install_program([(seccomp.BPF_RET_K, 0, 0, seccomp.RET_ALLOW)], log=False)
     calls = []
     sandbox.subprocess.Popen = lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(
