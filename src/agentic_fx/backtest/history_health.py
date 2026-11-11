@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from fractions import Fraction
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, NewType
 
 import yaml
 
@@ -58,6 +58,23 @@ _ONE_HOUR = timedelta(hours=1)
 _FILE_ERRORS = (ValueError, KeyError, OSError, ArithmeticError)
 
 IsOpen = Callable[[datetime], bool]
+
+# 人間 (運用者) 専用の証跡。日時・本数・理由・承認者を含むので agent へ渡さない。
+OperatorEvidence = NewType("OperatorEvidence", dict)
+
+
+class CalendarUnavailable(Exception):
+    """The market calendar could not answer; the check cannot be judged."""
+
+
+def _guarded_calendar(is_open: IsOpen) -> IsOpen:
+    """暦の呼出しの境界。どんな失敗も判定不能の暦例外に変換する。"""
+    def guarded(t: datetime) -> bool:
+        try:
+            return is_open(t)
+        except Exception as exc:
+            raise CalendarUnavailable(type(exc).__name__) from exc
+    return guarded
 
 
 def threshold_snapshot() -> dict:
@@ -108,6 +125,27 @@ class NoBarsList:
 
 EMPTY_NO_BARS = NoBarsList((), _no_bars_digest(()))
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """重複する mapping キーを黙って上書きせず拒否する。"""
+
+    def construct_mapping(self, node, deep=False):
+        if isinstance(node, yaml.MappingNode):
+            self.flatten_mapping(node)
+            seen = set()
+            for key_node, _value_node in node.value:
+                key = self.construct_object(key_node, deep=True)
+                try:
+                    duplicated = key in seen
+                except TypeError as exc:
+                    raise yaml.constructor.ConstructorError(
+                        None, None, "unhashable mapping key", key_node.start_mark) from exc
+                if duplicated:
+                    raise yaml.constructor.ConstructorError(
+                        None, None, f"duplicated mapping key {key!r}", key_node.start_mark)
+                seen.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+
 _ENTRY_KEYS = frozenset({"source", "base_interval", "symbol", "date_utc", "reason",
                          "approved_by", "approved_at"})
 _SYMBOL_RE = re.compile(r"[A-Za-z0-9._-]{1,32}")
@@ -128,9 +166,9 @@ def _parse_entry(idx: int, raw) -> NoBarsEntry:
         raise NoBarsConfigError(
             f"entries[{idx}] must have exactly the keys {sorted(_ENTRY_KEYS)}")
     source = raw["source"]
-    if source not in IMPORT_SOURCES:
+    if not isinstance(source, str) or source not in IMPORT_SOURCES:
         raise NoBarsConfigError(f"entries[{idx}].source is not a known history source")
-    if raw["base_interval"] not in _BASE_INTERVALS:
+    if not isinstance(raw["base_interval"], str) or raw["base_interval"] not in _BASE_INTERVALS:
         raise NoBarsConfigError(f"entries[{idx}].base_interval must be one of {_BASE_INTERVALS}")
     symbol = raw["symbol"]
     if not isinstance(symbol, str) or not _SYMBOL_RE.fullmatch(symbol):
@@ -167,14 +205,18 @@ def load_no_bars(path: Path) -> NoBarsList:
     except (OSError, UnicodeDecodeError) as exc:
         raise NoBarsConfigError(f"cannot read the no-bars list: {type(exc).__name__}") from exc
     try:
-        data = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
+        data = yaml.load(text, Loader=_UniqueKeyLoader)  # noqa: S506 (SafeLoader 派生)
+    except (yaml.YAMLError, RecursionError, ValueError, TypeError) as exc:
         raise NoBarsConfigError("the no-bars list is not valid YAML") from exc
-    if data is None:
-        return EMPTY_NO_BARS
     if not isinstance(data, dict) or set(data) != {"entries"} or not isinstance(data["entries"], list):
+        # 存在する空・null の文書も不正 (空一覧は「ファイルなし」か `entries: []`)
         raise NoBarsConfigError("the no-bars list must be a mapping with a single 'entries' list")
-    entries = [_parse_entry(i, raw) for i, raw in enumerate(data["entries"])]
+    try:
+        entries = [_parse_entry(i, raw) for i, raw in enumerate(data["entries"])]
+    except NoBarsConfigError:
+        raise
+    except (TypeError, ValueError, KeyError, AttributeError, OverflowError) as exc:
+        raise NoBarsConfigError(f"invalid no-bars entry: {type(exc).__name__}") from exc
     keys = [(e.source, e.base_interval, e.symbol, e.date_utc) for e in entries]
     if len(set(keys)) != len(keys):
         raise NoBarsConfigError("the no-bars list has a duplicated series/day")
@@ -304,11 +346,16 @@ class HistoryHealth:
     def ready(self) -> bool:
         return self.verdict == HISTORY_READY
 
-    def to_evidence(self) -> dict:
-        """承認の証跡 (payload JSON) に載せる形。人間専用で、agent には渡さない。"""
+    def to_operator_evidence(self) -> OperatorEvidence:
+        """承認の証跡 (payload JSON) に載せる、人間 (運用者) 専用の形。
+
+        日時・pair・本数・無足日の理由と承認者を含むので、agent の観測面
+        (tool 応答・prompt・要約・付属ファイル) へは渡さない。agent 向けの形は
+        用意しない (agent へは固定語だけを返す)。
+        """
         def iso(value):
             return None if value is None else value.isoformat()
-        return {
+        return OperatorEvidence({
             "version": GUARD_VERSION,
             "verdict": self.verdict,
             "checked_at": iso(self.checked_at),
@@ -328,7 +375,8 @@ class HistoryHealth:
             "calendar_version": CALENDAR_VERSION,
             "threshold_snapshot": threshold_snapshot(),
             "no_bars_digest": self.no_bars_digest,
-        }
+            "no_bars_applied": [e.as_dict() for e in self.applied_no_bars],
+        })
 
 
 def _combine(pairs: Iterable[PairHealth]) -> tuple[str, tuple[str, ...]]:
@@ -403,6 +451,7 @@ def check_history(conn: sqlite3.Connection, *, dataset: HistoryDataset,
     """
     now = _aware_utc(now, "now")
     pair_list = list(dict.fromkeys(pairs))
+    is_open = _guarded_calendar(is_open)
 
     def unavailable(detail: str, start=None, end=None) -> HistoryHealth:
         return HistoryHealth(
@@ -449,7 +498,7 @@ def check_history(conn: sqlite3.Connection, *, dataset: HistoryDataset,
                 width=dataset.width, grace=grace, present_times=present,
                 latest_confirmed=latest, latest_stored=stored, is_open=is_open,
                 excluded_dates=excluded))
-        except _FILE_ERRORS as exc:
+        except (CalendarUnavailable,) + _FILE_ERRORS as exc:
             results.append(_unavailable_pair(pair, type(exc).__name__))
         applied += [e for e in no_bars.entries
                     if (e.source, e.base_interval, e.symbol) ==

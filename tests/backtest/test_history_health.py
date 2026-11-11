@@ -341,6 +341,20 @@ def test_calendar_failure_is_unavailable(tmp_path):
     assert r.verdict == HISTORY_UNAVAILABLE
 
 
+@pytest.mark.parametrize("error", [RuntimeError("zoneinfo"), KeyError("tz"), OSError("io"),
+                                   ZeroDivisionError(), AttributeError("x")])
+def test_any_calendar_failure_is_unavailable(tmp_path, error):
+    conn = _conn(tmp_path)
+    _fill_db(conn)
+
+    def broken(_t):
+        raise error
+    r = check_history(conn, dataset=DS, pairs=("USDJPY",), now=NOW, holdout_months=1,
+                      grace=GRACE, is_open=broken)
+    assert r.verdict == HISTORY_UNAVAILABLE
+    assert r.pairs[0].reasons == (HISTORY_UNAVAILABLE,)
+
+
 def test_unavailable_outranks_stale_and_gap_in_the_representative_verdict(tmp_path):
     conn = _conn(tmp_path)
     _fill_db(conn, "EURUSD", until=datetime(2026, 11, 4, tzinfo=UTC))
@@ -480,6 +494,50 @@ def test_a_malformed_list_is_a_config_error(tmp_path, text):
         load_no_bars(_write(tmp_path, text))
 
 
+@pytest.mark.parametrize("text", [
+    "", "   \n", "null\n", "~", "# only a comment\n", "entries:\n", "entries: null\n",
+    ENTRY.replace("source: mt5", "source: [mt5]"),
+    ENTRY.replace("source: mt5", "source: {a: b}"),
+    ENTRY.replace("base_interval: 5m", "base_interval: [5m]"),
+    ENTRY.replace("symbol: USDJPY", "symbol: [USDJPY]"),
+    ENTRY.replace("date_utc: 2026-11-04", "date_utc: [2026-11-04]"),
+    ENTRY.replace("reason: broker closed", "reason: [x]"),
+    ENTRY.replace("approved_by: operator", "approved_by: 7"),
+    ENTRY.replace("approved_at: 2026-11-10T01:02:03Z", "approved_at: [1]"),
+    ENTRY.replace("source: mt5", "source: 3"),
+])
+def test_empty_null_and_wrongly_typed_documents_are_unavailable_through_evaluate(tmp_path, text):
+    conn = _conn(tmp_path)
+    _fill_db(conn)
+    p = _write(tmp_path, text)
+    with pytest.raises(NoBarsConfigError):
+        load_no_bars(p)
+    r = evaluate_history(conn, dataset=DS, pairs=("USDJPY",), now=NOW, holdout_months=1,
+                         grace=GRACE, no_bars_path=p)
+    assert r.verdict == HISTORY_UNAVAILABLE
+
+
+def test_an_explicit_empty_entries_list_is_a_valid_empty_list(tmp_path):
+    assert load_no_bars(_write(tmp_path, "entries: []\n")).entries == ()
+
+
+@pytest.mark.parametrize("text", [
+    "entries: []\nentries: []\n",                                         # トップレベル
+    ENTRY.replace("date_utc: 2026-11-04", "date_utc: 2026-11-04\n    date_utc: 2026-11-05"),
+    ENTRY.replace("reason: broker closed", "reason: a\n    reason: b"),
+    "entries:\n  - {source: mt5, source: mt5}\n",
+])
+def test_duplicate_yaml_keys_are_rejected_and_unavailable(tmp_path, text):
+    conn = _conn(tmp_path)
+    _fill_db(conn)
+    p = _write(tmp_path, text)
+    with pytest.raises(NoBarsConfigError):
+        load_no_bars(p)
+    r = evaluate_history(conn, dataset=DS, pairs=("USDJPY",), now=NOW, holdout_months=1,
+                         grace=GRACE, no_bars_path=p)
+    assert r.verdict == HISTORY_UNAVAILABLE
+
+
 def test_unreadable_list_is_unavailable_not_empty(tmp_path):
     conn = _conn(tmp_path)
     _fill_db(conn)
@@ -508,7 +566,7 @@ def test_evidence_has_the_agreed_shape_and_is_json_serializable(tmp_path):
     conn = _conn(tmp_path)
     _fill_db(conn)
     nb = load_no_bars(_write(tmp_path, ENTRY))
-    ev = _check(conn, no_bars=nb).to_evidence()
+    ev = _check(conn, no_bars=nb).to_operator_evidence()
     assert json.loads(json.dumps(ev)) == ev
     assert ev["version"] == hh.GUARD_VERSION
     assert ev["verdict"] == "ready"
@@ -525,6 +583,24 @@ def test_evidence_has_the_agreed_shape_and_is_json_serializable(tmp_path):
     assert ev["threshold_snapshot"] == {
         "stale_open_hours": 24, "min_fill_ratio": "99/100", "max_day_missing_minutes": 60}
     assert ev["no_bars_digest"] == nb.digest
+
+
+def test_operator_evidence_keeps_the_applied_no_bars_days_with_reason_and_approver(tmp_path):
+    conn = _conn(tmp_path)
+    _fill_db(conn, skip=lambda t: t.date() == date(2026, 11, 4))
+    nb = load_no_bars(_write(tmp_path, ENTRY))
+    ev = _check(conn, no_bars=nb).to_operator_evidence()
+    assert ev["verdict"] == "ready"
+    assert ev["no_bars_applied"] == [{
+        "source": "mt5", "base_interval": "5m", "symbol": "USDJPY", "date_utc": "2026-11-04",
+        "reason": "broker closed", "approved_by": "operator",
+        "approved_at": "2026-11-10T01:02:03+00:00"}]
+    assert json.loads(json.dumps(ev)) == ev
+
+
+def test_the_evidence_is_only_offered_under_an_operator_name():
+    assert not hasattr(hh.HistoryHealth, "to_evidence")
+    assert hh.HistoryHealth.to_operator_evidence.__doc__ and "agent" in hh.HistoryHealth.to_operator_evidence.__doc__
 
 
 def test_thresholds_are_fixed_constants():
