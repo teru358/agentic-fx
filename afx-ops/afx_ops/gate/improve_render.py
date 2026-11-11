@@ -453,7 +453,10 @@ COMPARISON_REASON_LABELS = {
     "gate_timeout": "比較が時間内に終わらなかった",
     "baseline_unhealthy": "配備中の版の状態が不良",
 }
-_NO_FLOOR_REASONS = frozenset({"not_improved", "same_name_contract_changed"})
+_NO_FLOOR_REASONS = frozenset({"not_improved", "same_name_contract_changed",
+                              "history_not_ready"})
+HISTORY_NOT_READY_LINE = ("履歴条件を満たさないため提出しませんでした。`afx status` で確認し、"
+                          "履歴補充後に候補を人間submitしてください")
 
 # 削る段 (本文が上限を超えたとき、小さい番号から順に落とす)。
 LEVEL_HANDOFF = 1
@@ -625,6 +628,7 @@ def _lead_lines(snapshot: dict, detail: dict) -> list[str]:
         ("observation", "demoted_recovered"): [_DEMOTED_LINE],
         ("gate_failed", "not_improved"): ["配備中の版を上回らなかったため見送ります"],
         ("gate_failed", "same_name_contract_changed"): ["意味が変わる変更は新しい名前で提出する"],
+        ("gate_failed", "history_not_ready"): [HISTORY_NOT_READY_LINE],
     }.get(key, [])
 
 
@@ -671,6 +675,8 @@ def _body_lines(snapshot: dict, detail: dict) -> list[str]:
         return ["配備中の版を上回らなかったため見送ります"]
     if key == ("gate_failed", "same_name_contract_changed"):
         return ["意味が変わる変更は新しい名前で提出する"]
+    if key == ("gate_failed", "history_not_ready"):
+        return [HISTORY_NOT_READY_LINE]
     return []
 
 

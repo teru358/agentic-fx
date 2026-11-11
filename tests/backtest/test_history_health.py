@@ -17,6 +17,8 @@ from agentic_fx.backtest.history_health import (
 from agentic_fx.core.market_hours import is_market_open
 from tests.backtest.factories import _conn
 
+pytestmark = pytest.mark.real_history_guard
+
 UTC = timezone.utc
 W = timedelta(minutes=5)
 GRACE = timedelta(seconds=30)

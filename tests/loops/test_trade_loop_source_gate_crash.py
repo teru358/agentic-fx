@@ -43,7 +43,9 @@ def _generations(world):
     second = world.version("strat", "s2", kind="strategy")
     world.deploy("strat", first, None, 1)
     world.deploy("strat", second, first, 2)
+    world.record_history_evidence()
     return first, second
+
 
 
 def _run_disable(world):

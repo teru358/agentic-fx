@@ -34,7 +34,7 @@ from typing import Callable
 from agentic_fx.core import improve_repeat as ir
 from agentic_fx.loops.econ_signal_report import (ABANDON_REASONS, KNOWN_MISSION_TERMINALS,
                                                   OTHER_KIND)
-from agentic_fx.plugin import base_identity
+from agentic_fx.plugin import base_identity, history_reasons
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 from agentic_fx.store import signal_decisions as _sig_dec
 from agentic_fx.store import signal_shadow as _sig_shadow
@@ -2130,7 +2130,8 @@ class OpsService:
                         require_plugin_kind=True, expected_payload_sha256=digest)
                     result = {"approval_id": approval_id, "outcome": outcome.outcome,
                               "status": outcome.status}
-                    if outcome.reason in ("reevaluation_stale", base_identity.BASE_CHANGED):
+                    if (outcome.reason in ("reevaluation_stale", base_identity.BASE_CHANGED)
+                            or outcome.reason in history_reasons.REASONS):
                         result["reason"] = outcome.reason
             except switch.PluginBusyError:
                 raise OpsError(ErrorCode.UNAVAILABLE if self.stop_event.is_set()
@@ -2146,7 +2147,9 @@ class OpsService:
             job.detail = outcome
             if outcome is not None and outcome.outcome == "already_decided":
                 raise _DecisionOutcome(ErrorCode.ALREADY_DECIDED, result, outcome)
-            if outcome is not None and outcome.outcome not in _DEPLOYED:
+            if (outcome is not None and outcome.outcome not in _DEPLOYED
+                    and not (outcome.outcome == history_reasons.OUTCOME
+                             and outcome.status == "invalidated")):
                 raise _DecisionOutcome(ErrorCode.INVALID_STATE, result, outcome)
             try:
                 plugin_kind = _approval_plugin_kind(self._decide_conn, approval_id)

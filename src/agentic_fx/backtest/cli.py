@@ -223,6 +223,12 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
                                  help="外す版の承認を取り消す")
     rollback_parser.add_argument("--force", action="store_true",
                                  help="依存 strategy を止めてでも続行する")
+    rollback_parser.add_argument(
+        "--force-history-guard", action="store_true",
+        help="履歴証跡の拒否だけを人間の判断で迂回する (--to に完全長 hash と --reason が必須。"
+             "実行は監査記録に残る)")
+    rollback_parser.add_argument("--reason", default=None, metavar="TEXT",
+                                 help="--force-history-guard の理由 (人間が記入する)")
     rollback_parser.add_argument("--dry-run", action="store_true")
     rollback_parser.add_argument("--yes", action="store_true", help="確認を省略する")
     revoke_parser = plugin_sub.add_parser("revoke", **_surface_parser_kw("plugin revoke", leaf=True))

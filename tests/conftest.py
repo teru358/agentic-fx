@@ -461,3 +461,62 @@ def pytest_sessionfinish(session, exitstatus):
         print(f"  {nodeid}")
     if exitstatus == 0:
         session.exitstatus = 1
+
+
+# ---- 履歴検査の ready 差し替え -------------------------------------------------
+#
+# 既存の合成 fixture は直近 3 か月の履歴を持たないので、共有 gate の履歴検査は
+# 本物のままでは全件止まる。次の対象パスのテストでは、検査関数
+# (`history_health.evaluate_history`) だけを、本物と同じ結果型を返す関数に差し替える。
+# 差し替えの所有者はこの fixture だけ。テストごとの失敗注入は `history_guard_fake`
+# の `verdict` で行い、同じ属性を重ねて monkeypatch しない。
+# `@pytest.mark.real_history_guard` を付けたテストは本物の検査を通る。
+
+_HISTORY_GUARD_FAKE_DIRS = (
+    "tests/plugin/", "tests/loops/", "tests/backtest/", "tests/e2e/", "tests/ops/",
+    "tests/integration/", "tests/service/", "tests/setup/", "tests/core/", "tests/store/",
+    "tests/fixtures/",
+)
+
+
+class HistoryGuardFake:
+    """差し替えた検査の応答設定と呼出し記録。"""
+
+    def __init__(self):
+        from agentic_fx.backtest import history_health as hh
+        self.verdict = hh.HISTORY_READY
+        self.calls: list[dict] = []
+        self.error: Exception | None = None
+
+
+def _make_ready_health(fake, conn, *, dataset, pairs, now, holdout_months, grace,
+                       no_bars_path):
+    from tests.history_support import ready_health
+    fake.calls.append({"dataset": dataset, "pairs": list(pairs), "now": now,
+                       "holdout_months": holdout_months, "grace": grace,
+                       "no_bars_path": no_bars_path})
+    if fake.error is not None:
+        raise fake.error
+    return ready_health(dataset=dataset, pairs=pairs, now=now, holdout_months=holdout_months,
+                        no_bars_path=no_bars_path, verdict=fake.verdict)
+
+
+@pytest.fixture(autouse=True)
+def history_guard_fake(request, monkeypatch):
+    if request.node.get_closest_marker("real_history_guard") is not None:
+        yield None
+        return
+    path = Path(str(request.node.path)).resolve().as_posix()
+    root = Path(__file__).resolve().parents[1].as_posix() + "/"
+    rel = path[len(root):] if path.startswith(root) else path
+    if not rel.startswith(_HISTORY_GUARD_FAKE_DIRS):
+        yield None
+        return
+    from agentic_fx.backtest import history_health as hh
+    fake = HistoryGuardFake()
+
+    def fake_evaluate(conn, **kwargs):
+        return _make_ready_health(fake, conn, **kwargs)
+
+    monkeypatch.setattr(hh, "evaluate_history", fake_evaluate)
+    yield fake

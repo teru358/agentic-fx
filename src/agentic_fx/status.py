@@ -10,9 +10,11 @@ import stat
 import subprocess
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from agentic_fx import status_history
 from agentic_fx.config import load_settings_text
 from agentic_fx.core.contracts import SystemClock
 from agentic_fx.core.display_time import convert_or_raw, display_header
@@ -179,6 +181,7 @@ class StatusData:
     display_timezone: str = "UTC"
     warnings: tuple[str, ...] = ()
     econ: tuple[str, ...] = ()
+    evaluation_history: tuple[str, ...] = ()
 
 
 def _settings(root: Path) -> tuple[str, Any | None]:
@@ -337,7 +340,8 @@ def _pending(root: Path, instance: str, settings: Any | None,
 
 
 def collect_status(root: Path, *, run: Callable[..., Any] = subprocess.run,
-                   unit_path: Path | None = None, instance: str | None = None) -> StatusData:
+                   unit_path: Path | None = None, instance: str | None = None,
+                   now: datetime | None = None) -> StatusData:
     """Collect independent local observations for a non-locked instance."""
     instance = probe_instance_lock(root) if instance is None else instance
     try:
@@ -380,6 +384,8 @@ def collect_status(root: Path, *, run: Callable[..., Any] = subprocess.run,
             db, db_bad = ("unavailable",) * 4, True
         steps, pending_bad = _pending(root, instance, settings_value, conn)
         econ = _econ(conn, tz)
+        history = status_history.collect(
+            root, settings_value, conn, tz, SystemClock().now() if now is None else now)
     finally:
         if conn is not None:
             conn.close()
@@ -388,7 +394,7 @@ def collect_status(root: Path, *, run: Callable[..., Any] = subprocess.run,
     return StatusData(instance, setup_state, settings_state, unit, ops, state, *db,
                       activity, steps, any((setup_bad, unit_bad, ops_bad, state_bad, db_bad,
                                             activity_bad, pending_bad)),
-                      tz, tuple(warnings), econ)
+                      tz, tuple(warnings), econ, history)
 
 
 def render_status(data: StatusData, *, root: Path | None = None) -> str:
@@ -406,6 +412,7 @@ def render_status(data: StatusData, *, root: Path | None = None) -> str:
     lines.extend(f"  - {step}" for step in data.steps or ())
     lines.extend(f"warning: {note}" for note in data.warnings)
     lines.extend(data.econ)
+    lines.extend(data.evaluation_history)
     lines.append(_NOTE)
     if data.setup in {"missing", "corrupt"}:
         next_step = "afx init"

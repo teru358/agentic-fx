@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -66,6 +67,20 @@ class ActivityLog:
                     self._on_write_failure(e)
                 except Exception:  # noqa: BLE001 — write remains non-throwing
                     _log.exception("activity write failure callback failed")
+
+    def write_required(self, category: Category | str, event: str, summary: str,
+                       ref_id: str | None = None) -> None:
+        """監査記録用の追記。`write` と違い、書けなければ例外を送出する。
+
+        書けなかった記録を前提に次の操作へ進まないための入口で、追記後に fsync する。
+        """
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        clean = " ".join(summary.split())
+        line = "\t".join([ts, Category(category).value, event, clean, ref_id or "-"])
+        with self._path.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
     def contains(self, event: str, ref_id: str) -> bool:
         """Whether a line with this event and ref_id is already in the log.

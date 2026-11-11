@@ -8,10 +8,11 @@ import logging
 import math
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
-from agentic_fx.backtest import holdout
+from agentic_fx.backtest import history_evidence, history_health, holdout
 from agentic_fx.backtest.dataset import HISTORY_SOURCE_UNCONFIGURED_REASON
 from agentic_fx.backtest.metrics import EVALUABLE_MIN_TRADES
 from agentic_fx.plugin import strategy_adapter
@@ -66,7 +67,9 @@ class StrategyGateVerdict:  # 新規命名 (元 _StrategyGateVerdict — 独立
     # 文字列ではなくこの値で分岐する。
     unevaluable_kind: Literal["insufficient_trades",
                               "history_source_unconfigured",
-                              "reference_history_missing"] = "insufficient_trades"
+                              "reference_history_missing",
+                              "history_stale", "history_gap",
+                              "history_check_unavailable"] = "insufficient_trades"
     # 配備中の同名版との比較 (`compare_mode` が shadow / enforce で、配備中の
     # 版があり、候補が床を通ったときだけ非 None)。`comparison` は承認
     # payload の `comparison` にそのまま載せる JSON 安全な dict。
@@ -84,6 +87,14 @@ class StrategyGateVerdict:  # 新規命名 (元 _StrategyGateVerdict — 独立
     # ときだけ入り、gate は `record_fn` へ流さない。永続化は呼び出し側が
     # 候補の行と同じ終端 tx で行う。
     baseline_rows: tuple[dict, ...] = ()
+    # 履歴検査が ready だったときの証跡 (人間専用、承認 payload の
+    # `history_guard`)。検査に到達しない・不合格なら None。
+    history_guard: dict | None = None
+
+
+# 履歴検査の不合格を表す判別子 (agent には固定の `not_submitted` だけを返す)。
+HISTORY_UNEVALUABLE_KINDS = (history_health.HISTORY_STALE, history_health.HISTORY_GAP,
+                             history_health.HISTORY_UNAVAILABLE)
 
 
 @dataclass(frozen=True)
@@ -399,6 +410,7 @@ def evaluate_strategy_adoption_gate(
     compare_mode: Literal["off", "shadow", "enforce"] = "off",
     baseline_replay_wall_clock_max_sec: float = 300.0,
     clock: Callable[[], float] = time.monotonic,
+    history_health_fn=None, no_bars_path: "Path | None" = None,
 ) -> "StrategyGateVerdict | None":
     """candidate/baseline/no_strategy の identity と評価可能性。
     indicator/signal はこのゲートを課さない (None を返す)。
@@ -629,6 +641,16 @@ def evaluate_strategy_adoption_gate(
             floor_detail=in_sample_floor_detail, candidate_metrics=per_pair,
             cpu_samples=tuple(cpu_samples))
 
+    # 評価用履歴の鮮度と充足は、in-sample の床の後・holdout の前に 1 回だけ検査する。
+    # 不合格なら候補・baseline の holdout は回さない (`floor_mode=warn` でも迂回不可)。
+    history_guard, history_failure = _check_history(
+        history_conn, dataset=dataset, pairs=pairs, now=now, settings=settings,
+        fn=history_health_fn, no_bars_path=no_bars_path)
+    if history_failure is not None:
+        return StrategyGateVerdict(
+            evaluable=False, observation_reason=history_failure,
+            unevaluable_kind=history_failure, cpu_samples=tuple(cpu_samples))
+
     holdout_per_pair: dict = {}
     for pair in pairs:
         intent_source = strategy_adapter.build_intent_source(
@@ -685,7 +707,7 @@ def evaluate_strategy_adoption_gate(
             not_improved=bool(
                 comparison and comparison["verdict"] == "not_improved"),
             baseline_failure_code=failure_code,
-            baseline_rows=tuple(replay_rows))
+            baseline_rows=tuple(replay_rows), history_guard=history_guard)
 
     for row in in_sample_rows:
         no_strategy_row = dict(row)
@@ -708,7 +730,33 @@ def evaluate_strategy_adoption_gate(
         evaluable=True, baseline_variant="no_strategy",
         baseline_row=baseline_row, candidate_metrics=per_pair,
         floor_reason=floor_reason, floor_detail=floor_detail,
-        holdout_metrics=holdout_per_pair, cpu_samples=tuple(cpu_samples))
+        holdout_metrics=holdout_per_pair, cpu_samples=tuple(cpu_samples),
+        history_guard=history_guard)
+
+
+def _check_history(history_conn, *, dataset, pairs, now: datetime, settings, fn,
+                   no_bars_path) -> "tuple[dict | None, str | None]":
+    """履歴検査の結果。ready なら (証跡, None)、不合格・検査不能なら (None, 固定語)。
+
+    `fn` が None のときは、呼出しの時点で `history_health.evaluate_history` を
+    引く (関数を束縛しない)。検査が例外を投げても通さず、検査不能として止める。"""
+    check = fn if fn is not None else history_health.evaluate_history
+    path = no_bars_path if no_bars_path is not None else history_evidence.no_bars_path()
+    try:
+        health = check(
+            history_conn, dataset=dataset, pairs=list(pairs), now=now,
+            holdout_months=settings.backtest.holdout_months,
+            grace=timedelta(seconds=settings.datafeed.closed_bar_grace_sec),
+            no_bars_path=path)
+        if health.ready:
+            return history_evidence.build_evidence(health), None
+        verdict = health.verdict
+    except Exception:  # noqa: BLE001 - an unreadable check must stop, never pass
+        _log.warning("history check failed", exc_info=True)
+        return None, history_health.HISTORY_UNAVAILABLE
+    if verdict in HISTORY_UNEVALUABLE_KINDS:
+        return None, verdict
+    return None, history_health.HISTORY_UNAVAILABLE
 
 
 def _compare_with_deployed(

@@ -98,6 +98,18 @@ class World:
         self.link(name, version)
         return aid
 
+    def record_history_evidence(self) -> None:
+        """全ての承認の payload に、本物の検証を通る履歴証跡を持たせる。strategy の
+        rollback は、戻り先自身の承認に有効な証跡を要する。"""
+        import json
+        from tests.history_support import ready_evidence
+        for row in self.conn.execute("SELECT id, payload_json FROM approval_requests").fetchall():
+            payload = json.loads(row["payload_json"])
+            payload["history_guard"] = ready_evidence()
+            self.conn.execute("UPDATE approval_requests SET payload_json=? WHERE id=?",
+                              (json.dumps(payload), row["id"]))
+        self.conn.commit()
+
     def three_generations(self, name: str = "sma"):
         a, b, c = (self.version(name, tag) for tag in ("a", "b", "c"))
         self.deploy(name, a, None, 1)
