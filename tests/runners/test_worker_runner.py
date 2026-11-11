@@ -28,6 +28,7 @@ from agentic_fx.runners import worker_runner as wr_mod
 from agentic_fx.runners.worker_runner import WorkerRunner
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.rag import Rag
+from tests._wait import wait_readable
 from datetime import datetime, timezone
 
 SETTINGS = load_settings(
@@ -3991,7 +3992,7 @@ def test_go_frame_is_written_as_real_frame_only_after_on_ready_returns(
     (`{"type": "go", "seq": <int>}`) として子へ書く。
 
     `on_ready` を意図的に `_ON_READY_DELAY_SEC` だけ遅延させ (`mark_running`
-    commit の I/O を模す)、子は `ready` 送出直後から `select.select` で
+    commit の I/O を模す)、子は `ready` 送出直後から `wait_readable` (poll) で
     **ノンブロッキングに** 短い間隔でポーリングする — `on_ready` の遅延窓の
     **内側**で `go` が読めてしまったら、それは `on_ready` 完了を待たずに
     書かれた証拠になる (子スレッドのスケジューリング遅延に依存する素朴な
@@ -4002,26 +4003,28 @@ def test_go_frame_is_written_as_real_frame_only_after_on_ready_returns(
     r, w = os.pipe()
     r2, w2 = os.pipe()
     observed: dict[str, object] = {"seen_within_delay": False}
+    child_errors: list[BaseException] = []
 
     def child_thread_fn():
-        import select
         child_in = os.fdopen(r2, "rb")
         child_out = os.fdopen(w, "wb")
-        json.loads(child_in.readline())  # handshake (seq=1)
-        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
-        deadline = time.monotonic() + _ON_READY_DELAY_SEC - 0.05
-        while time.monotonic() < deadline:
-            ready_fds, _, _ = select.select(
-                [child_in], [], [], max(0.0, deadline - time.monotonic()))
-            if ready_fds:
-                observed["seen_within_delay"] = True
-                break
-        line = child_in.readline()
-        go_frame = json.loads(line)
-        observed["go_frame"] = go_frame
-        write_frame(child_out, {"type": "result", "seq": 2,
-                                "status": "completed", "output": {}})
-        child_out.close()
+        try:
+            json.loads(child_in.readline())  # handshake (seq=1)
+            write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+            deadline = time.monotonic() + _ON_READY_DELAY_SEC - 0.05
+            while time.monotonic() < deadline:
+                if wait_readable(child_in, max(0.0, deadline - time.monotonic())):
+                    observed["seen_within_delay"] = True
+                    break
+            line = child_in.readline()
+            go_frame = json.loads(line)
+            observed["go_frame"] = go_frame
+            write_frame(child_out, {"type": "result", "seq": 2,
+                                    "status": "completed", "output": {}})
+        except BaseException as exc:
+            child_errors.append(exc)
+        finally:
+            child_out.close()
 
     t = threading.Thread(target=child_thread_fn, daemon=True)
     fake_proc = _fake_improve_proc(r, w, w2, r2)
@@ -4041,6 +4044,7 @@ def test_go_frame_is_written_as_real_frame_only_after_on_ready_returns(
     result = runner.run(_mission())
     t.join(timeout=2.0)
 
+    assert not child_errors, f"子スレッドが例外で死んだ: {child_errors[0]!r}"
     assert result.status == "completed"
     assert observed["seen_within_delay"] is False, (
         "on_ready の遅延窓の内側で go フレームが読めてしまった — "
@@ -4066,27 +4070,31 @@ def test_go_frame_is_sent_for_improve_profile_even_when_on_ready_is_none(
     # `profile == "improve"` → `on_ready is not None` の変異下で `go` が
     # 一度も送られず 300 秒超のハング (フルスイート全体の driver timeout
     # を焼く) になる — 検出はできる (緑にならない) が pin の形として
-    # 不良。`go` を待つ前にバックストップ `select.select` タイムアウトを
+    # 不良。`go` を待つ前にバックストップの poll タイムアウトを
     # 張り、タイムアウトしたら `received["frame"] = None` を入れて
     # `result` フレームを書いて抜けることで、変異下でも必ず**有限時間で
     # red** に倒す。
     _BACKSTOP_SEC = 3.0
 
+    child_errors: list[BaseException] = []
+
     def child_thread_fn():
-        import select
         child_in = os.fdopen(r2, "rb")
         child_out = os.fdopen(w, "wb")
-        json.loads(child_in.readline())  # handshake (seq=1)
-        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
-        ready_fds, _, _ = select.select([child_in], [], [], _BACKSTOP_SEC)
-        if ready_fds:
-            line = child_in.readline()
-            received["frame"] = json.loads(line)
-        else:
-            received["frame"] = None  # backstop: go は届かなかった
-        write_frame(child_out, {"type": "result", "seq": 2,
-                                "status": "completed", "output": {}})
-        child_out.close()
+        try:
+            json.loads(child_in.readline())  # handshake (seq=1)
+            write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+            if wait_readable(child_in, _BACKSTOP_SEC):
+                line = child_in.readline()
+                received["frame"] = json.loads(line)
+            else:
+                received["frame"] = None  # backstop: go は届かなかった
+            write_frame(child_out, {"type": "result", "seq": 2,
+                                    "status": "completed", "output": {}})
+        except BaseException as exc:
+            child_errors.append(exc)
+        finally:
+            child_out.close()
 
     t = threading.Thread(target=child_thread_fn, daemon=True)
     fake_proc = _fake_improve_proc(r, w, w2, r2)
@@ -4103,6 +4111,7 @@ def test_go_frame_is_sent_for_improve_profile_even_when_on_ready_is_none(
     result = runner.run(_mission())
     t.join(timeout=_BACKSTOP_SEC + 2.0)
 
+    assert not child_errors, f"子スレッドが例外で死んだ: {child_errors[0]!r}"
     assert result.status == "completed"
     assert (received.get("frame") or {}).get("type") == "go", (
         "on_ready=None でも improve profile なら go フレームが送られる"
@@ -4130,23 +4139,26 @@ def test_improve_ready_ok_false_does_not_call_on_ready_or_send_go(
     r2, w2 = os.pipe()
     received: dict = {}
     _BACKSTOP_SEC = 3.0
+    child_errors: list[BaseException] = []
 
     def child_thread_fn():
-        import select
         child_in = os.fdopen(r2, "rb")
         child_out = os.fdopen(w, "wb")
-        json.loads(child_in.readline())  # handshake (seq=1)
-        write_frame(child_out, {"type": "ready", "seq": 1, "ok": False,
-                                "error": "bootstrap failed", "reason": "bin_not_found"})
-        # go フレームが (誤って) 送られてこないか、有限時間だけ確認する
-        # (D29 是正と同じ規律: 変異下でも無限待ちにしない)。
-        ready_fds, _, _ = select.select([child_in], [], [], _BACKSTOP_SEC)
-        if ready_fds:
-            line = child_in.readline()
-            received["frame"] = json.loads(line) if line else None
-        else:
-            received["frame"] = None
-        child_out.close()
+        try:
+            json.loads(child_in.readline())  # handshake (seq=1)
+            write_frame(child_out, {"type": "ready", "seq": 1, "ok": False,
+                                    "error": "bootstrap failed", "reason": "bin_not_found"})
+            # go フレームが (誤って) 送られてこないか、有限時間だけ確認する
+            # (変異下でも無限待ちにしない)。
+            if wait_readable(child_in, _BACKSTOP_SEC):
+                line = child_in.readline()
+                received["frame"] = json.loads(line) if line else None
+            else:
+                received["frame"] = None
+        except BaseException as exc:
+            child_errors.append(exc)
+        finally:
+            child_out.close()
 
     t = threading.Thread(target=child_thread_fn, daemon=True)
     fake_proc = _fake_improve_proc(r, w, w2, r2)
@@ -4167,6 +4179,7 @@ def test_improve_ready_ok_false_does_not_call_on_ready_or_send_go(
     result = runner.run(_mission())
     t.join(timeout=_BACKSTOP_SEC + 2.0)
 
+    assert not child_errors, f"子スレッドが例外で死んだ: {child_errors[0]!r}"
     assert result.status == "failed"
     assert result.reason == "runner.claude.bin が見つかりません (bin_not_found)"
     assert on_ready_calls == [], (

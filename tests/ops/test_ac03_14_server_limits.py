@@ -23,6 +23,7 @@ import pytest
 from agentic_fx.ops import api_server, keys
 from agentic_fx.ops.api_server import ApiLimits, ApiServer, ApiStartError
 from agentic_fx.ops.contracts import Principal
+from tests._wait import wait_readable
 
 from ._api import _declare_empty_body, make_api
 
@@ -225,9 +226,7 @@ def _slowloris(api, results: list, index: int) -> None:
 
 
 def _poll(sock: socket.socket, timeout: float) -> bool:
-    import select
-    readable, _, _ = select.select([sock], [], [], timeout)
-    return bool(readable)
+    return wait_readable(sock, timeout)
 
 
 def test_ac14_slowloris_gets_408_within_5_5_seconds(api):

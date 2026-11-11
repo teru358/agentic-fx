@@ -16,6 +16,7 @@ from contextlib import contextmanager
 import pytest
 
 from agentic_fx.egress import upstream as up
+from tests._wait import wait_writable
 
 LO = "127.0.0.1"
 
@@ -61,7 +62,7 @@ def blackhole():
         probe.setblocking(False)
         probe.connect_ex(bl.getsockname())
         fillers.append(probe)
-        _, w, _ = select.select([], [probe], [], 0.5)
+        w = wait_writable(probe, 0.5)
         full = not w or probe.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) != 0
         if not full:
             pytest.skip("受付 queue を埋められない環境")

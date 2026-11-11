@@ -307,9 +307,8 @@ def test_tx0_crash_between_mission_insert_and_run_insert_leaves_no_orphan(
 def _sample_ctx_data():
     return {
         "performance_report": {
-            # precheck 2026-08-22 wave2: T10-M2 — improve_context.py:62 の
-            # 実shape は [30, 90] (複数窓)。単一 int ではない
-            "window_days": [30, 90], "win_rate": 0.5, "profit_factor": 1.2,
+            # 実 shape は集計日数の整数 (90)
+            "window_days": 90, "win_rate": 0.5, "profit_factor": 1.2,
             "by_pair": {"USDJPY": 0.4}, "by_hour": {"9": 0.3},
             "reject_breakdown": {"spread": 2}, "hold_rate": 0.1},
         "improvement_history": {
@@ -379,6 +378,23 @@ def test_render_improve_mission_prompt_fills_all_placeholders(tmp_path):
     # F7-5: 規律に「宣言全 pair を最低 1 回 backtest」が含まれる。
     assert "宣言した全 pair を" in text
     assert "最低 1 回 `run_backtest`" in text
+
+
+def test_render_improve_mission_prompt_states_the_real_ninety_day_window(tmp_path):
+    """実際の集計は 90 日窓だけなので、描画される集計期間も「直近 90 日」の 1 つだけ。"""
+    from agentic_fx.loops.improve_context import build_improve_context
+    from agentic_fx.loops.improve_loop import ImproveLoop
+
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    data = build_improve_context(conn, settings=SETTINGS,
+                                 now=datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc),
+                                 root=tmp_path, allowed_backlog_ids=None)
+    loop = ImproveLoop.__new__(ImproveLoop)
+    loop._settings = SETTINGS
+    ctx = _FakeRunContext(tmp_path / "staging", tmp_path / "source")
+    text = loop._render_improve_mission_prompt(data, ctx=ctx)
+    assert "- 集計期間: 直近 90 日\n" in text
 
 
 def test_render_improve_mission_prompt_states_sandbox_conversion_allowlist(tmp_path):
