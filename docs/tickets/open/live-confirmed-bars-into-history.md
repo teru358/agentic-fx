@@ -1,17 +1,18 @@
 ---
 id: live-confirmed-bars-into-history
-title: ライブで集めた確定足を履歴に積めず二重保存になる
-status: 設計待ち
-priority: 低
+title: backtest の履歴が自動で更新されず、評価が古い入力で通る
+status: 実装中
+priority: 高
 opened: 2026-09-21
 closed: null
 related: []
 backfilled: true
 source_section: 完了ログ
+kind: 不具合
 ---
 # [live-confirmed-bars-into-history]
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 実装中 / **優先**: 高 / **種別**: 不具合
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -21,3 +22,4 @@ source_section: 完了ログ
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-02: 状態: 設計待ち、優先: 低、題名: ライブで集めた確定足を履歴に積めず二重保存になる — 仕分け (2026-10-02、現物で成立を確認): prune_cache の GC 範囲やデータ版の扱いが設計項目。 根拠: ライブ確定足を履歴に積む実装・commit が無い。
+- 2026-11-11: 状態: 実装中、優先: 高、種別: 不具合、題名: backtest の履歴が自動で更新されず、評価が古い入力で通る — 2026-11-11: 評価用履歴 (mt5 5m) が USDJPY 09-04・参照 10-30 で止まり、holdout の充足率が 11-08 に 0.22 まで落ちたまま承認が通っていた。手で 11-10 まで取込み (参照 4 銘柄は 11-04〜11-09 が端末に無い)。sol・fable の実装案を突合し、段 1a (import の実時刻の境界・評価前検査・gate の既定拒否・承認の証跡照合・status・配備中 4 版の再評価) を設計 docs/superpowers/specs/2026-11-11-backtest-history-freshness-guard-design.md (C1) で承認。利用者裁定: 主 pair 不足は採用判定と承認だけ止める / 参照の穴は見せる / 同期は既定有効 / 09-04 以降承認の 15 件すべて再評価 / 非配備 7 版への rollback は監査まで拒否。
