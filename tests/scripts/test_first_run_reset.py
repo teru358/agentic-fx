@@ -4,13 +4,14 @@ import hashlib
 import errno
 import os
 import pty
-import select
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from tests._wait import wait_readable
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 
@@ -29,7 +30,7 @@ def _run_tty(command: list[str], *, cwd: Path, env: dict[str, str], input_text: 
     output = bytearray()
     try:
         while process.poll() is None:
-            ready, _, _ = select.select([master], [], [], 0.1)
+            ready = wait_readable(master, 0.1)
             if ready:
                 try:
                     output.extend(os.read(master, 4096))
@@ -38,7 +39,7 @@ def _run_tty(command: list[str], *, cwd: Path, env: dict[str, str], input_text: 
                         break
                     raise
         while True:
-            ready, _, _ = select.select([master], [], [], 0)
+            ready = wait_readable(master, 0)
             if not ready:
                 break
             try:

@@ -11,7 +11,6 @@ import io
 import os
 import pty
 import resource
-import select
 import signal
 import subprocess
 import sys
@@ -23,6 +22,8 @@ import pytest
 
 from agentic_fx.ops import client
 from agentic_fx.store.instance_lock import acquire_instance_lock
+
+from tests._wait import wait_readable
 
 from ._api import make_api
 
@@ -98,7 +99,7 @@ def run_pty(root: Path, argv: list[str], steps: list[tuple[str, str]], *,
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise AssertionError(f"pty timeout; output so far:\n{output.decode(errors='replace')}")
-            ready, _, _ = select.select([master], [], [], min(0.2, remaining))
+            ready = wait_readable(master, min(0.2, remaining))
             if not ready:
                 continue
             try:

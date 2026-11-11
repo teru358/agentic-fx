@@ -9,7 +9,6 @@ import ctypes
 import dataclasses
 import json
 import os
-import select
 import signal
 import struct
 import subprocess
@@ -20,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from agentic_fx.core import cli_launch as L
+from tests._wait import wait_readable
 from agentic_fx.core import cli_launch_protocol as P
 from tests.core import test_cli_launch as base
 from tests.core.test_cli_launch import PY, _wrapped_launcher
@@ -74,7 +74,7 @@ class Lines:
                 out.append(json.loads(line))
             if len(out) >= want:
                 break
-            if select.select([self.fd], [], [], 0.1)[0]:
+            if wait_readable(self.fd, 0.1):
                 data = os.read(self.fd, 4096)
                 if not data:
                     break
