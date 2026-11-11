@@ -18,7 +18,7 @@ import json
 import os
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from agentic_fx._safe_error import safe_error_text
@@ -31,7 +31,8 @@ from agentic_fx.backtest.holdout import (
 from agentic_fx.backtest.importer import import_dukascopy
 from agentic_fx.backtest.metrics import compute_metrics
 from agentic_fx.backtest.mt5_import import (
-    ImportConflictError, ImportTooLargeError, _is_grid_aligned, compare_sources, import_mt5)
+    ImportConflictError, ImportTooLargeError, _is_grid_aligned, compare_sources,
+    effective_import_end, import_mt5)
 from agentic_fx.backtest import plugin_deploy_cli
 from agentic_fx.backtest import time_repair
 from agentic_fx.backtest.runner import run_replay
@@ -73,10 +74,22 @@ def _surface_parser_kw(command: str, *, leaf: bool = False) -> dict:
 def _parse_date(v: str) -> datetime:
     """``YYYY-MM-DD`` (時刻付き ISO も可) を aware UTC に変換する。
 
-    時刻付き ISO でも tzinfo は無視し (naive として解釈)、UTC を付与する
-    (上書き節 B 逐語)。
+    日付のみ・時差なしの ISO 日時は UTC として解釈する。``Z`` / ``+00:00`` は
+    aware UTC として受ける。それ以外の時差は黙って捨てず、UTC での指定を
+    案内して拒否する。
     """
-    return datetime.fromisoformat(v).replace(tzinfo=timezone.utc)
+    parsed = datetime.fromisoformat(v)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    if parsed.utcoffset() != timedelta(0):
+        raise argparse.ArgumentTypeError(
+            f"{v!r} は UTC 以外の時差付きです。UTC (例: 2026-11-04T00:00 または "
+            "2026-11-04T00:00Z) で指定してください")
+    return parsed.astimezone(timezone.utc)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def register_subparsers(sub: "argparse._SubParsersAction") -> None:
@@ -281,9 +294,20 @@ def _history_import(conn, settings, args: argparse.Namespace) -> int:
         if bridge_url is None:
             print("datafeed.mt5.bridge_url が未設定です", file=sys.stderr)
             return 1
+        grace = timedelta(seconds=settings.datafeed.closed_bar_grace_sec)
+        now = _utc_now()
+        effective_end = effective_import_end(
+            args.to, now, grace=grace, interval=args.interval)
+        print(f"要求終端={args.to.isoformat()} 実効終端={effective_end.isoformat()} "
+              f"(確定済みの直近 1 本分は時計差の余裕として取り込みません)")
+        if args.from_ >= effective_end:
+            print("確定済みの取り込み対象なし (何も取得・書込みしていません)")
+            print("inserted=0 unchanged=0 conflicted=0")
+            return 0
         try:
             result = import_mt5(conn, args.symbol, args.from_, args.to,
-                                base_url=bridge_url, interval=args.interval)
+                                base_url=bridge_url, interval=args.interval,
+                                clock=lambda: now, grace=grace)
         except ImportConflictError as exc:
             # codex 2 周目 Minor: stderr だけを保存した運用記録でも conflict 行を
             # 一意に特定できるよう、主キー全フィールドを出す (CP3b の復旧資料)。

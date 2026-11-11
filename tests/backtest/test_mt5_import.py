@@ -45,11 +45,11 @@ def test_import_mt5_pages_daily_and_imports(tmp_path):
 
 
 def test_importer_window_filter_matches_shared_closed_normalizer(tmp_path):
-    """naive bridge time を UTC 化した後は live と同じ [start,end) 判定を使う。"""
+    """bridge time を UTC 化した後は live と同じ [start,end) 判定を使う。"""
     conn = _conn(tmp_path)
     start = H
     end = H + timedelta(minutes=3)
-    raw = [_bar(start, time=start.replace(tzinfo=None).isoformat()),
+    raw = [_bar(start),
            _bar(start + timedelta(minutes=1)),
            _bar(start + timedelta(minutes=2)), _bar(end)]
     result = import_mt5(conn, "USDJPY", start, end, base_url="http://x",
@@ -64,10 +64,12 @@ def test_importer_window_filter_matches_shared_closed_normalizer(tmp_path):
     assert [bar.ts for bar in got] == [bar.ts for bar in expected]
 
 
-def test_importer_uses_normalized_boundary_rows_including_naive_time(monkeypatch):
+def test_importer_uses_normalized_boundary_rows_with_the_fixed_clock(monkeypatch):
     start = H
     end = H + timedelta(minutes=2)
-    naive_closed = _bar(start, time=start.replace(tzinfo=None).isoformat())
+    now = H + timedelta(days=1)
+    grace = timedelta(seconds=45)
+    closed = _bar(start)
     forming_before_cutoff = _bar(start + timedelta(minutes=1))
     inclusive_right_edge = _bar(end)
     received = []
@@ -76,16 +78,17 @@ def test_importer_uses_normalized_boundary_rows_including_naive_time(monkeypatch
         received.append((raw, kwargs))
         assert kwargs["start"] == start
         assert kwargs["end"] == end
-        assert kwargs["cutoff"] == end
+        assert kwargs["cutoff"] == now
+        assert kwargs["grace"] == grace
         return [raw[0]]
 
     monkeypatch.setattr(mt5_import, "normalize_closed_range", normalized_only_closed)
-    rows, naive_count, right_edge_count = mt5_import._validated_window_rows(
-        _payload(naive_closed, forming_before_cutoff, inclusive_right_edge),
-        symbol="USDJPY", interval="1m", current=start, window_end=end)
+    rows, right_edge_count = mt5_import._validated_window_rows(
+        _payload(closed, forming_before_cutoff, inclusive_right_edge),
+        symbol="USDJPY", interval="1m", current=start, window_end=end,
+        now=now, grace=grace)
 
     assert [bar.ts for bar in received[0][0]] == [start, start + timedelta(minutes=1)]
-    assert naive_count == 1
     assert right_edge_count == 1
     assert [row[2] for row in rows] == [start.isoformat()]
 
@@ -255,25 +258,19 @@ def test_import_mt5_right_edge_bar_is_picked_up_by_the_next_window(tmp_path):
     assert [b.ts for b in bars] == [H, boundary]
 
 
-def test_import_mt5_logs_naive_and_right_edge_counts_once(tmp_path, caplog):
+def test_import_mt5_logs_right_edge_count_once(tmp_path, caplog):
     conn = _conn(tmp_path)
     window_end = H + timedelta(minutes=1)
-    naive_time = H.replace(tzinfo=None).isoformat()
 
     with caplog.at_level("DEBUG", logger="agentic_fx.backtest.mt5_import"):
         result = import_mt5(
             conn, "USDJPY", H, window_end, base_url="http://x",
-            fetch=lambda _url: _payload(
-                _bar(time=naive_time), _bar(window_end)))
+            fetch=lambda _url: _payload(_bar(), _bar(window_end)))
 
     assert result.inserted == 1
-    warnings = [record for record in caplog.records
-                if record.levelname == "WARNING" and "naive" in record.message]
     right_edge_debugs = [
         record for record in caplog.records
         if record.levelname == "DEBUG" and "right-edge" in record.message]
-    assert len(warnings) == 1
-    assert "1/1 bar(s)" in warnings[0].message
     assert len(right_edge_debugs) == 1
     assert "dropped 1 right-edge bar(s)" in right_edge_debugs[0].message
 
@@ -804,15 +801,15 @@ def test_import_mt5_second_window_conflict_exposes_committed_partial_result(
         inserted=1, unchanged=0, conflicted=1)
 
 
-def test_import_mt5_normalizes_naive_bar_time_for_join(tmp_path):
-    """上書き §3: bridge が naive time を返しても Dukascopy 行と JOIN できる
-    こと (正規化を怠ると compare_sources が 0 件の無音故障になる)。"""
+def test_import_mt5_normalizes_aware_non_utc_bar_time_for_join(tmp_path):
+    """bridge が UTC 以外の aware time を返しても Dukascopy 行と JOIN できること
+    (正規化を怠ると compare_sources が 0 件の無音故障になる)。"""
     conn = _conn(tmp_path)
-    naive_time = H.replace(tzinfo=None).isoformat()
+    jst_time = H.astimezone(timezone(timedelta(hours=9))).isoformat()
 
     def fetch(url):
         return {"symbol": "USDJPY", "interval": "1m", "bars": [
-            {"time": naive_time, "open": 148.0, "high": 148.2,
+            {"time": jst_time, "open": 148.0, "high": 148.2,
              "low": 147.9, "close": 148.10, "volume": 10}]}
 
     import_mt5(conn, "USDJPY", H, H + timedelta(days=1),

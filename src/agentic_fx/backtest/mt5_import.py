@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import math
 from datetime import datetime, timedelta, timezone
+from typing import Callable
 from urllib.parse import quote
 
 import httpx
@@ -66,6 +67,11 @@ def _default_fetch(url: str) -> dict:
 
 
 _INTERVAL_SECONDS = {"1m": 60, "5m": 300, "15m": 900}
+# ローカル・bridge・MT5 の時計差に対し、grace とは別に確定足 1 本分の余裕を取る。
+# 無制限な時計差への保証ではない。
+CLOCK_MARGIN_BARS = 1
+DEFAULT_GRACE = timedelta(seconds=30)
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _BAR_FIELDS = ("time", "open", "high", "low", "close", "volume")
 
 
@@ -74,38 +80,51 @@ def _is_grid_aligned(dt: datetime, width_sec: int) -> bool:
             % timedelta(seconds=width_sec) == timedelta(0))
 
 
+def _floor_grid(dt: datetime, width: timedelta) -> datetime:
+    return _EPOCH + ((dt - _EPOCH) // width) * width
+
+
+def effective_import_end(requested_end: datetime, now: datetime, *,
+                         grace: timedelta, interval: str) -> datetime:
+    """取り込みの排他的な実効終端 ``min(要求終端, floor_grid(now - grace - 余裕))``。
+
+    ``now`` は呼び出し側が一度だけ読んだ aware 時刻。確定済みでも余裕の
+    1 本は保存しない。
+    """
+    if interval not in _INTERVAL_SECONDS:
+        raise ValueError(
+            f"interval must be one of {sorted(_INTERVAL_SECONDS)}; got {interval!r}")
+    width = timedelta(seconds=_INTERVAL_SECONDS[interval])
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware; got naive datetime")
+    now = now.astimezone(timezone.utc)
+    margin = width * CLOCK_MARGIN_BARS
+    return min(requested_end, _floor_grid(now - grace - margin, width))
+
+
 def _window_url(base_url: str, symbol: str, start: datetime, end: datetime,
                 interval: str = "1m") -> str:
     return (f"{base_url}/ohlcv/{symbol}?from={quote(start.isoformat())}"
             f"&to={quote(end.isoformat())}&interval={interval}")
 
 
-def _normalize_bar_time(raw: str) -> tuple[str, bool]:
-    """bridge の "time" は naive ISO の可能性がある。naive なら UTC とみなし
-    (実測仕様。§ 上書き 3)、aware isoformat 文字列に正規化する。
+def _normalize_bar_time(raw: str) -> str:
+    """bridge の "time" を UTC の aware isoformat 文字列に正規化する。
 
-    これを怠ると bar_time の文字列表現が Dukascopy 行 ("+00:00" 付き) と
-    食い違い、compare_sources の bar_time JOIN が 0 件になる無音故障を
-    起こす。
-
-    Returns:
-        (正規化済み isoformat 文字列, naive だったか)。呼び出し側 (import_mt5)
-        は naive 件数を集計し 1 回だけ warning を出す (F2, fix round 1)。
-        同じ bridge の時刻系統が実際に破損した実績があり、将来 bridge が
-        naive 応答を返し始めたときに無音で UTC 仮定され続けるのを防ぐ。
+    naive な時刻は UTC かどうか判断できないので拒否する (bridge は aware UTC
+    を返す)。時刻の表現が行ごとに食い違うと、他 source の行との
+    bar_time JOIN が 0 件になる無音故障を起こす。
     """
     dt = datetime.fromisoformat(raw)
-    was_naive = dt.tzinfo is None
-    if was_naive:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
-    return dt.isoformat(), was_naive
+    if dt.tzinfo is None:
+        raise ValueError("naive time (timezone required)")
+    return dt.astimezone(timezone.utc).isoformat()
 
 
 def _validated_window_rows(payload, *, symbol: str, interval: str,
-                           current: datetime, window_end: datetime
-                           ) -> tuple[list[tuple], int, int]:
+                           current: datetime, window_end: datetime,
+                           now: datetime, grace: timedelta
+                           ) -> tuple[list[tuple], int]:
     """Validate a complete bridge response before returning import rows."""
     if not isinstance(payload, dict):
         raise ValueError("import_mt5: payload must be a dict")
@@ -131,7 +150,6 @@ def _validated_window_rows(payload, *, symbol: str, interval: str,
             f"{capacity} for interval={interval}")
 
     normalized = []
-    naive_count = 0
     for idx, bar in enumerate(payload["bars"]):
         if not isinstance(bar, dict):
             raise ValueError(f"import_mt5: bars[{idx}] must be a dict")
@@ -146,12 +164,11 @@ def _validated_window_rows(payload, *, symbol: str, interval: str,
                 raise ValueError(
                     f"import_mt5: bars[{idx}] {field} must be a finite number")
         try:
-            bar_time_iso, was_naive = _normalize_bar_time(bar["time"])
+            bar_time_iso = _normalize_bar_time(bar["time"])
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                f"import_mt5: bars[{idx}] time is not parseable: "
-                f"{bar['time']!r}") from exc
-        naive_count += int(was_naive)
+                f"import_mt5: bars[{idx}] time is not parseable or is naive "
+                f"(aware time required): {bar['time']!r}") from exc
 
         o, h, low, close, volume = (
             bar["open"], bar["high"], bar["low"], bar["close"],
@@ -200,16 +217,18 @@ def _validated_window_rows(payload, *, symbol: str, interval: str,
             [Bar(symbol, interval, bar_dt, o, h, low, close, volume)
              for _bar, bar_dt, _iso, o, h, low, close, volume in remaining],
             interval=interval, start=current, end=window_end,
-            cutoff=window_end, grace=timedelta(0))
+            cutoff=now, grace=grace)
     }
     rows = [(symbol, interval, bar_time_iso, o, h, low, close, volume, None)
             for _bar, bar_dt, bar_time_iso, o, h, low, close, volume in remaining
             if bar_dt in closed_times]
-    return rows, naive_count, right_edge_count
+    return rows, right_edge_count
 
 
 def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
-               base_url: str, fetch=None, interval: str = "1m") -> ImportResult:
+               base_url: str, fetch=None, interval: str = "1m",
+               clock: Callable[[], datetime] | None = None,
+               grace: timedelta = DEFAULT_GRACE) -> ImportResult:
     """MT5 bridge から 1 分足を 1 日窓でページングして取り込む。
 
     Args:
@@ -220,13 +239,21 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
         base_url: bridge のベース URL
         fetch: Optional fetch function (url: str) -> dict。既定は
             `_default_fetch` (httpx + raise_for_status)。
+        clock: 現在時刻 (aware) を返す関数。処理の最初に 1 回だけ読み、全窓の
+            確定判定と実効終端に同じ値を使う。既定は実時計。
+        grace: 確定判定の猶予。ライブの closed_bar_grace_sec と同じ値を渡す。
+
+    終端: 保存するのは ``start <= t < E`` かつ ``t + 幅 + grace <= T`` の足だけ。
+    ``E = effective_import_end(end, T, ...)`` なので、未来の ``end`` は切り詰められ、
+    確定済みでも直近 1 本分は余裕として保存しない。``start >= E`` なら
+    HTTP 取得も書込みもせず ImportResult(0, 0, 0) を返す。
 
     Returns:
         ImportResult (inserted/unchanged/conflicted 合算)。
 
     Raises:
-        ValueError: start/end が naive、または UTC 以外の場合 (正時境界は
-            不問 — Task 4 の hour boundary 要件はここには適用しない)。
+        ValueError: start/end が naive、または UTC 以外の場合。bridge 応答の
+            time が naive の場合も拒否する。
             または bridge が返したバーの time が要求窓の外にある場合
             (F5, 最終レビュー codex I2 — fail loud)。**窓終端ちょうどは
             例外にせず黙って落とす** — bridge の `to` は inclusive で
@@ -251,6 +278,16 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
 
     if fetch is None:
         fetch = _default_fetch
+    now = (clock or (lambda: datetime.now(timezone.utc)))()
+    if now.tzinfo is None:
+        raise ValueError("clock must return a timezone-aware datetime")
+    now = now.astimezone(timezone.utc)
+    end = effective_import_end(end, now, grace=grace,
+                               interval=interval)
+    if start >= end:
+        _log.info("import_mt5: no confirmed bars to import for symbol=%s "
+                  "(effective end %s)", symbol, end.isoformat())
+        return ImportResult(0, 0, 0)
 
     # 窓ごとの行数は窓の格子数を超えられない (検証済み) ので、期間の格子数で保持行数の上限が決まる。
     slots = int((end - start).total_seconds()) // width_sec
@@ -261,7 +298,6 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
     total_inserted = 0
     total_unchanged = 0
     total_conflicted = 0
-    naive_count = 0
     right_edge_drops = 0
 
     # 全窓を先に取得して検証し、メモリに溜める (HTTP を待つ間は DB の書き込み
@@ -276,15 +312,14 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
         url = _window_url(base_url, symbol, current, window_end, interval)
         payload = fetch(url)
         try:
-            rows, window_naive, window_right_edges = _validated_window_rows(
+            rows, window_right_edges = _validated_window_rows(
                 payload, symbol=symbol, interval=interval, current=current,
-                window_end=window_end)
+                window_end=window_end, now=now, grace=grace)
         except ValueError as exc:
             raise ValueError(
                 f"import_mt5: failed window [{current.isoformat()}, "
                 f"{window_end.isoformat()}): {exc}. 何も書き込んでいません。"
                 f"開始 {start.isoformat()} から取り直してください") from exc
-        naive_count += window_naive
         right_edge_drops += window_right_edges
         if rows:
             pending.append(rows)
@@ -323,17 +358,6 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
             "import_mt5: dropped %d right-edge bar(s) at window_end for "
             "symbol=%s (bridge returns \"to\" inclusive; picked up by the "
             "next window)", right_edge_drops, symbol)
-
-    if naive_count > 0:
-        # F2 (fix round 1, sonnet): 同じ bridge の時刻系統が実際に破損した
-        # 直後であり、将来 bridge が naive 応答を返し始めたときに無音で UTC
-        # 仮定され続けるのを防ぐ。毎バーではうるさいので import_mt5 呼び出し
-        # 単位で 1 回だけ warning する。
-        _log.warning(
-            "import_mt5: %d/%d bar(s) had naive \"time\" (assumed UTC) for "
-            "symbol=%s — bridge may be returning tz-less timestamps",
-            naive_count, total_inserted + total_unchanged + total_conflicted,
-            symbol)
 
     return ImportResult(total_inserted, total_unchanged, total_conflicted)
 
