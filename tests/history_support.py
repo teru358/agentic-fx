@@ -51,3 +51,54 @@ def ready_evidence(*, source: str = "dukascopy", base_interval: str = "1m", pair
     health = ready_health(dataset=HistoryDataset(source, base_interval), pairs=pairs, now=now,
                           holdout_months=holdout_months, no_bars_path=no_bars_path)
     return ev.build_evidence(health)
+
+
+# ---- 実 sqlite に評価用履歴を入れる (本物の検査を通す入口 test 用) -------------------
+
+def _floor5(t: datetime) -> datetime:
+    return t.replace(minute=t.minute - t.minute % 5, second=0, microsecond=0)
+
+
+def hole_day(now: datetime) -> tuple[datetime, datetime]:
+    """評価区間の中ほどにある平日の 03:00-06:00 UTC (開場中、5m で 36 本 > 60 分)。"""
+    day = (now - timedelta(days=12)).replace(hour=0, minute=0, second=0, microsecond=0)
+    while day.weekday() >= 5:
+        day -= timedelta(days=1)
+    return day + timedelta(hours=3), day + timedelta(hours=6)
+
+
+def fill_history(conn, *, source: str, pairs, now: datetime, scenario: str = "normal",
+                 interval: str = "5m") -> None:
+    """``now`` の時点で ``scenario`` の形になる履歴を pair ごとに入れる。
+
+    normal = 直近の確定足まで揃う / stale = 最終足が 72 時間前 / gap = 直近まで揃うが
+    1 日に 60 分を超える欠損がある。足は FX 暦の開場中だけ。"""
+    from agentic_fx.core.market_hours import is_market_open
+    step = timedelta(minutes=int(interval[:-1]))
+    last = _floor5(now) if scenario != "stale" else _floor5(now - timedelta(hours=72))
+    hole = hole_day(now) if scenario == "gap" else None
+    rows = []
+    for symbol in pairs:
+        t = _floor5(now - timedelta(days=45))
+        while t < last:
+            if is_market_open(t) and not (hole and hole[0] <= t < hole[1]):
+                rows.append((symbol, interval, t.isoformat(), 148.0, 148.2, 147.9, 148.1,
+                             1.0, source))
+            t += step
+    conn.executemany(
+        "INSERT OR IGNORE INTO ohlcv_history (symbol, interval, bar_time, open, high, low, "
+        "close, volume, source, spread) VALUES (?,?,?,?,?,?,?,?,?,NULL)", rows)
+    conn.commit()
+
+
+def write_no_bars(root: Path, *, source: str, symbol: str, day, interval: str = "5m") -> Path:
+    """root 基準の無足日一覧 (config/history-no-bars.yaml) に 1 日を書く。"""
+    path = ev.no_bars_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "entries:\n"
+        f"  - source: {source}\n    base_interval: {interval}\n    symbol: {symbol}\n"
+        f"    date_utc: \"{day.isoformat()}\"\n    reason: \"test closure\"\n"
+        "    approved_by: tester\n    approved_at: \"2026-01-01T00:00:00+00:00\"\n",
+        encoding="utf-8")
+    return path
