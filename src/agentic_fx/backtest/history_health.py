@@ -106,7 +106,7 @@ class NoBarsEntry:
                 "approved_at": self.approved_at.astimezone(timezone.utc).isoformat()}
 
 
-def _no_bars_digest(entries: Iterable[NoBarsEntry]) -> str:
+def no_bars_digest(entries: Iterable[NoBarsEntry]) -> str:
     rows = sorted((e.as_dict() for e in entries),
                   key=lambda d: (d["source"], d["base_interval"], d["symbol"], d["date_utc"]))
     blob = json.dumps(rows, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
@@ -123,7 +123,7 @@ class NoBarsList:
                          if (e.source, e.base_interval, e.symbol) == (source, base_interval, symbol))
 
 
-EMPTY_NO_BARS = NoBarsList((), _no_bars_digest(()))
+EMPTY_NO_BARS = NoBarsList((), no_bars_digest(()))
 
 class _UniqueKeyLoader(yaml.SafeLoader):
     """重複する mapping キーを黙って上書きせず拒否する。"""
@@ -220,7 +220,7 @@ def load_no_bars(path: Path) -> NoBarsList:
     keys = [(e.source, e.base_interval, e.symbol, e.date_utc) for e in entries]
     if len(set(keys)) != len(keys):
         raise NoBarsConfigError("the no-bars list has a duplicated series/day")
-    return NoBarsList(tuple(entries), _no_bars_digest(entries))
+    return NoBarsList(tuple(entries), no_bars_digest(entries))
 
 
 # ---- 純関数 -------------------------------------------------------------------
@@ -231,18 +231,27 @@ def _aware_utc(value: datetime, name: str) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def expected_grid(window_start: datetime, window_end: datetime, *, width: timedelta,
-                  now: datetime, grace: timedelta, is_open: IsOpen = is_market_open,
-                  excluded_dates: frozenset[date] = frozenset()) -> list[datetime]:
+def open_grid(window_start: datetime, window_end: datetime, *, width: timedelta,
+              now: datetime, grace: timedelta,
+              is_open: IsOpen = is_market_open) -> list[datetime]:
     """``[window_start, window_end)`` の基底足格子のうち、実時刻で確定済み・FX 暦で
-    開場・無足日の対象外である足の開始時刻。"""
+    開場である足の開始時刻。pair には依らないので、検査 1 回につき 1 回だけ作る。"""
     out: list[datetime] = []
     t = window_start
     while t < window_end:
-        if (t + width + grace <= now and t.date() not in excluded_dates and is_open(t)):
+        if t + width + grace <= now and is_open(t):
             out.append(t)
         t += width
     return out
+
+
+def expected_grid(window_start: datetime, window_end: datetime, *, width: timedelta,
+                  now: datetime, grace: timedelta, is_open: IsOpen = is_market_open,
+                  excluded_dates: frozenset[date] = frozenset()) -> list[datetime]:
+    """``open_grid`` から無足日の対象外の足を除いた、期待される足の開始時刻。"""
+    grid = open_grid(window_start, window_end, width=width, now=now, grace=grace,
+                     is_open=is_open)
+    return [t for t in grid if t.date() not in excluded_dates]
 
 
 def open_duration(start: datetime, end: datetime, *, is_open: IsOpen = is_market_open,
@@ -287,10 +296,16 @@ def assess_pair(symbol: str, *, window_start: datetime, window_end: datetime,
                 now: datetime, width: timedelta, grace: timedelta,
                 present_times: Iterable[datetime], latest_confirmed: datetime | None,
                 latest_stored: datetime | None = None, is_open: IsOpen = is_market_open,
-                excluded_dates: frozenset[date] = frozenset()) -> PairHealth:
-    """1 pair の判定。入力は読取済みの値だけで、DB も時計も触らない。"""
-    expected = expected_grid(window_start, window_end, width=width, now=now, grace=grace,
-                             is_open=is_open, excluded_dates=excluded_dates)
+                excluded_dates: frozenset[date] = frozenset(),
+                grid: list[datetime] | None = None) -> PairHealth:
+    """1 pair の判定。入力は読取済みの値だけで、DB も時計も触らない。
+
+    ``grid`` は ``open_grid`` の結果。渡されれば開場の判定を繰り返さず、この pair の
+    無足日だけを引く。"""
+    if grid is None:
+        grid = open_grid(window_start, window_end, width=width, now=now, grace=grace,
+                         is_open=is_open)
+    expected = [t for t in grid if t.date() not in excluded_dates]
     if not expected:
         return PairHealth(symbol, (HISTORY_UNAVAILABLE,), latest_stored, latest_confirmed,
                           None, None, 0, 0, None, (), None, "no expected bars in the window")
@@ -424,9 +439,10 @@ def _read_series(conn: sqlite3.Connection, dataset: HistoryDataset, symbol: str,
     stored = None
     if row is not None and row[0] is not None:
         try:
-            stored = datetime.fromisoformat(row[0]).astimezone(timezone.utc)
+            parsed = datetime.fromisoformat(row[0])
         except ValueError:
-            stored = None
+            parsed = None
+        stored = parsed.astimezone(timezone.utc) if parsed is not None and parsed.tzinfo else None
     latest = None
     cutoff = (now - grace - width).isoformat()
     for (raw,) in conn.execute(
@@ -489,15 +505,23 @@ def check_history(conn: sqlite3.Connection, *, dataset: HistoryDataset,
 
     results: list[PairHealth] = []
     applied: list[NoBarsEntry] = []
+    grid: list[datetime] | Exception
+    try:
+        grid = open_grid(window_start, window_end, width=dataset.width, now=now,
+                         grace=grace, is_open=is_open)
+    except (CalendarUnavailable,) + _FILE_ERRORS as exc:
+        grid = exc
     for pair in pair_list:
         present, latest, stored = series[pair]
         excluded = no_bars.dates_for(dataset.source, dataset.base_interval, pair)
         try:
+            if isinstance(grid, Exception):
+                raise grid
             results.append(assess_pair(
                 pair, window_start=window_start, window_end=window_end, now=now,
                 width=dataset.width, grace=grace, present_times=present,
                 latest_confirmed=latest, latest_stored=stored, is_open=is_open,
-                excluded_dates=excluded))
+                excluded_dates=excluded, grid=grid))
         except (CalendarUnavailable,) + _FILE_ERRORS as exc:
             results.append(_unavailable_pair(pair, type(exc).__name__))
         applied += [e for e in no_bars.entries

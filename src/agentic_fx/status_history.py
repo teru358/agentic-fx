@@ -146,7 +146,9 @@ def collect(root: Path, settings: Any, conn: sqlite3.Connection | None, tz: str,
             lines.append(f"  pair {pair.symbol}: " + ",".join(
                 "unavailable" if r == hh.HISTORY_UNAVAILABLE else r
                 for r in pair.reasons or (hh.HISTORY_READY,)))
-            lines.append(f"    latest stored {_shown(pair.latest_stored, tz)}; latest confirmed "
+            stored = "unavailable" if pair.latest_stored is None else _shown(
+                pair.latest_stored, tz)
+            lines.append(f"    latest stored {stored}; latest confirmed "
                          f"{_shown(pair.latest_confirmed, tz)}; wall gap {_hours(pair.wall_gap)}; "
                          f"open-time gap {_hours(pair.open_gap)}")
             if pair.fill is not None:

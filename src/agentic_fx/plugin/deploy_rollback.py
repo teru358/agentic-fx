@@ -27,10 +27,10 @@ from agentic_fx.store import signals as signals_store
 from agentic_fx.tools import plugin_loader as tools_plugin_loader
 
 _HASH_PREFIX_RE = re.compile(r"^[0-9a-f]{1,64}$")
-_DIR_NAME_RE = re.compile(r"^[0-9a-f]{64}$")
+DIR_NAME_RE = re.compile(r"^[0-9a-f]{64}$")
 
 HISTORY_REFUSAL_CODE = history_reasons.OUTCOME
-FORCE_AUDIT_EVENT = "rollback_history_guard_forced"
+FORCE_AUDIT_EVENT = "rollback_history_guard_force_started"
 FORCE_AUDIT_OP_EVENT = "rollback_history_guard_forced_op"
 
 
@@ -55,7 +55,7 @@ class HistoryGuardOverride:
     reason: str
 
     def problem(self, target_hash: str, requested_to: str | None) -> str | None:
-        if requested_to is None or not _DIR_NAME_RE.fullmatch(self.target_hash):
+        if requested_to is None or not DIR_NAME_RE.fullmatch(self.target_hash):
             return "--force-history-guard needs --to with the full 64-character artifact hash"
         if self.target_hash != requested_to or requested_to != target_hash:
             return "--force-history-guard --to does not name the rollback target"
@@ -135,7 +135,7 @@ def _resolve_prefix(plugins_root: Path, name: str, prefix: str) -> RollbackTarge
     matches: list[str] = []
     if base.is_dir():
         matches = sorted(entry.name for entry in base.iterdir()
-                         if _DIR_NAME_RE.fullmatch(entry.name) and entry.name.startswith(prefix))
+                         if DIR_NAME_RE.fullmatch(entry.name) and entry.name.startswith(prefix))
     if not matches:
         return RollbackRefusal("target_not_found", f"no version of {name!r} matches {prefix!r}")
     if len(matches) > 1:
@@ -249,7 +249,7 @@ def verify_rollback_target(conn: sqlite3.Connection, plugins_root: Path, name: s
     from agentic_fx.plugin import switch
 
     version_dir = plugins_root / ".versions" / name / target_hash
-    if not _DIR_NAME_RE.fullmatch(target_hash) or version_dir.is_symlink() or not version_dir.is_dir():
+    if not DIR_NAME_RE.fullmatch(target_hash) or version_dir.is_symlink() or not version_dir.is_dir():
         return VerificationFailure(
             (f"target version directory .versions/{name}/{target_hash} does not exist",))
     content = _approved_content_hash(conn, name, target_hash)
@@ -306,24 +306,11 @@ def history_evidence_refusal(conn: sqlite3.Connection, plugins_root: Path, name:
         if (not isinstance(payload, dict) or payload.get("content_hash") != target.content_hash
                 or payload.get("history_epoch", "none") != history_epoch(conn)):
             return refusal
-        check = history_evidence.verify_evidence(
-            payload.get("history_guard"), eval_source=payload.get("eval_source"),
-            base_interval=payload.get("base_interval"), pairs=_payload_pairs(payload),
-            no_bars_path=history_evidence.no_bars_path(plugins_root.parent))
+        check = history_evidence.verify_payload(
+            payload, no_bars_path=history_evidence.no_bars_path(plugins_root.parent))
     except Exception:  # noqa: BLE001 - an unreadable evidence refuses
         return refusal
     return None if check.ok else refusal
-
-
-def _payload_pairs(payload: dict) -> list[str] | None:
-    pairs = payload.get("pairs")
-    if isinstance(pairs, list) and all(isinstance(p, str) for p in pairs):
-        return pairs
-    for key in ("metrics", "in_sample"):
-        value = payload.get(key)
-        if isinstance(value, dict) and value and all(isinstance(v, dict) for v in value.values()):
-            return list(value)
-    return None
 
 
 def dependents_with_target(conn: sqlite3.Connection, plugins_root: Path, name: str,
@@ -627,10 +614,15 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
                     "target_artifact_hash": verified.artifact_hash,
                     "approval_id": approved["id"] if approved else None, "force": force,
                 }, revoke=deploy_ops.RevokeSpec(name, live.content_hash) if revoke else None,
-                cascade_identities=identities, now=now, actor=actor)
-        if forced:
+                cascade_identities=identities, now=now, actor=actor,
+                after_insert=(lambda new_id: deploy_store.mark_history_forced(conn, new_id))
+                if forced else None)
+        if forced or deploy_store.is_history_forced(conn, op_id):
+            required = getattr(activity, "write_required", None)
             try:
-                activity.write_required(
+                if required is None:
+                    raise OSError("the activity log is unavailable")
+                required(
                     Category.APPROVAL, FORCE_AUDIT_OP_EVENT,
                     f"name={name} target={verified.artifact_hash} op_id={op_id}")
             except Exception:  # noqa: BLE001 - the op stays open; a rerun finishes it

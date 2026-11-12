@@ -184,3 +184,13 @@ def test_status_survives_a_missing_database(tmp_path):
     data = status.collect_status(tmp_path, run=make_run(), instance="free", now=NOW)
     assert data.evaluation_history[0].startswith("evaluation history: unavailable")
     assert "instance: free" in status.render_status(data, root=tmp_path)
+
+
+def test_a_stored_bar_without_a_timezone_makes_latest_stored_unavailable(world):
+    _fill(world[1], "USDJPY")
+    world[1].execute(
+        "INSERT INTO ohlcv_history (symbol, interval, bar_time, open, high, low, close, "
+        "volume, source, spread) VALUES ('USDJPY','5m','2026-11-10T09:00:00',1,1,1,1,1,'mt5',NULL)")
+    world[1].commit()
+    text = _block(world)
+    assert "latest stored unavailable; latest confirmed 2026-11-10 14:55:00 +09:00" in text

@@ -149,6 +149,19 @@ def link_signals(conn: sqlite3.Connection, op_id: int,
         conn.commit()
 
 
+def mark_history_forced(conn: sqlite3.Connection, op_id: int) -> None:
+    """Mark an op as started by a history-guard override (the caller commits)."""
+    conn.execute(
+        "INSERT OR IGNORE INTO plugin_deploy_op_history_forced (op_id) VALUES (?)",
+        (op_id,))
+
+
+def is_history_forced(conn: sqlite3.Connection, op_id: int) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM plugin_deploy_op_history_forced WHERE op_id=?",
+        (op_id,)).fetchone() is not None
+
+
 def linked_signal_ids(conn: sqlite3.Connection, op_id: int) -> set[int]:
     return {row[0] for row in conn.execute(
         "SELECT signal_id FROM plugin_deploy_op_signals WHERE op_id=?", (op_id,))}

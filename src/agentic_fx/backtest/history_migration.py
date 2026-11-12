@@ -221,10 +221,7 @@ def verify_against_db(manifest: dict, conn: sqlite3.Connection, *, no_bars_path:
                 new.get("candidate_origin")) != (entry["name"], entry["artifact_hash"],
                                                  entry["content_hash"], "reevaluation"):
             out.append(f"{label}: the new approval is not this version's re-evaluation")
-        check = history_evidence.verify_evidence(
-            new.get("history_guard"), eval_source=new.get("eval_source"),
-            base_interval=new.get("base_interval"), pairs=new.get("pairs"),
-            no_bars_path=no_bars_path)
+        check = history_evidence.verify_payload(new, no_bars_path=no_bars_path)
         if not check.ok:
             out.append(f"{label}: the new approval has no valid history evidence")
         decided = {"approved": "approved", "rejected": "rejected"}.get(entry["human_decision"])

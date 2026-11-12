@@ -609,3 +609,37 @@ def test_thresholds_are_fixed_constants():
     assert hh.STALE_OPEN_HOURS == 24
     assert hh.MIN_FILL_RATIO == Fraction(99, 100)
     assert hh.MAX_DAY_MISSING == timedelta(minutes=60)
+
+
+def test_a_stored_bar_without_a_timezone_is_not_read_as_local_time(tmp_path):
+    conn = _conn(tmp_path)
+    _fill_db(conn)
+    conn.execute(
+        "INSERT INTO ohlcv_history (symbol, interval, bar_time, open, high, low, close, "
+        "volume, source, spread) VALUES ('USDJPY','5m','2026-11-10T09:00:00',1,1,1,1,1,'mt5',NULL)")
+    conn.commit()
+    p = _check(conn).pairs[0]
+    assert p.latest_stored is None
+    assert p.latest_confirmed == datetime(2026, 11, 10, 5, 55, tzinfo=UTC)
+
+
+def test_the_open_calendar_is_computed_once_per_check_whatever_the_pair_count(tmp_path):
+    conn = _conn(tmp_path)
+    for pair in ("USDJPY", "EURUSD", "GBPUSD"):
+        _fill_db(conn, pair)
+    calls = []
+
+    def counting(t):
+        calls.append(t)
+        return is_market_open(t)
+
+    one = _check(conn, pairs=("USDJPY",))
+    kw = dict(dataset=DS, pairs=("USDJPY",), now=NOW, holdout_months=1, grace=GRACE,
+              is_open=counting)
+    check_history(conn, **kw)
+    single = len(calls)
+    calls.clear()
+    kw["pairs"] = ("USDJPY", "EURUSD", "GBPUSD")
+    three = check_history(conn, **kw)
+    assert len(calls) < single * 1.5               # pair 数に比例して増えない
+    assert three.pairs[0].market_expected == one.pairs[0].market_expected

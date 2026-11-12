@@ -228,3 +228,21 @@ def test_the_no_bars_path_is_root_based_not_cwd_based(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert ev.no_bars_path(tmp_path / "r") == tmp_path / "r" / "config" / "history-no-bars.yaml"
     assert ev.no_bars_path().is_absolute() and ev.no_bars_path().name == "history-no-bars.yaml"
+
+
+def test_payload_pairs_prefers_pairs_and_falls_back_to_metrics_then_in_sample():
+    assert ev.payload_pairs({"pairs": ["A"], "metrics": {"B": {}}}) == ["A"]
+    assert ev.payload_pairs({"metrics": {"B": {"pf": 1}}}) == ["B"]
+    assert ev.payload_pairs({"metrics": {}, "in_sample": {"C": {}}}) == ["C"]
+    assert ev.payload_pairs({"metrics": {"B": 1}}) is None
+    assert ev.payload_pairs({"pairs": [1]}) is None
+
+
+def test_every_payload_check_infers_pairs_the_same_way(world):
+    conn, path = world
+    evidence = _evidence(conn, path)
+    ok = {"history_guard": evidence, "eval_source": "mt5", "base_interval": "5m",
+          "metrics": {"USDJPY": {}}}
+    assert ev.verify_payload(ok, no_bars_path=path).ok
+    other = {**ok, "metrics": {"EURUSD": {}}}
+    assert ev.verify_payload(other, no_bars_path=path).status == ev.CHECK_INVALID

@@ -185,7 +185,7 @@ def test_a_forced_rollback_goes_past_the_history_refusal_and_is_audited(world):
     assert outcome.outcome == "rolled_back"
     assert _live(world) == f".versions/sma/{a.name}"
     lines = _log_lines(world)
-    first = next(line for line in lines if "\trollback_history_guard_forced\t" in line)
+    first = next(line for line in lines if "\trollback_history_guard_force_started\t" in line)
     assert f"target={a.name}" in first and "actor=human_cli" in first
     assert "reason=broker 休場を確認" in first and "at=" in first
     op = next(line for line in lines if "\trollback_history_guard_forced_op\t" in line)
@@ -244,7 +244,7 @@ def test_a_forced_rollback_keeps_every_other_check(world):
 def test_a_forced_run_without_a_refusal_to_bypass_is_audited_not_at_all(world):
     a, b = _strategies(world)                                 # 証跡あり: 強行は不要
     assert _forced(world, a).outcome == "rolled_back"
-    assert not any("history_guard_forced" in line for line in _log_lines(world))
+    assert not any("history_guard_force" in line for line in _log_lines(world))
 
 
 def test_a_forced_rollback_leaves_no_evidence_and_the_next_plain_one_is_refused_again(world):
@@ -252,3 +252,60 @@ def test_a_forced_rollback_leaves_no_evidence_and_the_next_plain_one_is_refused_
     assert _forced(world, a).outcome == "rolled_back"
     world.link("sma", b)
     assert _rollback(world, to=a.name).refusal_code == history_reasons.OUTCOME
+
+
+class _FlakyAudit:
+    """write_required が n 回目 (1 起点) に失敗する監査ログ。"""
+
+    def __init__(self, inner, fail_on):
+        self.inner, self.fail_on, self.calls = inner, fail_on, 0
+
+    def write_required(self, *args, **kwargs):
+        self.calls += 1
+        if self.calls == self.fail_on:
+            raise OSError("audit unavailable")
+        return self.inner.write_required(*args, **kwargs)
+
+    def write(self, *args, **kwargs):
+        return self.inner.write(*args, **kwargs)
+
+
+def test_a_forced_rollback_resumed_after_a_failed_op_audit_still_records_the_op(world):
+    a, b = _strategies(world, target_evidence=None)
+    flaky = _FlakyAudit(_log(world), fail_on=2)
+    first = _forced(world, a, activity=flaky)
+    assert first.outcome == "needs_retry" and _live(world) == f".versions/sma/{b.name}"
+    assert not any("_forced_op\t" in line for line in _log_lines(world))
+    resumed = _rollback(world, to=a.name, activity=_log(world))          # 強行指定なしの再実行
+    assert resumed.outcome == "rolled_back" and resumed.op_id == first.op_id
+    op_lines = [line for line in _log_lines(world) if "\trollback_history_guard_forced_op\t" in line]
+    assert len(op_lines) == 1 and f"op_id={first.op_id}" in op_lines[0]
+
+
+def test_a_resume_cannot_finish_while_the_op_audit_stays_unwritable(world):
+    a, b = _strategies(world, target_evidence=None)
+    assert _forced(world, a, activity=_FlakyAudit(_log(world), fail_on=2)).outcome == "needs_retry"
+    stuck = _rollback(world, to=a.name, activity=_FlakyAudit(_log(world), fail_on=1))
+    assert stuck.outcome == "needs_retry" and _live(world) == f".versions/sma/{b.name}"
+
+
+def test_an_ordinary_open_rollback_resume_writes_no_forced_record(world):
+    a, b = _strategies(world, target_evidence=None)
+    world.intent("sma", from_ver=b, to_ver=a)
+    assert _rollback(world, to=a.name, activity=_log(world)).outcome == "rolled_back"
+    assert not any("history_guard_force" in line for line in _log_lines(world))
+
+
+def test_the_first_audit_row_reads_as_an_intent_and_a_failed_intent_leaves_no_op(world, monkeypatch):
+    a, b = _strategies(world, target_evidence=None)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("state changed")
+
+    monkeypatch.setattr(deploy_rollback.deploy_ops, "record_intent", boom)
+    with pytest.raises(RuntimeError):
+        _forced(world, a)
+    lines = _log_lines(world)
+    assert _ops(world) == [] and _live(world) == f".versions/sma/{b.name}"
+    assert len(lines) == 1 and "\trollback_history_guard_force_started\t" in lines[0]
+    assert "_forced_op" not in lines[0]

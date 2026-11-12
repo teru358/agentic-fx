@@ -2016,25 +2016,10 @@ def _decide_reevaluation(
             plugins_root=plugins_root, activity=activity, epoch_changed=epoch_changed)
 
 
-def _payload_pairs(payload: dict) -> "list[str] | None":
-    """payload が評価した pair の集合。決められなければ None。"""
-    pairs = payload.get("pairs")
-    if isinstance(pairs, list) and all(isinstance(p, str) for p in pairs):
-        return pairs
-    for key in ("metrics", "in_sample"):
-        value = payload.get(key)
-        if (isinstance(value, dict) and value
-                and all(isinstance(v, dict) for v in value.values())):
-            return list(value)
-    return None
-
-
 def _approval_evidence_check(payload: dict, plugins_root: Path):
     """提出時の履歴証跡を現在の方針と照合する。DB の履歴は測り直さない。"""
-    return history_evidence.verify_evidence(
-        payload.get("history_guard"), eval_source=payload.get("eval_source"),
-        base_interval=payload.get("base_interval"), pairs=_payload_pairs(payload),
-        no_bars_path=history_evidence.no_bars_path(plugins_root.parent))
+    return history_evidence.verify_payload(
+        payload, no_bars_path=history_evidence.no_bars_path(plugins_root.parent))
 
 
 def _hold_for_history_evidence(conn, approval_id: int, payload: dict, *,
@@ -2067,17 +2052,16 @@ def _hold_for_history_evidence(conn, approval_id: int, payload: dict, *,
 
 
 def _confirm_reevaluation(conn, approval_id, payload, *, decided_by, now, activity,
-                          epoch_changed, plugins_root=None) -> "ApprovalOutcome":
+                          epoch_changed, plugins_root) -> "ApprovalOutcome":
     name = payload["name"]
-    if plugins_root is not None:
-        check = _approval_evidence_check(payload, plugins_root)
-        if not check.ok:
-            reason = (history_reasons.CHECK_UNAVAILABLE
-                      if check.status == history_evidence.CHECK_UNAVAILABLE
-                      else history_reasons.EVIDENCE_REFRESH_REQUIRED)
-            approvals_store.set_reason(conn, approval_id, reason, commit=True)
-            return ApprovalOutcome(outcome=history_reasons.OUTCOME, name=name,
-                                   status="pending", reason=reason)
+    check = _approval_evidence_check(payload, plugins_root)
+    if not check.ok:
+        reason = (history_reasons.CHECK_UNAVAILABLE
+                  if check.status == history_evidence.CHECK_UNAVAILABLE
+                  else history_reasons.EVIDENCE_REFRESH_REQUIRED)
+        approvals_store.set_reason(conn, approval_id, reason, commit=True)
+        return ApprovalOutcome(outcome=history_reasons.OUTCOME, name=name,
+                               status="pending", reason=reason)
     with _immediate_tx(conn):
         if payload.get("history_epoch", "none") != history_epoch(conn):
             conn.rollback()
@@ -2976,9 +2960,8 @@ def _reevaluation_key(payload: dict) -> tuple:
 
 def _evidence_check(payload: dict, no_bars_path) -> "history_evidence.EvidenceCheck":
     """依頼 (または承認) の payload の履歴証跡を、現在の方針と照合する。"""
-    return history_evidence.verify_evidence(
-        payload.get("history_guard"), eval_source=payload.get("eval_source"),
-        base_interval=payload.get("base_interval"), pairs=payload.get("pairs"),
+    return history_evidence.verify_payload(
+        payload,
         no_bars_path=history_evidence.no_bars_path() if no_bars_path is None else no_bars_path)
 
 

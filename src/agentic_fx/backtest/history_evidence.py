@@ -54,7 +54,7 @@ def scope_no_bars(entries: Iterable[hh.NoBarsEntry], *, dataset: HistoryDataset,
 
 
 def scoped_digest(entries: Iterable[hh.NoBarsEntry]) -> str:
-    return hh._no_bars_digest(tuple(entries))
+    return hh.no_bars_digest(tuple(entries))
 
 
 def build_evidence(health: hh.HistoryHealth) -> dict:
@@ -132,6 +132,30 @@ def _shape_problem(evidence: Mapping, pairs: list) -> str | None:
         if evidence["missing_days"][pair] != []:
             return "a ready evidence cannot list missing days"
     return None
+
+
+def payload_pairs(payload: Mapping) -> "list[str] | None":
+    """payload が評価した pair の集合。決められなければ None。
+
+    ``pairs`` が無い旧い payload は、metrics / in_sample の鍵から推定する。証跡照合の
+    入口はすべてこの規則で pair を決める。"""
+    pairs = payload.get("pairs")
+    if isinstance(pairs, list) and all(isinstance(p, str) for p in pairs):
+        return pairs
+    for key in ("metrics", "in_sample"):
+        value = payload.get(key)
+        if (isinstance(value, dict) and value
+                and all(isinstance(v, dict) for v in value.values())):
+            return list(value)
+    return None
+
+
+def verify_payload(payload: Mapping, *, no_bars_path: Path) -> EvidenceCheck:
+    """payload の ``history_guard`` を、その payload の評価対象と現在の方針に照合する。"""
+    return verify_evidence(
+        payload.get("history_guard"), eval_source=payload.get("eval_source"),
+        base_interval=payload.get("base_interval"), pairs=payload_pairs(payload),
+        no_bars_path=no_bars_path)
 
 
 def verify_evidence(evidence: object, *, eval_source: object = None,

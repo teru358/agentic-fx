@@ -110,3 +110,22 @@ def test_the_no_bars_list_is_read_from_the_plugins_root_parent(world):
         (result.approval_id,)).fetchone()[0])
     entries = payload["history_guard"]["no_bars_entries"]
     assert [(e["symbol"], e["date_utc"]) for e in entries] == [("USDJPY", day.isoformat())]
+
+
+def test_confirming_a_reevaluation_always_checks_the_evidence(world):
+    import inspect
+
+    from agentic_fx.plugin import history_reasons
+    from agentic_fx.store import approvals as approvals_store
+
+    assert inspect.signature(switch._confirm_reevaluation).parameters[
+        "plugins_root"].default is inspect.Parameter.empty
+    payload = {"name": NAME, "content_hash": "c", "artifact_hash": "a",
+               "history_epoch": "none", "candidate_origin": "reevaluation"}   # 証跡なし
+    approval_id = approvals_store.create(world.conn, "plugin", payload, TUESDAY)
+    outcome = switch._confirm_reevaluation(
+        world.conn, approval_id, payload, decided_by="human", now=TUESDAY, activity=None,
+        epoch_changed=None, plugins_root=world.root)
+    assert outcome.outcome == history_reasons.OUTCOME and outcome.status == "pending"
+    assert world.conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                              (approval_id,)).fetchone()[0] == "pending"

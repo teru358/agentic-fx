@@ -482,6 +482,14 @@ CREATE INDEX IF NOT EXISTS plugin_deploy_op_signals_signal_id
   ON plugin_deploy_op_signals(signal_id);
 """
 
+# 履歴ガードの強行で始まった op の印。op と同じ transaction で書き、再開の経路が
+# 強行の監査記録を必ず書けるようにする。
+_PLUGIN_DEPLOY_OP_HISTORY_FORCED_DDL = """
+CREATE TABLE IF NOT EXISTS plugin_deploy_op_history_forced (
+  op_id INTEGER PRIMARY KEY REFERENCES plugin_deploy_ops(op_id)
+);
+"""
+
 _IMPROVEMENT_RUNS_MISSION_ID_UNIQUE_DDL = """
 CREATE UNIQUE INDEX IF NOT EXISTS ix_improvement_runs_mission_id
   ON improvement_runs(mission_id)
@@ -641,7 +649,7 @@ CREATE TABLE IF NOT EXISTS analysis_runs (
   source TEXT NOT NULL, created_at TEXT NOT NULL
 );
 """ + _CANDIDATE_ARCHIVES_DDL + """
-""" + _SIGNALS_V3_DDL.format(name="signals", ine="IF NOT EXISTS ") + _PLUGIN_DEPLOY_OPS_DDL + _PLUGIN_DEPLOY_OPS_OPEN_UNIQUE_DDL + _PLUGIN_DEPLOY_OP_SIGNALS_DDL + _ECON_SIGNAL_TABLES_DDL + """
+""" + _SIGNALS_V3_DDL.format(name="signals", ine="IF NOT EXISTS ") + _PLUGIN_DEPLOY_OPS_DDL + _PLUGIN_DEPLOY_OPS_OPEN_UNIQUE_DDL + _PLUGIN_DEPLOY_OP_SIGNALS_DDL + _PLUGIN_DEPLOY_OP_HISTORY_FORCED_DDL + _ECON_SIGNAL_TABLES_DDL + """
 -- プラン 9 束 C (codex 指摘の裏取り): prune_cache (store/ohlcv.py) の
 -- `WHERE bar_time < ?` は PK (symbol, interval, bar_time, source) の先頭列に
 -- 当たらず、autoindex のカバリングスキャンになる。定常状態では cutoff を
@@ -774,7 +782,8 @@ TABLE_NAMES = frozenset({
     "candidate_archives", "datafeed_outage_state", "datafeed_outage_gap",
     "cron_cursor", "mission_decision_bars",
     "ops_requests", "ops_idempotency", "ops_events", "ops_policies",
-    "plugin_deploy_ops", "plugin_deploy_op_signals", "improve_run_notices",
+    "plugin_deploy_ops", "plugin_deploy_op_signals", "plugin_deploy_op_history_forced",
+    "improve_run_notices",
     "improve_run_summaries", "signal_decisions", "signal_shadow", "ohlcv_slice_sets", "ohlcv_slices",
     "ohlcv_slice_generations", "econ_reaction_keys", "econ_reaction_values",
 })

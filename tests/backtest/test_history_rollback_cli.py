@@ -57,7 +57,7 @@ def test_a_forced_rollback_switches_and_leaves_an_audit_record(world, capsys):
     assert rc == 0, err
     assert _link(world) == world.target("sma", world.old)
     log = (world.base / "logs" / "activity.log").read_text(encoding="utf-8")
-    assert "rollback_history_guard_forced" in log and "reason=休場を確認した" in log
+    assert "rollback_history_guard_force_started" in log and "reason=休場を確認した" in log
 
 
 @pytest.mark.parametrize("argv", [
@@ -73,7 +73,7 @@ def test_an_incomplete_force_is_refused_before_anything_runs(world, capsys, argv
     assert rc == 1 and "code=invalid_request" in err
     assert _link(world) == world.target("sma", world.new)
     assert not (world.base / "logs" / "activity.log").exists() or (
-        "history_guard_forced" not in (world.base / "logs" / "activity.log").read_text())
+        "history_guard_force" not in (world.base / "logs" / "activity.log").read_text())
 
 
 def test_the_force_flag_is_only_a_local_cli_option_not_an_ops_or_agent_surface():
