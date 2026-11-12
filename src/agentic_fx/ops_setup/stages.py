@@ -21,11 +21,13 @@ from . import interfaces as interface_listing
 from .feature_config import InterfaceLookupFailed, collect, web_access_reason
 from .probe import run_probe
 from .systemd import Systemd, SystemdError
+from .write_key import KEY_MISMATCH_CODES, Inconsistent, check_write_key_consistency, stage_mode
 from .units import (OpsExecNotFound, UnitPaths, atomic_write, install_units, remove_durably,
                     resolve_ops_exec, uninstall_feature, units_match)
 from .web_setup import access_line
 
 
+WRITE_SWITCH_GUIDANCE = "afx ops web enable --write (又は --no-write) を再実行して書込みの切替を完了させる"
 _FEATURE_PRINCIPALS = {
     "bot": Principal.OPS_BOT,
     "web": Principal.OPS_WEB,
@@ -37,8 +39,7 @@ _ENABLE_ORDER = ("staged", "stopped", "enrolled", "installed", "started", "check
 _DISABLE_ORDER = (_ENABLE_TERMINAL, "stopping-ops", "uninstalled", _DISABLE_TERMINAL)
 _STAGES = {"enable": _ENABLE_ORDER, "disable": _DISABLE_ORDER}
 Hook = Callable[[str], None]
-# manifest は active なのに鍵 file が使えない・一致しない。
-_KEY_MISMATCH_CODES = frozenset({"key_missing", "key_file_invalid", "digest_mismatch"})
+_KEY_MISMATCH_CODES = KEY_MISMATCH_CODES
 # enable 前に afx がこの状態だったときだけ、enable の最後に afx を起こす。
 _AFX_RUNNING = frozenset({"active", "activating", "reloading"})
 
@@ -96,8 +97,13 @@ def read_stage(root: Path, feature: str, *, missing_ok: bool = False) -> dict[st
 _STAGE_FIELD_TYPES: dict[str, type] = {
     "principal": str, "registered": bool, "ops_active": bool, "committed": bool,
     "afx_before_stop": str, "failure": str, "failure_detail": str, "warn": str,
+    "write_target": bool, "write_principal": str, "write_step": str,
 }
 _STAGE_LIST_FIELDS = ("artifacts", "wants")
+# 書込みの切替の途中状態。3 つは揃って在るか、揃って無い。
+WRITE_STEPS = ("staged", "stopped", "keyed", "configured")
+_WRITE_PRINCIPALS = {True: Principal.OPS_WEB_WRITE.value, False: Principal.OPS_WEB.value}
+_WRITE_FIELDS = ("write_target", "write_principal", "write_step")
 
 
 def _stage_problem(data: object, feature: str) -> str:
@@ -119,6 +125,11 @@ def _stage_problem(data: object, feature: str) -> str:
         if key in data and (not isinstance(data[key], list)
                             or not all(isinstance(item, str) for item in data[key])):
             return f"{key} が文字列の list でない"
+    if any(key in data for key in _WRITE_FIELDS):
+        if feature != "web" or not all(key in data for key in _WRITE_FIELDS):
+            return "write の切替の key が揃っていない"
+        if data["write_step"] not in WRITE_STEPS or data["write_principal"] != _WRITE_PRINCIPALS[data["write_target"]]:
+            return "write の切替の key の値が不正"
     return ""
 
 
@@ -173,6 +184,14 @@ def _config_complete(root: Path, feature: str) -> bool:
     return collect(root, feature).complete
 
 
+def check_write_switch_idle(root: Path) -> None:
+    """書込みの切替が途中なら write_switch_pending で拒否する。stage file を読むだけで何も書かない。"""
+    for feature in _FEATURE_PRINCIPALS:
+        saved = read_stage(root, feature, missing_ok=True)
+        if saved is not None and "write_target" in saved:
+            raise InvalidState("write_switch_pending", WRITE_SWITCH_GUIDANCE)
+
+
 class OpsSetup:
     """stage file と実物を照合しながら一機能ずつ遷移する。"""
 
@@ -193,6 +212,10 @@ class OpsSetup:
         # 記録済みの OSError を持つ。
         self._current: dict[str, Any] | None = None
         self._recorded: BaseException | None = None
+        # 直近の enable が保持する write (書込みの鍵 ops-web-write を使う web か)。
+        self._write_on = False
+        # 成功した操作が利用者へ伝える警告 (1 行ずつ)。
+        self.notices: list[str] = []
 
     def _interface_addresses(self) -> list[str]:
         try:
@@ -221,6 +244,9 @@ class OpsSetup:
         self.hook(f"after_stage_{stage}")
 
     def _failure(self, state: dict[str, Any], reason: str, detail: str = "") -> None:
+        if state.get("unrecorded"):
+            # stage file を持たない回復の操作。理由は例外で返し、記録は作らない。
+            return
         state["failure"] = reason
         if detail:
             state["failure_detail"] = detail
@@ -231,11 +257,14 @@ class OpsSetup:
     def _unit_name(self, feature: str) -> str:
         return self.paths.feature_unit(feature)
 
-    def _unfinished(self, feature: str, operation: str) -> None:
+    def _unfinished(self, feature: str, operation: str, *, switching_write: bool = False) -> None:
         for other in _FEATURE_PRINCIPALS:
             saved = read_stage(self.root, other, missing_ok=True)
             if saved is None:
                 continue
+            if "write_target" in saved and not (switching_write and other == feature):
+                # write の切替が途中の間は、その記録と起動の阻止 (marker) を他の操作に壊させない。
+                raise InvalidState("write_switch_pending", WRITE_SWITCH_GUIDANCE)
             terminal = _ENABLE_TERMINAL if saved["operation"] == "enable" else _DISABLE_TERMINAL
             if saved["stage"] != terminal and (other != feature or saved["operation"] != operation):
                 raise InvalidState("invalid_state")
@@ -323,13 +352,13 @@ class OpsSetup:
         # afx keys と同じ検査を、afx を止める前に通す。鍵 dir が使えないなら外部変更をしない。
         check_key_dir_usable(key_dir(self.root), root=self.root)
 
-    def _principal_active(self, feature: str, state: dict[str, Any]) -> bool:
+    def _principal_active(self, feature: str, state: dict[str, Any], *, enrolling: bool = False) -> bool:
         """principal が active で鍵 file が manifest と一致するか。
 
         active なのに鍵が一致しなければ、enroll は無変更で成功してしまうので止める。
         鍵は再 enroll も revoke もせず、利用者に回復手順を示す。
         """
-        principal = _FEATURE_PRINCIPALS[feature]
+        principal = Principal.OPS_WEB_WRITE if feature == "web" and self._write_on and not enrolling else _FEATURE_PRINCIPALS[feature]
         try:
             return enrolled_key_matches(key_dir(self.root), principal)
         except KeySetError as error:
@@ -438,10 +467,10 @@ class OpsSetup:
         raw = (json.dumps({"feature": feature, "started_at": started}, sort_keys=True) + "\n").encode()
         atomic_write(enroll_marker_path(self.root), raw, 0o600)
 
-    def _quiesce_afx(self, state: dict[str, Any]):
+    def _quiesce_afx(self, state: dict[str, Any], *, reset_stage: bool = True):
         """marker を置き、afx を止めて止まったことを manager で確かめ、instance flock を取る。
 
-        失敗したら staged に戻す。marker は残し、同じ enable の再実行が回収する。
+        失敗したら (reset_stage なら) staged に戻す。marker は残し、同じ操作の再実行が回収する。
         """
         try:
             if "afx_before_stop" not in state:
@@ -465,7 +494,8 @@ class OpsSetup:
             self._before("lock")
             lock = self._lock()
         except SystemdError as error:
-            state["stage"] = "staged"
+            if reset_stage:
+                state["stage"] = "staged"
             self._failure(state, error.reason, error.detail)
             raise
         try:
@@ -480,10 +510,39 @@ class OpsSetup:
             raise ValueError("unknown_feature")
         return self._guarded(lambda: self._enable(feature))
 
+    def _check_web_write(self, feature: str, saved: dict[str, Any] | None) -> None:
+        """web の write と書込みの鍵が整合していなければ、stage にも何にも書かずに拒否する。"""
+        self._write_on = False
+        if feature != "web":
+            return
+        verdict = check_write_key_consistency(self.root, mode=stage_mode(saved))
+        if isinstance(verdict, Inconsistent):
+            raise InvalidState(verdict.reason, verdict.guidance)
+        self._write_on = verdict.write
+
+    def _warn_web_write(self, feature: str, saved: dict[str, Any] | None) -> None:
+        """disable は止める側の操作なので、write と鍵の食い違いでは拒否せず警告を `notices` に残す。
+
+        止めても権限は広がらず、食い違いは次の enable の判定が止める。
+        """
+        if feature != "web":
+            return
+        try:
+            verdict = check_write_key_consistency(self.root, mode=stage_mode(saved))
+        except (KeySetError, OSError):
+            verdict = Inconsistent("invalid_state")
+        if isinstance(verdict, Inconsistent):
+            self.notices.append(f"warning: web の write と書込みの鍵が整合していない ({verdict.reason})。"
+                                "web は止めた。次の afx ops web enable は整合を確かめて止まる"
+                                + (f" ({verdict.guidance})" if verdict.guidance else ""))
+
     def _enable(self, feature: str) -> StageResult:
         saved = read_stage(self.root, feature, missing_ok=True)
         self._unfinished(feature, "enable")
         self._check_marker_owner(feature)
+        if saved is not None and "write_target" in saved:
+            raise InvalidState("write_switch_pending", WRITE_SWITCH_GUIDANCE)
+        self._check_web_write(feature, saved)
         fresh = saved is None or saved["stage"] == _DISABLE_TERMINAL
         state = self._new_state(feature, "enable", "staged") if fresh else saved
         self._current = state
@@ -506,7 +565,7 @@ class OpsSetup:
             if state["stage"] == "staged":
                 lock = self._quiesce_afx(state)
                 self._set_stage(state, "stopped")
-            elif state["stage"] == "stopped" and not self._principal_active(feature, state):
+            elif state["stage"] == "stopped" and not self._principal_active(feature, state, enrolling=True):
                 # enroll 前に落ちた。flock は process と共に外れているので、止めて取り直す。
                 lock = self._quiesce_afx(state)
                 self._set_stage(state, "stopped")
@@ -597,12 +656,15 @@ class OpsSetup:
         return self._guarded(lambda: self._disable(feature))
 
     def _disable(self, feature: str) -> StageResult:
+        self.notices.clear()
+        check_write_switch_idle(self.root)
         saved = read_stage(self.root, feature, missing_ok=True)
+        if saved is not None and saved["operation"] == "enable" and saved["stage"] != _ENABLE_TERMINAL:
+            raise InvalidState("invalid_state")
+        self._warn_web_write(feature, saved)
         if saved is None:
             # 一度も enable していない。照合する記録が無い。
             return StageResult(feature, "disable", _DISABLE_TERMINAL)
-        if saved["operation"] == "enable" and saved["stage"] != _ENABLE_TERMINAL:
-            raise InvalidState("invalid_state")
         self._unfinished(feature, "disable")
         state = self._new_state(feature, "disable", "enabled") if saved["operation"] == "enable" else saved
         self._current = state
@@ -708,7 +770,10 @@ class OpsSetup:
         if saved and saved.get("operation") == "enable" and not self._afx_was_running(saved):
             waiting = f" afx_before_enable={saved.get('afx_before_stop') or 'unknown'} ops=starts_with_afx"
         warn = f" warn={saved['warn']}" if saved and saved.get("warn") else ""
-        return f"{feature}: {result.operation} {result.stage}{failure} {observed}{waiting}{warn}{left}"
+        switch = ""
+        if saved and "write_target" in saved:
+            switch = f" write_switch={saved['write_step']} target={'on' if saved['write_target'] else 'off'}"
+        return f"{feature}: {result.operation} {result.stage}{failure} {observed}{waiting}{warn}{switch}{left}"
 
     def web_access_line(self) -> str:
         """`afx ops web status` の公開範囲 1 行。stage を先に読み、共有 reader の最終 reason をそのまま出す。"""
@@ -745,4 +810,6 @@ def run_ops_command(root: Path, action: str, feature: str) -> int:
             print(f"配備操作が未完了: {open_ops} 件 (afx plugin versions <name>)")
     else:
         print(f"{feature}: {result.stage}")
+        for notice in setup.notices:
+            print(f"afx ops: {notice}", file=sys.stderr)
     return 0

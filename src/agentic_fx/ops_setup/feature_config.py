@@ -19,8 +19,8 @@ from agentic_fx.ops.keys import key_dir
 _SECRET_NAME = {"bot": "discord.token", "notify": "webhook.url"}
 _FIELDS = {"bot": ("guild_id", "channel_id", "allowlist_user_ids", "mention_user_ids", "token"), "web": ("port",), "notify": ("webhook_url",)}
 _COMMON = ("instance_root", "key_dir")
-# web の公開範囲の key。port と違って省略でき、省略は「自機のみ・allow 無し・認証無し・ユーザー名 afx」を表す
-_WEB_ACCESS = ("bind", "allow", "auth", "user")
+# web の公開範囲の key。port と違って省略でき、省略は「自機のみ・allow 無し・認証無し・ユーザー名 afx・読取専用」を表す
+_WEB_ACCESS = ("bind", "allow", "auth", "user", "write")
 DEFAULT_USER = "afx"
 USER_PATTERN = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 # web.password の size (byte)。起動側の検査と同じ範囲
@@ -36,6 +36,7 @@ def is_loopback(values: dict[str, Any]) -> bool:
     """bind (省略時 127.0.0.1) が 127.0.0.0/8 にあるか。"""
     return ipaddress.IPv4Address(values.get("bind", "127.0.0.1")) in LOOPBACK
 _WEB_PASSWORD = "web.password"
+WEB_PASSWORD_TEMP = re.compile(r"\.web\.password\.[0-9a-f]{32}\.tmp\Z")
 # 取引通知の出し方 (afx-ops の ops.toml の optional key。値の集合は afx-ops と同じ)
 _TRADE_KEYS = {"bot": ("trade_notices", "trade_amounts", "ops_notices", "improve_notices"), "web": (),
                "notify": ("deliver_trade_events", "deliver_improve_events")}
@@ -134,21 +135,29 @@ def _web_user(value: object) -> str:
     return value
 
 
+def _web_write(value: object) -> bool:
+    if type(value) is not bool: raise InputError("write")
+    return value
+
+
 def _web_values(values: dict[str, Any]) -> dict[str, Any]:
-    """web の 5 key (port・bind・allow・auth・user) の単独の文法。bind / allow / auth / user は省略できる。"""
+    """web の 6 key (port・bind・allow・auth・user・write) の単独の文法。port 以外は省略できる。"""
     if any(name in values for name in _COMMON): raise InputError("common_key")
     port = values.get("port")
     if type(port) is not int or not 1 <= port <= 65535: raise InputError("port")
     result: dict[str, Any] = {"port": port}
-    for name, check in (("bind", _web_bind), ("allow", _web_allow), ("auth", _web_auth), ("user", _web_user)):
+    for name, check in (("bind", _web_bind), ("allow", _web_allow), ("auth", _web_auth), ("user", _web_user),
+                          ("write", _web_write)):
         if name in values: result[name] = check(values[name])
     return result
 
 
 def web_written_values(values: dict[str, Any]) -> dict[str, Any]:
-    """writer が ops.toml に書く web の key。user は auth が basic のときだけ書き、値が既定でも省略しない。"""
+    """writer が ops.toml に書く web の key。user は auth が basic のときだけ書き、値が既定でも省略しない。
+    write は真のときだけ書く (偽は省略と同じ)。"""
     result = {name: values[name] for name in ("port", "bind", "allow", "auth") if name in values}
     if values.get("auth") == "basic": result["user"] = values.get("user", DEFAULT_USER)
+    if values.get("write") is True: result["write"] = True
     return result
 
 
@@ -323,11 +332,15 @@ class InterfaceLookupFailed(Exception):
     """本機の interface の列挙ができなかった (固定 reason `interface_lookup_failed`)。"""
 
 
-def _web_password_state(secret_fd: int) -> str:
-    """検査済みの secret dir fd から見た `web.password`: "absent" / "safe" / "unsafe"。"""
+def _web_password_state(secret_fd: int, ignore_temporaries: bool = False) -> str:
+    """検査済みの secret dir fd から見た `web.password`: "absent" / "safe" / "unsafe"。
+
+    ignore_temporaries は、writer の一時 file 名に完全一致する名前を数えない (後で回収される前提の読取り用)。
+    """
     try:
         with os.scandir(secret_fd) as entries: names = [entry.name for entry in entries]
     except OSError: return "unsafe"
+    if ignore_temporaries: names = [name for name in names if WEB_PASSWORD_TEMP.fullmatch(name) is None]
     if any(name != _WEB_PASSWORD for name in names): return "unsafe"
     if _WEB_PASSWORD not in names: return "absent"
     try: fd = os.open(_WEB_PASSWORD, os.O_RDONLY | os.O_NOFOLLOW | os.O_NOCTTY | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=secret_fd)
@@ -342,11 +355,11 @@ def _web_password_state(secret_fd: int) -> str:
     return "safe"
 
 
-def _web_secret_state(base_fd: int) -> str:
+def _web_secret_state(base_fd: int, ignore_temporaries: bool = False) -> str:
     try: secret_fd = open_child(base_fd, "secret", exact=0o700, readable=True, component="secret_dir")
     except FileNotFoundError: return "absent"
     except OSError: return "unsafe"
-    try: return _web_password_state(secret_fd)
+    try: return _web_password_state(secret_fd, ignore_temporaries)
     finally: os.close(secret_fd)
 
 
@@ -393,6 +406,9 @@ def web_access_check(root: Path, *, interfaces: Callable[[], Iterable[str]] | No
         if isinstance(parsed, str): return WebAccess(parsed, {})
         bind = ipaddress.IPv4Address(parsed.get("bind", "127.0.0.1"))
         loopback, allow, auth = is_loopback(parsed), parsed.get("allow"), parsed.get("auth", "none")
+        if parsed.get("write", False):
+            if auth != "basic": return WebAccess("write_requires_auth", {})
+            if not loopback: return WebAccess("write_requires_loopback", {})
         if not loopback and allow is None: return WebAccess("allow_required", {})
         if not loopback:
             try: found = {str(address) for address in interfaces()} if interfaces is not None else None
@@ -410,17 +426,59 @@ def web_access_check(root: Path, *, interfaces: Callable[[], Iterable[str]] | No
     finally: os.close(base_fd)
 
 
+def web_live_config(root: Path) -> dict[str, Any] | str:
+    """live の ops.toml を filesystem の安全性と全 key の文法まで検査して返す。通らなければ最終 reason (str)。
+
+    interface・secret は見ない (公開範囲の組み合わせの検査は `web_access_check`)。
+    """
+    try: base_fd = open_feature("web")
+    except FileNotFoundError: return "config_dir_missing"
+    except OSError: return "config_dir_invalid"
+    try:
+        try: config_fd = open_child(base_fd, "config", readable=True, component="config_dir")
+        except FileNotFoundError: return "config_dir_missing"
+        except OSError: return "config_dir_invalid"
+        try: return _web_parsed(root, config_fd)
+        finally: os.close(config_fd)
+    finally: os.close(base_fd)
+
+
+def web_retained_write(root: Path) -> bool | str | None:
+    """live の ops.toml が持つ `write` を、設定全体の検査と切り離して読む (reconfigure が保持すべき write)。
+
+    TOML として読めて `write` が真偽値ならその値、key が無ければ False。TOML として読めない・`write` が
+    真偽値でない・file が無いときは None (決められない)。config dir や file の安全性の違反は最終 reason (str)。
+    他の key の文法は見ない。
+    """
+    try: base_fd = open_feature("web")
+    except FileNotFoundError: return "config_dir_missing"
+    except OSError: return "config_dir_invalid"
+    try:
+        try: config_fd = open_child(base_fd, "config", readable=True, component="config_dir")
+        except FileNotFoundError: return "config_dir_missing"
+        except OSError: return "config_dir_invalid"
+        try: raw = _read_regular(config_fd, "ops.toml")
+        except FileNotFoundError: return None
+        except OSError: return "config_dir_invalid"
+        finally: os.close(config_fd)
+    finally: os.close(base_fd)
+    try: parsed = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeError, tomllib.TOMLDecodeError): return None
+    value = parsed.get("write", False)
+    return value if isinstance(value, bool) else None
+
+
 def web_access_reason(root: Path, *, interfaces: Callable[[], Iterable[str]] | None = None) -> str | None:
     """`web_access_check` の reason だけ。許可なら None。"""
     return web_access_check(root, interfaces=interfaces).reason
 
 
-def web_secret_state(root: Path) -> str:
+def web_secret_state(root: Path, *, ignore_temporaries: bool = False) -> str:
     """live の `web.password` の状態: "absent" / "safe" / "unsafe" (secret dir の不在は absent)。"""
     try: base_fd = open_feature("web")
     except FileNotFoundError: return "absent"
     except OSError: return "unsafe"
-    try: return _web_secret_state(base_fd)
+    try: return _web_secret_state(base_fd, ignore_temporaries)
     finally: os.close(base_fd)
 
 

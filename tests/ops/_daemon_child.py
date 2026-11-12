@@ -4,12 +4,15 @@ usage: _daemon_child.py <root> [--peer-probe <out>]
 
 外部へ出る取得 (価格・ニュース・経済指標) だけを失敗させ、runner と embedding を
 fake にする。それ以外は本番の run_service と同じ経路で起動・停止する。
+環境変数 ``AFX_TEST_TRANSCRIPTS_DIR`` があれば、実 mission worker の transcript の保存先を
+そこへ向ける (worker の env は最小で、既定の保存先は repo の ``logs/`` になるため)。
 ``--peer-probe`` を渡すと、listener が開いた後に daemon 自身の子 process から
 正しい鍵で whoami を送り、その応答を <out> に書く。
 """
 from __future__ import annotations
 
 import json
+import os
 import resource
 import subprocess
 import sys
@@ -26,6 +29,7 @@ import yfinance  # noqa: E402
 
 from agentic_fx import service as service_mod  # noqa: E402
 from agentic_fx.datafeed.econ_calendar import CalendarFetch  # noqa: E402
+from agentic_fx.runners import worker_runner  # noqa: E402
 from agentic_fx.runners.fake_runner import FakeRunner  # noqa: E402
 from tests.store.test_rag import FakeEmbedding  # noqa: E402
 
@@ -58,6 +62,14 @@ def main() -> int:
                              stop_event=stop_event)
         app.scheduler.on_improve_tick = None
         return app
+
+    transcripts = os.environ.get("AFX_TEST_TRANSCRIPTS_DIR")
+    if transcripts:
+        original_env = worker_runner._mission_worker_env
+
+        def worker_env(profile):
+            return {**original_env(profile), "AGENTIC_FX_MISSION_TRANSCRIPTS_DIR": transcripts}
+        worker_runner._mission_worker_env = worker_env
 
     if sys.argv[2:4] and sys.argv[2] == "--peer-probe":
         threading.Thread(target=_peer_probe, args=(root, Path(sys.argv[3])),

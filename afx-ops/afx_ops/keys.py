@@ -24,10 +24,11 @@ READY_NAME = ".ready"
 READY_VERSION = 2
 LEGACY_READY_VERSION = 1
 # このパッケージが読む principal。manifest にはこれ以外 (本体が後から足したもの) も現れうる。
-KNOWN_PRINCIPALS = frozenset({"operator", "approver", "ops-bot", "ops-web", "ops-notify"})
+KNOWN_PRINCIPALS = frozenset({"operator", "approver", "ops-bot", "ops-web", "ops-web-write",
+                              "ops-notify"})
 # 旧形式 v1 が持つ固定集合。v1 には ops の principal は居ない。
 LEGACY_PRINCIPALS = frozenset({"operator", "approver"})
-OPS_PRINCIPALS = ("ops-bot", "ops-web", "ops-notify")
+OPS_PRINCIPALS = ("ops-bot", "ops-web", "ops-web-write", "ops-notify")
 # manifest の principal 名の文法 (知らない名前も、この形でなければ manifest ごと拒む)。
 _PRINCIPAL_NAME = re.compile(r"[a-z][a-z0-9-]{0,31}")
 _KEY_OPS = ("enroll", "rotate", "revoke")

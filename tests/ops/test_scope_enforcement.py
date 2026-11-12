@@ -37,8 +37,12 @@ def test_operator_cannot_decide_or_use_local_guard(ops_env):
 def test_scope_table_matches_the_spec():
     assert PRINCIPAL_SCOPES[Principal.OPERATOR] == frozenset({
         Scope.STATUS_READ, Scope.EVENTS_READ, Scope.APPROVALS_LIST, Scope.APPROVALS_DETAIL,
-        Scope.LOGS_READ, Scope.JOBS_OWN, Scope.OPERATE, Scope.GUIDANCE_READ})
+        Scope.LOGS_READ, Scope.JOBS_OWN, Scope.OPERATE, Scope.GUIDANCE_READ,
+        Scope.IMPROVE_RUN})
     assert PRINCIPAL_SCOPES[Principal.APPROVER] == frozenset(Scope)
+    assert PRINCIPAL_SCOPES[Principal.OPS_WEB_WRITE] == frozenset({
+        Scope.STATUS_READ, Scope.EVENTS_READ, Scope.APPROVALS_LIST, Scope.APPROVALS_DETAIL,
+        Scope.LOGS_READ, Scope.DECIDE, Scope.IMPROVE_RUN, Scope.JOBS_OWN})
     validate_principal_scopes()
     with pytest.raises(ValueError):
         validate_principal_scopes({Principal.OPERATOR: frozenset({Scope.LOCAL_GUARD}),
@@ -47,6 +51,31 @@ def test_scope_table_matches_the_spec():
     scopes[Principal.OPS_WEB] = frozenset({Scope.GUIDANCE_READ})
     with pytest.raises(ValueError, match="guidance.read is operator/approver-only"):
         validate_principal_scopes(scopes)
+
+
+@pytest.mark.parametrize("principal", [Principal.OPS_BOT, Principal.OPS_WEB,
+                                       Principal.OPS_WEB_WRITE, Principal.OPS_NOTIFY])
+def test_operate_is_refused_in_any_row_other_than_operator_and_approver(principal):
+    scopes = dict(PRINCIPAL_SCOPES)
+    scopes[principal] = PRINCIPAL_SCOPES[principal] | {Scope.OPERATE}
+    with pytest.raises(ValueError, match="operate is operator/approver-only"):
+        validate_principal_scopes(scopes)
+
+
+@pytest.mark.parametrize("principal", [Principal.OPS_BOT, Principal.OPS_WEB, Principal.OPS_NOTIFY])
+def test_improve_run_is_refused_outside_operator_approver_and_web_write(principal):
+    scopes = dict(PRINCIPAL_SCOPES)
+    scopes[principal] = PRINCIPAL_SCOPES[principal] | {Scope.IMPROVE_RUN}
+    with pytest.raises(ValueError, match="improve.run is"):
+        validate_principal_scopes(scopes)
+
+
+def test_ops_web_write_cannot_hold_local_guard_or_guidance_read():
+    for scope in (Scope.LOCAL_GUARD, Scope.GUIDANCE_READ):
+        scopes = dict(PRINCIPAL_SCOPES)
+        scopes[Principal.OPS_WEB_WRITE] = PRINCIPAL_SCOPES[Principal.OPS_WEB_WRITE] | {scope}
+        with pytest.raises(ValueError):
+            validate_principal_scopes(scopes)
 
 
 def test_jobs_are_visible_only_to_their_owner(ops_env):

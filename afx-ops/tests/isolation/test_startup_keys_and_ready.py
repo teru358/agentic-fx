@@ -15,16 +15,19 @@ from _afx_isolation_support import (
     PRINCIPAL,
     SECRET_TEXT,
     Interactive,
+    install_web_password,
     layout_of,
     make_root,
     needs_landlock,
     needs_x86_64,
+    principal_of,
     run_canary,
 )
-from _keydir import digest, token_for, write_ready
+from _keydir import build_key_dir, digest, token_for, write_ready
 from _ops_harness import daemon, start, stop, token_in
 from afx_ops import api_client, keys, server_auth
-from afx_ops.api_client import ApiError, BotClient, NotifyClient, WebClient
+from afx_ops.api_client import ApiError, BotClient, NotifyClient, WebClient, WebWriteClient
+from afx_ops.config import OpsConfig
 from afx_ops.isolation import startup
 
 @pytest.fixture
@@ -78,8 +81,40 @@ def test_principal_is_fixed_per_feature():
         startup.PRINCIPALS["bot"] = "ops-web"  # type: ignore[index]
 
 
+def test_the_web_principal_is_one_of_two_fixed_values_chosen_by_write():
+    assert startup.principal_for("web", False) == "ops-web"
+    assert startup.principal_for("web", True) == "ops-web-write"
+    # write は web だけの値。bot と notify の principal は動かない
+    for write in (False, True):
+        assert startup.principal_for("bot", write) == "ops-bot"
+        assert startup.principal_for("notify", write) == "ops-notify"
+    with pytest.raises(KeyError):
+        startup.principal_for("other", False)
+
+
+@pytest.mark.parametrize("write", [False, True])
+def test_read_api_token_reads_only_the_chosen_web_principal(write, tmp_path):
+    directory = build_key_dir(tmp_path / "keys")
+    chosen = "ops-web-write" if write else "ops-web"
+    other = "ops-web" if write else "ops-web-write"
+    # 選ばれなかった方の鍵は開けない (開けば EACCES で別の失敗になる)
+    os.chmod(directory / keys.key_file_name(other), 0)
+    token = startup.read_api_token("web", directory, write=write)
+    assert token == token_for(chosen).encode()
+
+
+@pytest.mark.parametrize("write", [False, True])
+def test_a_missing_key_does_not_fall_back_to_the_other_web_principal(write, tmp_path):
+    directory = build_key_dir(tmp_path / "keys")
+    chosen = "ops-web-write" if write else "ops-web"
+    _entry(directory, chosen, None)
+    with pytest.raises(startup.StartupError) as caught:
+        startup.read_api_token("web", directory, write=write)
+    assert caught.value.reason == "key_not_enrolled"
+
+
 def test_clients_expose_a_production_token_factory_and_a_test_key_file_seam():
-    for cls in (BotClient, WebClient, NotifyClient):
+    for cls in (BotClient, WebClient, WebWriteClient, NotifyClient):
         assert list(inspect.signature(cls).parameters) == ["endpoint", "token"]
         assert list(inspect.signature(cls.from_token).parameters) == ["endpoint", "token"]
         seam = inspect.signature(cls.from_key_files).parameters["_for_tests"]
@@ -111,6 +146,42 @@ def test_api_token_is_read_after_the_digest_check_and_handed_over_as_bytes(featu
     got = run_canary(_spec(root, feature, "api_token"), child_env)
     assert got.rc == 0, got.stderr[-2000:]
     assert got.result == ["bytes", digest(token_for(PRINCIPAL[feature]))]
+
+
+def _web_spec(root, write, op="noop", **extra):
+    if write:
+        install_web_password(root)
+    return _spec(root, "web", op, web_auth="basic" if write else "none", web_write=write,
+                 **extra)
+
+
+@needs_x86_64
+@needs_landlock
+@pytest.mark.parametrize("write", [False, True])
+def test_web_reads_the_key_of_the_principal_chosen_by_write_and_no_other(write, root,
+                                                                         child_env):
+    chosen = principal_of("web", write)
+    # 選ばれた鍵以外はどれも開けない状態にしても、起動して選ばれた鍵が渡る
+    for principal in keys.KNOWN_PRINCIPALS - {chosen}:
+        os.chmod(root / "keys" / keys.key_file_name(principal), 0)
+    got = run_canary(_web_spec(root, write, "api_token"), child_env)
+    assert got.rc == 0, got.stderr[-2000:]
+    assert got.result == ["bytes", digest(token_for(chosen))]
+
+
+@needs_x86_64
+@needs_landlock
+@pytest.mark.parametrize("write", [False, True])
+def test_web_never_opens_the_key_it_does_not_use(write, root, child_env):
+    unused = "ops-web" if write else "ops-web-write"
+    got = run_canary(_web_spec(root, write, "api_token"), child_env)
+    assert got.rc == 0, got.stderr[-2000:]
+    assert got.result != ["bytes", digest(token_for(unused))]
+    # 使わない側の鍵が壊れていても起動に影響しない (その鍵は読まれていない)
+    _break("digest_mismatch", root / "keys", unused)
+    again = run_canary(_web_spec(root, write, "api_token"), child_env)
+    assert again.rc == 0, again.stderr[-2000:]
+    assert again.result == got.result
 
 
 @needs_x86_64
@@ -246,6 +317,37 @@ def test_key_failure_stops_before_isolation_with_a_key_reason(state, feature, ro
 
 @needs_x86_64
 @needs_landlock
+@pytest.mark.parametrize("state", sorted(_KEY_STATES))
+def test_write_web_stops_with_a_key_reason_when_its_own_key_is_unusable(state, root, child_env):
+    _break(state, root / "keys", "ops-web-write")
+    got = run_canary({**_web_spec(root, True), "trace": _TRACED}, child_env)
+    assert got.rc == startup.RC_ISOLATION_FAILED
+    assert got.stderr.strip().splitlines()[-1] == f"afx-ops: {_KEY_STATES[state]}"
+    assert not got.isolated
+    assert [line for line in got.stdout.splitlines() if line.startswith("CALL ")] == []
+
+
+@needs_x86_64
+@needs_landlock
+@pytest.mark.parametrize("state", sorted(set(_KEY_STATES) - {"not_initialized",
+                                                              "key_dir_invalid",
+                                                              "ready_invalid"}))
+def test_read_web_ignores_a_broken_write_key_and_write_web_never_falls_back(state, root,
+                                                                            child_env):
+    # write=false の web は ops-web-write の鍵の状態を見ない
+    _break(state, root / "keys", "ops-web-write")
+    got = run_canary(_web_spec(root, False, "api_token"), child_env)
+    assert got.rc == 0, got.stderr[-2000:]
+    assert got.result == ["bytes", digest(token_for("ops-web"))]
+    # write=true の web は、ops-web が active でも ops-web の鍵へ落ちない
+    stopped = run_canary(_web_spec(root, True, "api_token"), child_env)
+    assert stopped.rc == startup.RC_ISOLATION_FAILED
+    assert stopped.stderr.strip().splitlines()[-1] == f"afx-ops: {_KEY_STATES[state]}"
+    assert not stopped.isolated
+
+
+@needs_x86_64
+@needs_landlock
 def test_digest_mismatch_is_caught_although_the_key_file_is_readable(root, child_env):
     directory = root / "keys"
     _break("digest_mismatch", directory, "ops-bot")
@@ -270,12 +372,13 @@ def test_other_principals_keys_are_never_opened(feature, root, child_env):
     assert got.result == ["bytes", digest(token_for(PRINCIPAL[feature]))]
 
 
-def _fake_isolated(feature: str) -> startup.Isolated:
+def _fake_isolated(feature: str, write: bool = False) -> startup.Isolated:
     return startup.Isolated(
         feature=feature, pid=1, proc_dir="/proc/1", secrets={}, listener=None,
-        kept_fds=frozenset({0, 1, 2}), config=object(),
+        kept_fds=frozenset({0, 1, 2}),
+        config=OpsConfig(Path("/srv/afx"), Path("/srv/keys"), None, write=write),
         endpoint=startup.endpoint_for(Path("/srv/afx")),
-        api_token=token_for(PRINCIPAL[feature]).encode(), state_dir=Path("/srv/state"))
+        api_token=token_for(principal_of(feature, write)).encode(), state_dir=Path("/srv/state"))
 
 
 @pytest.mark.parametrize(("feature", "own"), [("bot", BotClient), ("web", WebClient),
@@ -289,6 +392,20 @@ def test_client_for_binds_the_own_principal_only(feature, own):
     for other in {BotClient, WebClient, NotifyClient} - {own}:
         with pytest.raises(ValueError):
             startup.client_for(isolated, other)
+
+
+@pytest.mark.parametrize(("write", "own", "other"), [(False, WebClient, WebWriteClient),
+                                                     (True, WebWriteClient, WebClient)])
+def test_client_for_web_follows_write_in_the_isolated_config(write, own, other):
+    isolated = _fake_isolated("web", write)
+    client = startup.client_for(isolated, own)
+    assert isinstance(client, own) and client.principal == principal_of("web", write)
+    assert token_for(principal_of("web", write)) not in repr(client)
+    with pytest.raises(ValueError):
+        startup.client_for(isolated, other)
+    for cls in (BotClient, NotifyClient):
+        with pytest.raises(ValueError):
+            startup.client_for(isolated, cls)
 
 
 @pytest.mark.parametrize("stage", ["feature_filter", "read_api_token", "read_secrets",
@@ -315,7 +432,7 @@ def test_isolation_failure_closes_notify_socket_and_prebound_listener(monkeypatc
     monkeypatch.setattr(startup, "close_unlisted_fds", lambda *args: None)
     monkeypatch.setattr(startup, "filter_count", lambda *args: 0)
     monkeypatch.setattr(startup, "feature_filter", lambda *args: _Filter())
-    monkeypatch.setattr(startup, "read_api_token", lambda *args: b"token")
+    monkeypatch.setattr(startup, "read_api_token", lambda *args, **kwargs: b"token")
     monkeypatch.setattr(startup, "read_secrets", lambda *args: {})
     monkeypatch.setattr(startup, "apply_landlock", lambda *args: None)
     monkeypatch.setattr(startup, "prebind_listener", lambda *args, **kw: _capture_listener())

@@ -25,8 +25,20 @@ ops_notices = "default"      # bot のみ: default | all。ops event 通知の�
 deliver_trade_events = false # notify のみ: 取引 event を webhook に配送するか (既定 false)
 improve_notices = "all"      # bot のみ: all | results | off。改善 mission の開始・終了通知 (results は終了のみ)
 deliver_improve_events = false # notify のみ: 改善 event を webhook に配送するか (既定 false)
+bind = "127.0.0.1"           # web のみ: 待受の address (既定 loopback)。loopback 以外は allow が要る
+allow = ["192.168.1.0/24"]   # web のみ: 接続を受ける network (loopback 以外の bind で必須)
+auth = "none"                # web のみ: none | basic。basic は secret の web.password が要る
+user = "afx"                 # web のみ: Basic のユーザー名 (小文字英字で始まる 32 字まで)
+write = false                # web のみ: 承認・却下・改善の開始・job の閲覧と取消を受けるか (既定 false)
 ```
 
+- `write = true` は `bind` が loopback で `auth = "basic"` のときだけ起動できる (満たさなければ
+  起動しない。TLS は未実装で、LAN の平文 HTTP からは書けない)。有効化は `afx ops web enable
+  --write` で行い、`ops.toml` を手で書き換えない (鍵の登録と afx の停止・再起動が要る)。書込みが
+  有効な web は `ops-web-write` の鍵だけを読み、読取りにもその鍵を使う。無効な web は `ops-web`
+  の鍵だけを読む。
+- 書込みが有効な web の前に reverse proxy (nginx 等) を置かない。web からは proxy の接続が
+  loopback に見えるため、LAN の平文 HTTP から書込みが通ってしまう。
 - UDS は `<instance_root>/data/run/api.sock`、lock は `<instance_root>/data/instance.lock` に固定
   (本体の `ops.socket_path` を既定から変えた instance は対象外)。
 - secret は `.../ops/<feature>/secret/` (0700) の `discord.token` (bot) / `webhook.url` (notify)、0600。

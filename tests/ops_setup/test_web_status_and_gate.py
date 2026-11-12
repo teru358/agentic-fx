@@ -60,21 +60,21 @@ def _access(capsys) -> str:
 # --- status の公開範囲行 -----------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("values, secret, line", [
-    ({"port": 8788}, False, "web-access: bind=127.0.0.1:8788 allow=loopback-default auth=none"),
+    ({"port": 8788}, False, "web-access: bind=127.0.0.1:8788 allow=loopback-default auth=none write=off"),
     ({"port": 8788, "bind": "127.0.0.1", "allow": ["203.0.113.5", "198.51.100.0/24"], "auth": "none"}, False,
-     "web-access: bind=127.0.0.1:8788 allow=restricted auth=none"),
+     "web-access: bind=127.0.0.1:8788 allow=restricted auth=none write=off"),
     ({"port": 8788, "bind": LAN, "allow": ["203.0.113.5", "198.51.100.0/24"], "auth": "none"}, False,
-     f"web-access: bind={LAN}:8788 allow=restricted auth=none"),
+     f"web-access: bind={LAN}:8788 allow=restricted auth=none write=off"),
     ({"port": 8788, "bind": LAN, "allow": ["0.0.0.0/0"], "auth": "none"}, False,
-     f"web-access: bind={LAN}:8788 allow=unrestricted auth=none"),
+     f"web-access: bind={LAN}:8788 allow=unrestricted auth=none write=off"),
     ({"port": 8788, "bind": LAN, "allow": ["0.0.0.0/0"], "auth": "basic"}, True,
-     f"web-access: bind={LAN}:8788 allow=unrestricted auth=basic user=afx"),
+     f"web-access: bind={LAN}:8788 allow=unrestricted auth=basic user=afx write=off"),
     ({"port": 8788, "bind": LAN, "allow": ["10.0.0.0/8"], "auth": "basic"}, True,
-     f"web-access: bind={LAN}:8788 allow=restricted auth=basic user=afx"),
+     f"web-access: bind={LAN}:8788 allow=restricted auth=basic user=afx write=off"),
     ({"port": 8788, "bind": LAN, "allow": ["10.0.0.0/8"], "auth": "basic", "user": "ops-web"}, True,
-     f"web-access: bind={LAN}:8788 allow=restricted auth=basic user=ops-web"),
+     f"web-access: bind={LAN}:8788 allow=restricted auth=basic user=ops-web write=off"),
     ({"port": 8788, "bind": "127.0.0.1", "auth": "basic", "user": "a" * 32}, True,
-     f"web-access: bind=127.0.0.1:8788 allow=loopback-default auth=basic user={'a' * 32}"),
+     f"web-access: bind=127.0.0.1:8788 allow=loopback-default auth=basic user={'a' * 32} write=off"),
 ])
 def test_status_prints_the_stage_line_then_one_access_line(root, xdg, capsys, quiet_manager, values, secret, line):
     apply_target(root, values, SecretPlan("install", PW) if secret else SecretPlan("absent"))

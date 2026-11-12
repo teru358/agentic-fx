@@ -14,7 +14,7 @@ from agentic_fx.ops_setup.interactive import interactive_enable
 from agentic_fx.ops_setup.setup_lease import acquire_setup_lease
 from agentic_fx.ops_setup.stages import InvalidState
 from agentic_fx.ops_setup.web_setup import SecretPlan, WebOptions, apply_target
-from web_support import (ACCESS_Q, BIND_EXPLANATION, CANDIDATES, CONFIRM_Q, IFNAME, KEEP_BASIC_Q, KEEP_Q, LAN, LAN2,
+from web_support import (ACCESS_Q, AUTH_Q, BIND_EXPLANATION, CANDIDATES, CONFIRM_Q, IFNAME, KEEP_BASIC_Q, KEEP_Q, LAN, LAN2,
                          ONE_CANDIDATE, PASSWORD_Q, SCOPE_Q, USER_Q, WARNING, ScriptIO, StubSetup, stage_file, tree)
 
 PW = "AAECAwQFBgcICQoLDA0ODw"  # bytes(range(16)) の base64url (padding なし)
@@ -120,10 +120,10 @@ def test_the_one_question_default_and_one_both_mean_keep(root, xdg, answer):
 
 def test_the_one_question_changes_into_the_full_question_set_with_existing_values_as_defaults(root, xdg):
     write_inputs(root, "web", {"port": 9000})
-    io = ScriptIO(answers=["2", "", ""])
+    io = ScriptIO(answers=["2", "", "", ""])
     run = run_enable(root, io)
     assert run.rc == 0
-    assert io.asked == [KEEP_Q, "port", SCOPE_Q]
+    assert io.asked == [KEEP_Q, "port", SCOPE_Q, AUTH_Q]
     assert io.defaults[1] == ("port", "9000")
     assert io.err[0] == "web: 待受 127.0.0.1:9000 / 公開 自機のみ / 認証 none"
 
@@ -177,10 +177,10 @@ def test_the_summary_is_stderr_only_and_never_starts_with_the_stdout_contract_wo
 @pytest.mark.parametrize("stage", FRESH)
 def test_ask_in_a_tty_asks_everything_with_the_existing_values_as_defaults(root, xdg, stage):
     _arrange(root, xdg, stage)
-    io = ScriptIO(answers=["", ""])
+    io = ScriptIO(answers=["", "", ""])
     run = run_enable(root, io, WebOptions(ask=True))
     assert run.rc == 0 and run.setup.enabled == ["web"]
-    assert io.asked == ["port", SCOPE_Q]
+    assert io.asked == ["port", SCOPE_Q, AUTH_Q]
     assert io.defaults[0] == ("port", "8788")
     assert io.err == []
 
@@ -314,10 +314,10 @@ def test_the_summary_line_for_every_existing_shape_goes_to_stderr_without_secret
 # --- 質問の順と書かれる設定 --------------------------------------------------------------------------
 
 def test_local_only_writes_just_the_port(root, xdg):
-    io = ScriptIO(answers=["9000", ""])
+    io = ScriptIO(answers=["9000", "", ""])
     run = run_enable(root, io)
     assert run.rc == 0
-    assert io.asked == ["port", SCOPE_Q]
+    assert io.asked == ["port", SCOPE_Q, AUTH_Q]
     assert config_text(xdg).splitlines()[2:] == ["port = 9000"]
     assert web_secret_state(root) == "absent"
 
@@ -563,15 +563,15 @@ def test_local_only_over_a_leftover_password_also_needs_the_explicit_remove(root
     apply_target(root, {"port": 8788}, SecretPlan("install", "E" * 22))
     io = ScriptIO(answers=["", "1"])
     run = run_enable(root, io)
-    assert run.rc == 0 and io.asked == [SCOPE_Q, REMOVE_Q] and not password_file(xdg).exists()
+    assert run.rc == 0 and io.asked == [AUTH_Q, REMOVE_Q] and not password_file(xdg).exists()
 
 
 # --- 不足だけを聞く (TTY・flag 無し) --------------------------------------------------------------
 
 def test_a_missing_config_asks_the_full_set_and_a_complete_one_asks_nothing_about_it(root, xdg):
-    io = ScriptIO(answers=["8788", ""])
+    io = ScriptIO(answers=["8788", "", ""])
     assert run_enable(root, io).rc == 0
-    assert io.asked == ["port", SCOPE_Q] and io.err == []
+    assert io.asked == ["port", SCOPE_Q, AUTH_Q] and io.err == []
 
 
 def test_a_lan_config_without_allow_asks_only_who_and_allow(root, xdg):
@@ -589,11 +589,12 @@ def test_a_bind_that_is_no_longer_local_asks_only_for_a_new_address(root, xdg):
     assert run.rc == 0 and io.asked == [BIND_Q3] and live(root)["bind"] == LAN
 
 
-def test_basic_without_a_password_on_a_local_web_asks_the_scope_again(root, xdg):
+def test_basic_without_a_password_on_a_local_web_asks_the_auth_again(root, xdg):
     write_inputs(root, "web", {"port": 8788, "auth": "basic"})
-    io = ScriptIO(answers=[""])
+    io = ScriptIO(answers=["1"])
     run = run_enable(root, io)
-    assert run.rc == 0 and io.asked == [SCOPE_Q] and live(root) == {"port": 8788}
+    assert run.rc == 0 and io.asked == [AUTH_Q] and live(root) == {"port": 8788}
+    assert io.defaults == [(AUTH_Q, "2")]
 
 
 def test_none_with_a_leftover_password_in_a_tty_asks_the_auth_choice(root, xdg):
@@ -655,9 +656,9 @@ def test_probe_bind_failed_reasks_the_port_then_the_address_for_a_lan(root, xdg)
 
 
 def test_probe_bind_failed_reasks_only_the_port_for_a_local_only_web(root, xdg):
-    io = ScriptIO(answers=["8788", "", "9001"])
+    io = ScriptIO(answers=["8788", "", "", "9001"])
     run = run_enable(root, io, probe=_fail_then_ok((73, "probe_bind_failed")))
-    assert run.rc == 0 and io.asked == ["port", SCOPE_Q, "port"]
+    assert run.rc == 0 and io.asked == ["port", SCOPE_Q, AUTH_Q, "port"]
 
 
 def test_bind_not_local_reasks_only_the_address(root, xdg):
@@ -673,9 +674,9 @@ def test_allow_required_reasks_only_who_and_allow(root, xdg):
 
 
 def test_config_invalid_reasks_the_port_and_the_scope(root, xdg):
-    io = ScriptIO(answers=["8788", "", "8788", ""])
+    io = ScriptIO(answers=["8788", "", "", "8788", "", ""])
     run = run_enable(root, io, probe=_fail_then_ok((71, "config_invalid")))
-    assert run.rc == 0 and io.asked == ["port", SCOPE_Q, "port", SCOPE_Q]
+    assert run.rc == 0 and io.asked == ["port", SCOPE_Q, AUTH_Q, "port", SCOPE_Q, AUTH_Q]
 
 
 def test_secret_missing_reasks_the_auth_and_secret(root, xdg):
@@ -711,14 +712,14 @@ def test_secret_unexpected_reasks_the_auth_with_the_explicit_remove_or_basic_cho
 
 @pytest.mark.parametrize("reason", ["secret_invalid", "interface_lookup_failed"])
 def test_secret_invalid_and_lookup_failure_end_the_attempt_at_once(root, xdg, reason):
-    io = ScriptIO(answers=["8788", ""])
+    io = ScriptIO(answers=["8788", "", ""])
     run = run_enable(root, io, probe=_fail_then_ok((71, reason)))
     assert (run.rc, run.reason) == (1, reason)
-    assert run.probes == ["web"] and io.asked == ["port", SCOPE_Q] and run.setup.enabled == []
+    assert run.probes == ["web"] and io.asked == ["port", SCOPE_Q, AUTH_Q] and run.setup.enabled == []
 
 
 def test_three_failures_end_with_the_last_fixed_reason_and_no_enable(root, xdg):
-    io = ScriptIO(answers=["8788", "", "8788", "", "8788", ""])
+    io = ScriptIO(answers=["8788", "", "", "8788", "", "", "8788", "", ""])
     run = run_enable(root, io, probe=lambda n: (71, f"config_invalid"))
     assert (run.rc, run.reason) == (1, "config_invalid") and len(run.probes) == 3
     assert run.setup.enabled == []
@@ -726,13 +727,13 @@ def test_three_failures_end_with_the_last_fixed_reason_and_no_enable(root, xdg):
 
 
 def test_other_probe_failures_are_not_reasked(root, xdg):
-    io = ScriptIO(answers=["8788", ""])
+    io = ScriptIO(answers=["8788", "", ""])
     run = run_enable(root, io, probe=_fail_then_ok((70, "runtime_unavailable")))
     assert (run.rc, run.reason) == (1, "runtime_unavailable") and run.probes == ["web"]
 
 
 def test_eof_while_reasking_is_aborted_and_keeps_what_was_already_applied(root, xdg):
-    io = ScriptIO(answers=["8788", ""], eof_after=2)
+    io = ScriptIO(answers=["8788", "", ""], eof_after=3)
     run = run_enable(root, io, probe=_fail_then_ok((73, "probe_bind_failed")))
     assert (run.rc, run.reason) == (1, "setup_aborted")
     assert live(root) == {"port": 8788} and run.setup.enabled == []
@@ -949,7 +950,7 @@ def test_the_flow_holds_a_given_lease_and_never_reacquires_the_lock(root, xdg, m
                         lambda _root: (_ for _ in ()).throw(AssertionError("lock reacquired")))
     lease = acquire_setup_lease(root)
     try:
-        run = run_enable(root, ScriptIO(answers=["8788", ""]), lease=lease)
+        run = run_enable(root, ScriptIO(answers=["8788", "", ""]), lease=lease)
     finally:
         lease.close()
     assert run.rc == 0

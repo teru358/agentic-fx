@@ -254,3 +254,37 @@ def test_the_route_of_each_upstream_line_is_the_matched_client_method(capsys):
     response = handle_request(Request("GET", "/logs", {}), Client())
     assert response.status == 502
     assert capsys.readouterr().err == "afx-ops: web_upstream error=OSError route=log\n"
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"])
+@pytest.mark.parametrize("path", ["/approvals/7/approve", "/approvals/7/reject", "/improve",
+                                  "/improve/runs", "/confirm", "/confirm/check",
+                                  "/jobs/" + "0123456789abcdef" * 2,
+                                  "/jobs/" + "0123456789abcdef" * 2 + "/cancel"])
+def test_with_write_on_a_method_outside_the_route_is_405_without_daemon_call(method, path):
+    from _write_support import Rig
+    rig = Rig()
+    response = rig.send(rig.request(method, path, {}))
+    assert response.status == 405
+    assert rig.client.calls == []
+
+
+@pytest.mark.parametrize("path", ["/", "/approvals", "/approvals/7", "/logs", "/activity",
+                                  "/plugins", "/plugins/x"])
+def test_with_write_on_a_read_route_still_refuses_every_change_method(path):
+    from _write_support import Rig
+    rig = Rig()
+    for method in ("POST", "PUT", "PATCH", "DELETE"):
+        response = rig.send(rig.request(method, path, {"x": "1"}))
+        assert response.status == 405 and response.headers["Allow"] == "GET, HEAD", (method, path)
+    assert rig.client.calls == []
+
+
+@pytest.mark.parametrize("path", ["/decide", "/jobs", "/events", "/approvals/7/retry",
+                                  "/approvals/7/cancel", "/jobs/abc/cancel", "/jobs/abc", "/improve/jobs"])
+def test_with_write_on_an_out_of_scope_path_is_404_for_every_method(path):
+    from _write_support import Rig
+    rig = Rig()
+    for method in ("GET", "POST", "PUT", "DELETE"):
+        assert rig.send(rig.request(method, path, {})).status == 404, (method, path)
+    assert rig.client.calls == []

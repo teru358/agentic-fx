@@ -578,15 +578,15 @@ def test_access_line_is_not_configured_without_calling_the_reader(root, xdg):
 
 
 @pytest.mark.parametrize("values, lister, line", [
-    ({"port": 8788}, None, "web-access: bind=127.0.0.1:8788 allow=loopback-default auth=none"),
+    ({"port": 8788}, None, "web-access: bind=127.0.0.1:8788 allow=loopback-default auth=none write=off"),
     ({"port": 8788, "bind": "127.0.0.1", "allow": ["10.0.0.0/8"]}, None,
-     "web-access: bind=127.0.0.1:8788 allow=restricted auth=none"),
+     "web-access: bind=127.0.0.1:8788 allow=restricted auth=none write=off"),
     ({"port": 8788, "bind": "127.0.0.1", "allow": ["0.0.0.0/0"]}, None,
-     "web-access: bind=127.0.0.1:8788 allow=unrestricted auth=none"),
+     "web-access: bind=127.0.0.1:8788 allow=unrestricted auth=none write=off"),
     ({"port": 8788, "bind": LAN, "allow": ["203.0.113.5", "10.0.0.0/8"], "auth": "none"}, [LAN],
-     f"web-access: bind={LAN}:8788 allow=restricted auth=none"),
+     f"web-access: bind={LAN}:8788 allow=restricted auth=none write=off"),
     ({"port": 8788, "bind": LAN, "allow": ["0.0.0.0/0"], "auth": "none"}, [LAN],
-     f"web-access: bind={LAN}:8788 allow=unrestricted auth=none"),
+     f"web-access: bind={LAN}:8788 allow=unrestricted auth=none write=off"),
 ])
 def test_access_line_for_a_healthy_enabled_web(root, xdg, values, lister, line):
     write_inputs(root, "web", values)
@@ -599,7 +599,7 @@ def test_access_line_basic_with_a_password_never_shows_the_password(root, xdg):
     apply_target(root, {"port": 8788, "bind": LAN, "allow": ["10.0.0.0/8"], "auth": "basic"},
                  SecretPlan("install", PW))
     got = access_line(root, _stage(), interfaces=lambda: [LAN])
-    assert got == f"web-access: bind={LAN}:8788 allow=restricted auth=basic user=afx"
+    assert got == f"web-access: bind={LAN}:8788 allow=restricted auth=basic user=afx write=off"
     assert PW not in got
 
 
@@ -607,11 +607,11 @@ def test_access_line_basic_shows_the_configured_user_and_the_default(root, xdg):
     apply_target(root, {"port": 8788, "bind": LAN, "allow": ["192.168.1.0/24"], "auth": "basic",
                         "user": "ops-web"}, SecretPlan("install", PW))
     assert access_line(root, _stage(), interfaces=lambda: [LAN]) == \
-        f"web-access: bind={LAN}:8788 allow=restricted auth=basic user=ops-web"
+        f"web-access: bind={LAN}:8788 allow=restricted auth=basic user=ops-web write=off"
     text = (xdg / "config" / "ops.toml").read_text().replace('user = "ops-web"\n', "")
     (xdg / "config" / "ops.toml").write_text(text)
     assert access_line(root, _stage(), interfaces=lambda: [LAN]) == \
-        f"web-access: bind={LAN}:8788 allow=restricted auth=basic user=afx"
+        f"web-access: bind={LAN}:8788 allow=restricted auth=basic user=afx write=off"
 
 
 def test_access_line_none_never_shows_a_user(root, xdg):
@@ -629,7 +629,7 @@ def test_access_line_unavailable_reasons_follow_the_shared_reader(root, xdg):
     assert access_line(root, _stage()) == "web-access: unavailable reason=config_dir_invalid"
     (xdg / "config" / "ops.toml").unlink()
     write_inputs(root, "web", {"port": 8788, "bind": LAN, "allow": ["10.0.0.0/8"]})
-    assert access_line(root, _stage(), interfaces=lambda: [LAN]) == f"web-access: bind={LAN}:8788 allow=restricted auth=none"
+    assert access_line(root, _stage(), interfaces=lambda: [LAN]) == f"web-access: bind={LAN}:8788 allow=restricted auth=none write=off"
     assert access_line(root, _stage(), interfaces=lambda: ["192.168.9.9"]) == \
         "web-access: unavailable reason=bind_not_local"
     assert access_line(root, _stage()) == "web-access: unavailable reason=interface_lookup_failed"

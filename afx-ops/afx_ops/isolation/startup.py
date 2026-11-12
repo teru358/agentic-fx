@@ -186,12 +186,21 @@ PLANS: Mapping[str, FeaturePlan] = MappingProxyType({
 })
 
 
-# 機能ごとに固定の principal。設定からは指せない (他 principal の鍵を読ませない)
+# 機能ごとに固定の principal。設定からは指せない (他 principal の鍵を読ませない)。
+# web だけは検証済みの `write` が真のとき `WEB_WRITE_PRINCIPAL` になる (`principal_for`)
 PRINCIPALS: Mapping[str, str] = MappingProxyType({
     "bot": "ops-bot",
     "web": "ops-web",
     "notify": "ops-notify",
 })
+WEB_WRITE_PRINCIPAL = "ops-web-write"
+
+
+def principal_for(feature: str, write: bool) -> str:
+    """機能の principal。鍵の読取りも client の束縛も、検証済みの同じ `write` からこれで選ぶ。"""
+    if feature == "web" and write:
+        return WEB_WRITE_PRINCIPAL
+    return PRINCIPALS[feature]
 
 
 @dataclass(frozen=True)
@@ -314,7 +323,8 @@ _Client = TypeVar("_Client")
 
 def client_for(isolated: Isolated, client_cls: type[_Client]) -> _Client:
     """機能の固定 principal の client だけを、受け取った鍵で作る。"""
-    if getattr(client_cls, "principal", None) != PRINCIPALS[isolated.feature]:
+    if getattr(client_cls, "principal", None) != principal_for(isolated.feature,
+                                                               isolated.config.write):
         raise ValueError("client principal does not match the feature")
     return client_cls.from_token(isolated.endpoint, isolated.api_token)
 
@@ -868,13 +878,16 @@ def check_web_access(plan: StartupPlan, config: OpsConfig, *,
 _SECRET_MAX = 65536
 
 
-def read_api_token(feature: str, key_dir: Path) -> bytes:
+def read_api_token(feature: str, key_dir: Path, *, write: bool) -> bytes:
     """機能の固定 principal の鍵を、manifest の state と digest を照合して読む。隔離前に呼ぶ。
+
+    `write` は検証済みの設定の値。web は真のとき `ops-web-write` の鍵だけを読み、偽のとき
+    `ops-web` の鍵だけを読む (どちらかが読めなくても他方へは落ちない)。
 
     feature secret の reader は使わない (manifest の照合を欠くため)。失敗は `key_*` の固定
     reason で、例外文に path や鍵を載せない。
     """
-    principal = PRINCIPALS[feature]
+    principal = principal_for(feature, write)
     key_dir = Path(key_dir)
     try:
         token = keys.read_token(principal, key_file=key_dir / keys.key_file_name(principal),
@@ -1014,7 +1027,7 @@ def isolate(plan: StartupPlan, config: OpsConfig, *,
         if release_config_dir is not None:
             release_config_dir()
         try:
-            api_token = read_api_token(plan.feature, config.key_dir)
+            api_token = read_api_token(plan.feature, config.key_dir, write=config.write)
             secrets = read_secrets(plan)
             listener = None
             if PLANS[plan.feature].listener:

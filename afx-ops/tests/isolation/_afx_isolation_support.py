@@ -26,6 +26,20 @@ from afx_ops.isolation import landlock  # noqa: E402
 CANARY = HERE / "afx_isolation_canary.py"
 FEATURES = ("bot", "web", "notify")
 PRINCIPAL = {"bot": "ops-bot", "web": "ops-web", "notify": "ops-notify"}
+WEB_WRITE_PRINCIPAL = "ops-web-write"
+WEB_PASSWORD_TEXT = b"isolation-web-pass-0042"
+
+
+def principal_of(feature: str, write: bool = False) -> str:
+    """試験が期待する機能の principal。書込みが有効な web だけが `ops-web-write`。"""
+    return WEB_WRITE_PRINCIPAL if feature == "web" and write else PRINCIPAL[feature]
+
+
+def install_web_password(root: Path) -> None:
+    """web の secret dir に Basic 用の password を置く (書込みの web は basic が要る)。"""
+    path = root / "web" / "secret" / "web.password"
+    path.write_bytes(WEB_PASSWORD_TEXT)
+    path.chmod(0o600)
 
 needs_x86_64 = pytest.mark.skipif(
     sys.platform != "linux" or platform.machine() != "x86_64",

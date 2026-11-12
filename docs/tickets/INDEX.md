@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 161 件。完了分は closed/。
+未完了: 162 件。完了分は closed/。
 
 ## 実装中 (2)
 
@@ -69,9 +69,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (141)
+## 設計待ち (142)
 
-### 不具合 (77)
+### 不具合 (78)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -105,6 +105,7 @@
 | [verify-backend-counts-preexisting-descendants](open/verify-backend-counts-preexisting-descendants.md) | 中 | 2026-11-06 | verify_backend が実行前から居た子孫プロセスも未回収と数えて失敗する |
 | [plugin-inherited-filter-test-hits-fingerprint-selftest-first](open/plugin-inherited-filter-test-hits-fingerprint-selftest-first.md) | 中 | 2026-11-07 | 継承 seccomp filter の拒否 test が fingerprint 自己試験の失敗を先に返す |
 | [improve-eval-window-reference-availability](open/improve-eval-window-reference-availability.md) | 中 | 2026-11-09 | 参照系列を宣言した候補の評価区間に、参照の履歴が無い先頭の足が入る |
+| [web-write-recover-idle-interruption](open/web-write-recover-idle-interruption.md) | 中 | 2026-11-10 | 有効でない web の鍵と write の回復が中断に弱い |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
 | [tier-a-directive-ignored](open/tier-a-directive-ignored.md) | 中 |  | 自己テストの連続失敗の警告が無視され続け、止める仕組みが無い |

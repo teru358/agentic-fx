@@ -19,20 +19,22 @@ from agentic_fx.ops.contracts import Principal
 from agentic_fx.ops.keys import KeySetError, enrolled_key_matches, key_dir
 from agentic_fx.ops_setup import interfaces as interface_listing
 from agentic_fx.ops_setup.feature_config import web_defaults, web_secret_state
-from agentic_fx.ops_setup.stages import (InvalidState, OpsSetup, _ENABLE_TERMINAL, _FEATURE_PRINCIPALS,
-                                         _KEY_MISMATCH_CODES, read_marker, read_stage)
+from agentic_fx.ops_setup.stages import (InvalidState, OpsSetup, WRITE_SWITCH_GUIDANCE, _ENABLE_TERMINAL,
+                                         _FEATURE_PRINCIPALS, _KEY_MISMATCH_CODES, read_marker, read_stage)
 from agentic_fx.ops_setup.systemd import SystemdError
 from agentic_fx.ops_setup.units import OpsExecNotFound, resolve_ops_exec, units_match
-from agentic_fx.ops_setup.web_setup import (SECRET_GUIDANCE_TEMPLATE, WebOptions, WebSetupError, cleanup_temporaries,
-                                            generated_password_line, options_problem, plan_for_input, read_config_file, read_password_file,
-                                            target_from_config_file)
+from agentic_fx.ops_setup.web_setup import (SECRET_GUIDANCE_TEMPLATE, WRITE_CHANGE_GUIDANCE, WRITE_KEPT_GUIDANCE, WebOptions, WebSetupError,
+                                            cleanup_temporaries, generated_password_line, options_problem, plan_for_input,
+                                            read_config_file, read_password_file, target_from_config_file, write_problem)
 from agentic_fx.ops_setup.web_wizard import FULL, Session
+from agentic_fx.ops_setup.write_key import Inconsistent, check_write_key_consistency
 
 FEATURE = "web"
 RERUN = "afx ops web reconfigure を再実行する"
 RECOVER = "afx ops web enable で状態を回復してから再実行する"
 RELOAD = "systemctl --user daemon-reload の後に再実行する"
-KEYS = "afx を止めて afx keys rotate ops-web を実行し、afx を起動してから afx ops web reconfigure を再実行する"
+KEYS_TEMPLATE = "afx を止めて afx keys rotate {principal} を実行し、afx を起動してから afx ops web reconfigure を再実行する"
+KEYS = KEYS_TEMPLATE.format(principal="ops-web")
 SECRET_GUIDANCE = SECRET_GUIDANCE_TEMPLATE.format(verb="reconfigure")
 _AFX_RUNNING = frozenset({"active", "activating", "reloading"})
 _AFX_DOWN = frozenset({"inactive", "failed"})
@@ -56,6 +58,8 @@ def _check_stage(root: Path) -> None:
         raise Refusal("not_enabled")
     if not (saved["operation"] == "enable" and saved["stage"] == _ENABLE_TERMINAL):
         raise Refusal("invalid_state")
+    if "write_target" in saved:
+        raise Refusal("write_switch_pending", WRITE_SWITCH_GUIDANCE)
 
 
 def _check_others(setup: OpsSetup) -> None:
@@ -79,12 +83,21 @@ def _check_others(setup: OpsSetup) -> None:
         raise Refusal("invalid_state", RECOVER)
 
 
-def _check_principal(setup: OpsSetup) -> None:
+def current_write(root: Path) -> bool:
+    """reconfigure が保持すべき write。判定は `check_write_key_consistency` に従い、不整合なら拒否する。"""
+    verdict = check_write_key_consistency(root, mode="enabled", strict_config=True)
+    if isinstance(verdict, Inconsistent):
+        raise Refusal(verdict.reason, verdict.guidance)
+    return verdict.write
+
+
+def _check_principal(setup: OpsSetup, write: bool) -> None:
+    principal = Principal.OPS_WEB_WRITE if write else Principal.OPS_WEB
     try:
-        matches = enrolled_key_matches(key_dir(setup.root), Principal.OPS_WEB)
+        matches = enrolled_key_matches(key_dir(setup.root), principal)
     except KeySetError as error:
         if error.code in _KEY_MISMATCH_CODES:
-            raise Refusal("principal_key_mismatch", KEYS) from None
+            raise Refusal("principal_key_mismatch", KEYS_TEMPLATE.format(principal=principal.value)) from None
         raise Refusal("invalid_state") from None
     except OSError:
         raise Refusal("invalid_state") from None
@@ -131,6 +144,9 @@ def run_ops_reconfigure(root: Path, feature: str, *, options: WebOptions | None 
     options = options if options is not None else WebOptions()
     io = io if io is not None else ConsoleIO()
     emit = hook if hook is not None else (lambda _name: None)
+    if options.write is not None:
+        print(f"afx ops: write_change_refused ({WRITE_CHANGE_GUIDANCE})", file=sys.stderr)
+        return 2
     problem = options_problem(options, reconfigure=True)
     if problem:
         print(f"afx ops: {problem}", file=sys.stderr)
@@ -148,7 +164,8 @@ def run_ops_reconfigure(root: Path, feature: str, *, options: WebOptions | None 
                 setup.paths = resolve_ops_exec(setup.paths)
             except OpsExecNotFound:
                 raise Refusal("ops_exec_not_found") from None
-            _check_principal(setup)
+            write = current_write(root)
+            _check_principal(setup, write)
             _check_units(setup)
             if options.flagless and not io.isatty():
                 raise Refusal("setup_input_required", rc=2)
@@ -176,20 +193,26 @@ def run_ops_reconfigure(root: Path, feature: str, *, options: WebOptions | None 
         session = Session(root, io, lambda: probe_one(FEATURE),
                           candidates if candidates is not None else default_candidates(root),
                           hook=hook, token_bytes=token_bytes, before_probe=ensure_stopped,
-                          echo_each=interactive)
+                          echo_each=interactive, write=write)
         try:
-            cleanup_temporaries(root, hook=hook)
             if interactive:
-                secret_state = web_secret_state(root)
+                secret_state = web_secret_state(root, ignore_temporaries=True)
                 if secret_state == "unsafe":
                     raise WebSetupError("secret_invalid")
                 values, plan = session.collect(web_defaults(root), secret_state, FULL)
             else:
-                values = target_from_config_file(read_config_file(options.config_file or ""))
+                parsed = read_config_file(options.config_file or "")
+                if "write" in parsed:
+                    raise WebSetupError("write_change_refused", 2, WRITE_CHANGE_GUIDANCE)
+                values = target_from_config_file(parsed)
                 password = read_password_file(options.password_file) if options.password_file else None
-                plan = plan_for_input(values, web_secret_state(root), options.secret_action or "", password)
+                plan = plan_for_input(values, web_secret_state(root, ignore_temporaries=True), options.secret_action or "", password)
+            problem = write_problem(values) if write else None
+            if problem is not None:
+                raise WebSetupError(problem, 1, WRITE_KEPT_GUIDANCE)
+            cleanup_temporaries(root, hook=hook)
         except WebSetupError as error:
-            guidance = SECRET_GUIDANCE if error.reason == "secret_invalid" else ""
+            guidance = SECRET_GUIDANCE if error.reason == "secret_invalid" else error.guidance
             _report(Refusal(error.reason, guidance), rerun=False)
             return error.rc
         except OSError:

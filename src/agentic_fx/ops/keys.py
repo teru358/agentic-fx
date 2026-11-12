@@ -371,6 +371,22 @@ def enrolled_key_matches(directory: Path, principal: Principal) -> bool:
         os.close(dir_fd)
 
 
+def principal_entry(directory: Path, principal: Principal) -> tuple[str, str | None] | None:
+    """manifest 上の principal の状態 ``(state, op)``。未登録は None。
+
+    state は active / revoked / preparing で、op は preparing のときだけ (enroll / rotate / revoke)。
+    鍵 file の中身は読まない。
+    """
+    dir_fd = _open_dir(Path(directory))
+    try:
+        entry = _read_ready(dir_fd)["principals"].get(principal.value)
+    finally:
+        os.close(dir_fd)
+    if entry is None:
+        return None
+    return entry["state"], entry.get("op") if entry["state"] == "preparing" else None
+
+
 def read_token(directory: Path, principal: Principal) -> str:
     """client が鍵を読む。同じ検査を通し、生成はしない。"""
     dir_fd = _open_dir(Path(directory))

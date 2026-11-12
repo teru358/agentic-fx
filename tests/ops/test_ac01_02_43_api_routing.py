@@ -282,7 +282,7 @@ _EXPECTED_TABLE = {
     "killswitch_reset": ("POST", "/v1/killswitch/reset", Scope.LOCAL_GUARD),
     "killswitch_reconcile": ("POST", "/v1/killswitch/reconcile", Scope.LOCAL_GUARD),
     "reflection_retry": ("POST", "/v1/reflections/{order_id}/retry", Scope.OPERATE),
-    "improve": ("POST", "/v1/improve/runs", Scope.OPERATE),
+    "improve": ("POST", "/v1/improve/runs", Scope.IMPROVE_RUN),
     "backlog_add": ("POST", "/v1/backlog", Scope.OPERATE),
     "backlog_list": ("GET", "/v1/backlog", Scope.GUIDANCE_READ),
     "backlog_reject": ("POST", "/v1/backlog/{id}/reject", Scope.OPERATE),
