@@ -17,8 +17,8 @@ afx 再起動で socket / lock の inode が変わっても、次の要求は新
 ``run_guarded`` で非零終了し、systemd の restart に委ねる)。
 
 HTTP は stdlib socket の最小実装: ``Content-Length`` 必須、chunked 不可、
-``Connection: close``、JSON。応答喪失の再送はしない (ops の principal が届く endpoint に
-``Idempotency-Key`` 付きのものは無く、決定は正本を読み直して扱うため)。
+``Connection: close``、JSON。応答喪失の再送はしない (決定は正本を読み直して扱い、改善の開始は
+呼出し側が同じ ``Idempotency-Key`` で呼び直すため)。
 """
 from __future__ import annotations
 
@@ -31,9 +31,10 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import TextIO
 from urllib.parse import quote, urlencode
 
@@ -45,8 +46,16 @@ READINESS_INTERVAL = 0.25
 READINESS_LIMIT = 30.0
 HTTP_TIMEOUT = 15.0
 ACTOR_HEADER = "X-Afx-Asserted-Actor"
-ACTOR_MAX_BYTES = 28
-_ACTOR = re.compile(r"discord:[0-9]{17,20}")
+IDEMPOTENCY_HEADER = "Idempotency-Key"
+# principal ごとの actor の形式 (本体 daemon の ``ACTOR_RULES`` と同じ値。値の一致は test で固定する)。
+ACTOR_RULES: Mapping[str, tuple[re.Pattern[str], int]] = MappingProxyType({
+    "ops-bot": (re.compile(r"discord:[0-9]{17,20}"), 28),
+    # `web:` + 設定の Basic ユーザー名 (`config.WEB_USER_PATTERN`。config は本 module を間接に
+    # import するので、ここには値を置き、一致は test で固定する)
+    "ops-web-write": (re.compile(r"web:[a-z][a-z0-9_-]{0,31}"), 36),
+})
+ACTOR_MAX_BYTES = ACTOR_RULES["ops-bot"][1]
+_IDEMPOTENCY_KEY = re.compile(r"[A-Za-z0-9_-]{1,200}")
 _JOB_ID = re.compile(r"[0-9a-f]{32}")
 _MAX_RESPONSE = 8 * 1024 * 1024
 
@@ -58,7 +67,7 @@ RC_KEY = 4
 # (socket 無し・接続拒否・socket を使えない・connect の期限切れ・起動待ちの期限・actor
 # 形式外) と、鍵を送った後の応答喪失。
 CLIENT_REASONS = ("no_socket", "refused", "socket_unusable", "timeout", "readiness_timeout",
-                  "invalid_actor", "response_lost")
+                  "invalid_actor", "invalid_idempotency_key", "response_lost")
 # 起動待ちが待ってよい失敗 (daemon がまだ listen していない・fd の一時的な枯渇)。
 # それ以外 (権限・socket でない等の恒久的な失敗、認証の失敗) は待たずに止める。
 _WAITABLE = ("no_socket", "refused", "pidfd_transient")
@@ -107,33 +116,40 @@ class Reply:
 
 
 class Actor:
-    """``X-Afx-Asserted-Actor`` の値。形式を通ったものだけが作れる。"""
+    """``X-Afx-Asserted-Actor`` の値。その principal の形式を通ったものだけが作れる。"""
 
-    __slots__ = ("_value",)
+    __slots__ = ("_value", "_principal")
 
-    def __init__(self, value: str) -> None:
-        _check_actor_text(value)
+    def __init__(self, value: str, principal: str = "ops-bot") -> None:
+        _check_actor_text(value, principal)
         self._value = value
+        self._principal = principal
 
     @property
     def value(self) -> str:
         return self._value
 
+    @property
+    def principal(self) -> str:
+        # __init__ を通らない継承 object でも例外にせず、規則に無い値として扱う
+        return getattr(self, "_principal", "")
+
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, Actor) and other._value == self._value
+        return (isinstance(other, Actor) and other._value == self._value
+                and other.principal == self.principal)
 
     def __hash__(self) -> int:
-        return hash(self._value)
+        return hash((self._value, self.principal))
 
     def __repr__(self) -> str:
         return f"Actor({self._value!r})"
 
 
-def _check_actor_text(value: object) -> str:
+def _check_actor_text(value: object, principal: str = "ops-bot") -> str:
+    rule = ACTOR_RULES.get(principal) if type(principal) is str else None
     # \d は全角数字にも一致するので [0-9] の fullmatch で決める (末尾改行も許さない)。
-    if (type(value) is not str or not value.isascii()
-            or len(value.encode("ascii")) > ACTOR_MAX_BYTES
-            or _ACTOR.fullmatch(value) is None):
+    if (rule is None or type(value) is not str or not value.isascii()
+            or len(value.encode("ascii")) > rule[1] or rule[0].fullmatch(value) is None):
         raise ApiError("invalid_actor")
     return value
 
@@ -322,7 +338,7 @@ def _parse_response(buffer: bytes) -> tuple[int, bytes, int | None] | None:
 
 
 def _encode(method: str, target: str, token: str, body: bytes | None,
-            actor: Actor | None) -> bytes:
+            actor: Actor | None, idempotency_key: str | None = None) -> bytes:
     lines = [f"{method} {target} HTTP/1.1", "Host: afx", f"Authorization: Bearer {token}",
              f"Content-Length: {0 if body is None else len(body)}", "Connection: close"]
     if body is not None:
@@ -331,15 +347,19 @@ def _encode(method: str, target: str, token: str, body: bytes | None,
         # header を組む唯一の箇所。型と形式をここでも確かめる (継承や別 object で迂回させない)。
         if not isinstance(actor, Actor):
             raise ApiError("invalid_actor")
-        lines.append(f"{ACTOR_HEADER}: {_check_actor_text(actor.value)}")
+        lines.append(f"{ACTOR_HEADER}: {_check_actor_text(actor.value, actor.principal)}")
+    if idempotency_key is not None:
+        if type(idempotency_key) is not str or _IDEMPOTENCY_KEY.fullmatch(idempotency_key) is None:
+            raise ApiError("invalid_idempotency_key")
+        lines.append(f"{IDEMPOTENCY_HEADER}: {idempotency_key}")
     return ("\r\n".join(lines) + "\r\n\r\n").encode("ascii") + (body or b"")
 
 
 def _build(token: str, method: str, path: str, query: dict | None, body: dict | None,
-           actor: Actor | None) -> bytes:
+           actor: Actor | None, idempotency_key: str | None = None) -> bytes:
     target = path + ("?" + urlencode(query) if query else "")
     raw = None if body is None else json.dumps(body, separators=(",", ":")).encode()
-    return _encode(method, target, token, raw, actor)
+    return _encode(method, target, token, raw, actor, idempotency_key)
 
 
 def _reply(status: int, body: bytes, retry_after: int | None = None) -> Reply:
@@ -497,7 +517,7 @@ class BotClient(_Client):
     def _call_as(self, actor: Actor, method: str, path: str, *,
                  body: dict | None = None) -> Reply:
         """actor header を付ける唯一の経路。"""
-        if not isinstance(actor, Actor):
+        if not isinstance(actor, Actor) or actor.principal != self.principal:
             raise ApiError("invalid_actor")
         return self._send(_build(self._token, method, path, None, body, actor))
 
@@ -545,6 +565,43 @@ class WebClient(_Client):
         return self._get("/v1/activity", n=n, category=category)
 
 
+class WebWriteClient(WebClient):
+    """``ops-web-write``。読取は ``WebClient`` と同じ。書込みは呼出しごとに ``web:<user>`` の
+    actor を受けて形式を検査し、決定・改善の開始・job の閲覧と取消にだけ付ける。actor を保持せず、任意の
+    header を足す口も持たない。"""
+
+    principal = "ops-web-write"
+
+    def approve(self, actor: str, approval_id: int, *, payload_sha256: str) -> Reply:
+        return self._write(actor, f"/v1/approvals/{_int_id(approval_id)}/approve",
+                           {"payload_sha256": payload_sha256})
+
+    def reject(self, actor: str, approval_id: int, *, reason: str | None) -> Reply:
+        return self._write(actor, f"/v1/approvals/{_int_id(approval_id)}/reject",
+                           {} if reason is None else {"reason": reason})
+
+    def improve_run(self, actor: str, body: dict, *, idempotency_key: str) -> Reply:
+        if type(idempotency_key) is not str:
+            raise ApiError("invalid_idempotency_key")
+        return self._write(actor, "/v1/improve/runs", body, idempotency_key=idempotency_key)
+
+    def job(self, actor: str, job_id: str) -> Reply:
+        """job 1 件の状態。daemon は job を作った actor と同じ actor にだけ見せる。"""
+        checked = Actor(actor, self.principal)
+        return self._send(_build(self._token, "GET", f"/v1/jobs/{_job_id(job_id)}", None,
+                                 None, checked))
+
+    def cancel_job(self, actor: str, job_id: str) -> Reply:
+        return self._write(actor, f"/v1/jobs/{_job_id(job_id)}/cancel", {})
+
+    def _write(self, actor: str, path: str, body: dict, *,
+               idempotency_key: str | None = None) -> Reply:
+        # 形式外は鍵を送る前に止まる (Actor を作る時点で検査する)。
+        checked = Actor(actor, self.principal)
+        return self._send(_build(self._token, "POST", path, None, body, checked,
+                                 idempotency_key))
+
+
 class NotifyClient(_Client):
     """``ops-notify``。event の読取りだけで、actor を付ける手段を持たない。"""
 
@@ -581,6 +638,12 @@ _PLUGIN_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
 def _plugin_name(value: str) -> str:
     if type(value) is not str or _PLUGIN_NAME.fullmatch(value) is None:
         raise ValueError("plugin name")
+    return value
+
+
+def _job_id(value: str) -> str:
+    if type(value) is not str or _JOB_ID.fullmatch(value) is None:
+        raise ValueError("job id")
     return value
 
 

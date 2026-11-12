@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from enum import StrEnum
 
 
@@ -56,6 +57,7 @@ class Scope(StrEnum):
     APPROVALS_DETAIL = "approvals.detail"
     LOGS_READ = "logs.read"
     JOBS_OWN = "jobs.own"
+    IMPROVE_RUN = "improve.run"
     GUIDANCE_READ = "guidance.read"
     OPERATE = "operate"
     DECIDE = "decide"
@@ -67,6 +69,7 @@ class Principal(StrEnum):
     APPROVER = "approver"
     OPS_BOT = "ops-bot"
     OPS_WEB = "ops-web"
+    OPS_WEB_WRITE = "ops-web-write"
     OPS_NOTIFY = "ops-notify"
 
 
@@ -91,7 +94,7 @@ PRINCIPAL_SCOPES: dict[Principal, frozenset[Scope]] = {
     Principal.OPERATOR: frozenset({
         Scope.STATUS_READ, Scope.EVENTS_READ, Scope.APPROVALS_LIST,
         Scope.APPROVALS_DETAIL, Scope.LOGS_READ, Scope.JOBS_OWN, Scope.GUIDANCE_READ,
-        Scope.OPERATE}),
+        Scope.OPERATE, Scope.IMPROVE_RUN}),
     Principal.APPROVER: frozenset(Scope),
     # bot は決定と、その job を追う jobs.own だけ。operate / local_guard / logs.read は持たない。
     Principal.OPS_BOT: frozenset({
@@ -100,17 +103,35 @@ PRINCIPAL_SCOPES: dict[Principal, frozenset[Scope]] = {
     Principal.OPS_WEB: frozenset({
         Scope.STATUS_READ, Scope.EVENTS_READ, Scope.APPROVALS_LIST,
         Scope.APPROVALS_DETAIL, Scope.LOGS_READ}),
+    # 書込みが有効な web。読取は ops-web と同じで、決定・改善の開始・自分の job の追跡だけを足す。
+    Principal.OPS_WEB_WRITE: frozenset({
+        Scope.STATUS_READ, Scope.EVENTS_READ, Scope.APPROVALS_LIST,
+        Scope.APPROVALS_DETAIL, Scope.LOGS_READ, Scope.DECIDE, Scope.IMPROVE_RUN,
+        Scope.JOBS_OWN}),
     Principal.OPS_NOTIFY: frozenset({Scope.EVENTS_READ}),
 }
 
-# 外部主体を申告できる principal と、その値の形式 (Discord user ID)。
-ACTOR_PRINCIPALS: frozenset[Principal] = frozenset({Principal.OPS_BOT})
-_ACTOR_PATTERN = re.compile(r"discord:[0-9]{17,20}")
-ACTOR_MAX_BYTES = 28
+@dataclass(frozen=True, slots=True)
+class ActorRule:
+    """principal が申告できる外部主体の形式。値は ASCII で、byte 数の上限も持つ。"""
+    pattern: re.Pattern[str]
+    max_bytes: int
+
+
+# 外部主体を申告できる principal と、その値の形式。表に無い principal は申告できない。
+# ops-bot は Discord user ID、ops-web-write は web のユーザー名 (afx-ops の WEB_USER_PATTERN)。
+ACTOR_RULES: dict[Principal, ActorRule] = {
+    Principal.OPS_BOT: ActorRule(re.compile(r"discord:[0-9]{17,20}"), 28),
+    Principal.OPS_WEB_WRITE: ActorRule(re.compile(r"web:[a-z][a-z0-9_-]{0,31}"), 36),
+}
+ACTOR_PRINCIPALS: frozenset[Principal] = frozenset(ACTOR_RULES)
 
 # `GET /v1/improve/runs` の limit の既定と上限。サーバーと CLI が同じ値を使う。
 IMPROVE_RUNS_DEFAULT_LIMIT = 50
 IMPROVE_RUNS_MAX_LIMIT = 100
+
+
+_IMPROVE_RUN_PRINCIPALS = (Principal.OPERATOR, Principal.APPROVER, Principal.OPS_WEB_WRITE)
 
 
 def validate_principal_scopes(table: dict[Principal, frozenset[Scope]] = PRINCIPAL_SCOPES) -> None:
@@ -123,6 +144,10 @@ def validate_principal_scopes(table: dict[Principal, frozenset[Scope]] = PRINCIP
             raise ValueError("local_guard is approver-only")
         if Scope.GUIDANCE_READ in scopes and principal not in (Principal.OPERATOR, Principal.APPROVER):
             raise ValueError("guidance.read is operator/approver-only")
+        if Scope.OPERATE in scopes and principal not in (Principal.OPERATOR, Principal.APPROVER):
+            raise ValueError("operate is operator/approver-only")
+        if Scope.IMPROVE_RUN in scopes and principal not in _IMPROVE_RUN_PRINCIPALS:
+            raise ValueError("improve.run is operator/approver/ops-web-write-only")
 
 
 def assert_authorized(principal: Caller, scope: Scope) -> None:
@@ -136,15 +161,17 @@ def assert_authorized(principal: Caller, scope: Scope) -> None:
 def validate_asserted_actor(principal: Caller, actor: str | None) -> str | None:
     """申告された外部主体を検査する。認可や decided_by の根拠にはしない。
 
-    申告できるのは ``ACTOR_PRINCIPALS`` だけで、値は ASCII の ``discord:`` と
-    17〜20 桁の十進数。それ以外 (空・空白・制御文字・非 ASCII を含む) は invalid_argument。
+    申告できるのは ``ACTOR_RULES`` に載る principal だけで、値はその principal の形式
+    (ASCII、byte 数の上限、パターン全体一致)。それ以外 (空・空白・制御文字・非 ASCII を含む)
+    は invalid_argument。
     """
     if actor is None:
         return None
-    if principal not in ACTOR_PRINCIPALS or not isinstance(actor, str):
+    rule = ACTOR_RULES.get(principal) if isinstance(principal, Principal) else None
+    if rule is None or not isinstance(actor, str):
         raise OpsError(ErrorCode.INVALID_ARGUMENT)
     # \d は全角数字にも一致するので [0-9] の fullmatch で決める (末尾改行も許さない)。
-    if (not actor.isascii() or len(actor.encode("ascii")) > ACTOR_MAX_BYTES
-            or _ACTOR_PATTERN.fullmatch(actor) is None):
+    if (not actor.isascii() or len(actor.encode("ascii")) > rule.max_bytes
+            or rule.pattern.fullmatch(actor) is None):
         raise OpsError(ErrorCode.INVALID_ARGUMENT)
     return actor

@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 
-PRINCIPALS = ("operator", "approver", "ops-bot", "ops-web", "ops-notify")
+PRINCIPALS = ("operator", "approver", "ops-bot", "ops-web", "ops-web-write", "ops-notify")
 
 
 def token_for(principal: str) -> str:

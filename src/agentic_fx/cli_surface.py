@@ -239,7 +239,7 @@ _BASE_COMMANDS: tuple[CommandRecord, ...] = (
             "improve を実行する (-t / -n で繰り返し、-c で今回だけの指示)", "ops/client.py",
             shell_usage="improve", shell=True,
             ctl_fold="join",
-            scope="operate", endpoint_code="improve", daemon_required=True, exposed=True),
+            scope="improve.run", endpoint_code="improve", daemon_required=True, exposed=True),
     _record(Group.GUIDANCE, Lane.CTL, "ctl improve runs", "afx ctl improve runs [--limit <n>]",
             Label.READ, "終了した improve の一覧を表示する", "ops/client.py",
             scope="approvals.list", endpoint_code="improve_runs", daemon_required=True,

@@ -17,7 +17,8 @@ from _write_support import (
 
 READ_ONLY_CSP_ACTION = "form-action 'none'"
 WRITE_PATHS = ["/approvals/7/approve", "/approvals/7/reject", "/improve/runs", "/confirm",
-               "/confirm/check", "/improve"]
+               "/confirm/check", "/improve", "/jobs/" + "0123456789abcdef" * 2,
+               "/jobs/" + "0123456789abcdef" * 2 + "/cancel"]
 
 
 def _rig(**kwargs) -> Rig:
@@ -488,11 +489,11 @@ def test_reject_is_not_sent_when_re_reading_the_detail_fails():
 
 def test_a_daemon_refusal_is_a_known_result_shown_with_its_fixed_code_only():
     rig = _rig()
-    rig.client.approve_reply = Reply(409, None, "digest_mismatch")
+    rig.client.approve_reply = Reply(409, None, "payload_changed")
     token = rig.first_post("approve")
     response = rig.confirm(token)
     assert response.status == 409
-    assert "digest_mismatch" in response.body.decode()
+    assert "payload_changed" in response.body.decode()
     assert rig.confirm(token).status == 409 and len(rig.client.calls) == 1
 
 
@@ -501,6 +502,24 @@ def test_a_free_text_code_from_the_daemon_is_not_shown():
     rig.client.approve_reply = Reply(422, None, "Bad Thing <script>")
     response = rig.confirm(rig.first_post("approve"))
     assert b"script" not in response.body and b"Bad Thing" not in response.body
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_a_lowercase_code_the_daemon_never_sends_is_not_shown(action):
+    rig = _rig()
+    reply = Reply(422, None, "private_customer_note")
+    rig.client.approve_reply = reply
+    rig.client.reject_reply = reply
+    response = rig.confirm(rig.first_post(action))
+    assert b"private_customer_note" not in response.body
+    assert b"code=" in response.body
+
+
+def test_a_lowercase_code_the_daemon_never_sends_is_not_shown_on_an_improve():
+    rig = _rig()
+    rig.client.improve_reply = Reply(422, None, "private_customer_note")
+    response = rig.confirm(rig.first_improve())
+    assert b"private_customer_note" not in response.body
 
 
 @pytest.mark.parametrize("reply", [Reply(500, None, "internal"), Reply(503, None, "busy"),

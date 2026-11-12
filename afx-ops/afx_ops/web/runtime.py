@@ -12,6 +12,8 @@ aiohttp は起動口の preload (隔離前) が import する。この module �
 要求の検査 (method / path / query / header / body の上限) と表示は adapter が受け持つ。
 ここは aiohttp が解釈した要求を adapter が読む bytes に戻し、同期の `WebClient` 呼出しを
 含む adapter 全体を上限付きの thread pool で回し、応答を aiohttp の応答へ写すだけである。
+設定の `write` が真のときだけ、`ops-web-write` の client と書込みの状態 (`WriteContext`) を
+adapter へ渡す。偽のときは読取り専用のまま。
 """
 from __future__ import annotations
 
@@ -23,7 +25,7 @@ from asyncio import selector_events
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 
-from afx_ops.api_client import HTTP_TIMEOUT, WebClient
+from afx_ops.api_client import HTTP_TIMEOUT, WebClient, WebWriteClient
 from afx_ops.isolation.accept_loop import AcceptLoop
 from afx_ops.isolation.startup import WEB_PASSWORD, client_for
 from afx_ops.web.auth import BasicAuthenticator
@@ -38,6 +40,7 @@ from afx_ops.web.request import (
     handle_request,
     wire_authorization_values,
 )
+from afx_ops.web.write import ConfirmationStore, WriteContext
 
 # 同時に開いておく接続の上限。超えた接続は受けてすぐ閉じる (fd と memory を有界にする)
 MAX_CONNECTIONS = 16
@@ -76,15 +79,22 @@ def run(isolated, *, client=None, on_serving: Callable[[], None] | None = None,
     1 回呼ばれ、stop_after は閉じた接続の数がそれに達したら rc 0 で戻る。
     """
     use_send_only_transport()
-    if client is None:
-        client = client_for(isolated, WebClient)
     config = isolated.config
+    if client is None:
+        # 鍵は起動時に、設定の `write` が選んだ principal の 1 本だけを読んである。client も
+        # 同じ値から選ぶ (write が真なら読取りもその client の GET を使う)
+        client = client_for(isolated, WebWriteClient if config.write else WebClient)
     authenticator = (BasicAuthenticator(isolated.secrets[WEB_PASSWORD], user=config.user)
                      if config.auth == "basic" else None)
+    # 書込みの口は `write` が真のときだけ作る。経路は設定の bind が loopback のときだけ書込みを
+    # 許す (起動時の検査が通した構成で、TLS は未実装)。偽なら今までどおり POST は 405 / 404
+    write_context = (WriteContext(user=config.user, port=config.port, client=client,
+                                  store=ConfirmationStore(), loopback=config.web_loopback)
+                     if config.write else None)
     asyncio.run(_serve(_aiohttp_parts(), isolated.listener, client, on_serving, stop_after,
                        allow=config.web_allow_networks(),
                        host_policy=HostPolicy(config.web_bind, config.port, config.web_loopback),
-                       authenticator=authenticator))
+                       authenticator=authenticator, write_context=write_context))
     return RC_OK
 
 
@@ -275,10 +285,12 @@ class _Service:
     def __init__(self, parts, loop: asyncio.AbstractEventLoop, client,
                  executor: ThreadPoolExecutor, stop_after: int | None, *,
                  host_policy: HostPolicy | None = None,
-                 authenticator: BasicAuthenticator | None = None) -> None:
+                 authenticator: BasicAuthenticator | None = None,
+                 write_context: WriteContext | None = None) -> None:
         server_cls, self._response = parts
         self._host_policy = host_policy
         self._authenticator = authenticator
+        self._write_context = write_context
         self._loop = loop
         self._client = client
         self._executor = executor
@@ -337,7 +349,8 @@ class _Service:
             return handle_request(raw, self._client, host_policy=self._host_policy,
                                   authenticator=self._authenticator, peer=peer,
                                   authorization=authorization,
-                                  report_upstream=lambda: not call.abandoned)
+                                  report_upstream=lambda: not call.abandoned,
+                                  write_context=self._write_context)
         finally:
             with self._calls_lock:
                 call.ident = None
@@ -461,12 +474,13 @@ def _loop_error(loop: asyncio.AbstractEventLoop, context: dict) -> None:
 
 async def _serve(parts, listener, client, on_serving, stop_after, *,
                  allow=None, host_policy: HostPolicy | None = None,
-                 authenticator: BasicAuthenticator | None = None) -> None:
+                 authenticator: BasicAuthenticator | None = None,
+                 write_context: WriteContext | None = None) -> None:
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(_loop_error)
     executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="afx-web")
     service = _Service(parts, loop, client, executor, stop_after, host_policy=host_policy,
-                       authenticator=authenticator)
+                       authenticator=authenticator, write_context=write_context)
     acceptor = (AcceptLoop(listener, service.accept) if allow is None
                 else AcceptLoop(listener, service.accept, allow=allow))
     try:

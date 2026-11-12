@@ -456,7 +456,7 @@ def test_the_endpoint_needs_no_pidfd_and_notify_cannot_read_it():
     assert Scope.APPROVALS_DETAIL not in PRINCIPAL_SCOPES[Principal.OPS_NOTIFY]
     readers = {p for p, scopes in PRINCIPAL_SCOPES.items() if Scope.APPROVALS_DETAIL in scopes}
     assert readers == {Principal.OPERATOR, Principal.APPROVER, Principal.OPS_BOT,
-                       Principal.OPS_WEB}
+                       Principal.OPS_WEB, Principal.OPS_WEB_WRITE}
 
 
 # ---- HTTP 層 ----

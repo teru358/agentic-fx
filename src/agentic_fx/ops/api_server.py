@@ -405,7 +405,7 @@ def _call(ops, route: Route, params: dict, request: Request, principal: Principa
     if name == "improve":
         # 渡された key だけを写す。本文が空なら従来と同じ呼び出しになる。検査は認可の後。
         known = {"duration_sec", "max_runs", "comment"}
-        return ops.improve(principal, key, deadline=deadline,
+        return ops.improve(principal, key, deadline=deadline, asserted_actor=actor,
                            **{(k if k in known else f"unknown_{k}"): v
                               for k, v in body.items()})
     if name == "backlog_add":

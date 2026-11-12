@@ -430,7 +430,7 @@ def handle_request(request: Request | bytes, client, *,
         if write_context is not None and match is None:
             write_match = write.resolve_write_route(request.path)
             if write_match is not None:
-                return _write_response(write_context, write_match, request, head)
+                return _write_response(write_context, write_match, request, head, report_upstream)
         if match is None:
             return _error(404, head=head, writable=writable)
         if request.method not in {"GET", "HEAD"}:
@@ -478,7 +478,7 @@ def _host_values(request: Request) -> list[str]:
 
 
 def _write_response(context: write.WriteContext, match: write.WriteMatch, request: Request,
-                    head: bool) -> Response:
+                    head: bool, report_upstream: Callable[[], bool] | None = None) -> Response:
     """書込みの route 1 本。拒否は `WriteReject` の 4xx で、daemon を 1 回も呼ばずに返す。"""
     if request.method not in match.methods:
         return _error(405, head=head, extra={"Allow": ", ".join(match.methods)}, writable=True)
@@ -487,10 +487,39 @@ def _write_response(context: write.WriteContext, match: write.WriteMatch, reques
             if not context.transport_ok:
                 raise write.WriteReject(403)
             return _response(200, write_pages.improve_form_page(), head=head, writable=True)
+        if match.kind == "job_view":
+            if not context.transport_ok:
+                raise write.WriteReject(403)
+            if request.query or request.body:
+                raise write.WriteReject(400)
+            status, body = _job_view(context, match.job_id, report_upstream)
+            return _response(status, body, head=head, writable=True)
         status, body = _post(context, match, request)
     except write.WriteReject as reject:
         return _error(reject.status, head=head, writable=True)
     return _response(status, body, head=head, writable=True)
+
+
+def _job_view(context: write.WriteContext, job_id: str,
+              report_upstream: Callable[[], bool] | None = None) -> tuple[int, bytes]:
+    """job の状態。actor は設定のユーザーから作り、daemon が job の持ち主と照合する。"""
+    report = _Reporter("job", report_upstream)
+    reply = _call(report, context.client.job, context.actor, job_id)
+    refused = write_pages.job_refused_status(reply)
+    if refused is not None:
+        return refused, write_pages.job_refused_page(reply)
+    data = getattr(reply, "data", None)
+    page = None
+    if getattr(reply, "status", None) == 200 and getattr(reply, "code", None) is None \
+            and type(data) is dict:
+        page = write_pages.job_page(job_id, data)
+        if page is None:
+            report("shape=invalid")
+    else:
+        _report_bad_reply(reply, report)
+    if page is None:
+        raise _Upstream
+    return 200, page
 
 
 def _post(context: write.WriteContext, match: write.WriteMatch,
@@ -504,6 +533,9 @@ def _post(context: write.WriteContext, match: write.WriteMatch,
         return 200, write_pages.confirm_page(intent, context.store.create(context.user, intent))
     if match.kind == write.IMPROVE:
         intent = write.improve_intent(form)
+        return 200, write_pages.confirm_page(intent, context.store.create(context.user, intent))
+    if match.kind == write.CANCEL:
+        intent = write.cancel_intent(match.job_id)
         return 200, write_pages.confirm_page(intent, context.store.create(context.user, intent))
     token = form["token"]
     if match.kind == "confirm":

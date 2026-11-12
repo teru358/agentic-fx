@@ -232,7 +232,7 @@ def test_production_start_maps_a_listener_failure_to_listener_invalid(tmp_path, 
     monkeypatch.setattr(startup, "check_preconditions", lambda *args: None)
     monkeypatch.setattr(startup, "prepare_dirs", lambda *args, **kwargs: startup.PreparedDirs(-1, -1))
     monkeypatch.setattr(startup, "feature_filter", lambda *args: _Filter())
-    monkeypatch.setattr(startup, "read_api_token", lambda *args: b"token")
+    monkeypatch.setattr(startup, "read_api_token", lambda *args, **kwargs: b"token")
 
     def mismatch(port, *, bind):
         raise ListenerError("address")

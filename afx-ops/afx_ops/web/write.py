@@ -1,6 +1,6 @@
 """web からの書込み (承認・却下・改善の開始) の入力処理と確認 record の状態機械。
 
-書込みの POST は 2 段で受ける。1 回目 (承認 / 却下 / 改善の form) は何も実行せず、確認 record
+書込みの POST は 2 段で受ける。1 回目 (承認 / 却下 / 改善 / job の取消の form) は何も実行せず、確認 record
 を作って確認画面を返す。2 回目 (`/confirm`) は token だけを送り、中身は record に保存したものを
 使う。record は web の memory だけに置く (disk・URL・log に token を出さない)。
 
@@ -33,6 +33,7 @@ from afx_ops.api_client import ApiError, Reply
 APPROVE = "approve"
 REJECT = "reject"
 IMPROVE = "improve"
+CANCEL = "cancel"
 
 # 確認 record の状態。未使用 → 実行中 → 結果判明 / 結果不明
 UNUSED = "unused"
@@ -65,6 +66,16 @@ _JOB_ID = re.compile(r"[0-9a-f]{32}\Z")
 _WORD = re.compile(r"[a-z_]{1,40}\Z")
 _FORBIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 OUTCOME_UNKNOWN_CODE = "outcome_unknown"
+# daemon (本体の ErrorCode) が返しうる code。値の一致は本体側の test で固定する。
+KNOWN_DAEMON_CODES = frozenset({
+    "invalid_argument", "forbidden", "not_found", "request_timeout", "autopilot_restricted",
+    "idempotency_mismatch", "outcome_unknown", "job_running", "invalid_state",
+    "attempt_changed", "already_decided", "payload_changed", "payload_too_large",
+    "unsupported_kind", "plugin_busy", "mission_busy", "improve_running",
+    "decision_in_progress", "generation_mismatch", "not_latched", "database_busy",
+    "unavailable", "internal",
+})
+UNRECOGNIZED_CODE = "other"
 _DEFAULT_PORT = {"http": 80, "https": 443}
 
 
@@ -87,6 +98,10 @@ class WriteClient(Protocol):
 
     def improve_run(self, actor: str, body: dict, *, idempotency_key: str) -> Reply: ...
 
+    def job(self, actor: str, job_id: str) -> Reply: ...
+
+    def cancel_job(self, actor: str, job_id: str) -> Reply: ...
+
 
 @dataclass(frozen=True)
 class Intent:
@@ -99,6 +114,7 @@ class Intent:
     duration_sec: int | None = None
     max_runs: int | None = None
     comment: str | None = None
+    job_id: str | None = None
 
     def improve_body(self) -> dict:
         body: dict = {}
@@ -304,9 +320,11 @@ class WriteMatch:
     kind: str
     methods: tuple[str, ...]
     approval_id: int | None = None
+    job_id: str | None = None
 
 
 _APPROVAL_DECISION = re.compile(r"/approvals/([1-9][0-9]{0,17})/(approve|reject)\Z")
+_JOB_PATH = re.compile(r"/jobs/([0-9a-f]{32})(/cancel)?\Z")
 _FIXED = {
     "/improve": WriteMatch("improve_form", ("GET", "HEAD")),
     "/improve/runs": WriteMatch(IMPROVE, ("POST",)),
@@ -322,6 +340,11 @@ def resolve_write_route(path: str) -> WriteMatch | None:
     matched = _APPROVAL_DECISION.fullmatch(path)
     if matched is not None:
         return WriteMatch(matched.group(2), ("POST",), int(matched.group(1)))
+    matched = _JOB_PATH.fullmatch(path)
+    if matched is not None:
+        if matched.group(2):
+            return WriteMatch(CANCEL, ("POST",), job_id=matched.group(1))
+        return WriteMatch("job_view", ("GET", "HEAD"), job_id=matched.group(1))
     return None
 
 
@@ -409,6 +432,7 @@ FORM_FIELDS: Mapping[str, Mapping[str, bool]] = {
     IMPROVE: {"duration_sec": False, "max_runs": False, "comment": False},
     "confirm": {"token": True},
     "check": {"token": True},
+    CANCEL: {},
 }
 
 
@@ -418,7 +442,7 @@ def _fixed_word(value: object) -> str | None:
     return value if type(value) is str and _WORD.fullmatch(value) else None
 
 
-def _classify(reply: object) -> tuple[str, Outcome | None]:
+def _classify(reply: object, expect_id: str | None = None) -> tuple[str, Outcome | None]:
     """daemon の応答を (状態, 結果) にする。
 
     5xx と読めない応答、および daemon が `outcome_unknown` と答えたもの (HTTP status は問わない。
@@ -430,15 +454,20 @@ def _classify(reply: object) -> tuple[str, Outcome | None]:
     code = _fixed_word(getattr(reply, "code", None))
     if code == OUTCOME_UNKNOWN_CODE:
         return UNKNOWN, None
+    if code is not None and code not in KNOWN_DAEMON_CODES:
+        code = UNRECOGNIZED_CODE
     if 200 <= status < 300 and code is None:
         data = getattr(reply, "data", None)
+        if expect_id is not None and not (type(data) is dict and data.get("id") == expect_id):
+            return UNKNOWN, None
         job = data.get("job_id") if type(data) is dict else None
         job_id = job if type(job) is str and _JOB_ID.fullmatch(job) else None
         return DONE, Outcome(APPLIED, status, None, job_id)
     return DONE, Outcome(REFUSED, status, code)
 
 
-def _call(function: Callable[[], object]) -> tuple[str, Outcome | None]:
+def _call(function: Callable[[], object],
+          expect_id: str | None = None) -> tuple[str, Outcome | None]:
     """daemon への書込み 1 回。応答を失った (例外) ときは結果不明にする。
 
     鍵を 1 byte も送っていない失敗だけは、実行されていないと言える。
@@ -451,7 +480,7 @@ def _call(function: Callable[[], object]) -> tuple[str, Outcome | None]:
         return UNKNOWN, None
     except Exception:  # noqa: BLE001 — 原因の文は持たない
         return UNKNOWN, None
-    return _classify(reply)
+    return _classify(reply, expect_id)
 
 
 def _reject_verified(context: WriteContext, intent: Intent) -> tuple[str, Outcome | None]:
@@ -469,6 +498,10 @@ def _reject_verified(context: WriteContext, intent: Intent) -> tuple[str, Outcom
                                                reason=intent.reason))
 
 
+def cancel_intent(job_id: str) -> Intent:
+    return Intent(CANCEL, job_id=job_id)
+
+
 def execute(context: WriteContext, snapshot: Snapshot, token: str) -> Snapshot:
     """実行中にした record の中身を daemon に送り、結果を record に残して返す。"""
     intent = snapshot.intent
@@ -477,6 +510,9 @@ def execute(context: WriteContext, snapshot: Snapshot, token: str) -> Snapshot:
             context.actor, intent.approval_id, payload_sha256=intent.payload_sha256))
     elif intent.action == REJECT:
         state, outcome = _reject_verified(context, intent)
+    elif intent.action == CANCEL:
+        state, outcome = _call(lambda: context.client.cancel_job(context.actor, intent.job_id),
+                               expect_id=intent.job_id)
     elif intent.action == IMPROVE:
         key = idempotency_key_of(token)
         state, outcome = _call(lambda: context.client.improve_run(

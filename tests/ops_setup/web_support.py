@@ -21,6 +21,7 @@ ONE_CANDIDATE = (Candidate(LAN, 2, "global", IFNAME),)
 
 # 質問の label。既定の番号は label でなく ask の default (`ScriptIO.defaults`) に載る
 SCOPE_Q = "公開範囲 [1] 自機のみ [2] LAN"
+AUTH_Q = "認証 [1] なし [2] Basic 認証"
 KEEP_Q = "この設定で有効化します。[1] このまま [2] 変更する"
 BIND_EXPLANATION = "この PC のどの IP アドレスで待ち受けるかを選んでください（他の PC はこのアドレスにアクセスします）。"
 ACCESS_Q = "アクセス制限 [1] 許可 IP [2] Basic 認証 [3] 両方 [4] なし (到達できる全 IPv4)"
