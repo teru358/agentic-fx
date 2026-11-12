@@ -9,7 +9,7 @@ import pytest
 import yaml
 
 from agentic_fx.activity import ActivityLog
-from agentic_fx.plugin import deploy_rollback, history_reasons, loader
+from agentic_fx.plugin import deploy_reconcile, deploy_rollback, history_reasons, loader
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 from tests.history_support import ready_evidence
@@ -309,3 +309,99 @@ def test_the_first_audit_row_reads_as_an_intent_and_a_failed_intent_leaves_no_op
     assert _ops(world) == [] and _live(world) == f".versions/sma/{b.name}"
     assert len(lines) == 1 and "\trollback_history_guard_force_started\t" in lines[0]
     assert "_forced_op" not in lines[0]
+
+
+# ---- 強行の op が監査なしで完了しない -------------------------------------------
+
+class _NoAudit(_FlakyAudit):
+    """op 記録 (write_required) が毎回失敗する監査ログ。"""
+
+    def write_required(self, *args, **kwargs):
+        self.calls += 1
+        raise OSError("audit unavailable")
+
+    def contains(self, *args, **kwargs):
+        return self.inner.contains(*args, **kwargs)
+
+
+class _Counting(_FlakyAudit):
+    def __init__(self, inner):
+        super().__init__(inner, fail_on=0)
+
+    def contains(self, *args, **kwargs):
+        return self.inner.contains(*args, **kwargs)
+
+
+def _op_audit_lines(world):
+    return [line for line in _log_lines(world) if "\trollback_history_guard_forced_op\t" in line]
+
+
+def _stalled_forced_op(world):
+    """強行の開始記録と印は残り、op 記録だけ書けずに needs_retry で止まった op。"""
+    a, b = _strategies(world, target_evidence=None)
+    first = _forced(world, a, activity=_FlakyAudit(_log(world), fail_on=2))
+    assert first.outcome == "needs_retry" and deploy_store.is_history_forced(world.conn, first.op_id)
+    return a, b, first.op_id
+
+
+def _reconcile(world, activity):
+    return deploy_reconcile.reconcile_deploy_ops(
+        world.conn, world.root, now=NOW, settings=SETTINGS, activity=activity)
+
+
+def _phase(world, op_id):
+    return deploy_store.get_by_id(world.conn, op_id)["phase"]
+
+
+def test_reconcile_after_a_failed_op_audit_does_not_complete_the_op(world):
+    a, b, op_id = _stalled_forced_op(world)
+    _reconcile(world, _NoAudit(_log(world), fail_on=0))
+    assert _phase(world, op_id) == "needs_retry"
+    assert _live(world) == f".versions/sma/{b.name}" and _op_audit_lines(world) == []
+
+
+def test_a_forced_op_switched_before_the_crash_is_audited_on_a_cli_resume(world):
+    a, b, op_id = _stalled_forced_op(world)
+    world.link("sma", a)                                      # 切替は済み、op は未完
+    stuck = _rollback(world, to=a.name, activity=_NoAudit(_log(world), fail_on=0))
+    assert stuck.outcome == "needs_retry" and _phase(world, op_id) == "needs_retry"
+    done = _rollback(world, to=a.name, activity=_log(world))
+    assert done.outcome == "rolled_back" and _phase(world, op_id) == "done"
+    assert len(_op_audit_lines(world)) == 1
+
+
+def test_a_forced_op_switched_before_the_crash_is_audited_on_reconcile(world):
+    a, b, op_id = _stalled_forced_op(world)
+    world.link("sma", a)
+    _reconcile(world, _NoAudit(_log(world), fail_on=0))
+    assert _phase(world, op_id) == "needs_retry" and _op_audit_lines(world) == []
+    _reconcile(world, _log(world))
+    assert _phase(world, op_id) == "done" and len(_op_audit_lines(world)) == 1
+
+
+def test_an_unswitched_forced_op_is_audited_before_reconcile_switches_it(world):
+    a, b, op_id = _stalled_forced_op(world)
+    _reconcile(world, _NoAudit(_log(world), fail_on=0))
+    assert _live(world) == f".versions/sma/{b.name}" and _phase(world, op_id) == "needs_retry"
+    _reconcile(world, _log(world))
+    assert _live(world) == f".versions/sma/{a.name}" and _phase(world, op_id) == "done"
+    assert len(_op_audit_lines(world)) == 1
+
+
+def test_a_recorded_op_audit_is_not_written_twice(world):
+    a, b, op_id = _stalled_forced_op(world)
+    world.link("sma", a)
+    counting = _Counting(_log(world))
+    _reconcile(world, counting)
+    _rollback(world, to=a.name, activity=counting)            # 済みの op の再実行
+    assert _phase(world, op_id) == "done" and counting.calls == 1
+    deploy_rollback.ensure_forced_op_audit(world.conn, counting, op_id, "sma", a.name)
+    assert counting.calls == 1 and len(_op_audit_lines(world)) == 1
+
+
+def test_an_op_without_the_forced_mark_never_needs_the_audit(world):
+    a, b = _strategies(world, target_evidence=None)
+    op_id = world.intent("sma", from_ver=b, to_ver=a)
+    world.link("sma", a)
+    _reconcile(world, _NoAudit(_log(world), fail_on=0))
+    assert _phase(world, op_id) == "done"
