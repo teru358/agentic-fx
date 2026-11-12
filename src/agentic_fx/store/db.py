@@ -482,11 +482,15 @@ CREATE INDEX IF NOT EXISTS plugin_deploy_op_signals_signal_id
   ON plugin_deploy_op_signals(signal_id);
 """
 
-# 履歴ガードの強行で始まった op の印。op と同じ transaction で書き、再開の経路が
-# 強行の監査記録を必ず書けるようにする。
+# 履歴ガードの強行で始まった op の印。op と同じ transaction で書く。force_token は
+# 開始の監査行 (activity) と同じ値で、op と監査行を結ぶ。人間の理由の本文は持たない。
 _PLUGIN_DEPLOY_OP_HISTORY_FORCED_DDL = """
 CREATE TABLE IF NOT EXISTS plugin_deploy_op_history_forced (
-  op_id INTEGER PRIMARY KEY REFERENCES plugin_deploy_ops(op_id)
+  op_id INTEGER PRIMARY KEY REFERENCES plugin_deploy_ops(op_id),
+  target_artifact_hash TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  forced_at TEXT NOT NULL,
+  force_token TEXT NOT NULL
 );
 """
 

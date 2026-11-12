@@ -94,3 +94,21 @@ def test_write_does_not_raise_on_none_summary_or_str_category(tmp_path, caplog):
         log.write("TRADE", "some_event", None)  # category が str, summary が None
     assert "activity write failed" in caplog.text
     assert "some_event" in caplog.text
+
+
+def test_write_required_after_a_torn_line_starts_a_new_line(tmp_path):
+    path = tmp_path / "activity.log"
+    path.write_bytes(b"2026-01-01T00:00:00+00:00\tsystem\tpartial\tbody")      # 改行なしの部分行
+    ActivityLog(path).write_required(Category.SYSTEM, "next_event", "ok", "r1")
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0].endswith("partial\tbody") and len(lines) == 2
+    fields = lines[1].split("\t")
+    assert fields[2:] == ["next_event", "ok", "r1"]
+
+
+def test_write_required_adds_no_blank_line_after_a_complete_line(tmp_path):
+    log = ActivityLog(tmp_path / "activity.log")
+    log.write_required(Category.SYSTEM, "one", "a")
+    log.write_required(Category.SYSTEM, "two", "b")
+    assert len((tmp_path / "activity.log").read_text(encoding="utf-8").splitlines()) == 2

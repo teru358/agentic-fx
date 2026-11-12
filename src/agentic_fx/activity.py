@@ -73,10 +73,13 @@ class ActivityLog:
         """監査記録用の追記。`write` と違い、書けなければ例外を送出する。
 
         書けなかった記録を前提に次の操作へ進まないための入口で、追記後に fsync する。
+        前回の書込み中に落ちて末尾が改行で終わっていなければ、先に改行を足して
+        新しい行が部分行に連結されないようにする。
         """
         ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
         clean = " ".join(summary.split())
         line = "\t".join([ts, Category(category).value, event, clean, ref_id or "-"])
+        self.end_partial_line()
         with self._path.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
             f.flush()

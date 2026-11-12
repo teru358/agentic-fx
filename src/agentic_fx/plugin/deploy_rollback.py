@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -31,7 +32,6 @@ DIR_NAME_RE = re.compile(r"^[0-9a-f]{64}$")
 
 HISTORY_REFUSAL_CODE = history_reasons.OUTCOME
 FORCE_AUDIT_EVENT = "rollback_history_guard_force_started"
-FORCE_AUDIT_OP_EVENT = "rollback_history_guard_forced_op"
 
 
 @dataclass(frozen=True)
@@ -349,34 +349,6 @@ def _finish(conn: sqlite3.Connection, op_id: int, phase: str, activity, *, now: 
                          now=now, fail_reason=fail_reason)
 
 
-class ForcedAuditError(RuntimeError):
-    """A forced rollback op's audit record could not be written."""
-
-
-def ensure_forced_op_audit(conn: sqlite3.Connection, activity, op_id: int, name: str,
-                           target_artifact_hash: str) -> None:
-    """Write the op audit record of an op started by a history-guard override.
-
-    Does nothing for an op without the mark. A record already in the log for this
-    op is not written twice. Raises ``ForcedAuditError`` when the record is neither
-    present nor writable: the caller must then neither swap nor close the op.
-    """
-    if not deploy_store.is_history_forced(conn, op_id):
-        return
-    ref = str(op_id)
-    try:
-        required = getattr(activity, "write_required", None)
-        if required is None:
-            raise OSError("the activity log is unavailable")
-        contains = getattr(activity, "contains", None)
-        if contains is not None and contains(FORCE_AUDIT_OP_EVENT, ref):
-            return
-        required(Category.APPROVAL, FORCE_AUDIT_OP_EVENT,
-                 f"name={name} target={target_artifact_hash} op_id={op_id}", ref)
-    except Exception as exc:  # noqa: BLE001 - no audit record, no switch and no close
-        raise ForcedAuditError(str(exc)) from exc
-
-
 def _success(name: str, op_id: int, to_target: str, cascade: set[str]) -> RollbackOutcome:
     return RollbackOutcome("rolled_back", name, True, "pending_restart",
                            tuple(sorted(cascade)), to_target=to_target, op_id=op_id)
@@ -537,13 +509,6 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
                 return RollbackOutcome("dry_run", name, to_target=to_target,
                                        op_id=int(open_row["op_id"]), expectation=observed)
             op_id = deploy_ops.match_or_reject(open_row, requested, live, conn=conn, now=now)
-            try:
-                ensure_forced_op_audit(conn, activity, op_id, name,
-                                       open_row["target_artifact_hash"])
-            except ForcedAuditError:
-                _finish(conn, op_id, "needs_retry", activity, now=now,
-                        fail_reason="syscall_failed")
-                return RollbackOutcome("needs_retry", name, op_id=op_id, to_target=to_target)
             _finish(conn, op_id, "done", activity, now=now)
             return _success(name, op_id, to_target, report.dependent_names)
 
@@ -612,6 +577,7 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
                                    to_target=verified.to_target, expectation=observed)
         requested = _requested_signature(
             name, open_row, live, verified.to_target, revoke, force, lost_source)
+        force_token = secrets.token_hex(16)
         if forced:
             required = getattr(activity, "write_required", None)
             if required is None:
@@ -623,6 +589,7 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
                 required(Category.APPROVAL, FORCE_AUDIT_EVENT,
                          f"name={name} target={verified.artifact_hash} actor={actor} "
                          f"at={now.astimezone(timezone.utc).isoformat()} "
+                         f"force_token={force_token} "
                          f"reason={history_override.reason.strip()}")
             except Exception:  # noqa: BLE001 - no audit record, no switch
                 return RollbackOutcome(
@@ -650,15 +617,10 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
                     "approval_id": approved["id"] if approved else None, "force": force,
                 }, revoke=deploy_ops.RevokeSpec(name, live.content_hash) if revoke else None,
                 cascade_identities=identities, now=now, actor=actor,
-                after_insert=(lambda new_id: deploy_store.mark_history_forced(conn, new_id))
-                if forced else None)
-        try:
-            ensure_forced_op_audit(conn, activity, op_id, name, verified.artifact_hash)
-        except ForcedAuditError:
-            _finish(conn, op_id, "needs_retry", activity, now=now,
-                    fail_reason="syscall_failed")
-            return RollbackOutcome("needs_retry", name, op_id=op_id,
-                                   to_target=verified.to_target)
+                after_insert=(lambda new_id: deploy_store.mark_history_forced(
+                    conn, new_id, target_artifact_hash=verified.artifact_hash, actor=actor,
+                    forced_at=now.astimezone(timezone.utc).isoformat(),
+                    force_token=force_token)) if forced else None)
         if not deploy_ops.live_matches_from(live_path, raw_target):
             _finish(conn, op_id, "foreign", activity, now=now)
             return RollbackOutcome("foreign", name, op_id=op_id)

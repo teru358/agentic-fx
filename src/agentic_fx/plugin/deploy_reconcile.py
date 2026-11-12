@@ -85,15 +85,6 @@ def _subject_kind(conn, plugins_root: Path, row: dict) -> str | None:
     return deploy_rollback.current_deployed_kind(conn, plugins_root, row["name"])
 
 
-def _forced_audit_written(conn, row: dict, activity) -> bool:
-    try:
-        deploy_rollback.ensure_forced_op_audit(
-            conn, activity, int(row["op_id"]), row["name"], row["target_artifact_hash"])
-    except deploy_rollback.ForcedAuditError:
-        return False
-    return True
-
-
 def _reconcile_rollback(conn, plugins_root: Path, row: dict, activity, *, settings,
                         now) -> ReconcileResult:
     name = row["name"]
@@ -106,8 +97,6 @@ def _reconcile_rollback(conn, plugins_root: Path, row: dict, activity, *, settin
             return _syscall_failed(conn, row, activity, now=now)
         if raw is not None:
             if raw == to_target:
-                if not _forced_audit_written(conn, row, activity):
-                    return _syscall_failed(conn, row, activity, now=now)
                 return _set(conn, row, "done", activity, now=now)
             at_from = (row["from_kind"] == "symlink"
                        and deploy_ops.live_matches_from(live, row["from_target"]))
@@ -139,8 +128,6 @@ def _reconcile_rollback(conn, plugins_root: Path, row: dict, activity, *, settin
     if force:
         deploy_rollback.supplement_cascade(
             conn, plugins_root, int(row["op_id"]), verified.dependents.dependent_names, now=now)
-    if not _forced_audit_written(conn, row, activity):
-        return _syscall_failed(conn, row, activity, now=now)
     try:
         deploy_rollback.swap_to_target(plugins_root, name, int(row["op_id"]), to_target)
     except OSError:
