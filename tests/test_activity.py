@@ -1,5 +1,7 @@
 import logging
 
+import pytest
+
 from agentic_fx.activity import ActivityLog, Category
 
 
@@ -112,3 +114,58 @@ def test_write_required_adds_no_blank_line_after_a_complete_line(tmp_path):
     log.write_required(Category.SYSTEM, "one", "a")
     log.write_required(Category.SYSTEM, "two", "b")
     assert len((tmp_path / "activity.log").read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_write_required_fsyncs_the_directory_only_when_it_creates_the_file(tmp_path, monkeypatch):
+    from agentic_fx import activity
+    synced = []
+    monkeypatch.setattr(activity, "_fsync_dir", synced.append)
+    log = ActivityLog(tmp_path / "activity.log")
+    log.write_required(Category.SYSTEM, "one", "a")
+    assert synced == [tmp_path]
+    log.write_required(Category.SYSTEM, "two", "b")
+    assert synced == [tmp_path]
+
+
+def test_write_required_raises_when_the_directory_fsync_fails(tmp_path, monkeypatch):
+    from agentic_fx import activity
+
+    def boom(path):
+        raise OSError(5, "io")
+
+    monkeypatch.setattr(activity, "_fsync_dir", boom)
+    with pytest.raises(OSError):
+        ActivityLog(tmp_path / "activity.log").write_required(Category.SYSTEM, "one", "a")
+
+
+def _race_after_newline_decision(monkeypatch, path, other):
+    original = ActivityLog._needs_newline
+
+    def racing(fd):
+        decided = original(fd)
+        with open(path, "ab") as f:
+            f.write(other)
+        return decided
+
+    monkeypatch.setattr(ActivityLog, "_needs_newline", staticmethod(racing))
+
+
+def test_a_line_appended_by_another_writer_survives_write_required(tmp_path, monkeypatch):
+    path = tmp_path / "activity.log"
+    path.write_bytes(b"partial")
+    other = b"OTHER\tfull\tline\n"
+    _race_after_newline_decision(monkeypatch, path, other)
+    ActivityLog(path).write_required(Category.SYSTEM, "mine", "ok", "r1")
+    data = path.read_bytes()
+    assert other in data and data.startswith(b"partial")
+    assert data.count(b"mine") == 1
+
+
+def test_a_line_appended_by_another_writer_survives_end_partial_line(tmp_path, monkeypatch):
+    path = tmp_path / "activity.log"
+    path.write_bytes(b"partial")
+    other = b"OTHER\tfull\tline\n"
+    _race_after_newline_decision(monkeypatch, path, other)
+    ActivityLog(path).end_partial_line()
+    data = path.read_bytes()
+    assert data.startswith(b"partial") and other in data

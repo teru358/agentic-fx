@@ -23,6 +23,20 @@ class Category(StrEnum):
     SYSTEM = "SYSTEM"
 
 
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 class ActivityLog:
     def __init__(self, path: Path, *,
                  on_write_failure: Callable[[Exception], None] | None = None) -> None:
@@ -79,11 +93,21 @@ class ActivityLog:
         ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
         clean = " ".join(summary.split())
         line = "\t".join([ts, Category(category).value, event, clean, ref_id or "-"])
-        self.end_partial_line()
-        with self._path.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        existed = self._path.exists()
+        fd = os.open(self._path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            data = (("\n" if self._needs_newline(fd) else "") + line + "\n").encode("utf-8")
+            _write_all(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if not existed:
+            _fsync_dir(self._path.parent)
+
+    @staticmethod
+    def _needs_newline(fd: int) -> bool:
+        size = os.fstat(fd).st_size
+        return size > 0 and os.pread(fd, 1, size - 1) != b"\n"
 
     def contains(self, event: str, ref_id: str) -> bool:
         """Whether a line with this event and ref_id is already in the log.
@@ -105,18 +129,20 @@ class ActivityLog:
         """Terminate a last line left without its newline (a torn append).
 
         Without this the next appended line would join the torn one.  A missing
-        or empty file needs nothing; other failures are raised.
+        or empty file needs nothing; other failures are raised.  The newline is
+        appended (never written at a remembered offset), so a concurrent writer
+        can at worst leave one extra blank line; no other line's bytes are
+        overwritten.
         """
         try:
-            with self._path.open("rb+") as f:
-                f.seek(0, 2)
-                if f.tell() == 0:
-                    return
-                f.seek(-1, 2)
-                if f.read(1) != b"\n":
-                    f.write(b"\n")
+            fd = os.open(self._path, os.O_RDWR | os.O_APPEND)
         except FileNotFoundError:
             return
+        try:
+            if self._needs_newline(fd):
+                _write_all(fd, b"\n")
+        finally:
+            os.close(fd)
 
     def tail(self, n: int = 20, category: Category | None = None) -> list[str]:
         if not self._path.exists():

@@ -370,3 +370,32 @@ def test_the_human_reason_is_kept_out_of_the_database(world):
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall():
         for row in world.conn.execute(f'SELECT * FROM "{table}"'):
             assert canary not in " ".join(str(value) for value in tuple(row)), table
+
+
+def test_the_human_reason_never_reaches_the_improve_agent_input(world):
+    import json
+
+    from agentic_fx.loops.improve_context import build_improve_context
+    from agentic_fx.loops.improve_loop import ImproveLoop
+
+    a, b = _strategies(world, target_evidence=None)
+    canary = "秘密の理由-canary-9d41"
+    assert _forced(world, a, reason=canary).outcome == "rolled_back"
+    assert any(canary in line for line in _log_lines(world))
+    view = {"plugins": [], "pin_broken_strategies": []}
+    ctx_data = build_improve_context(
+        world.conn, settings=SETTINGS, now=NOW, root=world.root,
+        allowed_backlog_ids=None, inventory_view=view)
+
+    class _Ctx:
+        staging_dir = world.root.parent / "staging"
+        source_snapshot_dir = world.root.parent / "source"
+        inventory_view = view
+        baseline_gate_mode = "off"
+
+    loop = ImproveLoop.__new__(ImproveLoop)
+    loop._settings = SETTINGS
+    prompt = loop._render_improve_mission_prompt(ctx_data, ctx=_Ctx())
+    assert prompt
+    assert canary not in prompt
+    assert canary not in json.dumps(ctx_data, ensure_ascii=False, default=str)
