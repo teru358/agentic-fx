@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 168 件。完了分は closed/。
+未完了: 170 件。完了分は closed/。
 
 ## 実装中 (2)
 
@@ -69,9 +69,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (148)
+## 設計待ち (150)
 
-### 不具合 (82)
+### 不具合 (83)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -110,6 +110,7 @@
 | [web-write-recover-idle-interruption](open/web-write-recover-idle-interruption.md) | 中 | 2026-11-10 | 有効でない web の鍵と write の回復が中断に弱い |
 | [history-import-stops-at-first-conflict](open/history-import-stops-at-first-conflict.md) | 中 | 2026-11-13 | history import は食い違う足 1 本で partial 停止し後続を取り込まない |
 | [status-history-hidden-while-daemon-runs](open/status-history-hidden-while-daemon-runs.md) | 中 | 2026-11-13 | daemon 稼働中は評価用履歴の状態を見る面が無い |
+| [reference-daily-session-completeness](open/reference-daily-session-completeness.md) | 中 | 2026-11-14 | 非24時間銘柄の1d参照を取引セッションに沿って確定する |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
 | [tier-a-directive-ignored](open/tier-a-directive-ignored.md) | 中 |  | 自己テストの連続失敗の警告が無視され続け、止める仕組みが無い |
@@ -158,11 +159,12 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (42)
+### 機能 (43)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [killswitch-reset-hwm-rebase](open/killswitch-reset-hwm-rebase.md) | 高 | 2026-11-13 | kill switch の手動解除で HWM を付け直す明示操作が無い |
+| [backtest-history-snapshot-reproducibility](open/backtest-history-snapshot-reproducibility.md) | 高 | 2026-11-14 | 履歴が変わった後も同じ入力で backtest を再現できるようにする |
 | [backtest-dedup-cache](open/backtest-dedup-cache.md) | 中 | 2026-09-08 | 同一 (候補, config) の backtest 再実行で予算を消費しない (run6: 6 枠中 3 枠がビット… |
 | [strategy-attribution-and-shadow-evaluation](open/strategy-attribution-and-shadow-evaluation.md) | 中 | 2026-10-16 | 戦略ごとの帰属と影の評価 (共有建玉のまま戦略別の成績を出す) |
 | [weekly-improve-rebacktests-deployed-strategies](open/weekly-improve-rebacktests-deployed-strategies.md) | 中 | 2026-10-25 | 週次改善の冒頭で稼働中の戦略を再 backtest し、成績を改善の方向性の材料にする |
