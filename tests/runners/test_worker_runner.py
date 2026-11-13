@@ -163,7 +163,7 @@ def _rag(tmp_path):
 
 
 def _mission():
-    return Mission(prompt="hi", tools=[], output_schema={"type": "object"},
+    return Mission(prompt="依頼文の既定値です", tools=[], output_schema={"type": "object"},
                    max_turns=1, timeout_sec=5.0)
 
 
@@ -1589,7 +1589,7 @@ def test_real_subprocess_starts_and_reports_ready_then_times_out(tmp_path):
     clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
     runner = WorkerRunner(root=root, settings=settings, clock=clock,
                           rag=_rag(tmp_path))
-    mission = Mission(prompt="hi", tools=[], output_schema={"type": "object"},
+    mission = Mission(prompt="依頼文の既定値です", tools=[], output_schema={"type": "object"},
                       max_turns=1, timeout_sec=2.0)
     result = runner.run(mission)
     assert result.status in ("timeout", "failed")
@@ -4372,7 +4372,7 @@ def test_real_improve_worker_ready_then_on_ready_then_result_ordering(
     runner = WorkerRunner(root=root, settings=settings, clock=clock,
                           rag=_rag(tmp_path), worker_profile="improve",
                           run_context=_RunContext(), on_ready=_on_ready)
-    mission = Mission(prompt="hi", tools=[], output_schema={"type": "object"},
+    mission = Mission(prompt="依頼文の既定値です", tools=[], output_schema={"type": "object"},
                       max_turns=1, timeout_sec=20.0)
     started = time.monotonic()
     result = runner.run(mission)
@@ -4455,7 +4455,7 @@ def test_real_improve_worker_on_ready_exception_leaves_no_surviving_child(
     runner = WorkerRunner(root=root, settings=settings, clock=clock,
                           rag=_rag(tmp_path), worker_profile="improve",
                           run_context=_RunContext(), on_ready=_boom)
-    mission = Mission(prompt="hi", tools=[], output_schema={"type": "object"},
+    mission = Mission(prompt="依頼文の既定値です", tools=[], output_schema={"type": "object"},
                       max_turns=1, timeout_sec=20.0)
     result = runner.run(mission)
 
@@ -4584,7 +4584,7 @@ def test_worker_runner_dispatches_improve_tool_rpc_via_rpc_handlers_not_rag(
         on_ready=_on_ready,
         rpc_handlers={"run_backtest": run_backtest_handler,
                      "analyze_corr": analyze_corr_handler})
-    mission = Mission(prompt="hi", tools=[], output_schema={"type": "object"},
+    mission = Mission(prompt="依頼文の既定値です", tools=[], output_schema={"type": "object"},
                       max_turns=1, timeout_sec=20.0)
     runner.run(mission)
     probe_done.wait(timeout=15.0)
@@ -4987,7 +4987,7 @@ def test_worker_runner_reaps_real_cli_pgid_via_mission_worker_wiring(
     # `mission.prompt` は `CliRunner._run_cli_process` によって
     # `workdir/prompt.txt` に書かれ stdin へ回るだけで、driver
     # (`fake_claude_pgid_driver.py`) はそれを読まない — 内容は任意でよい。
-    mission = Mission(prompt="hi", tools=[],
+    mission = Mission(prompt="依頼文の既定値です", tools=[],
                       output_schema={"type": "object"},
                       max_turns=1, timeout_sec=120.0)
 
@@ -5206,7 +5206,7 @@ def test_worker_runner_reaps_real_cli_pgid_under_improve_profile(
     runner = WorkerRunner(root=root, settings=settings, clock=FixedClock(NOW),
                           rag=_rag(tmp_path), worker_profile="improve",
                           run_context=_RunContext())
-    mission = Mission(prompt="hi", tools=[], output_schema={"type": "object"},
+    mission = Mission(prompt="依頼文の既定値です", tools=[], output_schema={"type": "object"},
                       max_turns=1, timeout_sec=120.0)
 
     thread = threading.Thread(target=lambda: runner.run(mission))
@@ -5350,7 +5350,7 @@ def test_trade_claude_real_process_completes_via_factory_build_runner(
 
     runner = WorkerRunner(root=root, settings=settings, clock=FixedClock(NOW),
                           rag=_rag(tmp_path), worker_profile="trade")
-    mission = Mission(prompt="hi", tools=[], output_schema={},
+    mission = Mission(prompt="依頼文の既定値です", tools=[], output_schema={},
                       max_turns=1, timeout_sec=180.0)
     # 段A (mission transcript 常時保存): このテストは本物の
     # mission_worker 子プロセスを spawn する — 子は別プロセスなので
