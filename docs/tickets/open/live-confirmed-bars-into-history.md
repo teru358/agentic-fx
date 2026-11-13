@@ -5,7 +5,7 @@ status: 実装中
 priority: 高
 opened: 2026-09-21
 closed: null
-related: [improve-eval-window-reference-availability]
+related: [history-import-stops-at-first-conflict]
 backfilled: true
 source_section: 完了ログ
 kind: 不具合
@@ -24,3 +24,4 @@ kind: 不具合
 - 2026-10-02: 状態: 設計待ち、優先: 低、題名: ライブで集めた確定足を履歴に積めず二重保存になる — 仕分け (2026-10-02、現物で成立を確認): prune_cache の GC 範囲やデータ版の扱いが設計項目。 根拠: ライブ確定足を履歴に積む実装・commit が無い。
 - 2026-11-11: 状態: 実装中、優先: 高、種別: 不具合、題名: backtest の履歴が自動で更新されず、評価が古い入力で通る — 2026-11-11: 評価用履歴 (mt5 5m) が USDJPY 09-04・参照 10-30 で止まり、holdout の充足率が 11-08 に 0.22 まで落ちたまま承認が通っていた。手で 11-10 まで取込み (参照 4 銘柄は 11-04〜11-09 が端末に無い)。sol・fable の実装案を突合し、段 1a (import の実時刻の境界・評価前検査・gate の既定拒否・承認の証跡照合・status・配備中 4 版の再評価) を設計 docs/superpowers/specs/2026-11-11-backtest-history-freshness-guard-design.md (C1) で承認。利用者裁定: 主 pair 不足は採用判定と承認だけ止める / 参照の穴は見せる / 同期は既定有効 / 09-04 以降承認の 15 件すべて再評価 / 非配備 7 版への rollback は監査まで拒否。
 - 2026-11-13: 関連: [improve-eval-window-reference-availability] — 段 1a を main へ merge (2026-11-13)。履歴の鮮度・充足を共有 gate で検査し、主 pair が古い・穴ありなら採用判定と承認を止める。承認・再評価・rollback は承認時の証跡を照合し、rollback の強行は人間専用で、開始の監査を activity に、op との関連付けを DB に token で記録する (設計 C2.2)。評価区間の設計 (improve-eval-window-reference-availability) はこの上に乗せる。残り: 配備、task 6 (配備中 4 版の再評価)、段 1b (非配備 7 版の監査)、段 2 (afx history sync)、段 3 (daemon の定期同期)。
+- 2026-11-13: 関連: [history-import-stops-at-first-conflict] — 段 1a の配備と task 6 を完了 (2026-11-13)。履歴を 11-13 12:05Z まで補充 (参照 4 銘柄が取り込めなかった真因は import の衝突停止、history-import-stops-at-first-conflict に起票)。配備中 4 版を再評価し #122〜#125 を作成、利用者が 4 件とも承認。manifest に記録し validate・verify_against_db とも問題 0 件。残り: 段 1b (非配備 7 版の監査)、段 2 (afx history sync)、段 3 (daemon の定期同期)、status-history-hidden-while-daemon-runs。
