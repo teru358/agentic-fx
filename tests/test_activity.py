@@ -122,9 +122,29 @@ def test_write_required_fsyncs_the_directory_only_when_it_creates_the_file(tmp_p
     monkeypatch.setattr(activity, "_fsync_dir", synced.append)
     log = ActivityLog(tmp_path / "activity.log")
     log.write_required(Category.SYSTEM, "one", "a")
-    assert synced == [tmp_path]
+    assert synced == [tmp_path, tmp_path.parent]
     log.write_required(Category.SYSTEM, "two", "b")
-    assert synced == [tmp_path]
+    assert synced == [tmp_path, tmp_path.parent]
+
+
+def test_write_required_fsyncs_the_directory_when_the_file_vanishes_after_a_check(
+        tmp_path, monkeypatch):
+    from agentic_fx import activity
+    synced = []
+    monkeypatch.setattr(activity, "_fsync_dir", synced.append)
+    path = tmp_path / "activity.log"
+    path.write_text("old\n", encoding="utf-8")
+    log = ActivityLog(path)
+    path.unlink()
+    log.write_required(Category.SYSTEM, "one", "a")
+    assert synced == [tmp_path, tmp_path.parent]
+
+
+def test_write_required_raises_when_a_write_makes_no_progress(tmp_path, monkeypatch):
+    from agentic_fx import activity
+    monkeypatch.setattr(activity.os, "write", lambda fd, data: 0)
+    with pytest.raises(OSError):
+        ActivityLog(tmp_path / "activity.log").write_required(Category.SYSTEM, "one", "a")
 
 
 def test_write_required_raises_when_the_directory_fsync_fails(tmp_path, monkeypatch):
@@ -156,9 +176,11 @@ def test_a_line_appended_by_another_writer_survives_write_required(tmp_path, mon
     other = b"OTHER\tfull\tline\n"
     _race_after_newline_decision(monkeypatch, path, other)
     ActivityLog(path).write_required(Category.SYSTEM, "mine", "ok", "r1")
-    data = path.read_bytes()
-    assert other in data and data.startswith(b"partial")
-    assert data.count(b"mine") == 1
+    lines = path.read_bytes().split(b"\n")
+    assert lines[0] == b"partial" + other.rstrip(b"\n")
+    assert lines[1] == b""
+    assert lines[2].split(b"\t")[2:] == [b"mine", b"ok", b"r1"]
+    assert lines[3:] == [b""]
 
 
 def test_a_line_appended_by_another_writer_survives_end_partial_line(tmp_path, monkeypatch):
@@ -167,5 +189,4 @@ def test_a_line_appended_by_another_writer_survives_end_partial_line(tmp_path, m
     other = b"OTHER\tfull\tline\n"
     _race_after_newline_decision(monkeypatch, path, other)
     ActivityLog(path).end_partial_line()
-    data = path.read_bytes()
-    assert data.startswith(b"partial") and other in data
+    assert path.read_bytes() == b"partial" + other + b"\n"

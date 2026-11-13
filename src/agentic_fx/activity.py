@@ -1,6 +1,7 @@
 """activity ログ (カテゴリ軸)。ユーザーが読む行動記録 — 設計書 §13。"""
 from __future__ import annotations
 
+import errno
 import logging
 import os
 from collections.abc import Callable
@@ -26,7 +27,10 @@ class Category(StrEnum):
 def _write_all(fd: int, data: bytes) -> None:
     view = memoryview(data)
     while view:
-        view = view[os.write(fd, view):]
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError(errno.EIO, "activity log write made no progress")
+        view = view[written:]
 
 
 def _fsync_dir(path: Path) -> None:
@@ -87,22 +91,31 @@ class ActivityLog:
         """監査記録用の追記。`write` と違い、書けなければ例外を送出する。
 
         書けなかった記録を前提に次の操作へ進まないための入口で、追記後に fsync する。
-        前回の書込み中に落ちて末尾が改行で終わっていなければ、先に改行を足して
-        新しい行が部分行に連結されないようにする。
+        前回の書込み中に落ちて末尾が改行で終わっていなければ、先に改行を足すので、
+        この行は必ず独立した 1 行になる。書込みは追記だけで、他の行の byte は上書き
+        しない。ただし書き手どうしは排他しないため、改行の要否を見た直後に別の書き手が
+        追記すると、その行は前の部分行に連結されたまま残り (通常の `write` が部分行の
+        後に書く場合と同じ)、この行の前に空行が 1 行入る。
+        ファイルを新しく作ったときは、その directory と親 directory も fsync する。
         """
         ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
         clean = " ".join(summary.split())
         line = "\t".join([ts, Category(category).value, event, clean, ref_id or "-"])
-        existed = self._path.exists()
-        fd = os.open(self._path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            fd = os.open(self._path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o644)
+            created = True
+        except FileExistsError:
+            fd = os.open(self._path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
+            created = False
         try:
             data = (("\n" if self._needs_newline(fd) else "") + line + "\n").encode("utf-8")
             _write_all(fd, data)
             os.fsync(fd)
         finally:
             os.close(fd)
-        if not existed:
+        if created:
             _fsync_dir(self._path.parent)
+            _fsync_dir(self._path.parent.parent)
 
     @staticmethod
     def _needs_newline(fd: int) -> bool:
@@ -130,9 +143,10 @@ class ActivityLog:
 
         Without this the next appended line would join the torn one.  A missing
         or empty file needs nothing; other failures are raised.  The newline is
-        appended (never written at a remembered offset), so a concurrent writer
-        can at worst leave one extra blank line; no other line's bytes are
-        overwritten.
+        appended (never written at a remembered offset), so no other line's bytes
+        are overwritten.  Writers do not lock each other: a line another writer
+        appends between the check and this append stays joined to the torn line,
+        followed by one blank line.
         """
         try:
             fd = os.open(self._path, os.O_RDWR | os.O_APPEND)
