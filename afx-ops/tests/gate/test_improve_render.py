@@ -62,6 +62,7 @@ PAIRS_WITH_HEADING = {
     ("observation", "duplicate_logic"), ("observation", "duplicate_metrics"),
     ("observation", "family_redirect"), ("gate_failed", "unprofitable"),
     ("gate_failed", "not_improved"), ("gate_failed", "same_name_contract_changed"),
+    ("gate_failed", "history_not_ready"),
     ("report", None), ("report", "duplicate_skipped"),
 }
 
@@ -77,7 +78,7 @@ def test_the_heading_table_is_a_plain_dict_literal_the_daemon_side_can_read_by_a
              and any(isinstance(t, ast.Name) and t.id == "IMPROVE_HEADINGS" for t in n.targets)]
     assert len(nodes) == 1 and isinstance(nodes[0].value, ast.Dict)
     keys = [ast.literal_eval(key) for key in nodes[0].value.keys]
-    assert len(keys) == len(set(keys)) == 13
+    assert len(keys) == len(set(keys)) == 14
 
 
 @pytest.mark.parametrize("result,reason,heading", [
@@ -92,6 +93,7 @@ def test_the_heading_table_is_a_plain_dict_literal_the_daemon_side_can_read_by_a
     ("gate_failed", "unprofitable", "[改善] 床未達で見送り #9 (unprofitable)"),
     ("gate_failed", "not_improved", "[改善] 配備中の版を上回らず見送り #9"),
     ("gate_failed", "same_name_contract_changed", "[改善] 見送り #9 (同名更新の条件変更)"),
+    ("gate_failed", "history_not_ready", "[改善] 履歴条件のため提出を保留 #9"),
     ("report", None, "[改善] レポートを公開 #9"),
     ("report", "duplicate_skipped", "[改善] レポートを公開 #9 (duplicate_skipped)"),
 ])

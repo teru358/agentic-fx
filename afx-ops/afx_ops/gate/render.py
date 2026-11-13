@@ -7,7 +7,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 
-from afx_ops import base_text, display_time, reevaluation_text
+from afx_ops import base_text, display_time, history_text, reevaluation_text
 from afx_ops.display_zone import zone_of
 from afx_ops.notify.payload import encode_event
 
@@ -319,6 +319,9 @@ def render_approval(record: ApprovalRecord, detail: object | None = None) -> str
     warning = base_text.warning_line(data.get("base_check"))
     if warning is not None:
         parts.append((escape_discord(warning), 1))
+    held = history_text.text_for(data.get("reason"))
+    if held is not None:
+        parts.append((escape_discord(held), 1))
     parts += _reevaluation_parts(data, zone_of(data))
     parts += _summary_parts(change, performance=not reeval)
     parts.append((f"期限: {expires}" if expires is not None else "期限: なし", 1))
@@ -376,6 +379,9 @@ def render_terminal(record: ApprovalRecord, detail: object | None) -> str | None
         parts.append((outcome, 0))
     if state == "invalidated" and data.get("reason") == base_text.BASE_CHANGED:
         parts.append((base_text.BASE_CHANGED_TEXT, 0))
+    held = history_text.text_for(data.get("reason"))
+    if state == "invalidated" and held is not None:
+        parts.append((escape_discord(held), 0))
     parts += _reevaluation_parts(data, zone_of(data))
     parts += _summary_parts(change, performance=not reeval)
     parts.append((_guide(record.approval_id), 0))
@@ -485,6 +491,7 @@ IMPROVE_HEADINGS = {
     ("gate_failed", "unprofitable"): "[改善] 床未達で見送り #{id} (unprofitable)",
     ("gate_failed", "not_improved"): "[改善] 配備中の版を上回らず見送り #{id}",
     ("gate_failed", "same_name_contract_changed"): "[改善] 見送り #{id} (同名更新の条件変更)",
+    ("gate_failed", "history_not_ready"): "[改善] 履歴条件のため提出を保留 #{id}",
     ("report", None): "[改善] レポートを公開 #{id}",
     ("report", "duplicate_skipped"): "[改善] レポートを公開 #{id} (duplicate_skipped)",
 }

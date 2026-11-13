@@ -20,6 +20,7 @@ from agentic_fx.loops import approval_facts
 from agentic_fx.store import approvals, candidate_archives
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.state import StateStore
+from tests.history_support import ready_evidence
 
 NOW = datetime(2026, 10, 2, 12, 0, tzinfo=timezone.utc)
 SETTINGS = load_settings(
@@ -482,7 +483,7 @@ def test_decisions_do_not_use_the_display_path(
     _wire_plugins(tmp_path, cmds)
     payload = _new_payload(candidate_origin="staging",
                            candidate_path="plugins/_staging/1/sma_cross",
-                           artifact_hash="a" * 64)
+                           artifact_hash="a" * 64, history_guard=ready_evidence())
     approval_id = approvals.create(conn, kind="plugin", payload=payload, now=NOW)
 
     def boom(*a, **k):

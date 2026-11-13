@@ -667,6 +667,7 @@ def _strategy_scene(world):
     world.deploy("strat", s1, None, 2)
     world.deploy("strat", s2, s1, 3)
     world.link("strat", s1)
+    world.record_history_evidence()
     return ind, s1, s2
 
 

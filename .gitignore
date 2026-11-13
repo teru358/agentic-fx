@@ -13,6 +13,8 @@ wheels/
 .env
 config/settings.yaml
 policy/directives.md
+# 人が無足を認める日の一覧 (broker の休場の確認結果。個人の運用値)
+config/history-no-bars.yaml
 
 # Local data / logs / personal notes
 data/

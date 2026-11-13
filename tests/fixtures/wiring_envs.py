@@ -441,6 +441,17 @@ def mission_for(ctx):
                    timeout_sec=60)
 
 
+def _double_evidence(kw: dict) -> dict:
+    """gate double が返す履歴証跡。本物の検証を通る形で、呼出しの dataset・pair・時刻に合わせる。"""
+    from tests.history_support import ready_evidence
+    settings = kw["settings"]
+    meta = kw.get("meta")
+    pairs = list(meta.pairs) if meta is not None else list(kw.get("pairs") or ["USDJPY"])
+    return ready_evidence(
+        source=settings.backtest.eval_source, base_interval=settings.backtest.base_interval,
+        pairs=pairs, now=kw["now"], holdout_months=settings.backtest.holdout_months)
+
+
 def install_gate_double(monkeypatch, *, pytest_ok: bool = True):
     """[codex plan r1 C1] strategy gate (= 実 backtest) を差し替える。
 
@@ -489,7 +500,8 @@ def install_gate_double(monkeypatch, *, pytest_ok: bool = True):
             evaluable=True, baseline_variant="no_strategy",
             baseline_row={"plugin_ref": "no_strategy:cand",
                           "variant": "no_strategy"},
-            candidate_metrics={"USDJPY": {"trades": 40, "pf": 1.2}})
+            candidate_metrics={"USDJPY": {"trades": 40, "pf": 1.2}},
+            history_guard=_double_evidence(kw))
 
     monkeypatch.setattr(
         strategy_gate, "evaluate_strategy_adoption_gate", _fake)

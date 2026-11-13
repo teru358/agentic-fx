@@ -3,7 +3,13 @@
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 未完了: 164 件。完了分は closed/。
 
-## 実装中 (1)
+## 実装中 (2)
+
+### 不具合 (1)
+
+| id | 優先 | 起票 | 概要 |
+|---|---|---|---|
+| [live-confirmed-bars-into-history](open/live-confirmed-bars-into-history.md) | 高 | 2026-09-21 | backtest の履歴が自動で更新されず、評価が古い入力で通る |
 
 ### 機能 (1)
 
@@ -63,7 +69,7 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (145)
+## 設計待ち (144)
 
 ### 不具合 (80)
 
@@ -150,7 +156,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (42)
+### 機能 (41)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -168,7 +174,6 @@
 | [improve-targeted-run](open/improve-targeted-run.md) | 低 | 2026-09-12 | 現状は `improve add <text>` + 引数なし `improve` で LLM が open から自分… |
 | [pine-script-to-plugin](open/pine-script-to-plugin.md) | 低 | 2026-09-12 | Pine script を plugin に変換する手段が無い |
 | [indicator-reference-oracle-gate](open/indicator-reference-oracle-gate.md) | 低 | 2026-09-15 | indicator の正しさを確かめる門が無い |
-| [live-confirmed-bars-into-history](open/live-confirmed-bars-into-history.md) | 低 | 2026-09-21 | ライブで集めた確定足を履歴に積めず二重保存になる |
 | [multi-decision-timeframes](open/multi-decision-timeframes.md) | 低 | 2026-09-21 | 判断足を複数持つ構想 (将来拡張) |
 | [intent-evidence-timeframe-gate](open/intent-evidence-timeframe-gate.md) | 低 | 2026-09-27 | 判断足と無関係な足を根拠にした OPEN を gate が弾かない |
 | [trade-cron-hybrid-mode](open/trade-cron-hybrid-mode.md) | 低 | 2026-09-28 | 取引判断 LLM の起動をハイブリッドにする — 建玉・未約定指値が**ある**間だけ判断足ごとの cron miss… |

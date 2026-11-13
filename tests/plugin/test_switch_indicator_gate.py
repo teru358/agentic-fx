@@ -19,6 +19,7 @@ from agentic_fx.plugin import indicator_pipeline, switch
 from agentic_fx.plugin.resolve import ApprovedInventory, InventoryBuildResult
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import db as db_store
+from tests.history_support import ready_evidence
 from tests.fixtures import indicator_gate_fakes as fakes
 
 NOW = datetime(2026, 8, 20, 3, 0, tzinfo=timezone.utc)
@@ -612,6 +613,7 @@ def test_approve_does_not_rejudge_a_payload_that_is_not_an_indicator(env, monkey
     approval_id = env.submit("cand")
     payload = _payload(env.conn, approval_id)
     payload["kind"] = "strategy"
+    payload["history_guard"] = ready_evidence()
     env.conn.execute("UPDATE approval_requests SET payload_json=? WHERE id=?",
                      (json.dumps(payload), approval_id))
     env.conn.commit()

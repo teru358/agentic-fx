@@ -42,7 +42,7 @@ from agentic_fx.datafeed.reference_status import REFERENCE_STATES
 from agentic_fx.loops.econ_signal_report import format_econ_lines
 from agentic_fx.loops import approval_facts
 from agentic_fx.ops import reevaluation_view
-from agentic_fx.plugin import base_identity
+from agentic_fx.plugin import base_identity, history_reasons
 from agentic_fx.loops.approval_facts import display_text
 from agentic_fx.cli_surface import render_ctl_help
 from agentic_fx.setup.pending_text import (STEP_PARAMS, PendingStep, is_ident,
@@ -1692,12 +1692,15 @@ class Runner:
         status = display_text(result.get("status"))
         if job.get("state") != "done":
             code = job.get("result_code")
+            history = history_reasons.text_for(result.get("reason")) if (
+                result.get("outcome") == history_reasons.OUTCOME) else None
+            tail = "" if history is None else f"\n{history}"
             if kind == "retry" and result:
                 raise ClientError(RC_FAILED, f"approval #{approval_id} の再試行は完了しませんでした "
-                                  f"(status={status} outcome={outcome})")
+                                  f"(status={status} outcome={outcome})" + tail)
             if kind == "approve" and result:
                 raise ClientError(RC_FAILED, f"approval #{approval_id} は今回の操作では承認され"
-                                  f"ませんでした (status={status} outcome={outcome})")
+                                  f"ませんでした (status={status} outcome={outcome})" + tail)
             if kind == "reject" and result.get("outcome") == "history_epoch_changed":
                 raise ClientError(RC_FAILED, f"approval #{approval_id} "
                                   + reevaluation_view.EPOCH_STOP_TEXT.format(
@@ -1707,7 +1710,11 @@ class Runner:
             "reason") == "reevaluation_stale"
         base_changed = result.get("outcome") == "invalidated" and result.get(
             "reason") == base_identity.BASE_CHANGED
-        if stale:
+        history_text = (history_reasons.text_for(result.get("reason"))
+                        if result.get("outcome") == history_reasons.OUTCOME else None)
+        if history_text is not None:
+            self.say(f"approval #{approval_id} {history_text}")
+        elif stale:
             self.say(f"approval #{approval_id} " + (
                 reevaluation_view.STALE_STOP_TEXT.format(name=name or "<name>")
                 if kind == "reject" else reevaluation_view.STALE_TEXT))

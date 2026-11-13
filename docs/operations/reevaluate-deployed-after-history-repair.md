@@ -66,3 +66,46 @@ web の承認ページと Discord の承認カードにも同じ内容が出ま�
 ## 6. 再評価のやり直し
 
 依頼は、履歴の epoch・最新の決定・配備世代が評価時と同じ間だけ有効です。変わった依頼は承認も却下も「古い」として無効になるので、もう一度 `afx plugin reevaluate --all-deployed` を実行します。変わっていない依頼は `existing` と表示され、評価はやり直しません。
+
+## 7. 履歴の穴埋め (通常の import) のあとに再評価する
+
+time repair だけでなく、評価用履歴が古い・欠けているときも、この手順で再評価します。新しい holdout 評価と採用は、評価用履歴の鮮度と充足を満たさないと止まります (改善の in-sample は続きます)。既存の配備と資金保護は、この検査で自動停止しません。
+
+1. `afx status` の `evaluation history` で、主 pair の最新確定足・充足率・60 分を超える日別欠損を確かめます。取得も修復もしないので、足りなければ開場中に `afx history import --source mt5` で補います。閉場中に bridge が 503 を返したら、開場後に再試行するか、期間を分けて取り、取得後にもう一度 `afx status` で日別の充足を確かめます。最新足が更新されただけで完了にしません。
+2. broker の休場で足が無い日だと確認できたときだけ、`config/history-no-bars.yaml` に 1 系列・1 日の項目を足します (例は `config/history-no-bars.yaml.example`。実ファイルは gitignore 対象で、`reason` `approved_by` `approved_at` は確認した人が書く)。履歴の行は消さず補間もしません。足したら `afx status` の `no-bars applied` で、検査の対象範囲に当たる項目と digest を確かめます。壊れた一覧は空として続けず、検査が判定不能になります。
+3. `afx plugin reevaluate --all-deployed --yes` を実行します。通常の import でも `history_epoch` は変わらないので、穴埋め後は新しい依頼が作られます。
+
+### guard の規則版と `existing`
+
+依頼の重複判定 (`existing`) は、次のすべてが成り立つときだけです。既存の鍵 (コード・artifact・epoch・基準決定・配備世代) が同じ / 現在の guard 規則版・暦版・閾値が同じ / 依頼の証跡に保存した dataset・pair・評価区間で見た現在の無足日一覧が同じ / 正しい `ready` の証跡がある。規則版は完全一致で、互換扱いはありません。条件を満たさない pending は再利用されず、新しい評価に成功すると旧依頼が `reevaluation_superseded` で無効になります (整理のための却下はしません。却下は配備停止です)。評価が履歴不足で作れなかったときは、旧依頼は pending のまま残ります。穴埋め後にもう一度実行します。
+
+### 履歴証跡で止まった承認 (`history_not_ready`)
+
+提出時の履歴証跡を承認時に照合します。止まった承認は、固定の reason と次の操作が shell・`afx ctl`・web・承認カードに出ます。
+
+| 状況 | status | reason | 次の操作 |
+|---|---|---|---|
+| 通常の依頼の証跡が合わない | `invalidated` | `history_evidence_invalidated` | 候補が残っていれば `plugins/_human/<name>` に保存し (旧依頼の hash と照合し、別の候補で上書きしない)、`afx status` で履歴と無足日一覧を確かめ、`afx plugin submit <name> --from _human` で新しく評価して承認する。候補が消えていれば復元か再作成が要る。元の mission との結び付きは戻らない |
+| 再評価の依頼の証跡が合わない | `pending` | `history_evidence_refresh_required` | 履歴条件を確かめ、`afx plugin reevaluate --all-deployed --yes` を再実行する。却下しない |
+| 一覧・設定の読取失敗などで照合できない | `pending` | `history_check_unavailable` | `afx status` で読取エラーを確かめ、直してから承認を再試行する (通常の依頼もこの場合は失効しない) |
+
+journal が始まっている承認の再開には、この照合を掛けません。再評価の却下にも掛けません。
+
+### rollback
+
+履歴証跡の無い strategy の版へは rollback できません (`history_not_ready` / `history_evidence_required`)。証跡は、戻り先の名前と完全長 artifact hash に一致する最新の承認済み payload のものだけを使います。人間が確認した上でこの拒否だけを迂回するときは、ローカルで次を実行します。完全長 hash と理由が要り、既定の戻り先や短縮 hash では強行できません。実行者・時刻・理由が activity に監査記録として残り、記録できなければ切替えません。hash・依存・live の状態など他の検証は迂回しません。
+
+```bash
+afx plugin rollback <name> --to <完全長の artifact hash> --force-history-guard --reason "<人間が記入する理由>"
+```
+
+強行は適正な証跡を作らず、監査完了にも数えません。
+
+## 8. 移行 manifest (承認 15 件の追跡表)
+
+`data/history-guard-migration/manifest-2026-11-11.json` (gitignore 対象、DB のバックアップとともに人間が保全する) に、旧承認 1 件 1 行で計 15 行を持ちます。書き手は運用担当者で、gate や worker は書きません。
+
+- 作成: `agentic_fx.backtest.history_migration.initial_manifest(...)` に、旧承認 id ごとの完全長 hash と依存 pin (旧承認の payload から写す) を渡す。配備中 8 行は `1a / pending`、非配備 7 行は `1b / deferred`。
+- 更新: 再評価の結果ごとに、同じ版の旧承認 2 行へ同じ新依頼 id (`evaluated`) か同じ固定の評価不能理由 (`unevaluable`) と、評価試行の時刻・根拠参照を書く。人間が決めたら `human_decision` と `decided_at` を書く。
+- 検証: `validate_manifest(manifest)` が形と受入条件 (15 行の一致、配備中 8 行の結果、同じ版 2 行の一致、非配備 7 行が段 1b 未完了のまま) を、`verify_against_db(manifest, conn, no_bars_path=...)` が DB との一致 (新依頼がその版自身の再評価で、有効な証跡があること、決定の一致) を確かめます。
+- `unevaluable` は再評価の成功ではありません。配備中 4 版の評価・人間の決定が残っていれば、その残作業を最終報告に書きます。

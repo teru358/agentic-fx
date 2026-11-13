@@ -46,6 +46,8 @@ def _settings():
     s.improve.gate.max_trades_per_eval_bar = 0.25
     s.backtest.eval_source = "dukascopy"
     s.backtest.dataset.return_value = HistoryDataset("dukascopy", "1m")
+    s.backtest.holdout_months = 3
+    s.datafeed.closed_bar_grace_sec = 30
     return s
 
 

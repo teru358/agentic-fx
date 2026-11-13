@@ -1,0 +1,17 @@
+# 評価用履歴 (ohlcv_history) で「その日は足が無くて正しい」と人間が認める日の一覧。
+# 実ファイルは config/history-no-bars.yaml (gitignore 対象)。無ければ空一覧として扱う。
+# 内容が壊れている・読めないときは、空として続けず履歴検査が判定不能になる。
+#
+# - 1 項目は 1 系列・1 日 (UTC)。期間指定・ワイルドカード・無期限指定は使えない。
+# - reason / approved_by / approved_at は、broker の休場等を確認した人が手書きする。
+# - 追加・削除したら `afx status` で適用結果 (対象範囲の項目と digest) を確認する。
+# - 履歴の行は削除・補間しない。この日は期待する足の数と鮮度の開場時間から除くだけ。
+entries: []
+# entries:
+#   - source: mt5
+#     base_interval: 5m
+#     symbol: USDJPY
+#     date_utc: "2026-01-01"
+#     reason: "<休場を確認した根拠を書く>"
+#     approved_by: "<記入者>"
+#     approved_at: "2026-01-02T00:00:00+00:00"   # timezone 付き

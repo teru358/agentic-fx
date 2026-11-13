@@ -14,6 +14,7 @@ from agentic_fx.plugin import deploy_ops, loader, switch
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import db as db_store
 
+from tests.history_support import ready_evidence
 from ._change_fixtures import insert_journal, make_live, make_version
 from .conftest import APPROVER, OPERATOR, digest_of, wait_job
 
@@ -59,6 +60,7 @@ class Fixture:
             "basis_decision_id": self.basis,
             "deploy_generation": switch.deploy_generation(self.conn, NAME),
             "previous": {}, "reason": "history_time_repaired", "indicator_deps": {},
+            "history_guard": ready_evidence(),
         }
 
     def row(self):

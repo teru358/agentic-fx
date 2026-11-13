@@ -1,0 +1,401 @@
+"""strategy の rollback は、戻り先自身の最新の承認に有効な履歴証跡があるときだけ新しく始められる。
+人間だけが、完全長 hash と理由を伴って、この拒否だけを迂回できる (監査記録つき)。"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+import yaml
+
+from agentic_fx.activity import ActivityLog
+from agentic_fx.plugin import deploy_reconcile, deploy_rollback, history_reasons, loader
+from agentic_fx.store import approvals as approvals_store
+from agentic_fx.store import plugin_deploy_ops as deploy_store
+from tests.history_support import ready_evidence
+from tests.plugin.conftest import SETTINGS
+from tests.plugin.deploy_world import World, at
+
+NOW = at(60)
+REFUSED = history_reasons.ROLLBACK_EVIDENCE_REQUIRED
+
+
+@pytest.fixture
+def world(tmp_path):
+    return World(tmp_path)
+
+
+def _approve(world, name, version, minute, *, evidence="ready", status="approved", **extra):
+    payload = {"name": name, "kind": "strategy", "content_hash": loader.content_hash(version),
+               "artifact_hash": version.name, **extra}
+    if evidence == "ready":
+        payload["history_guard"] = ready_evidence()
+    elif evidence is not None:
+        payload["history_guard"] = evidence
+    aid = approvals_store.create(world.conn, "plugin", payload, at(minute))
+    if status != "pending":
+        approvals_store.apply_decision(world.conn, aid, status, decided_by="human",
+                                       now=at(minute))
+    return aid
+
+
+def _strategies(world, *, target_evidence="ready"):
+    """a (戻り先、承認に証跡 = target_evidence) → b (配備中)。"""
+    a, b = (world.version("sma", tag, kind="strategy") for tag in ("a", "b"))
+    aid = _approve(world, "sma", a, 1, evidence=target_evidence)
+    world.journal("sma", "approve", None, a, 1, aid)
+    bid = _approve(world, "sma", b, 2)
+    world.journal("sma", "approve", a, b, 2, bid)
+    world.link("sma", b)
+    return a, b
+
+
+def _rollback(world, **kwargs):
+    kwargs.setdefault("to", None)
+    kwargs.setdefault("revoke", False)
+    kwargs.setdefault("force", False)
+    return deploy_rollback.rollback_plugin(
+        world.conn, world.root, "sma", now=NOW, settings=SETTINGS, **kwargs)
+
+
+def _ops(world):
+    return [dict(r) for r in world.conn.execute("SELECT * FROM plugin_deploy_ops")]
+
+
+def _live(world):
+    live = world.root / "sma"
+    return os.readlink(live) if live.is_symlink() else None
+
+
+def _refused(outcome):
+    return (outcome.outcome, outcome.refusal_code, outcome.reasons[0])
+
+
+# ---- 通常の rollback -----------------------------------------------------------
+
+def test_a_target_with_a_sound_evidence_rolls_back(world):
+    a, b = _strategies(world)
+    assert _rollback(world, to=a.name).outcome == "rolled_back"
+    assert _live(world) == f".versions/sma/{a.name}"
+
+
+def test_the_default_target_is_checked_too(world):
+    a, b = _strategies(world, target_evidence=None)
+    outcome = _rollback(world)
+    assert _refused(outcome) == ("refused", history_reasons.OUTCOME, REFUSED)
+    assert _live(world) == f".versions/sma/{b.name}" and _ops(world) == []
+
+
+@pytest.mark.parametrize("evidence", [None, "broken"])
+def test_a_target_without_a_sound_evidence_is_refused_with_nothing_started(world, evidence):
+    a, b = _strategies(world, target_evidence=evidence)
+    outcome = _rollback(world, to=a.name)
+    assert _refused(outcome) == ("refused", history_reasons.OUTCOME, REFUSED)
+    assert _live(world) == f".versions/sma/{b.name}" and _ops(world) == []
+
+
+@pytest.mark.parametrize("tamper", [
+    lambda e: e.update(version=0), lambda e: e.update(verdict="history_gap"),
+    lambda e: e.update(calendar_version="old"),
+    lambda e: e.update(dataset={"source": "none", "base_interval": "1m"}),
+])
+def test_an_invalid_evidence_is_refused(world, tamper):
+    evidence = ready_evidence()
+    tamper(evidence)
+    a, b = _strategies(world, target_evidence=evidence)
+    assert _rollback(world, to=a.name).refusal_code == history_reasons.OUTCOME
+
+
+def test_the_dry_run_reports_the_same_refusal(world):
+    a, b = _strategies(world, target_evidence=None)
+    assert _rollback(world, to=a.name, dry_run=True).refusal_code == history_reasons.OUTCOME
+
+
+def test_another_versions_evidence_or_a_pending_request_is_not_substituted(world):
+    a, b = _strategies(world, target_evidence=None)
+    _approve(world, "sma", a, 5, status="pending")           # a の新依頼 (まだ pending)
+    assert _rollback(world, to=a.name).refusal_code == history_reasons.OUTCOME
+
+
+def test_only_the_latest_approved_payload_of_that_version_counts(world):
+    a, b = _strategies(world)
+    _approve(world, "sma", a, 7, evidence=None)              # 後の承認に証跡が無い
+    assert _rollback(world, to=a.name).refusal_code == history_reasons.OUTCOME
+
+
+def test_an_epoch_mismatch_is_refused(world):
+    a, b = _strategies(world)
+    world.conn.execute("INSERT INTO data_migrations(name, applied_at) VALUES "
+                       "('time_repair_dst_v1', ?)", (at(0).isoformat(),))
+    world.conn.commit()
+    assert _rollback(world, to=a.name).refusal_code == history_reasons.OUTCOME
+
+
+def test_an_unreadable_no_bars_list_refuses(world):
+    a, b = _strategies(world)
+    path = world.root.parent / "config" / "history-no-bars.yaml"
+    path.parent.mkdir(parents=True)
+    path.write_text("entries: [", encoding="utf-8")
+    assert _rollback(world, to=a.name).refusal_code == history_reasons.OUTCOME
+    path.unlink()
+    assert _rollback(world, to=a.name).outcome == "rolled_back"
+
+
+def test_an_indicator_is_outside_the_guard(world):
+    a, b, c = world.three_generations()                       # indicator
+    assert _rollback(world, to=b.name).outcome == "rolled_back"
+
+
+def test_a_rollback_already_started_is_resumed_without_the_check(world):
+    a, b = _strategies(world, target_evidence=None)
+    op_id = world.intent("sma", from_ver=b, to_ver=a)
+    world.link("sma", a)                                      # 切替は済み、op は未完
+    outcome = _rollback(world, to=a.name)
+    assert outcome.outcome == "rolled_back" and outcome.op_id == op_id
+
+
+def test_an_open_rollback_whose_switch_is_still_to_come_is_finished_without_the_check(world):
+    a, b = _strategies(world, target_evidence=None)
+    op_id = world.intent("sma", from_ver=b, to_ver=a)         # intent は記録済み、symlink は未切替
+    outcome = _rollback(world, to=a.name)
+    assert outcome.outcome == "rolled_back" and outcome.op_id == op_id
+    assert _live(world) == f".versions/sma/{a.name}"
+
+
+# ---- 人間専用の強行 ------------------------------------------------------------
+
+def _forced(world, a, *, reason="確認済み", target=None, activity=None, **kw):
+    override = deploy_rollback.HistoryGuardOverride(target or a.name, reason)
+    return _rollback(world, to=a.name, history_override=override,
+                     activity=activity if activity is not None else _log(world), **kw)
+
+
+def _log(world):
+    return ActivityLog(world.root.parent / "logs" / "activity.log")
+
+
+def _log_lines(world):
+    path = world.root.parent / "logs" / "activity.log"
+    return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+
+def test_a_forced_rollback_goes_past_the_history_refusal_and_is_audited(world):
+    a, b = _strategies(world, target_evidence=None)
+    outcome = _forced(world, a, reason="broker 休場を確認")
+    assert outcome.outcome == "rolled_back"
+    assert _live(world) == f".versions/sma/{a.name}"
+    lines = _log_lines(world)
+    first = next(line for line in lines if "\trollback_history_guard_force_started\t" in line)
+    assert f"target={a.name}" in first and "actor=human_cli" in first
+    assert "reason=broker 休場を確認" in first and "at=" in first
+    mark = deploy_store.history_forced_mark(world.conn, outcome.op_id)
+    assert mark["target_artifact_hash"] == a.name and mark["actor"] == "human_cli"
+    assert mark["forced_at"] == NOW.isoformat() and f"force_token={mark['force_token']}" in first
+
+
+@pytest.mark.parametrize("short,reason", [
+    (True, "確認済み"),              # 短縮 hash
+    (False, ""), (False, "   "),     # 理由なし
+])
+def test_a_forced_rollback_needs_the_full_hash_and_a_reason(world, short, reason):
+    a, b = _strategies(world, target_evidence=None)
+    target = a.name[:12] if short else a.name
+    outcome = _rollback(world, to=a.name, activity=_log(world),
+                        history_override=deploy_rollback.HistoryGuardOverride(target, reason))
+    assert outcome.outcome == "refused" and outcome.refusal_code == history_reasons.OUTCOME
+    assert _live(world) == f".versions/sma/{b.name}" and _ops(world) == []
+    assert _log_lines(world) == []
+
+
+def test_a_forced_rollback_must_name_the_actual_target(world):
+    a, b = _strategies(world, target_evidence=None)
+    outcome = _forced(world, a, target=b.name)
+    assert outcome.outcome == "refused" and _ops(world) == []
+
+
+def test_the_default_target_cannot_be_forced(world):
+    a, b = _strategies(world, target_evidence=None)
+    outcome = _rollback(world, history_override=deploy_rollback.HistoryGuardOverride(
+        a.name, "x"), activity=_log(world))
+    assert outcome.outcome == "refused" and _ops(world) == []
+
+
+def test_without_an_audit_record_nothing_is_switched(world):
+    a, b = _strategies(world, target_evidence=None)
+    override = deploy_rollback.HistoryGuardOverride(a.name, "x")
+    no_activity = _rollback(world, to=a.name, history_override=override, activity=None)
+    assert no_activity.outcome == "refused" and _ops(world) == []
+    log = world.root.parent / "logs" / "activity.log"
+    activity = ActivityLog(log)
+    log.mkdir()                                              # 追記できないログ
+    unwritable = _rollback(world, to=a.name, activity=activity, history_override=override)
+    assert unwritable.outcome == "refused" and _ops(world) == []
+    assert _live(world) == f".versions/sma/{b.name}"
+
+
+def test_a_forced_rollback_keeps_every_other_check(world):
+    a, b = _strategies(world, target_evidence=None)
+    # 戻り先の版の中身を壊す: hash 検証は強行でも迂回できない
+    (world.root / ".versions" / "sma" / a.name / "plugin.py").write_text("tampered")
+    outcome = _forced(world, a)
+    assert outcome.outcome == "refused" and outcome.refusal_code == "target_verification_failed"
+    assert _ops(world) == [] and _live(world) == f".versions/sma/{b.name}"
+
+
+def test_a_forced_run_without_a_refusal_to_bypass_is_audited_not_at_all(world):
+    a, b = _strategies(world)                                 # 証跡あり: 強行は不要
+    assert _forced(world, a).outcome == "rolled_back"
+    assert not any("history_guard_force" in line for line in _log_lines(world))
+
+
+def test_a_forced_rollback_leaves_no_evidence_and_the_next_plain_one_is_refused_again(world):
+    a, b = _strategies(world, target_evidence=None)
+    assert _forced(world, a).outcome == "rolled_back"
+    world.link("sma", b)
+    assert _rollback(world, to=a.name).refusal_code == history_reasons.OUTCOME
+
+
+class _FlakyAudit:
+    """write_required が n 回目 (1 起点) に失敗する監査ログ。"""
+
+    def __init__(self, inner, fail_on):
+        self.inner, self.fail_on, self.calls = inner, fail_on, 0
+
+    def write_required(self, *args, **kwargs):
+        self.calls += 1
+        if self.calls == self.fail_on:
+            raise OSError("audit unavailable")
+        return self.inner.write_required(*args, **kwargs)
+
+    def write(self, *args, **kwargs):
+        return self.inner.write(*args, **kwargs)
+
+
+def _marks(world):
+    return [dict(r) for r in world.conn.execute("SELECT * FROM plugin_deploy_op_history_forced")]
+
+
+def _phase(world, op_id):
+    return deploy_store.get_by_id(world.conn, op_id)["phase"]
+
+
+def _reconcile(world, activity):
+    return deploy_reconcile.reconcile_deploy_ops(
+        world.conn, world.root, now=NOW, settings=SETTINGS, activity=activity)
+
+
+def test_when_the_start_audit_cannot_be_written_no_op_no_mark_and_no_switch(world):
+    a, b = _strategies(world, target_evidence=None)
+    outcome = _forced(world, a, activity=_FlakyAudit(_log(world), fail_on=1))
+    assert outcome.outcome == "refused"
+    assert _ops(world) == [] and _marks(world) == []
+    assert _live(world) == f".versions/sma/{b.name}"
+
+
+def test_a_failure_between_the_op_and_its_mark_leaves_neither(world, monkeypatch):
+    a, b = _strategies(world, target_evidence=None)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("mark failed")
+
+    monkeypatch.setattr(deploy_store, "mark_history_forced", boom)
+    with pytest.raises(RuntimeError):
+        _forced(world, a)
+    assert _ops(world) == [] and _marks(world) == []
+    assert world.conn.execute("SELECT COUNT(*) FROM plugin_deploy_op_signals").fetchone()[0] == 0
+    assert _live(world) == f".versions/sma/{b.name}"
+
+
+def test_the_mark_token_is_the_one_in_the_start_audit_row(world):
+    a, b = _strategies(world, target_evidence=None)
+    outcome = _forced(world, a)
+    (mark,) = _marks(world)
+    assert mark["op_id"] == outcome.op_id and len(mark["force_token"]) >= 32
+    starts = [line for line in _log_lines(world)
+              if "\trollback_history_guard_force_started\t" in line]
+    assert len(starts) == 1 and f"force_token={mark['force_token']} " in starts[0]
+
+
+def test_a_plain_rollback_leaves_no_mark(world):
+    a, b = _strategies(world)
+    assert _rollback(world, to=a.name).outcome == "rolled_back" and _marks(world) == []
+
+
+def _stopped_forced_op(world, monkeypatch, *, switch_first):
+    """強行で始めた op が swap の前 / 後で落ちて intent のまま残った状態。"""
+    a, b = _strategies(world, target_evidence=None)
+    real = deploy_rollback.swap_to_target
+
+    def crash(*args, **kwargs):
+        if switch_first:
+            real(*args, **kwargs)
+        raise RuntimeError("crash")
+
+    monkeypatch.setattr(deploy_rollback, "swap_to_target", crash)
+    with pytest.raises(RuntimeError):
+        _forced(world, a)
+    monkeypatch.setattr(deploy_rollback, "swap_to_target", real)
+    (mark,) = _marks(world)
+    assert _phase(world, mark["op_id"]) == "intent"
+    return a, b, mark
+
+
+@pytest.mark.parametrize("switch_first", [False, True])
+def test_a_forced_op_is_finished_by_a_cli_resume_without_the_force_flag(
+        world, monkeypatch, switch_first):
+    a, b, mark = _stopped_forced_op(world, monkeypatch, switch_first=switch_first)
+    before = _log_lines(world)
+    done = _rollback(world, to=a.name, activity=_log(world))
+    assert done.outcome == "rolled_back" and done.op_id == mark["op_id"]
+    assert _phase(world, mark["op_id"]) == "done" and _marks(world) == [mark]
+    assert _live(world) == f".versions/sma/{a.name}"
+    assert not any("history_guard_force" in line for line in _log_lines(world)[len(before):])
+
+
+@pytest.mark.parametrize("switch_first", [False, True])
+def test_a_forced_op_is_finished_by_reconcile_even_with_an_unwritable_audit(
+        world, monkeypatch, switch_first):
+    a, b, mark = _stopped_forced_op(world, monkeypatch, switch_first=switch_first)
+    _reconcile(world, _FlakyAudit(_log(world), fail_on=1))
+    assert _phase(world, mark["op_id"]) == "done" and _marks(world) == [mark]
+    assert _live(world) == f".versions/sma/{a.name}"
+
+
+def test_the_human_reason_is_kept_out_of_the_database(world):
+    a, b = _strategies(world, target_evidence=None)
+    canary = "秘密の理由-canary-7f3a"
+    assert _forced(world, a, reason=canary).outcome == "rolled_back"
+    assert any(canary in line for line in _log_lines(world))        # 理由は activity だけにある
+    for (table,) in world.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+        for row in world.conn.execute(f'SELECT * FROM "{table}"'):
+            assert canary not in " ".join(str(value) for value in tuple(row)), table
+
+
+def test_the_human_reason_never_reaches_the_improve_agent_input(world):
+    import json
+
+    from agentic_fx.loops.improve_context import build_improve_context
+    from agentic_fx.loops.improve_loop import ImproveLoop
+
+    a, b = _strategies(world, target_evidence=None)
+    canary = "秘密の理由-canary-9d41"
+    assert _forced(world, a, reason=canary).outcome == "rolled_back"
+    assert any(canary in line for line in _log_lines(world))
+    view = {"plugins": [], "pin_broken_strategies": []}
+    ctx_data = build_improve_context(
+        world.conn, settings=SETTINGS, now=NOW, root=world.root,
+        allowed_backlog_ids=None, inventory_view=view)
+
+    class _Ctx:
+        staging_dir = world.root.parent / "staging"
+        source_snapshot_dir = world.root.parent / "source"
+        inventory_view = view
+        baseline_gate_mode = "off"
+
+    loop = ImproveLoop.__new__(ImproveLoop)
+    loop._settings = SETTINGS
+    prompt = loop._render_improve_mission_prompt(ctx_data, ctx=_Ctx())
+    assert prompt
+    assert canary not in prompt
+    assert canary not in json.dumps(ctx_data, ensure_ascii=False, default=str)

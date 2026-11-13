@@ -34,6 +34,7 @@ _RENAME_NOREPLACE = 1
 from agentic_fx._safe_error import safe_error_text, safe_text
 from agentic_fx.activity import Category
 from agentic_fx.backtest.dataset import HISTORY_SOURCE_UNCONFIGURED_REASON
+from agentic_fx.backtest import history_evidence
 from agentic_fx.backtest import holdout  # precheck 2026-08-22 wave2: 型6#5 —
     # module-level で import する (関数内 import だと monkeypatch.setattr
     # ("agentic_fx.loops.improve_loop.holdout.run_in_sample", ...) が
@@ -2412,6 +2413,7 @@ class ImproveLoop:
             meta=meta, kind=kind, record_fn=record_fn, floor_mode="enforce",
             inventory=inventory, evaluation_sink=evaluation_sink,
             resolved=resolved, compare_mode=compare_mode,
+            no_bars_path=history_evidence.no_bars_path(self._root),
             baseline_replay_wall_clock_max_sec=(
                 baseline_replay_wall_clock_max_sec))
 
@@ -2440,6 +2442,8 @@ class ImproveLoop:
                                    getattr(gate_metrics.get("meta"), "timeframe", None))
                                if kind == "strategy" else None),
             **({"history_epoch": history_epoch(conn)} if kind == "strategy" else {}),
+            **({"history_guard": gate_metrics.get("history_guard")}
+               if kind == "strategy" else {}),
             "live_source": self._settings.datafeed.primary,
             "mission_id": mission_id, "backlog_id": backlog_id,
             "in_sample": gate_metrics.get("in_sample"),
@@ -4124,6 +4128,7 @@ class ImproveLoop:
                         baseline_for_payload = {
                             **baseline_for_payload, "comparison": comparison}
                     gate_metrics["baseline"] = baseline_for_payload
+                    gate_metrics["history_guard"] = strategy_verdict.history_guard
                     # [approval-payload-missing-gate-metrics] 是正 (A4 10
                     # 回目 claude #69 観測 A、2026-09-11): ゲートが実際に
                     # 測った in-sample/holdout の成績を承認 payload へ載せる。

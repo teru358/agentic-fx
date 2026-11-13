@@ -21,6 +21,9 @@ from tests.plugin.reevaluation_world import FakeGate
 @pytest.fixture
 def world(tmp_path, monkeypatch):
     built = CliWorld(tmp_path)
+    settings_path = tmp_path / "config" / "settings.yaml"
+    settings_path.write_text(settings_path.read_text().replace(
+        'eval_source: "none"', 'eval_source: "mt5"', 1))
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(plugin_deploy_cli, "_isatty", lambda: False)
     for name, minute in (("alpha", 2), ("sma", 3)):

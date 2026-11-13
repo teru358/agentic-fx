@@ -40,6 +40,8 @@ def _configure_gate_mock(settings: MagicMock) -> MagicMock:
     settings.improve.gate.max_trades_per_eval_bar = 0.25
     settings.backtest.eval_source = "dukascopy"
     settings.backtest.dataset.return_value = HistoryDataset("dukascopy", "1m")
+    settings.backtest.holdout_months = 3
+    settings.datafeed.closed_bar_grace_sec = 30
     return settings
 
 

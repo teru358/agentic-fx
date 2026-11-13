@@ -248,7 +248,9 @@ class GateOutcome:
     verdict_kind: Literal["ok", "insufficient_trades",
                           "history_source_unconfigured", "floor",
                           "indicator_unresolved",
-                          "reference_history_missing"] = "ok"
+                          "reference_history_missing",
+                          "history_stale", "history_gap",
+                          "history_check_unavailable"] = "ok"
     # [profitability-floor] codex 2 周目レビュー CR6 (2026-09-13):
     # `floor_failed` フィールドは削除した (`verdict_kind == "floor"` と
     # 完全な同値で、生産コードのどこからも読まれず — `switch.py::
@@ -278,6 +280,9 @@ class GateOutcome:
     gate_warnings: tuple[str, ...] = ()
     similar_to: tuple[dict[str, str], ...] = ()
     indicator_report: "object | None" = None
+    # 履歴検査が ready だったときの証跡 (人間専用)。gate が作ったものを payload 生成の
+    # 各入口がそのまま写す (再計算しない)。
+    history_guard: "dict | None" = None
 
 
 # precheck 2026-08-22 wave2: T11-B-11d
@@ -290,6 +295,7 @@ def run_kind_gate(conn: sqlite3.Connection, meta: PluginMeta, *,
                   record_fn: "Callable[[dict], None] | None" = None,
                   sink: "list[dict] | None" = None,
                   pin_mode: PinMode = "require",
+                  no_bars_path: "Path | None" = None,
                   ) -> GateOutcome:
     """`switch.py` の `submit_candidate`/`bless_candidate` (`_run_full_gate`
     手順 7) から共有呼び出しされる kind 別検証の入口。indicator/signal は
@@ -364,7 +370,7 @@ def run_kind_gate(conn: sqlite3.Connection, meta: PluginMeta, *,
         verdict = strategy_gate.evaluate_strategy_adoption_gate(
             conn, meta=meta, settings=settings, now=now,
             floor_mode=floor_mode, record_fn=_sink, resolved=resolved,
-            inventory=inventory)
+            inventory=inventory, no_bars_path=no_bars_path)
         cpu_samples = verdict.cpu_samples if verdict is not None else ()
         if verdict is None or not verdict.evaluable:
             # strategy_gate.evaluate_strategy_adoption_gate は既に
@@ -388,11 +394,12 @@ def run_kind_gate(conn: sqlite3.Connection, meta: PluginMeta, *,
                 verdict_kind="floor",
                 floor_warning=verdict.floor_reason,
                 floor_detail=verdict.floor_detail, gate_rows=rows,
-                resolved=resolved, cpu_samples=cpu_samples)
+                resolved=resolved, cpu_samples=cpu_samples,
+                history_guard=verdict.history_guard)
         return GateOutcome(
             metrics=verdict.candidate_metrics or {}, evaluable=verdict.evaluable,
             verdict_kind="ok", gate_rows=rows, resolved=resolved,
-            cpu_samples=cpu_samples)
+            cpu_samples=cpu_samples, history_guard=verdict.history_guard)
     metrics, evaluable = _validate_kind(
         conn, meta, settings=settings, now=now, sandbox_run=sandbox_run,
         run_in_sample_fn=run_in_sample_fn,

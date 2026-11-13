@@ -32,7 +32,7 @@ from agentic_fx.store.state import (
     GenerationMismatch, NotLatched, ResetNotApplied, StateStore, StateUncertain)
 from agentic_fx.loops import econ_signal_report
 from agentic_fx.ops import base_view, reevaluation_view
-from agentic_fx.plugin import base_identity
+from agentic_fx.plugin import base_identity, history_reasons
 from agentic_fx.ops.contracts import ErrorCode, OpsError, ShellCaller
 from agentic_fx.policy_projection import (
     POLICY_TEXT_LIMIT, MigrationRecordUnknown, ProjectionReconcileBlocked, insert_policy,
@@ -861,6 +861,11 @@ class Commands:
             return f"この承認は既に決着しています (status={outcome.status})"
         if kind == "history_epoch_changed":
             return "履歴修復後の評価でないため承認できません (history_epoch_changed)"
+        if kind == history_reasons.OUTCOME:
+            text = history_reasons.text_for(outcome.reason)
+            if text is None:
+                raise ValueError(f"unknown history reason: {outcome.reason!r}")
+            return text
         raise ValueError(f"unknown approval outcome: {kind!r}")
 
     def _reevaluation_reject_text(self, shown_id: str, outcome) -> str:

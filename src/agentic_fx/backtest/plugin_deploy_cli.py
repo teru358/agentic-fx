@@ -24,6 +24,7 @@ from agentic_fx.activity import ActivityLog
 from agentic_fx.core.display_time import effective_tz_name
 from agentic_fx.plugin import deploy_disable, deploy_ops, deploy_retire, deploy_rollback
 from agentic_fx.plugin import deploy_versions, read_model, read_model_inputs
+from agentic_fx.plugin import strategy_gate
 from agentic_fx.plugin import switch as plugin_switch
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 
@@ -255,8 +256,9 @@ def render_rollback(outcome, conn, name: str, *, revoke: bool) -> Report:
         if code == "already_live":
             return Report(RC_OK, out=[f"plugin {name!r}: {reason} (変更なし)",
                                       *_notified_lines(outcome)])
+        extra = [HISTORY_REFUSAL_HINT] if code == deploy_rollback.HISTORY_REFUSAL_CODE else []
         return _failure(f"plugin {name!r} の rollback を拒否しました: {reason}", code,
-                        *_notified_lines(outcome))
+                        *extra, *_notified_lines(outcome))
     if kind == "dependents_blocked":
         return _failure(
             f"戻り先を置くと解決できなくなる strategy があります (plugin {name!r})",
@@ -524,17 +526,46 @@ def plugin_disable(conn, settings, args, root: Path) -> int:
             live_hash=_live_hash(plugins_dir, args.name) if revoke else None))
 
 
+def _history_override(args):
+    """`--force-history-guard` の指定。完全長 hash と理由が揃わなければ失敗の Report。"""
+    forced = bool(getattr(args, "force_history_guard", False))
+    reason = getattr(args, "reason", None)
+    if not forced:
+        if reason is not None:
+            return None, _failure("--reason は --force-history-guard と一緒に指定してください",
+                                  "invalid_request")
+        return None, None
+    target = getattr(args, "to", None)
+    if target is None or not deploy_rollback.DIR_NAME_RE.fullmatch(target):
+        return None, _failure(
+            "--force-history-guard には --to で完全長 (64 桁) の artifact hash を指定してください"
+            " (既定の戻り先・短縮 hash では強行できません)", "invalid_request")
+    if reason is None or not reason.strip():
+        return None, _failure("--force-history-guard には --reason で理由を記入してください",
+                              "invalid_request")
+    return deploy_rollback.HistoryGuardOverride(target, reason.strip()), None
+
+
+HISTORY_REFUSAL_HINT = (
+    "  履歴証跡の無い版へは rollback できません。人間が確認した上で戻すなら "
+    "`afx plugin rollback <name> --to <完全長の artifact hash> --force-history-guard "
+    "--reason \"<理由>\"` (監査記録に残ります)。")
+
+
 @guarded
 def plugin_rollback(conn, settings, args, root: Path) -> int:
     plugins_dir, activity = _common(root)
     revoke = bool(getattr(args, "revoke", False))
+    override, failure = _history_override(args)
+    if failure is not None:
+        return _emit(failure)
 
     def call(dry_run: bool, deadline: float, expect):
         return deploy_rollback.rollback_plugin(
             conn, plugins_dir, args.name, to=getattr(args, "to", None), revoke=revoke,
             force=bool(getattr(args, "force", False)), now=datetime.now(timezone.utc),
             settings=settings, activity=activity, deadline=deadline, dry_run=dry_run,
-            expect=expect)
+            expect=expect, history_override=override)
 
     def recover(outcome):
         return deploy_rollback.recover_already_live_notifications(
@@ -632,6 +663,8 @@ def reevaluate_line(result) -> str:
         parts.append(f"({result.reason})")
     parts.append(REEVALUATE_RESULT_TEXT[result.status])
     if result.status == "unevaluable":
+        if result.reason in strategy_gate.HISTORY_UNEVALUABLE_KINDS:
+            parts.append("履歴条件を満たしていません。`afx status` で確認し、補充後に再実行してください")
         parts.append(f"止めるには: afx plugin disable {result.name}")
     return "  ".join(parts)
 

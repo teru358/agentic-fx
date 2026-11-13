@@ -6,14 +6,20 @@ rollback verifies exactly what a normal switch would.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
+import secrets
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
+from agentic_fx.activity import Category
+from agentic_fx.backtest import history_evidence
+from agentic_fx.core.history_epoch import history_epoch
 from agentic_fx.plugin import deploy_ops
+from agentic_fx.plugin import history_reasons
 from agentic_fx.plugin import loader
 from agentic_fx.plugin.deploy_deps import DependentsReport, enumerate_dependents
 from agentic_fx.plugin.resolve import IndicatorResolutionError, resolve_indicator_deps
@@ -22,7 +28,10 @@ from agentic_fx.store import signals as signals_store
 from agentic_fx.tools import plugin_loader as tools_plugin_loader
 
 _HASH_PREFIX_RE = re.compile(r"^[0-9a-f]{1,64}$")
-_DIR_NAME_RE = re.compile(r"^[0-9a-f]{64}$")
+DIR_NAME_RE = re.compile(r"^[0-9a-f]{64}$")
+
+HISTORY_REFUSAL_CODE = history_reasons.OUTCOME
+FORCE_AUDIT_EVENT = "rollback_history_guard_force_started"
 
 
 @dataclass(frozen=True)
@@ -36,6 +45,23 @@ class RollbackTarget:
 class RollbackRefusal:
     code: str
     reason: str
+
+
+@dataclass(frozen=True)
+class HistoryGuardOverride:
+    """人間 (ローカル CLI) が、履歴証跡の拒否だけを迂回するための指定。
+    完全長の artifact hash と、空でない理由が要る。"""
+    target_hash: str
+    reason: str
+
+    def problem(self, target_hash: str, requested_to: str | None) -> str | None:
+        if requested_to is None or not DIR_NAME_RE.fullmatch(self.target_hash):
+            return "--force-history-guard needs --to with the full 64-character artifact hash"
+        if self.target_hash != requested_to or requested_to != target_hash:
+            return "--force-history-guard --to does not name the rollback target"
+        if not isinstance(self.reason, str) or not self.reason.strip():
+            return "--force-history-guard needs a non-empty --reason"
+        return None
 
 
 @dataclass(frozen=True)
@@ -109,7 +135,7 @@ def _resolve_prefix(plugins_root: Path, name: str, prefix: str) -> RollbackTarge
     matches: list[str] = []
     if base.is_dir():
         matches = sorted(entry.name for entry in base.iterdir()
-                         if _DIR_NAME_RE.fullmatch(entry.name) and entry.name.startswith(prefix))
+                         if DIR_NAME_RE.fullmatch(entry.name) and entry.name.startswith(prefix))
     if not matches:
         return RollbackRefusal("target_not_found", f"no version of {name!r} matches {prefix!r}")
     if len(matches) > 1:
@@ -223,7 +249,7 @@ def verify_rollback_target(conn: sqlite3.Connection, plugins_root: Path, name: s
     from agentic_fx.plugin import switch
 
     version_dir = plugins_root / ".versions" / name / target_hash
-    if not _DIR_NAME_RE.fullmatch(target_hash) or version_dir.is_symlink() or not version_dir.is_dir():
+    if not DIR_NAME_RE.fullmatch(target_hash) or version_dir.is_symlink() or not version_dir.is_dir():
         return VerificationFailure(
             (f"target version directory .versions/{name}/{target_hash} does not exist",))
     content = _approved_content_hash(conn, name, target_hash)
@@ -257,6 +283,34 @@ def verify_rollback_target(conn: sqlite3.Connection, plugins_root: Path, name: s
         listing = ", ".join(f"{s}:{a}:{r}" for s, a, r in report.unresolvable)
         return VerificationFailure((f"dependents_unresolvable: {listing}",), report)
     return VerifiedTarget(_version_target(name, target_hash), content, target_hash, report)
+
+
+def history_evidence_refusal(conn: sqlite3.Connection, plugins_root: Path, name: str,
+                             target: VerifiedTarget) -> RollbackRefusal | None:
+    """The target needs a valid history evidence from its own latest approval.
+
+    Only the approved payload of this name and full artifact hash counts; another
+    version's evidence, or a rejected / pending request, is never substituted.
+    Anything unreadable refuses.
+    """
+    refusal = RollbackRefusal(HISTORY_REFUSAL_CODE, history_reasons.ROLLBACK_EVIDENCE_REQUIRED)
+    try:
+        rows = conn.execute(
+            "SELECT payload_json FROM approval_requests WHERE kind='plugin' AND status='approved' "
+            "AND CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.name') END = ? "
+            "AND CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.artifact_hash') END = ? "
+            "ORDER BY id DESC LIMIT 1", (name, target.artifact_hash)).fetchall()
+        if not rows:
+            return refusal
+        payload = json.loads(rows[0][0])
+        if (not isinstance(payload, dict) or payload.get("content_hash") != target.content_hash
+                or payload.get("history_epoch", "none") != history_epoch(conn)):
+            return refusal
+        check = history_evidence.verify_payload(
+            payload, no_bars_path=history_evidence.no_bars_path(plugins_root.parent))
+    except Exception:  # noqa: BLE001 - an unreadable evidence refuses
+        return refusal
+    return None if check.ok else refusal
 
 
 def dependents_with_target(conn: sqlite3.Connection, plugins_root: Path, name: str,
@@ -381,11 +435,17 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
                     revoke: bool, force: bool, now: datetime, actor: str = "human_cli",
                     settings, activity=None, deadline: float | None = None, stop_event=None,
                     dry_run: bool = False,
-                    expect: deploy_ops.Expectation | None = None) -> RollbackOutcome:
+                    expect: deploy_ops.Expectation | None = None,
+                    history_override: HistoryGuardOverride | None = None) -> RollbackOutcome:
     """Journal-first replacement of a canonical live symlink by an earlier version.
 
     ``expect`` is the state a preview showed; a real run refuses with
     ``StateChangedError``, changing nothing, when the state under the lock differs.
+
+    A new strategy rollback needs a valid history evidence on the target's own latest
+    approval (``history_not_ready`` refusal otherwise). ``history_override`` is the
+    human-only way past that single refusal; it is never read for a rollback already
+    started (a rerun or a recovery).
     """
     if not loader.is_canonical_plugin_name(name):
         raise ValueError(f"invalid plugin name: {name!r}")
@@ -496,6 +556,20 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
             return RollbackOutcome("refused", name, reasons=verified.reasons,
                                    refusal_code="target_verification_failed",
                                    to_target=target.to_target)
+        forced = False
+        if open_row is None and current_kind == "strategy":
+            evidence_refusal = history_evidence_refusal(conn, plugins_root, name, verified)
+            if evidence_refusal is not None:
+                override_problem = (history_override.problem(verified.artifact_hash, to)
+                                    if history_override is not None else "not requested")
+                if history_override is None or override_problem is not None:
+                    reasons = [evidence_refusal.reason]
+                    if history_override is not None and override_problem is not None:
+                        reasons.append(override_problem)
+                    return RollbackOutcome("refused", name, reasons=tuple(reasons),
+                                           refusal_code=evidence_refusal.code,
+                                           to_target=verified.to_target)
+                forced = True
         cascade = verified.dependents.dependent_names
         if dry_run:
             return RollbackOutcome("dry_run", name, cascade_strategies=tuple(sorted(cascade)),
@@ -503,6 +577,24 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
                                    to_target=verified.to_target, expectation=observed)
         requested = _requested_signature(
             name, open_row, live, verified.to_target, revoke, force, lost_source)
+        force_token = secrets.token_hex(16)
+        if forced:
+            required = getattr(activity, "write_required", None)
+            if required is None:
+                return RollbackOutcome(
+                    "refused", name, reasons=("the forced rollback needs an audit record "
+                                              "but the activity log is unavailable",),
+                    refusal_code=HISTORY_REFUSAL_CODE, to_target=verified.to_target)
+            try:
+                required(Category.APPROVAL, FORCE_AUDIT_EVENT,
+                         f"name={name} target={verified.artifact_hash} actor={actor} "
+                         f"at={now.astimezone(timezone.utc).isoformat()} "
+                         f"force_token={force_token} "
+                         f"reason={history_override.reason.strip()}")
+            except Exception:  # noqa: BLE001 - no audit record, no switch
+                return RollbackOutcome(
+                    "refused", name, reasons=("the audit record could not be written",),
+                    refusal_code=HISTORY_REFUSAL_CODE, to_target=verified.to_target)
         if open_row is not None:
             op_id = deploy_ops.match_or_reject(
                 open_row, requested, _match_identity(open_row, live, lost_source),
@@ -524,7 +616,11 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
                     "target_artifact_hash": verified.artifact_hash,
                     "approval_id": approved["id"] if approved else None, "force": force,
                 }, revoke=deploy_ops.RevokeSpec(name, live.content_hash) if revoke else None,
-                cascade_identities=identities, now=now, actor=actor)
+                cascade_identities=identities, now=now, actor=actor,
+                after_insert=(lambda new_id: deploy_store.mark_history_forced(
+                    conn, new_id, target_artifact_hash=verified.artifact_hash, actor=actor,
+                    forced_at=now.astimezone(timezone.utc).isoformat(),
+                    force_token=force_token)) if forced else None)
         if not deploy_ops.live_matches_from(live_path, raw_target):
             _finish(conn, op_id, "foreign", activity, now=now)
             return RollbackOutcome("foreign", name, op_id=op_id)

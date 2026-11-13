@@ -16,6 +16,7 @@ from agentic_fx.plugin import deploy_ops, loader, switch
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 from agentic_fx.store import plugin_switch_journal as journal_store
+from tests.history_support import ready_evidence
 from tests.plugin.conftest import SETTINGS
 from tests.plugin.deploy_world import World, at
 
@@ -70,6 +71,7 @@ class Case:
             "basis_decision_id": self.basis_id,
             "deploy_generation": switch.deploy_generation(self.conn, NAME),
             "previous": {}, "reason": "history_time_repaired",
+            "history_guard": ready_evidence(),
             "indicator_deps": ({"fast": {
                 "plugin": "ind", "content_hash": loader.content_hash(self.indicator),
                 "params": {}}} if self.indicator is not None else {}),
@@ -633,9 +635,11 @@ def test_an_ordinary_candidate_submitted_before_the_approval_deploys_after_it(
 
     install_gate_double(monkeypatch)
     _stage_candidate(case, "b")
+    configured = SETTINGS.model_copy(update={
+        "backtest": SETTINGS.backtest.model_copy(update={"eval_source": "mt5"})})
     candidate_id = switch.submit_candidate(
         case.conn, name=NAME, staging_dir=case.root / "_staging" / "1",
-        candidate_origin="staging", mission_id=1, backlog_id=None, settings=SETTINGS,
+        candidate_origin="staging", mission_id=1, backlog_id=None, settings=configured,
         now=at(20))
     deployed_before = case.live_target()
 
@@ -648,7 +652,7 @@ def test_an_ordinary_candidate_submitted_before_the_approval_deploys_after_it(
 
     outcome = switch.approve_candidate(
         case.conn, candidate_id, decided_by="human", now=at(60), plugins_root=case.root,
-        settings=SETTINGS, activity=case.activity)
+        settings=configured, activity=case.activity)
 
     assert outcome.outcome == "deployed"
     assert case.live_target() != deployed_before

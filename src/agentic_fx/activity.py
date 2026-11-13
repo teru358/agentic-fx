@@ -1,7 +1,9 @@
 """activity ログ (カテゴリ軸)。ユーザーが読む行動記録 — 設計書 §13。"""
 from __future__ import annotations
 
+import errno
 import logging
+import os
 from collections.abc import Callable
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -20,6 +22,23 @@ class Category(StrEnum):
     IMPROVE = "IMPROVE"
     APPROVAL = "APPROVAL"
     SYSTEM = "SYSTEM"
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError(errno.EIO, "activity log write made no progress")
+        view = view[written:]
+
+
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 class ActivityLog:
@@ -67,6 +86,56 @@ class ActivityLog:
                 except Exception:  # noqa: BLE001 — write remains non-throwing
                     _log.exception("activity write failure callback failed")
 
+    def write_required(self, category: Category | str, event: str, summary: str,
+                       ref_id: str | None = None) -> None:
+        """監査記録用の追記。`write` と違い、書けなければ例外を送出する。
+
+        書けなかった記録を前提に次の操作へ進まないための入口で、追記後に fsync する。
+        前回の書込み中に落ちて末尾が改行で終わっていなければ、先に改行を足すので、
+        既に残っている部分行にこの行が連結されることはない。書込みは追記だけで、他の
+        行の byte は上書きしない。書き手どうしは排他しないため、改行の要否を見た直後に
+        別の書き手が追記すると、次のどちらかになる。完全な行なら、それは前の部分行に
+        連結されたまま残り (通常の `write` が部分行の後に書く場合と同じ)、この行の前に
+        空行が 1 行入る。その書き手が書込み中に落ちて部分行を残したなら、この行はその
+        部分行に連結される。
+        ファイルを新しく作ったときは、その directory と親 directory も fsync する。
+        """
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        clean = " ".join(summary.split())
+        line = "\t".join([ts, Category(category).value, event, clean, ref_id or "-"])
+        fd, created = self._open_for_append()
+        try:
+            data = (("\n" if self._needs_newline(fd) else "") + line + "\n").encode("utf-8")
+            _write_all(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if created:
+            _fsync_dir(self._path.parent)
+            _fsync_dir(self._path.parent.parent)
+
+    def _open_for_append(self) -> tuple[int, bool]:
+        """追記用に開き、このプロセスがファイルを作ったかを返す。
+
+        作成は `O_EXCL` でだけ行い、既存なら `O_CREAT` なしで開く。その間に消されたら
+        作成からやり直すので、作ったのに作っていないと判定することはない。
+        """
+        flags = os.O_RDWR | os.O_APPEND
+        while True:
+            try:
+                return os.open(self._path, flags | os.O_CREAT | os.O_EXCL, 0o644), True
+            except FileExistsError:
+                pass
+            try:
+                return os.open(self._path, flags), False
+            except FileNotFoundError:
+                continue
+
+    @staticmethod
+    def _needs_newline(fd: int) -> bool:
+        size = os.fstat(fd).st_size
+        return size > 0 and os.pread(fd, 1, size - 1) != b"\n"
+
     def contains(self, event: str, ref_id: str) -> bool:
         """Whether a line with this event and ref_id is already in the log.
 
@@ -87,18 +156,21 @@ class ActivityLog:
         """Terminate a last line left without its newline (a torn append).
 
         Without this the next appended line would join the torn one.  A missing
-        or empty file needs nothing; other failures are raised.
+        or empty file needs nothing; other failures are raised.  The newline is
+        appended (never written at a remembered offset), so no other line's bytes
+        are overwritten.  Writers do not lock each other: a line another writer
+        appends between the check and this append stays joined to the torn line,
+        followed by one blank line.
         """
         try:
-            with self._path.open("rb+") as f:
-                f.seek(0, 2)
-                if f.tell() == 0:
-                    return
-                f.seek(-1, 2)
-                if f.read(1) != b"\n":
-                    f.write(b"\n")
+            fd = os.open(self._path, os.O_RDWR | os.O_APPEND)
         except FileNotFoundError:
             return
+        try:
+            if self._needs_newline(fd):
+                _write_all(fd, b"\n")
+        finally:
+            os.close(fd)
 
     def tail(self, n: int = 20, category: Category | None = None) -> list[str]:
         if not self._path.exists():

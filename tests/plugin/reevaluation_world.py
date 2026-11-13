@@ -159,8 +159,13 @@ class FakeGate:
         if self.with_rows:
             for pair in pairs:
                 rows.append(self.row(snapshot, "holdout_gate", pair, now))
+        from tests.history_support import ready_evidence
         return StrategyGateVerdict(
             evaluable=True,
             candidate_metrics={p: self.metrics("in_sample") for p in pairs},
             holdout_metrics={p: self.metrics("holdout") for p in pairs},
-            floor_reason=self.floor, floor_detail="detail" if self.floor else "")
+            floor_reason=self.floor, floor_detail="detail" if self.floor else "",
+            history_guard=ready_evidence(
+                source=settings.backtest.eval_source,
+                base_interval=settings.backtest.base_interval, pairs=pairs, now=now,
+                holdout_months=settings.backtest.holdout_months))

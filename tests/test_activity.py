@@ -1,5 +1,7 @@
 import logging
 
+import pytest
+
 from agentic_fx.activity import ActivityLog, Category
 
 
@@ -94,3 +96,131 @@ def test_write_does_not_raise_on_none_summary_or_str_category(tmp_path, caplog):
         log.write("TRADE", "some_event", None)  # category が str, summary が None
     assert "activity write failed" in caplog.text
     assert "some_event" in caplog.text
+
+
+def test_write_required_after_a_torn_line_starts_a_new_line(tmp_path):
+    path = tmp_path / "activity.log"
+    path.write_bytes(b"2026-01-01T00:00:00+00:00\tsystem\tpartial\tbody")      # 改行なしの部分行
+    ActivityLog(path).write_required(Category.SYSTEM, "next_event", "ok", "r1")
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0].endswith("partial\tbody") and len(lines) == 2
+    fields = lines[1].split("\t")
+    assert fields[2:] == ["next_event", "ok", "r1"]
+
+
+def test_write_required_adds_no_blank_line_after_a_complete_line(tmp_path):
+    log = ActivityLog(tmp_path / "activity.log")
+    log.write_required(Category.SYSTEM, "one", "a")
+    log.write_required(Category.SYSTEM, "two", "b")
+    assert len((tmp_path / "activity.log").read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_write_required_fsyncs_the_directory_only_when_it_creates_the_file(tmp_path, monkeypatch):
+    from agentic_fx import activity
+    synced = []
+    monkeypatch.setattr(activity, "_fsync_dir", synced.append)
+    log = ActivityLog(tmp_path / "activity.log")
+    log.write_required(Category.SYSTEM, "one", "a")
+    assert synced == [tmp_path, tmp_path.parent]
+    log.write_required(Category.SYSTEM, "two", "b")
+    assert synced == [tmp_path, tmp_path.parent]
+
+
+def test_write_required_fsyncs_the_directory_when_the_file_vanishes_after_a_check(
+        tmp_path, monkeypatch):
+    from agentic_fx import activity
+    synced = []
+    monkeypatch.setattr(activity, "_fsync_dir", synced.append)
+    path = tmp_path / "activity.log"
+    path.write_text("old\n", encoding="utf-8")
+    log = ActivityLog(path)
+    path.unlink()
+    log.write_required(Category.SYSTEM, "one", "a")
+    assert synced == [tmp_path, tmp_path.parent]
+
+
+def test_write_required_fsyncs_the_directory_when_the_file_vanishes_between_opens(
+        tmp_path, monkeypatch):
+    from agentic_fx import activity
+    synced = []
+    monkeypatch.setattr(activity, "_fsync_dir", synced.append)
+    path = tmp_path / "activity.log"
+    path.write_text("old\n", encoding="utf-8")
+    log = ActivityLog(path)
+    real_open = activity.os.open
+    calls = []
+
+    def racing_open(p, flags, *args):
+        calls.append(flags)
+        if len(calls) == 2:
+            path.unlink()
+        return real_open(p, flags, *args)
+
+    monkeypatch.setattr(activity.os, "open", racing_open)
+    log.write_required(Category.SYSTEM, "one", "a")
+    assert synced == [tmp_path, tmp_path.parent]
+    assert path.read_text(encoding="utf-8").splitlines()[0].split("\t")[2] == "one"
+
+
+def test_a_torn_append_by_another_writer_after_the_check_joins_the_required_line(
+        tmp_path, monkeypatch):
+    path = tmp_path / "activity.log"
+    path.write_bytes(b"old\n")
+    _race_after_newline_decision(monkeypatch, path, b"torn")
+    ActivityLog(path).write_required(Category.SYSTEM, "mine", "ok", "r1")
+    lines = path.read_bytes().split(b"\n")
+    assert lines[0] == b"old"
+    assert lines[1].startswith(b"torn") and lines[1].split(b"\t")[2:] == [b"mine", b"ok", b"r1"]
+
+
+def test_write_required_raises_when_a_write_makes_no_progress(tmp_path, monkeypatch):
+    from agentic_fx import activity
+    monkeypatch.setattr(activity.os, "write", lambda fd, data: 0)
+    with pytest.raises(OSError):
+        ActivityLog(tmp_path / "activity.log").write_required(Category.SYSTEM, "one", "a")
+
+
+def test_write_required_raises_when_the_directory_fsync_fails(tmp_path, monkeypatch):
+    from agentic_fx import activity
+
+    def boom(path):
+        raise OSError(5, "io")
+
+    monkeypatch.setattr(activity, "_fsync_dir", boom)
+    with pytest.raises(OSError):
+        ActivityLog(tmp_path / "activity.log").write_required(Category.SYSTEM, "one", "a")
+
+
+def _race_after_newline_decision(monkeypatch, path, other):
+    original = ActivityLog._needs_newline
+
+    def racing(fd):
+        decided = original(fd)
+        with open(path, "ab") as f:
+            f.write(other)
+        return decided
+
+    monkeypatch.setattr(ActivityLog, "_needs_newline", staticmethod(racing))
+
+
+def test_a_line_appended_by_another_writer_survives_write_required(tmp_path, monkeypatch):
+    path = tmp_path / "activity.log"
+    path.write_bytes(b"partial")
+    other = b"OTHER\tfull\tline\n"
+    _race_after_newline_decision(monkeypatch, path, other)
+    ActivityLog(path).write_required(Category.SYSTEM, "mine", "ok", "r1")
+    lines = path.read_bytes().split(b"\n")
+    assert lines[0] == b"partial" + other.rstrip(b"\n")
+    assert lines[1] == b""
+    assert lines[2].split(b"\t")[2:] == [b"mine", b"ok", b"r1"]
+    assert lines[3:] == [b""]
+
+
+def test_a_line_appended_by_another_writer_survives_end_partial_line(tmp_path, monkeypatch):
+    path = tmp_path / "activity.log"
+    path.write_bytes(b"partial")
+    other = b"OTHER\tfull\tline\n"
+    _race_after_newline_decision(monkeypatch, path, other)
+    ActivityLog(path).end_partial_line()
+    assert path.read_bytes() == b"partial" + other + b"\n"

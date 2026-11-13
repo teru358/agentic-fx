@@ -34,10 +34,12 @@ from agentic_fx.plugin.resolve import (  # [indicator-consumption-wiring] T4b St
 from agentic_fx.plugin.sandbox import SandboxError, check_source
 from agentic_fx.tools import plugin_loader as tools_plugin_loader
 from agentic_fx.store import approvals as approvals_store
+from agentic_fx.backtest import history_evidence
 from agentic_fx.core.history_epoch import history_epoch
 from agentic_fx.store import backtest_runs as backtest_runs_store  # [profitability-floor] T1 Step 1-6: 人間 corridor の gate 行保存
 from agentic_fx.store import candidate_archives as candidate_archives_store  # T4 §1 L4 の archive GC が使う
 from agentic_fx.plugin import base_identity
+from agentic_fx.plugin import history_reasons
 from agentic_fx.plugin import deploy_ops as deploy_ops_common
 from agentic_fx.plugin import indicator_pipeline
 from agentic_fx.store import plugin_deploy_ops as deploy_store
@@ -53,7 +55,7 @@ _TERMINAL_PHASES = ("decided", "reverted")
 APPROVAL_OUTCOMES = frozenset({
     "deployed", "deployed_after_rollback", "already_decided", "foreign_waiting",
     "still_pending", "legacy_plain_present", "invalidated", "history_epoch_changed",
-    "reevaluation_confirmed", "rejected",
+    "reevaluation_confirmed", "rejected", history_reasons.OUTCOME,
 })
 
 REEVALUATION_ORIGIN = "reevaluation"
@@ -1332,7 +1334,8 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
                 conn, plugins_root, settings=settings)
         outcome = approval.run_kind_gate(  # 手順 7
             conn, meta, settings=settings, now=now, floor_mode=floor_mode,
-            sink=rows, inventory=inventory, pin_mode="require")
+            sink=rows, inventory=inventory, pin_mode="require",
+            no_bars_path=history_evidence.no_bars_path(plugins_root.parent))
         # CR7 (2026-09-13): `sink=rows` を渡したので `outcome.gate_rows`
         # は `rows` と同一オブジェクト — 二重の list を作らない。
         assert outcome.gate_rows is rows
@@ -1367,6 +1370,11 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
         raise ValueError(
             f"plugin {name!r}: 履歴源が設定されていません "
             "(backtest.eval_source を mt5 か対応履歴源にしてください)")
+    if outcome.verdict_kind in strategy_gate.HISTORY_UNEVALUABLE_KINDS:
+        _persist_human_gate_rows(conn, rows, mission_outcome="gate_failed", now=now)
+        raise ValueError(
+            f"plugin {name!r}: strategy not evaluable ({outcome.verdict_kind}) — "
+            "履歴条件を満たしていません。`afx status` で確認し、履歴補充後に提出してください")
     if outcome.verdict_kind == "floor" and floor_mode == "enforce":
         _persist_human_gate_rows(conn, rows, mission_outcome="unprofitable", now=now)
         g = settings.improve.gate
@@ -1395,12 +1403,26 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
         raise ValueError(
             f"plugin {name!r}: unprofitable ({condition}) ({settings_kv}){detail}")
 
+    # 続行できるのは ok と、warn のときの floor (いずれも evaluable) だけ。ここまでに
+    # 個別に扱っていない評価不能・未知の判別子は、既定で拒否する。
+    if not _gate_outcome_may_continue(outcome, floor_mode=floor_mode):
+        _persist_human_gate_rows(conn, rows, mission_outcome="gate_failed", now=now)
+        raise ValueError(f"plugin {name!r}: strategy not evaluable")
+
     if meta.kind == "indicator":
         outcome = _run_indicator_fixture_stage(
             conn, meta, name=name, lane=lane, settings=settings,
             plugins_root=plugins_root, inventory=inventory,
             static_report=static_report, outcome=outcome, activity=activity)
     return meta, after_content, after_artifact, outcome
+
+
+def _gate_outcome_may_continue(outcome, *, floor_mode: str) -> bool:
+    if not outcome.evaluable:
+        return False
+    if outcome.verdict_kind == "ok":
+        return True
+    return outcome.verdict_kind == "floor" and floor_mode == "warn"
 
 
 def _run_indicator_fixture_stage(conn, meta, *, name, lane, settings, plugins_root,
@@ -1493,6 +1515,7 @@ def submit_candidate(
             "eval_timeframe": (strategy_gate._eval_timeframe(meta.timeframe)
                               if meta.kind == "strategy" else None),
             **({"history_epoch": history_epoch(conn)} if meta.kind == "strategy" else {}),
+            **({"history_guard": outcome.history_guard} if meta.kind == "strategy" else {}),
             "live_source": settings.datafeed.primary,
             "mission_id": mission_id, "backlog_id": backlog_id,
             # [profitability-floor] T1 Step 1-8 (codex I3): 適用した閾値
@@ -1986,15 +2009,59 @@ def _decide_reevaluation(
         if action == "approve":
             return _confirm_reevaluation(
                 conn, approval_id, payload, decided_by=decided_by, now=now,
-                activity=activity, epoch_changed=epoch_changed)
+                activity=activity, epoch_changed=epoch_changed,
+                plugins_root=plugins_root)
         return _reject_reevaluation(
             conn, approval_id, payload, decided_by=decided_by, reason=reason, now=now,
             plugins_root=plugins_root, activity=activity, epoch_changed=epoch_changed)
 
 
-def _confirm_reevaluation(conn, approval_id, payload, *, decided_by, now, activity,
-                          epoch_changed) -> "ApprovalOutcome":
+def _approval_evidence_check(payload: dict, plugins_root: Path):
+    """提出時の履歴証跡を現在の方針と照合する。DB の履歴は測り直さない。"""
+    return history_evidence.verify_payload(
+        payload, no_bars_path=history_evidence.no_bars_path(plugins_root.parent))
+
+
+def _hold_for_history_evidence(conn, approval_id: int, payload: dict, *,
+                               plugins_root: Path, now: datetime, activity
+                               ) -> "ApprovalOutcome | None":
+    """通常の依頼を新しく承認し始めるときの証跡照合 (lock の中、自身の journal が無い
+    ときだけ呼ぶ)。合えば None。確定した不一致は固定理由で失効させる (候補・archive は
+    削除しない)。一覧の読取失敗などは pending のまま保留する。"""
     name = payload["name"]
+    check = _approval_evidence_check(payload, plugins_root)
+    if check.ok:
+        return None
+    if check.status == history_evidence.CHECK_UNAVAILABLE:
+        approvals_store.set_reason(
+            conn, approval_id, history_reasons.CHECK_UNAVAILABLE, commit=True)
+        return ApprovalOutcome(
+            outcome=history_reasons.OUTCOME, name=name, status="pending",
+            reason=history_reasons.CHECK_UNAVAILABLE)
+    with _immediate_tx(conn):
+        approvals_store.apply_decision(
+            conn, approval_id, "invalidated", decided_by="system", now=now,
+            reason=history_reasons.EVIDENCE_INVALIDATED, commit=False)
+    if activity is not None:
+        activity.write(
+            Category.APPROVAL, "approval_history_evidence_invalidated",
+            f"name={name} approval_id={approval_id}")
+    return ApprovalOutcome(
+        outcome=history_reasons.OUTCOME, name=name, status="invalidated",
+        reason=history_reasons.EVIDENCE_INVALIDATED)
+
+
+def _confirm_reevaluation(conn, approval_id, payload, *, decided_by, now, activity,
+                          epoch_changed, plugins_root) -> "ApprovalOutcome":
+    name = payload["name"]
+    check = _approval_evidence_check(payload, plugins_root)
+    if not check.ok:
+        reason = (history_reasons.CHECK_UNAVAILABLE
+                  if check.status == history_evidence.CHECK_UNAVAILABLE
+                  else history_reasons.EVIDENCE_REFRESH_REQUIRED)
+        approvals_store.set_reason(conn, approval_id, reason, commit=True)
+        return ApprovalOutcome(outcome=history_reasons.OUTCOME, name=name,
+                               status="pending", reason=reason)
     with _immediate_tx(conn):
         if payload.get("history_epoch", "none") != history_epoch(conn):
             conn.rollback()
@@ -2174,6 +2241,14 @@ def approve_candidate(
         # (§5.1 codex 12 周目の early-exit — 未定義の retry_approval を
         # 経由せずここで直接処理する、11c の NameError landmine を踏まない)。
         existing_journal = journal_store.get_open_by_name(conn, name)
+        if payload.get("kind") == "strategy" and existing_journal is None:
+            # 自身の journal を再開するときは検査しない (切替済みの再開を止めない)。
+            # 別 approval の未完 journal は、後段の既存処理が拒否する。
+            held = _hold_for_history_evidence(
+                conn, approval_id, payload, plugins_root=plugins_root, now=now,
+                activity=activity)
+            if held is not None:
+                return held
         if payload.get("kind") == "indicator" and existing_journal is None:
             payload = _rejudge_indicator_at_approval(
                 conn, approval_id, payload, settings=settings,
@@ -2739,6 +2814,7 @@ def bless_candidate(
             "eval_timeframe": (strategy_gate._eval_timeframe(meta.timeframe)
                               if meta.kind == "strategy" else None),
             **({"history_epoch": history_epoch(conn)} if meta.kind == "strategy" else {}),
+            **({"history_guard": outcome.history_guard} if meta.kind == "strategy" else {}),
             "live_source": settings.datafeed.primary,
             "mission_id": None, "backlog_id": None,
             "floor_warning": outcome.floor_warning,
@@ -2853,11 +2929,14 @@ class _Snapshot:
     deploy_generation: list
     history_epoch: str
     lock_names: tuple
+    no_bars_path: "Path | None" = None
 
     def key(self) -> tuple:
-        """依頼の一意性の鍵。同じ名前の pending 再評価は高々 1 件。"""
+        """依頼の一意性の鍵。同じ名前の pending 再評価は高々 1 件。履歴守りの
+        方針 (規則版・暦版・閾値) も含めるので、方針が変われば旧依頼は同じ依頼にならない。"""
         return (self.meta.name, self.meta.content_hash, self.meta.artifact_hash,
-                self.history_epoch, self.decision_id, tuple(self.deploy_generation))
+                self.history_epoch, self.decision_id, tuple(self.deploy_generation),
+                history_evidence.current_policy_key())
 
 
 def reevaluation_candidate_names(plugins_root: Path) -> list[str]:
@@ -2875,7 +2954,22 @@ def _reevaluation_key(payload: dict) -> tuple:
     generation = payload.get("deploy_generation")
     return (payload.get("name"), payload.get("content_hash"), payload.get("artifact_hash"),
             payload.get("history_epoch"), payload.get("basis_decision_id"),
-            tuple(generation) if isinstance(generation, (list, tuple)) else generation)
+            tuple(generation) if isinstance(generation, (list, tuple)) else generation,
+            history_evidence.policy_key(payload.get("history_guard")))
+
+
+def _evidence_check(payload: dict, no_bars_path) -> "history_evidence.EvidenceCheck":
+    """依頼 (または承認) の payload の履歴証跡を、現在の方針と照合する。"""
+    return history_evidence.verify_payload(
+        payload,
+        no_bars_path=history_evidence.no_bars_path() if no_bars_path is None else no_bars_path)
+
+
+def _is_existing_reevaluation(payload: dict, snapshot: "_Snapshot") -> bool:
+    """同じ評価の pending か。鍵が同じで、証跡が今の方針で有効なときだけ真。
+    証跡なし・旧規則・対象範囲の一覧が変わった依頼は再利用しない。"""
+    return (_reevaluation_key(payload) == snapshot.key()
+            and _evidence_check(payload, snapshot.no_bars_path).ok)
 
 
 def _pending_reevaluations(conn: sqlite3.Connection, name: str) -> list[tuple[int, dict]]:
@@ -2945,7 +3039,8 @@ def _take_reevaluation_snapshot(conn, plugins_root: Path, name: str, settings,
         meta=meta, resolved=resolved, inventory=inventory, target=target, pins=pins,
         decision_id=decision["id"], previous_id=latest_approved["id"],
         deploy_generation=deploy_generation(conn, name), history_epoch=history_epoch(conn),
-        lock_names=tuple(lock_names))
+        lock_names=tuple(lock_names),
+        no_bars_path=history_evidence.no_bars_path(plugins_root.parent))
 
 
 def _snapshot_is_current(conn, plugins_root: Path, snapshot: _Snapshot) -> bool:
@@ -3051,7 +3146,7 @@ def _evaluate_deployed(conn, snapshot: _Snapshot, *, settings, now, rows: list):
     return strategy_gate.evaluate_strategy_adoption_gate(
         conn, meta=snapshot.meta, settings=settings, now=now, resolved=snapshot.resolved,
         inventory=snapshot.inventory, floor_mode="warn", compare_mode="off",
-        record_fn=rows.append)
+        record_fn=rows.append, no_bars_path=snapshot.no_bars_path)
 
 
 def reevaluate_deployed(
@@ -3096,7 +3191,7 @@ def reevaluate_deployed(
             except _Skip as skip:
                 return ReevaluationResult(name, "skipped", reason=skip.reason)
             for approval_id, payload in _pending_reevaluations(conn, name):
-                if _reevaluation_key(payload) == snapshot.key():
+                if _is_existing_reevaluation(payload, snapshot):
                     return ReevaluationResult(name, "existing", approval_id)
 
         rows: list[dict] = []
@@ -3107,6 +3202,12 @@ def reevaluate_deployed(
                 _reevaluation_activity(
                     activity, "reevaluation_changed_during_evaluation", f"name={name}")
                 return ReevaluationResult(name, "changed_during_evaluation")
+            if verdict.evaluable and verdict.history_guard is None:
+                # 履歴検査の証跡が無い成功は、成功として扱わない (依頼を作らない)。
+                verdict = dataclass_replace(
+                    verdict, evaluable=False,
+                    observation_reason=history_reasons.CHECK_UNAVAILABLE,
+                    unevaluable_kind=history_reasons.CHECK_UNAVAILABLE)
             if not verdict.evaluable:
                 reason = verdict.observation_reason or verdict.unevaluable_kind
                 if rows and not _store_unevaluable_rows(conn, snapshot, rows):
@@ -3155,7 +3256,7 @@ def _store_reevaluation(conn, snapshot: _Snapshot, verdict, rows: list, *, setti
             return ReevaluationResult(name, "changed_during_evaluation")
         stale = []
         for approval_id, payload in _pending_reevaluations(conn, name):
-            if _reevaluation_key(payload) == snapshot.key():
+            if _is_existing_reevaluation(payload, snapshot):
                 conn.rollback()
                 return ReevaluationResult(name, "existing", approval_id)
             stale.append(approval_id)
@@ -3194,6 +3295,7 @@ def _store_reevaluation(conn, snapshot: _Snapshot, verdict, rows: list, *, setti
             "base_interval": dataset.base_interval,
             "eval_timeframe": strategy_gate._eval_timeframe(meta.timeframe),
             "live_source": settings.datafeed.primary,
+            "history_guard": verdict.history_guard,
         }
         approval_id = approvals_store.create(
             conn, kind="plugin", payload=payload, now=now, commit=False)

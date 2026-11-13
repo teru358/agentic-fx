@@ -149,6 +149,24 @@ def link_signals(conn: sqlite3.Connection, op_id: int,
         conn.commit()
 
 
+def mark_history_forced(conn: sqlite3.Connection, op_id: int, *, target_artifact_hash: str,
+                        actor: str, forced_at: str, force_token: str) -> None:
+    """Mark an op as started by a history-guard override (the caller commits).
+
+    The token is the one written in the start audit row; the human's reason is not kept here.
+    """
+    conn.execute(
+        "INSERT INTO plugin_deploy_op_history_forced "
+        "(op_id, target_artifact_hash, actor, forced_at, force_token) VALUES (?,?,?,?,?)",
+        (op_id, target_artifact_hash, actor, forced_at, force_token))
+
+
+def history_forced_mark(conn: sqlite3.Connection, op_id: int) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM plugin_deploy_op_history_forced WHERE op_id=?", (op_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
 def linked_signal_ids(conn: sqlite3.Connection, op_id: int) -> set[int]:
     return {row[0] for row in conn.execute(
         "SELECT signal_id FROM plugin_deploy_op_signals WHERE op_id=?", (op_id,))}
