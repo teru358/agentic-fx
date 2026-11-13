@@ -1,7 +1,7 @@
 ---
 id: bot-gateway-disconnect-is-silent
 title: bot が Discord から切断されたまま黙って生き続ける
-status: 設計待ち
+status: 実装中
 priority: 高
 kind: 不具合
 opened: 2026-11-13
@@ -10,7 +10,7 @@ related: [auto-killswitch-latch-emits-no-event]
 ---
 # [bot-gateway-disconnect-is-silent] bot が Discord から切断されたまま黙って生き続ける
 
-**状態**: 設計待ち / **優先**: 高 / **種別**: 不具合
+**状態**: 実装中 / **優先**: 高 / **種別**: 不具合
 
 ## 現象
 
@@ -25,3 +25,4 @@ afx-ops@bot の process は active のまま Discord gateway への接続が無�
 ## 経緯
 
 - 2026-11-13: 起票。
+- 2026-11-14: 状態: 実装中 — 設計 C4 を 2026-11-14 に利用者承認 (同上の spec)。直し方は discord の WARNING を出す案ではなく、gateway・送信・poll・event loop・停止処理の進捗監視と exit 分類 (一時 79 / loop 停止 80 / 恒久 78) + bot 専用 systemd drop-in の backoff 再起動、health を /v1/status と web に出す形に変えた。discord.py の log template 棚卸しは別チケット。

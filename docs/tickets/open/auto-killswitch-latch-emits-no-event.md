@@ -1,7 +1,7 @@
 ---
 id: auto-killswitch-latch-emits-no-event
 title: drawdown による kill switch の自動作動が通知されない
-status: 設計待ち
+status: 実装中
 priority: 高
 kind: 不具合
 opened: 2026-11-13
@@ -10,7 +10,7 @@ related: [bot-gateway-disconnect-is-silent]
 ---
 # [auto-killswitch-latch-emits-no-event] drawdown による kill switch の自動作動が通知されない
 
-**状態**: 設計待ち / **優先**: 高 / **種別**: 不具合
+**状態**: 実装中 / **優先**: 高 / **種別**: 不具合
 
 ## 現象
 
@@ -25,3 +25,4 @@ executor が drawdown の閾値で kill switch をラッチしても ops event (
 ## 経緯
 
 - 2026-11-13: 起票。
+- 2026-11-14: 状態: 実装中 — 設計 C4 を 2026-11-14 に利用者承認 (docs/superpowers/specs/2026-11-14-ops-alert-delivery-design.md)。直し方は producer best-effort ではなく ops lane 内の単一 guard sweep が state と既存 event を照合して欠けた latched / released を出す形に変えた。完了条件は「遷移ごとに 1 回」から縮め、解除済みで event が無い世代 (clear + event 無し) には後から通知しない (古い「作動しました」を出さないため)。activity の重複・世代の下限は別チケット。
