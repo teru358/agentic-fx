@@ -140,6 +140,40 @@ def test_write_required_fsyncs_the_directory_when_the_file_vanishes_after_a_chec
     assert synced == [tmp_path, tmp_path.parent]
 
 
+def test_write_required_fsyncs_the_directory_when_the_file_vanishes_between_opens(
+        tmp_path, monkeypatch):
+    from agentic_fx import activity
+    synced = []
+    monkeypatch.setattr(activity, "_fsync_dir", synced.append)
+    path = tmp_path / "activity.log"
+    path.write_text("old\n", encoding="utf-8")
+    log = ActivityLog(path)
+    real_open = activity.os.open
+    calls = []
+
+    def racing_open(p, flags, *args):
+        calls.append(flags)
+        if len(calls) == 2:
+            path.unlink()
+        return real_open(p, flags, *args)
+
+    monkeypatch.setattr(activity.os, "open", racing_open)
+    log.write_required(Category.SYSTEM, "one", "a")
+    assert synced == [tmp_path, tmp_path.parent]
+    assert path.read_text(encoding="utf-8").splitlines()[0].split("\t")[2] == "one"
+
+
+def test_a_torn_append_by_another_writer_after_the_check_joins_the_required_line(
+        tmp_path, monkeypatch):
+    path = tmp_path / "activity.log"
+    path.write_bytes(b"old\n")
+    _race_after_newline_decision(monkeypatch, path, b"torn")
+    ActivityLog(path).write_required(Category.SYSTEM, "mine", "ok", "r1")
+    lines = path.read_bytes().split(b"\n")
+    assert lines[0] == b"old"
+    assert lines[1].startswith(b"torn") and lines[1].split(b"\t")[2:] == [b"mine", b"ok", b"r1"]
+
+
 def test_write_required_raises_when_a_write_makes_no_progress(tmp_path, monkeypatch):
     from agentic_fx import activity
     monkeypatch.setattr(activity.os, "write", lambda fd, data: 0)

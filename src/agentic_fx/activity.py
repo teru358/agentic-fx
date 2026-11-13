@@ -92,21 +92,18 @@ class ActivityLog:
 
         書けなかった記録を前提に次の操作へ進まないための入口で、追記後に fsync する。
         前回の書込み中に落ちて末尾が改行で終わっていなければ、先に改行を足すので、
-        この行は必ず独立した 1 行になる。書込みは追記だけで、他の行の byte は上書き
-        しない。ただし書き手どうしは排他しないため、改行の要否を見た直後に別の書き手が
-        追記すると、その行は前の部分行に連結されたまま残り (通常の `write` が部分行の
-        後に書く場合と同じ)、この行の前に空行が 1 行入る。
+        既に残っている部分行にこの行が連結されることはない。書込みは追記だけで、他の
+        行の byte は上書きしない。書き手どうしは排他しないため、改行の要否を見た直後に
+        別の書き手が追記すると、次のどちらかになる。完全な行なら、それは前の部分行に
+        連結されたまま残り (通常の `write` が部分行の後に書く場合と同じ)、この行の前に
+        空行が 1 行入る。その書き手が書込み中に落ちて部分行を残したなら、この行はその
+        部分行に連結される。
         ファイルを新しく作ったときは、その directory と親 directory も fsync する。
         """
         ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
         clean = " ".join(summary.split())
         line = "\t".join([ts, Category(category).value, event, clean, ref_id or "-"])
-        try:
-            fd = os.open(self._path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o644)
-            created = True
-        except FileExistsError:
-            fd = os.open(self._path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
-            created = False
+        fd, created = self._open_for_append()
         try:
             data = (("\n" if self._needs_newline(fd) else "") + line + "\n").encode("utf-8")
             _write_all(fd, data)
@@ -116,6 +113,23 @@ class ActivityLog:
         if created:
             _fsync_dir(self._path.parent)
             _fsync_dir(self._path.parent.parent)
+
+    def _open_for_append(self) -> tuple[int, bool]:
+        """追記用に開き、このプロセスがファイルを作ったかを返す。
+
+        作成は `O_EXCL` でだけ行い、既存なら `O_CREAT` なしで開く。その間に消されたら
+        作成からやり直すので、作ったのに作っていないと判定することはない。
+        """
+        flags = os.O_RDWR | os.O_APPEND
+        while True:
+            try:
+                return os.open(self._path, flags | os.O_CREAT | os.O_EXCL, 0o644), True
+            except FileExistsError:
+                pass
+            try:
+                return os.open(self._path, flags), False
+            except FileNotFoundError:
+                continue
 
     @staticmethod
     def _needs_newline(fd: int) -> bool:
