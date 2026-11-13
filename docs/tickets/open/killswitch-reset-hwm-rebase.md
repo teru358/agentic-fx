@@ -1,7 +1,7 @@
 ---
 id: killswitch-reset-hwm-rebase
 title: kill switch の手動解除で HWM を付け直す明示操作が無い
-status: 設計待ち
+status: 実装待ち
 priority: 高
 kind: 機能
 opened: 2026-11-13
@@ -10,7 +10,7 @@ related: [auto-killswitch-latch-emits-no-event]
 ---
 # [killswitch-reset-hwm-rebase] kill switch の手動解除で HWM を付け直す明示操作が無い
 
-**状態**: 設計待ち / **優先**: 高 / **種別**: 機能
+**状態**: 実装待ち / **優先**: 高 / **種別**: 機能
 
 ## 現象
 
@@ -25,3 +25,4 @@ live の kill switch reset は latch を解くだけで HWM を付け直さな�
 ## 経緯
 
 - 2026-11-13: 起票。
+- 2026-11-14: 状態: 実装待ち — 設計 C2.1 を 2026-11-14 に利用者承認 (docs/superpowers/specs/2026-11-14-killswitch-hwm-rebase-design.md)。reset と別の操作 afx ctl --as approver killswitch rebase <世代> で HWM を今の equity に付け直す。PaperBroker・flat・新鮮な snapshot・DD≥閾値・世代>0 が条件。累積に硬い上限は置かず、各回の率の合計が閾値の 3 倍を超えたら警告。実口座 broker の導入時は硬い上限を必須とする。実装は運用異常の通知 (opsalert) の guard sweep の後。
