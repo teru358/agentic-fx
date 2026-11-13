@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 164 件。完了分は closed/。
+未完了: 168 件。完了分は closed/。
 
 ## 実装中 (2)
 
@@ -69,9 +69,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (144)
+## 設計待ち (148)
 
-### 不具合 (80)
+### 不具合 (82)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -108,6 +108,8 @@
 | [plugin-inherited-filter-test-hits-fingerprint-selftest-first](open/plugin-inherited-filter-test-hits-fingerprint-selftest-first.md) | 中 | 2026-11-07 | 継承 seccomp filter の拒否 test が fingerprint 自己試験の失敗を先に返す |
 | [improve-eval-window-reference-availability](open/improve-eval-window-reference-availability.md) | 中 | 2026-11-09 | 参照系列を宣言した候補の評価区間に、参照の履歴が無い先頭の足が入る |
 | [web-write-recover-idle-interruption](open/web-write-recover-idle-interruption.md) | 中 | 2026-11-10 | 有効でない web の鍵と write の回復が中断に弱い |
+| [history-import-stops-at-first-conflict](open/history-import-stops-at-first-conflict.md) | 中 | 2026-11-13 | history import は食い違う足 1 本で partial 停止し後続を取り込まない |
+| [status-history-hidden-while-daemon-runs](open/status-history-hidden-while-daemon-runs.md) | 中 | 2026-11-13 | daemon 稼働中は評価用履歴の状態を見る面が無い |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
 | [tier-a-directive-ignored](open/tier-a-directive-ignored.md) | 中 |  | 自己テストの連続失敗の警告が無視され続け、止める仕組みが無い |
@@ -156,10 +158,11 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (41)
+### 機能 (42)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
+| [killswitch-reset-hwm-rebase](open/killswitch-reset-hwm-rebase.md) | 高 | 2026-11-13 | kill switch の手動解除で HWM を付け直す明示操作が無い |
 | [backtest-dedup-cache](open/backtest-dedup-cache.md) | 中 | 2026-09-08 | 同一 (候補, config) の backtest 再実行で予算を消費しない (run6: 6 枠中 3 枠がビット… |
 | [strategy-attribution-and-shadow-evaluation](open/strategy-attribution-and-shadow-evaluation.md) | 中 | 2026-10-16 | 戦略ごとの帰属と影の評価 (共有建玉のまま戦略別の成績を出す) |
 | [weekly-improve-rebacktests-deployed-strategies](open/weekly-improve-rebacktests-deployed-strategies.md) | 中 | 2026-10-25 | 週次改善の冒頭で稼働中の戦略を再 backtest し、成績を改善の方向性の材料にする |
@@ -202,7 +205,7 @@
 | [legacy-e2e-model](open/legacy-e2e-model.md) | 低 |  | backend を切り替えるたびにモデル名の手編集が要る |
 | [legacy-oc-qwen3-8-toolcall](open/legacy-oc-qwen3-8-toolcall.md) | 低 |  | モデルが壊れた引数でツールを連打し予算を焼く |
 
-### 保守 (23)
+### 保守 (24)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -220,6 +223,7 @@
 | [improve-repeat-shutdown-test-flaky](open/improve-repeat-shutdown-test-flaky.md) | 低 | 2026-10-31 | improve_repeat の shutdown test が束でだけ落ちる (flaky) |
 | [time-repair-generalize-beyond-known-fingerprint](open/time-repair-generalize-beyond-known-fingerprint.md) | 低 | 2026-11-03 | repair と cache 誤り行検出を他の利用者の履歴へ一般化する |
 | [improve-e2e-floor-test-flakes-on-wallclock-seconds](open/improve-e2e-floor-test-flakes-on-wallclock-seconds.md) | 低 | 2026-11-07 | improve e2e の床 test が activity 行の時刻の秒に数字が当たると落ちる |
+| [opencode-subreaper-real-cli-test-red](open/opencode-subreaper-real-cli-test-red.md) | 低 | 2026-11-13 | 実 opencode CLI の subreaper test が main で赤 |
 | [backend-descriptor](open/backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
 | [credentials-file-copied-unused](open/credentials-file-copied-unused.md) | 低 |  | `ClaudeRunner.__init__(credentials_file_copied)` が未使用 |
 | [db-rebuild-helper](open/db-rebuild-helper.md) | 低 |  | DB の table rebuild migration が 7 本重複している |
