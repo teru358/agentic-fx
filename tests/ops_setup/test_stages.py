@@ -2165,6 +2165,27 @@ def test_disabling_web_on_an_old_manager_never_writes_the_bot_dropin(tmp_path, m
     assert read_stage(setup.root, "bot")["stage"] == "enabled"
 
 
+def test_a_resumed_disable_still_shows_the_bot_dropin_warning(tmp_path, monkeypatch):
+    setup, systemd, home = _versioned(tmp_path, 259)
+    _with_home(home, monkeypatch)
+    setup.enable("bot")
+    setup.enable("web")
+    systemd.reported = 252
+    setup.paths.bot_dropin_path.unlink()
+    setup.disable("web")
+    # uninstalled の記録の後で中断した状態から、別の process として再開する
+    saved = read_stage(setup.root, "web")
+    saved["stage"] = "uninstalled"
+    saved.pop("committed", None)
+    _write_stage(setup.root, saved)
+    setup.notices.clear()
+
+    setup.disable("web")
+
+    assert read_stage(setup.root, "web")["stage"] == "disabled"
+    assert any("bot の recovery drop-in" in line for line in setup.notices)
+
+
 def test_disabling_web_leaves_a_changed_bot_dropin_as_it_was(tmp_path, monkeypatch):
     setup, systemd, home = _versioned(tmp_path, 259)
     _with_home(home, monkeypatch)
@@ -2235,3 +2256,16 @@ def test_only_enable_paths_write_the_bot_dropin():
         ("write_bot_dropin", False)]
     # uninstall_feature の呼出し元の全数。
     assert len(calls(stages, "uninstall_feature")) == 2
+    # 製品コード全体で、install_units を呼ぶのは上の 2 module だけ (他から既定で書く経路を作らない)。
+    from pathlib import Path
+    src = Path(units.__file__).resolve().parents[1]
+    callers = set()
+    for path in src.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                called = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+                if called == "install_units":
+                    callers.add(path.relative_to(src).as_posix())
+    assert callers == {"ops_setup/stages.py", "ops_setup/units.py"}
