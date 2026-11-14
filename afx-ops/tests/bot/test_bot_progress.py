@@ -406,6 +406,7 @@ class Harness:
         self.login = login
         self.connect = connect
         self.close_error = False
+        self.close_gate: threading.Event | None = None
         self.progress = ProgressTracker(self.clock)
         harness = self
 
@@ -420,6 +421,8 @@ class Harness:
                 await asyncio.Event().wait()
 
             async def close(self):
+                while harness.close_gate is not None and not harness.close_gate.is_set():
+                    await asyncio.sleep(0.01)
                 if harness.close_error:
                     raise RuntimeError("close failed")
 
@@ -432,12 +435,14 @@ class Harness:
         """`_main` を回す。実時間の期限を超えたら、止めて明示的な失敗として報告する。"""
         timeout = kwargs.pop("timeout", HARNESS_TIMEOUT)
         monitor_interval = kwargs.pop("monitor_interval", 10.0)
+        watchdog = kwargs.pop("watchdog", None)
 
         async def go() -> bool:
             task = asyncio.ensure_future(runtime._main(
                 SimpleNamespace(config=CONFIG), "token", self.client, self.fd,
                 connector_factory=None, stop=self.stop, poll_interval=0.01, now=lambda: 0.0,
-                progress=self.progress, sleep=self.sleeper, monitor_interval=monitor_interval))
+                progress=self.progress, sleep=self.sleeper, monitor_interval=monitor_interval,
+                watchdog=watchdog))
             done, _ = await asyncio.wait({task}, timeout=timeout)
             if done:
                 task.result()

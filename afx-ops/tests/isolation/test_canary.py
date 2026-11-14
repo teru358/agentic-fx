@@ -664,3 +664,20 @@ def test_landlock_follows_the_checked_state_dir_not_a_later_swap(root, child_env
                                              "to": str(root / "keys")}}, child_env)
     assert got.rc == 0, got.stderr[-2000:]
     assert got.result == [3, 0]
+
+
+@pytest.mark.parametrize(("mode", "rc", "line"), [
+    ("stall", 80, "afx-ops: loop_stalled"),
+    ("shutdown", 79, "afx-ops: shutdown_timeout"),
+])
+def test_bot_watchdog_ends_the_isolated_process_with_its_code(mode, rc, line, root, child_env):
+    # poll・exit_group・thread 用の legacy clone・fcntl が実 seccomp の下で通る
+    got = run_canary(_spec(root, "bot", "watchdog", mode=mode), child_env, timeout=30)
+    assert got.isolated and got.rc == rc, (got.rc, got.stderr[-2000:])
+    assert got.stderr.splitlines()[-1] == line
+    assert not got.token_sent
+
+
+def test_bot_watchdog_thread_runs_under_the_isolation_without_firing(root, child_env):
+    got = run_canary(_spec(root, "bot", "watchdog", mode="ok"), child_env, timeout=30)
+    assert got.rc == 0 and got.result == [2, 0] and got.stderr == ""

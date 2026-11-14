@@ -48,6 +48,7 @@ from afx_ops.bot.exits import (REASONS, RC_BOT_LOOP_STALLED, RC_BOT_PERMANENT,  
                                RC_BOT_TRANSIENT, RC_OK, rc_for_reason)
 from afx_ops.bot.progress import GATEWAY_HEALTHY, ProgressTracker
 from afx_ops.bot.rest import PERMANENT, REST_ERRORS, classify
+from afx_ops.bot.watchdog import Watchdog
 from afx_ops.gate.service import GateService
 from afx_ops.gate.state import BotState
 from afx_ops.isolation.startup import client_for
@@ -93,15 +94,18 @@ def run(isolated, *, client=None, connector_factory: Callable[[], object] | None
         now: Callable[[], float] = time.time, stderr: TextIO | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], object] = asyncio.sleep,
-        monitor_interval: float = MONITOR_INTERVAL) -> int:
+        monitor_interval: float = MONITOR_INTERVAL,
+        watchdog: Watchdog | None = None) -> int:
     """production は `isolated` だけで呼ばれ、失敗するまで戻らない。
 
     client / connector_factory / api_base / gateway_url / stop / poll_interval / now / stderr /
-    monotonic / sleep / monitor_interval は試験だけが渡す (loopback の偽 Discord・試験 CA・試験用の
+    monotonic / sleep / monitor_interval / watchdog は試験だけが渡す (loopback の偽 Discord・試験 CA・試験用の
     名前解決・停止の合図・進捗の時計)。stop が立つと rc 0 で戻る。失敗は理由ごとに `exits` の
     終了コード (恒久 78 / 一時 79) を返す。
     """
     out = sys.stderr if stderr is None else stderr
+    watchdog = new_watchdog() if watchdog is None else watchdog
+    watchdog.start()
     try:
         token = parse_token(isolated.secrets.get(SECRET_NAME))
         if client is None:
@@ -117,19 +121,27 @@ def run(isolated, *, client=None, connector_factory: Callable[[], object] | None
             asyncio.run(_main(isolated, token, client, dir_fd, connector_factory=connector_factory,
                               stop=stop, poll_interval=poll_interval, now=now,
                               progress=ProgressTracker(monotonic), sleep=sleep,
-                              monitor_interval=monitor_interval))
+                              monitor_interval=monitor_interval, watchdog=watchdog))
         finally:
             os.close(dir_fd)
     except BotFailure as failure:
+        watchdog.begin_shutdown()
         _say(out, failure.reason)
         return rc_for_reason(failure.reason)
     except ApiError as exc:
+        watchdog.begin_shutdown()
         _say(out, with_detail(exc.reason, exc.detail))
         return RC_UNREACHABLE
     except Exception:  # 例外文には token や URL が入り得るので、固定語だけにする
+        watchdog.begin_shutdown()
         _say(out, "bot_internal_error")
         return rc_for_reason("bot_internal_error")
+    watchdog.begin_shutdown()
     return RC_OK
+
+
+def new_watchdog() -> Watchdog:
+    return Watchdog()
 
 
 def _say(out: TextIO, text: str) -> None:
@@ -166,8 +178,11 @@ class _Client(discord.Client):
 
 async def _main(isolated, token: str, client, dir_fd: int, *, connector_factory, stop,
                 poll_interval: float, now, progress: ProgressTracker | None = None,
-                sleep=asyncio.sleep, monitor_interval: float = MONITOR_INTERVAL) -> None:
+                sleep=asyncio.sleep, monitor_interval: float = MONITOR_INTERVAL,
+                watchdog: Watchdog | None = None) -> None:
     progress = progress if progress is not None else ProgressTracker()
+    if watchdog is not None:
+        watchdog.attach(asyncio.get_running_loop())
     config = isolated.config
     settings = BotSettings(guild_id=config.guild_id, channel_id=config.channel_id,
                            mention_role_id=config.mention_role_id,
@@ -212,6 +227,8 @@ async def _main(isolated, token: str, client, dir_fd: int, *, connector_factory,
         if gateway in done:
             raise BotFailure("gateway_failed")
     finally:
+        if watchdog is not None:
+            watchdog.begin_shutdown()
         if stop is not None:
             stop.set()
         for task in tasks:

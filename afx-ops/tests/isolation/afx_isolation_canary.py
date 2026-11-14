@@ -682,6 +682,32 @@ def op_bot_runtime(p, iso):
     return {"rc": rc, "new_modules": new_modules, "after": after}
 
 
+def op_watchdog(p, iso):
+    """隔離後に本物の watchdog thread を起動し、loop を止める (mode=stall) か終了を詰まらせる
+    (mode=shutdown) と、固定の一行の後に rc 80 / 79 で process ごと終わる。mode=ok は応答する
+    loop を 1 秒回して結果を返す (poll・clone・exit が通ることの確認)。"""
+    import asyncio
+
+    from afx_ops.bot.watchdog import Watchdog
+    mode = p["mode"]
+    dog = Watchdog(interval=0.02, window=0.4, shutdown_limit=0.4)
+    loop = asyncio.new_event_loop()
+
+    async def body():
+        dog.attach(loop)
+        dog.start()
+        if mode == "stall":
+            time.sleep(30)
+        elif mode == "shutdown":
+            dog.begin_shutdown()
+            time.sleep(30)
+        else:
+            await asyncio.sleep(1.0)
+    loop.run_until_complete(body())
+    loop.close()
+    return [threading.active_count(), 0]
+
+
 OPS = {name[3:]: fn for name, fn in globals().items() if name.startswith("op_")}
 
 
