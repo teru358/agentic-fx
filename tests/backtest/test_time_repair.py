@@ -470,7 +470,8 @@ def test_bridge_window_with_unmatched_rows_is_rejected(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("point", ["after_backup", "after_H1", "after_C1", "after_C2",
-                                    "after_C3", "after_approvals", "after_marker", "before_commit"])
+                                    "after_C3", "after_approvals", "after_marker", "before_commit",
+                                    "after_supersede"])
 def test_precommit_faults_leave_database_unchanged(tmp_path, monkeypatch, point):
     conn, path = _db(tmp_path, monkeypatch)
     plan = time_repair.build_plan(conn, indicator_pending="keep")
@@ -748,3 +749,166 @@ def test_strategy_approval_from_old_history_epoch_stays_pending(tmp_path, monkey
     with pytest.raises(time_repair.RepairError) as error:
         time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"])
     assert error.value.exit_code == 5
+
+
+def _conflict(conn, symbol, bar_time, *, source="mt5", interval="5m", state="open", digest="a"):
+    conn.execute(
+        "INSERT INTO history_conflicts (source, interval, symbol, bar_time, history_epoch, "
+        "existing_json, incoming_json, existing_digest, incoming_digest, origin, last_origin, "
+        "state, first_seen_at, last_seen_at) VALUES (?,?,?,?,'none','{}','{}',?,?, 'import','import',"
+        "?,'2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00')",
+        (source, interval, symbol, bar_time, digest, digest, state))
+
+
+def _conflict_states(conn):
+    return {(r["symbol"], r["bar_time"], r["incoming_digest"]): r["state"]
+            for r in conn.execute("SELECT * FROM history_conflicts")}
+
+
+def _seed_conflicts(conn):
+    _conflict(conn, "EURUSD", "2026-01-05T12:00:00+00:00")                  # 移動元
+    _conflict(conn, "USDJPY", "2026-01-05T13:05:00+00:00")                  # 移動先
+    _conflict(conn, "EURUSD", "2026-01-05T12:00:00+00:00", state="kept", digest="k")
+    _conflict(conn, "GBPUSD", "2026-01-05T12:00:00+00:00")                  # 別銘柄
+    _conflict(conn, "EURUSD", "2026-01-05T12:00:00+00:00", source="dukascopy", digest="d")
+    _conflict(conn, "EURUSD", "2026-02-01T12:00:00+00:00")                  # 無関係な時刻
+    conn.commit()
+
+
+def test_repair_supersedes_only_open_conflicts_on_moved_keys(tmp_path, monkeypatch):
+    conn, path = _db(tmp_path, monkeypatch)
+    _seed_conflicts(conn)
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"])
+    states = _conflict_states(conn)
+    assert states[("EURUSD", "2026-01-05T12:00:00+00:00", "a")] == "superseded"
+    assert states[("USDJPY", "2026-01-05T13:05:00+00:00", "a")] == "superseded"
+    assert states[("EURUSD", "2026-01-05T12:00:00+00:00", "k")] == "kept"
+    assert states[("GBPUSD", "2026-01-05T12:00:00+00:00", "a")] == "open"
+    assert states[("EURUSD", "2026-01-05T12:00:00+00:00", "d")] == "open"
+    assert states[("EURUSD", "2026-02-01T12:00:00+00:00", "a")] == "open"
+    row = conn.execute("SELECT * FROM history_conflicts WHERE state='superseded' LIMIT 1").fetchone()
+    assert row["resolution_action"] == "supersede" and row["resolved_by"] == "system:time_repair"
+    assert row["bar_time"] in ("2026-01-05T12:00:00+00:00", "2026-01-05T13:05:00+00:00")
+    assert row["history_epoch"] == "none"
+
+
+@pytest.mark.parametrize("point", ["after_supersede", "after_marker", "before_commit"])
+def test_supersede_rolls_back_with_the_repair(tmp_path, monkeypatch, point):
+    conn, path = _db(tmp_path, monkeypatch)
+    _seed_conflicts(conn)
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    before = conn.serialize()
+    def fail(at):
+        if at == point:
+            raise RuntimeError("injected")
+    with pytest.raises(RuntimeError, match="injected"):
+        time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"], hook=fail)
+    assert conn.serialize() == before
+    assert set(_conflict_states(conn).values()) == {"open", "kept"}
+
+
+def test_supersede_failure_rolls_back_history_move(tmp_path, monkeypatch):
+    conn, path = _db(tmp_path, monkeypatch)
+    _seed_conflicts(conn)
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    before = conn.serialize()
+    def boom(*args, **kwargs):
+        raise sqlite3_error()
+    import sqlite3
+    sqlite3_error = lambda: sqlite3.OperationalError("audit write failed")
+    monkeypatch.setattr(time_repair, "_supersede_open_conflicts", boom)
+    with pytest.raises(sqlite3.OperationalError):
+        time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"])
+    assert conn.serialize() == before
+
+
+def test_noop_rerun_changes_no_conflict_records(tmp_path, monkeypatch):
+    conn, path = _db(tmp_path, monkeypatch)
+    _seed_conflicts(conn)
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"])
+    _conflict(conn, "EURUSD", "2026-01-05T13:00:00+00:00", digest="late")
+    conn.commit()
+    after_first = conn.serialize()
+    assert time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"]) is None
+    assert conn.serialize() == after_first
+    assert _conflict_states(conn)[("EURUSD", "2026-01-05T13:00:00+00:00", "late")] == "open"
+
+
+def test_repair_yields_when_another_history_writer_holds_the_lease(tmp_path, monkeypatch):
+    from agentic_fx.store.history_lease import history_mutation_lease
+    conn, path = _db(tmp_path, monkeypatch)
+    _seed_conflicts(conn)
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    before = conn.serialize()
+    other = connect(path)
+    try:
+        with history_mutation_lease(other):
+            with pytest.raises(time_repair.RepairError) as error:
+                time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"])
+    finally:
+        other.close()
+    assert error.value.exit_code == 1
+    assert conn.serialize() == before
+    assert not list(path.parent.glob("*.bak-time-repair-*"))
+
+
+def test_lease_is_held_through_commit_and_released_after(tmp_path, monkeypatch):
+    from agentic_fx.store.history_lease import HistoryLeaseBusy, history_mutation_lease
+    conn, path = _db(tmp_path, monkeypatch)
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    seen = {}
+    def probe(at):
+        if at in ("after_backup", "before_commit"):
+            other = connect(path)
+            try:
+                with history_mutation_lease(other):
+                    seen[at] = "free"
+            except HistoryLeaseBusy:
+                seen[at] = "held"
+            finally:
+                other.close()
+    time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"], hook=probe)
+    assert seen == {"after_backup": "held", "before_commit": "held"}
+    with history_mutation_lease(conn):
+        pass
+
+
+def test_writer_admission_is_taken_after_the_lease_and_released(tmp_path, monkeypatch):
+    from agentic_fx.store.history_lease import HistoryLeaseBusy, history_mutation_lease
+    conn, path = _db(tmp_path, monkeypatch)
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    events = []
+    class Admission:
+        def admit(self, begin):
+            other = connect(path)
+            try:
+                with history_mutation_lease(other):
+                    events.append("lease-free-at-admit")
+            except HistoryLeaseBusy:
+                events.append("lease-held-at-admit")
+            finally:
+                other.close()
+            begin()
+            return True
+        def end(self):
+            events.append("end")
+    time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"], admission=Admission())
+    assert events == ["lease-held-at-admit", "end"]
+    assert not conn.in_transaction
+
+
+def test_writer_admission_refusal_fails_with_rc1_and_changes_nothing(tmp_path, monkeypatch):
+    from agentic_fx.core.writer_admission import WriterAdmission
+    conn, path = _db(tmp_path, monkeypatch)
+    _seed_conflicts(conn)
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    before = conn.serialize()
+    admission = WriterAdmission()
+    with admission.scheduler_write():
+        with pytest.raises(time_repair.RepairError) as error:
+            time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"], admission=admission)
+    assert error.value.exit_code == 1
+    assert conn.serialize() == before
+    time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"], admission=admission)

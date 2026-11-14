@@ -13,11 +13,13 @@ import os
 import shutil
 import sqlite3
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from agentic_fx.store.db import FLOAT_TOL
+from agentic_fx.store.history_lease import HistoryLeaseBusy, history_mutation_lease
 
 REPAIR_ID = "time_repair_dst_v1"
 
@@ -372,6 +374,43 @@ def _cache_changes(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], list
     return changes, replacements
 
 
+@contextmanager
+def _mutation_lease(conn: sqlite3.Connection):
+    """履歴 writer の排他。取れなければ待たず RepairError(rc=1)。"""
+    lease = history_mutation_lease(conn)
+    try:
+        lease.__enter__()
+    except HistoryLeaseBusy as exc:
+        raise RepairError(str(exc), 1) from exc
+    try:
+        yield
+    except BaseException as exc:
+        if not lease.__exit__(type(exc), exc, exc.__traceback__):
+            raise
+    else:
+        lease.__exit__(None, None, None)
+
+
+def _supersede_open_conflicts(conn: sqlite3.Connection, rows, *, at: datetime) -> int:
+    """移動元と移動先の key 集合の和集合に属する open の衝突記録を superseded にする。
+
+    呼出し側の履歴変更 transaction の中で使い、commit は呼ばない。
+    kept など閉じた記録と、無関係な key の記録は変えない。
+    """
+    keys = set()
+    for row in rows:
+        keys.add((row["source"], row["interval"], row["symbol"], row["bar_time"]))
+        keys.add((row["source"], row["interval"], row["symbol"], _shift(row["bar_time"])))
+    targets = [r[0] for r in conn.execute(
+        "SELECT id, source, interval, symbol, bar_time FROM history_conflicts WHERE state='open'")
+        if (r[1], r[2], r[3], r[4]) in keys]
+    for ident in targets:
+        conn.execute("UPDATE history_conflicts SET state='superseded', resolved_at=?, "
+                     "resolved_by='system:time_repair', resolution_action='supersede', "
+                     "reason_ref=? WHERE id=? AND state='open'", (at.isoformat(), REPAIR_ID, ident))
+    return len(targets)
+
+
 def _call_hook(hook, point: str) -> None:
     if hook is not None:
         hook(point)
@@ -611,7 +650,7 @@ def _shift(iso: str) -> str:
 
 
 def apply_plan(conn: sqlite3.Connection, db_path: Path, plan: dict[str, Any], *, confirm: str,
-               root: Path | None = None, hook=None, instance_lock=None) -> None:
+               root: Path | None = None, hook=None, instance_lock=None, admission=None) -> None:
     expected = plan.get("plan_hash")
     payload = {key: value for key, value in plan.items() if key != "plan_hash"}
     if not isinstance(expected, str) or confirm != expected or plan_hash(payload) != expected:
@@ -629,7 +668,7 @@ def apply_plan(conn: sqlite3.Connection, db_path: Path, plan: dict[str, Any], *,
         except InstanceAlreadyRunning as exc:
             raise RepairError(str(exc), 1) from exc
     try:
-        with deploy_guard(root / "plugins", exclusive=True):
+        with deploy_guard(root / "plugins", exclusive=True), _mutation_lease(conn):
             marked = conn.execute("SELECT 1 FROM data_migrations WHERE name=?", (REPAIR_ID,)).fetchone()
             if marked:
                 if _post_state_matches(conn, plan):
@@ -657,7 +696,13 @@ def apply_plan(conn: sqlite3.Connection, db_path: Path, plan: dict[str, Any], *,
             _write_manifest(manifest, manifest_body)
             _call_hook(hook, "after_backup")
             _call_hook(hook, "before_begin")
-            conn.execute("BEGIN IMMEDIATE")
+            admitted = False
+            if admission is None:
+                conn.execute("BEGIN IMMEDIATE")
+            else:
+                admitted = admission.admit(lambda: conn.execute("BEGIN IMMEDIATE"))
+                if not admitted:
+                    raise RepairError("writer admission is busy", 1)
             try:
                 begin_at = datetime.now(timezone.utc)
                 if conn.execute("PRAGMA data_version").fetchone()[0] != v0:
@@ -684,6 +729,8 @@ def apply_plan(conn: sqlite3.Connection, db_path: Path, plan: dict[str, Any], *,
                 conn.execute("INSERT INTO ohlcv_history SELECT * FROM time_repair_h1")
                 conn.execute("DROP TABLE time_repair_h1")
                 _call_hook(hook, "after_H1")
+                _supersede_open_conflicts(conn, rows, at=begin_at)
+                _call_hook(hook, "after_supersede")
                 for prefix in ("C1", "C2", "C3"):
                     for item in CACHE_SETS:
                         if not item.name.startswith(prefix):
@@ -721,6 +768,9 @@ def apply_plan(conn: sqlite3.Connection, db_path: Path, plan: dict[str, Any], *,
             except BaseException:
                 conn.rollback()
                 raise
+            finally:
+                if admitted:
+                    admission.end()
             try:
                 manifest_body["committed"] = True
                 manifest_body["committed_at"] = datetime.now(timezone.utc).isoformat()
