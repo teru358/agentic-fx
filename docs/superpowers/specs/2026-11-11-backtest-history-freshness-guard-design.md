@@ -9,6 +9,8 @@
 
 C0に対するopus 1周目のCritical 1件・Important 10件・Minor 10件の対応を維持する。C2では、opus閉鎖確認2周目の新Important 5件・Minor 6件と指揮者の裁定を反映する。非配備7版への証跡なしrollbackは段1aで拒否する。
 
+**import の衝突の扱いは前倒しで置き換わった。** 本書の「停止・部分 commit の維持」と「衝突の永続記録は段 2」は、`docs/superpowers/specs/2026-11-14-history-status-and-import-conflicts-design.md` (C2.2) が置き換える (衝突は `history_conflicts` へ記録して非衝突行の確定を続け、事前遮断器と rc を持つ)。以下の該当記述は旧契約の記録であり、実装・受入の正本は C2.2 である。同期 (段 2・3) は `docs/superpowers/specs/2026-11-14-backtest-history-sync-design.md` (C5) が定める。
+
 task 1・2の実装が進行中のため、C1からの§2・§3の変更は、§3.3の日別欠損閾値を「60分ぶん超」にする変更だけに限定する。無足一覧の照合範囲と管理方法の補足は§5・§7に定める。
 
 ## 0. 確認した事実
@@ -19,7 +21,7 @@ task 1・2の実装が進行中のため、C1からの§2・§3の変更は、§
 |---|---|
 | importは現在、実時計ではなく `cutoff=window_end, grace=0` で確定判定する。naive応答はUTCとみなす。 | `backtest/mt5_import.py:83`, `:198` |
 | import本体はnaive・非UTCの入力境界を拒否する。一方、CLIは指定された時差を捨ててUTCを付ける。 | `backtest/mt5_import.py:235`、`backtest/cli.py:73` |
-| importは全窓を取得・検証してから書く。不正応答なら書かず、衝突時は既存値を保持して部分commit後に例外を返す。 | `backtest/mt5_import.py:263`, `:296` |
+| importは全窓を取得・検証してから書く。不正応答なら書かず、衝突時は既存値を保持して部分commit後に例外を返す (この衝突時の挙動は C2.2 が置換済み。上記冒頭参照)。 | `backtest/mt5_import.py:263`, `:296` |
 | 共通確定式は `bar_start + width + grace <= cutoff`。graceの既定値は30秒。 | `datafeed/closed_bars.py`、`config.py` |
 | holdout境界はハーネス所有。保存済みcoverageのexpectedは休場込みの全格子数で、presentは区間内の行数。 | `backtest/holdout.py:92`, `:145` |
 | strategy gateはin-sample、取引数判定、in-sampleの床、holdout、baseline比較の順に進む。 | `plugin/strategy_gate.py:595`以降 |
@@ -56,7 +58,7 @@ C1ではC0とレビューを全文確認し、主要分岐をコードで確認�
 6. 履歴補充と配備中4版の再評価、過去承認8件への関連付けの記録。
 7. 新しいrollback操作の証跡照合と、人間専用の明示的な強行操作。
 
-人が無足を認める日の一覧は、検査の例外を人間が管理できるよう、task 2と5に含める。非配備版の監査、ctl・webのstatus拡張、衝突の永続記録などは段1aの受入条件に含めない。
+人が無足を認める日の一覧は、検査の例外を人間が管理できるよう、task 2と5に含める。非配備版の監査、ctl・webのstatus拡張、ctl・webのstatus拡張などは段1aの受入条件に含めない。衝突の永続記録と衝突後の続行は C2.2 が前倒しで担う。
 
 対象はstrategy。indicator等のfixture検証には適用しない。
 
@@ -104,7 +106,7 @@ bridge応答のnaive日時は拒否する。aware応答はUTCへ正規化する�
 
 ### 2.3 衝突・閉場中の運用
 
-異値衝突は上書きせず、既存の停止・部分commit契約を維持する。段1aでは新しい衝突テーブルを作らず、既存例外の衝突内容と部分結果を人間が確認する。
+異値衝突は上書きしない。C2.2 が、旧契約 (停止・部分commit、新しい衝突テーブルを作らない) を置き換える。衝突は `history_conflicts` へ記録して非衝突行の確定を続け (completed_with_conflicts、rc=3)、系統的なずれは事前遮断器で系列の書込み 0 件とする (rc=4)。人間は記録と表示で旧新値を確認し、置換は同期 (段 2) の明示操作へ送る。
 
 bridgeは閉場中、時刻規則を検証できず503を返す場合がある。これを「対象なし」や成功に変換しない。人間向け案内とrunbookに、開場後の再試行、期間を分けた取得、取得後の日別充足確認を書く。
 
@@ -571,7 +573,7 @@ task 6の記録の受入は、次をすべて満たすこととする。
 | importの時計境界 | 5m・grace30秒で `T=12:05:20Z` なら `E=11:55Z`、保存は11:50足まで。`T=12:05:30Z` なら `E=12:00Z`、保存は11:55足まで |
 | importの入出力 | naive応答・不正窓・格子外を保存前に拒否。CLIの非ゼロ時差を拒否。UTC・naiveの文書どおりの入力を受理 |
 | ページ・容量 | inclusive右端を次窓で取得。容量は実効終端で判定。対象なしは取得0・書込み0・rc0 |
-| 不変保存 | 衝突時に旧値を保持し、既存の部分commit契約を維持 |
+| 不変保存 | 衝突時に旧値を保持。衝突後の続行・記録・遮断・rc は C2.2 §4 の受入 (H1〜H19) で検証する |
 | 暦と充足 | DST・週末・祝日、24時間境界、比率0.99境界、1mの60／61本・5mの12／13本・15mの4／5本を検証 |
 | 無足一覧 | 指定系列・日のみ除外。不正設定はunavailable。対象範囲の変更は再評価、別dataset・別pair・区間外の変更は照合を妨げない |
 | 無足一覧の管理 | repository rootから解決。実ファイルはgitignore、exampleは追跡。人間記入の承認情報をstatus・証跡で確認できる |
@@ -587,7 +589,7 @@ task 6の記録の受入は、次をすべて満たすこととする。
 | improve notice | 新許可対を `RESULT_CODES`・`validate_pair` が受理し、Discordは指定文言、agent面は既存not_submitted |
 | 再評価の鍵 | epoch不変の穴埋め後でも旧guard依頼をexistingにせず、新依頼作成とsupersededを一体で記録 |
 | 漏洩 | 日時・本数・比率・pairのcanaryと、人間の強行理由が全agent sinkに不在。分類は既存not_submitted |
-| status | daemon停止中も計算。参照の11-04〜11-09の0本日を、該当観測のDB写しで表示。失敗はブロック単位のunavailable |
+| status | instance lock が free のとき、および locked のうち保持者 unknown のときだけ計算 (他の保持者は従来の 6 行、正本は C2.2 §1.2)。参照の11-04〜11-09の0本日を、該当観測のDB写しで表示。失敗はブロック単位のunavailable |
 | rollback | 明示・既定対象とも証跡なし・不正・対象不一致を既存RollbackRefusalで拒否。新操作・切替なし。再開・補償rollbackは阻害しない |
 | 人間専用の強行 | 完全長hash・理由が必須。agent経路から指定不可。監査記録失敗時は切替なし。既存の他の検証を迂回しない |
 | 移行 | manifest15行の対象一致、配備中8行の新idまたは理由、同一版2行の対応を検証。非配備7版は通常経路で配備されない |
@@ -630,13 +632,13 @@ improve・submit・bless・reevaluateの各入口に、`real_history_guard` mark
 | 段1b以降 | ctl・webのstatus、参照銘柄の20有足日中央値による欠損検知 |
 | 段1b以降 | archive候補の専用再提出・保全操作 |
 | 段1b以降・必要性を再検討 | 同じ読取transaction、snapshot/as-of、不変履歴による再現性 |
-| 段2 | 衝突の永続記録、衝突後続行、人間による置換、`afx history sync` |
+| 段2 | 人間による置換、`afx history sync` (衝突の永続記録と衝突後続行は C2.2 が前倒し済み) |
 | 段3 | 開場中の定期同期、閉場時deferred、異常・悪化・回復通知 |
 | 別チケット | cache/historyの二重保存解消・表統合 |
 
 証跡のない版への新規rollback拒否と人間専用の強行操作は、段1aに含める。
 
-新しい永続テーブルが必要になる段では、リポジトリ規約どおりschema version・migration・旧fixture・整合性テストを伴わせる。
+新しい永続テーブルが必要になる段では、旧fixture・`init_db` の冪等導入・`TABLE_NAMES` の整合テストを伴わせる (DB の schema version は新設しない。settings の schema_version とは別である)。
 
 ## 11. 残余と限界
 
@@ -685,6 +687,7 @@ improve・submit・bless・reevaluateの各入口に、`real_history_guard` mark
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-11-14 | C2.3 | import の「停止・部分commit維持」と「衝突の永続記録は段2」を C2.2 が前倒しで置換したと、概要・§2.3・§7・§9・段の表に明記。status の読取条件を保持者別に訂正。schema version の記述を撤回 | C2.2 付録B 4・6・7。同期は C5 | — |
 | 2026-11-12 | C2.1 | §5 の保存時の再照合を実装に合わせて訂正 (現在の一覧を既存依頼自身の区間で照合) | 新評価の区間で照合すると、評価中に時計が進んだだけで適正な pending が無効になるため。入口ごとの実検査の結合 test を追加 | — |
 | 2026-11-12 | C2.2 | 強行rollbackの監査を、activityの読み返しによるop記録から、開始の監査行(force_token入り)とopと同一transactionのDBの印の対へ組み直し。op記録のevent・完了経路での書込みを廃止。activityの追記は部分行を改行で閉じてから書く | 同じ部品でCriticalが3周続いたため。指揮者の指示 | — |
 | 2026-11-11 | C2 | 日別欠損を60分ぶん超へ変更。無足一覧の照合を評価対象範囲に限定し、pendingの出口と次の操作を定義。rollback拒否・人間専用強行を段1aへ追加。移行manifest、test差し替え、実検査の結合テスト、Minor 6件を具体化 | opus閉鎖確認 新Important 5 / Minor 6。指揮者裁定を反映し、I8の残りを閉鎖。§2・§3の変更は日別閾値だけに限定 | — |

@@ -117,7 +117,7 @@ N=0や新規異値1件だけでは系列ずれを検出できない。bridge の
 
 **MT5/Dukascopy共に、一操作の一系列内の全要求窓を取得・検証してから判定・書込みする。** 複数系列は設定の安定順で系列ごとにstage→判定→確定する。全系列一括stage/一括rollbackはしない。取得失敗0件は当該操作・系列の範囲だけであり、先行系列の確定を戻さない。失敗後も独立した他系列を続け、全体rcは§3へ集約する。Dukascopyの逐次HTTP取得・rate limitは維持するが、C0のhour単位network partial案は撤回する。一操作・系列の全範囲の0件遮断は、すでにhourを確定する方式では実現できないためである。検証済み行をメモリまたは権限0600の一時spoolへ保持し、上限MAX_IMPORT_ROWS (現行100万) を厳守する。spoolに認証情報やraw応答を保存せず、操作完了・失敗・中断で削除する。通常cycle間は§2.5の寿命内で保持する。容量・取得・decode・検証失敗は当該操作・系列の履歴/衝突0件。sourceごとの別衝突実装を作らない。
 
-事前読取とbatchの間に別の履歴writerが追加してN/Cが変わる競合を防ぐため、全取得後に **共通のhistory mutation用advisory lease** を取り、preflightから全batch終了まで保持する。SQLite write transactionを長時間保持する方式ではない。instance lockによる取得経路制限とは別の排他である。共通coreの全取込・time repair・将来置換/live writerがこのleaseを通る。履歴writer同士のみ直列化し、schedulerの通常取引DB書込みとstatus readerは対象外。repairはinstance/deploy lockの後、mutation leaseの後にDB transaction。histbugs単独のimportはinstance/deploy lockを取らず、mutation leaseの後にbatch DB lockを取る。**同期段2からはhistsync C2 §1.2/T2でimportの取得前instance lockを追加し稼働中取得を拒否する**。その段ではinstance lock→取得 (mutation leaseなし)→mutation lease→batch DB lockの順とし、deploy lockは追加しない。待たせず取得不能なら `database_busy` で書込み0件とする。段3もmutation lease→WriterAdmission→BEGINの順で逆順取得を禁止する。これにより同じseriesの判定後に新しい衝突が突然増え、途中から遮断になって「0件」を破ることを防ぐ。直接SQL等の契約外writerまで保証しない。
+事前読取とbatchの間に別の履歴writerが追加してN/Cが変わる競合を防ぐため、全取得後に **共通のhistory mutation用advisory lease** を取り、preflightから全batch終了まで保持する。SQLite write transactionを長時間保持する方式ではない。instance lockによる取得経路制限とは別の排他である。共通coreの全取込・time repair・将来置換/live writerがこのleaseを通る。履歴writer同士のみ直列化し、schedulerの通常取引DB書込みとstatus readerは対象外。repairはinstance/deploy lockの後、mutation leaseの後にDB transaction。histbugs単独のimportはinstance/deploy lockを取らず、mutation leaseの後にbatch DB lockを取る。**同期段2からは同期 C5 (`docs/superpowers/specs/2026-11-14-backtest-history-sync-design.md`) §1.2/T2でimportの取得前instance lockを追加し稼働中取得を拒否する**。その段ではinstance lock→取得 (mutation leaseなし)→mutation lease→batch DB lockの順とし、deploy lockは追加しない。待たせず取得不能なら `database_busy` で書込み0件とする。段3もmutation lease→WriterAdmission→BEGINの順で逆順取得を禁止する。これにより同じseriesの判定後に新しい衝突が突然増え、途中から遮断になって「0件」を破ることを防ぐ。直接SQL等の契約外writerまで保証しない。
 
 ### 2.4 最終形の衝突表と同一性
 
@@ -268,6 +268,7 @@ import/syncの語彙は次を共有し、別名のpartial成功を作らない�
 | 2026-11-14 | C2 | 分割再開generation・suffix分母・stage寿命・cursor、系列別取得原子性、空参照文言、同期C1整合 | terra閉鎖確認 Important 2 / Minor 2 | — (本改訂、未commit) |
 | 2026-11-14 | C2.1 | §2.5a に stage の期限到達時の処理 (未確定 batch の rollback、prefix と cursor の維持、lease 解放、`stage_expired`、次 cycle で suffix を新 generation で再取得) と受入を追加 | terra の C2 閉鎖確認 Minor 1 | — |
 | 2026-11-14 | C2.2 | C_new/C_known・N_test、表示と遮断の分離、小N維持、足幅別検査尾と検査不足、段1 T3正本、rc/FK整合 | 同期r2 I-4を利用者指定のsol推奨で閉鎖、m12/m14/m18追随 | — (未commit) |
+| 2026-11-14 | C2.3 | §2.3 の同期への参照を同期 C5 へ。T4 の `ImportConflictError` の記述を廃止済みの実態へ。time repair は mutation lease と WriterAdmission の順に参加し、移動元・移動先の open 記録の supersede を同じ transaction で行う (T5) | 段1a・UTC 時刻規則 spec の食い違い訂正 (T6)、repair の実装 | — |
 
 ## 6. 短い task 表
 
@@ -278,7 +279,7 @@ import/syncの語彙は次を共有し、別名のpartial成功を作らない�
 | T1 | locked契約: `status.py`, `store/db.py`, `tests/test_status_locks.py`, observer関連test、cli-surface spec §6.1/golden/AC-18、`docs/operations/first-run-acceptance.md:172` | unknownのみ履歴読取・ro強制、他保持者6行維持、timezoneと固定理由、helper docstringも整合 |
 | T2 | DTO/参照/案内: `status_history.py` と関連test、段1a §7、`docs/operations/reevaluate-deployed-after-history-repair.md` §7手順3、同期C2 §1.3/§2.8、評価区間C2 §2.5との接点 | watch正本、見出し、空文言/期待値、条件付きnext、再評価は具体的結果から案内、共通スロットの所有権を明示 |
 | T3 | schema/core: `store/db.py`, `store/ohlcv.py`, 新 `store/history_conflicts.py`, schema/旧DB fixture/`TABLE_NAMES` test | 最終形、二段判定、epoch付きUNIQUE/upsert、closed state維持、agent隔離 |
-| T4 | import両source/CLI: `backtest/mt5_import.py`, Dukascopy `importer.py`, `cli.py`, import test、共通mutation lease | 操作・系列別全取得→遮断→batch、rc/進捗/再実行・stage寿命・generation/cursor、例外契約変更。`ImportConflictError` docstring/全利用箇所、mt5末尾「1回の短いtransaction」コメント、ohlcvの古い件数だけ/窓分割前提コメントを更新または廃止 |
+| T4 | import両source/CLI: `backtest/mt5_import.py`, Dukascopy `importer.py`, `cli.py`, import test、共通mutation lease | 操作・系列別全取得→遮断→batch、rc/進捗/再実行・stage寿命・generation/cursor、例外契約変更。`ImportConflictError` の廃止と docstring/全利用箇所の除去 (実装済み)、mt5末尾「1回の短いtransaction」コメント、ohlcvの古い件数だけ/窓分割前提コメントを更新または廃止 |
 | T5 | repair: `backtest/time_repair.py`, `core/history_epoch.py`との契約、修復test | 同じlease、移動元/先のsupersede原子性、既存epoch/no-op/backupの意味を維持 |
 | T6 | 原本の前倒し整合: 段1a概要/§2.3/§7/受入表/段の表/変更履歴、同期分は C1 で反映済み、C2/C2.2との実装時照合だけ (run/series status・rc・原子性・受入を含む) | 停止・部分commit維持と段2後送りを本件が置換。同期の二重所有宣言、partial rc=3、全locked読取、表/keyの食い違いを訂正 |
 | T7 | runbook/公開変更履歴/性能受入 | 再起動後import、Dukascopy rcと取得原子性変更、失敗時再実行、閾値N/Cとwrite lock実測、§4受入を確認してから完了判断 |

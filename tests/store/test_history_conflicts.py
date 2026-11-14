@@ -699,23 +699,28 @@ def test_conflict_canaries_do_not_reach_agent_tool_responses(tmp_path):
 
     canary_value = 7654321.125
     canary_reason = "CANARY-REASON-5d1f"
+    now = datetime(2026, 1, 2, 0, 5, tzinfo=timezone.utc)
+    last = now.replace(minute=0) - timedelta(hours=1)
     conn = _conn(tmp_path)
-    _seed(conn, [_row(0, volume=canary_value)])
+    # 衝突は tool が問い合わせる系列 (同じ通貨・時間足・時刻) に作る。
+    existing = ("USDJPY", "1h", last.isoformat(), 1.0, 2.0, 0.5, 1.5, 1.0, None)
+    incoming = ("USDJPY", "1h", last.isoformat(), 1.0, 2.0, 0.5, 1.6, canary_value, None)
+    _seed(conn, [existing])
     conn.commit()
-    res = _apply(conn, _cls(conn, [_row(0, volume=canary_value + 5, close=148.15)]))
+    res = _apply(conn, _cls(conn, [incoming]))
     assert res.conflicted_new == 1
     conn.execute("UPDATE history_conflicts SET reason_ref=?", (canary_reason,))
     conn.commit()
-    digest = conn.execute("SELECT existing_digest FROM history_conflicts").fetchone()[0]
-    canaries = (str(canary_value), str(canary_value + 5), canary_reason, digest)
+    record = conn.execute("SELECT existing_digest, incoming_digest, bar_time, symbol, interval "
+                          "FROM history_conflicts").fetchone()
+    assert (record["symbol"], record["interval"], record["bar_time"]) == ("USDJPY", "1h", last.isoformat())
+    canaries = (str(canary_value), canary_reason, record["existing_digest"], record["incoming_digest"])
 
     settings = load_settings(Path(__file__).resolve().parents[2]
                              / "config" / "settings.yaml.example")
     settings.datafeed.primary = "mt5"
     settings.datafeed.mt5.enabled = True
     settings.datafeed.yfinance.enabled = False
-    now = datetime(2026, 1, 2, 0, 5, tzinfo=timezone.utc)
-    last = now.replace(minute=0) - timedelta(hours=1)
     bars = [Bar("USDJPY", "1h", last - timedelta(hours=199 - i), 1.0, 2.0, 0.5, 1.5, 1)
             for i in range(200)]
     provider = PriceProvider(conn, settings, FixedClock(now), readonly=True)
@@ -725,6 +730,7 @@ def test_conflict_canaries_do_not_reach_agent_tool_responses(tmp_path):
         responses = [tools["get_ohlcv"].func("USDJPY", "1h"),
                      tools["get_indicators"].func("USDJPY", "1h")]
     assert responses[0] and "sma_20" in responses[1]
+    assert last.isoformat()[:16] in json.dumps(responses[0], default=str)
 
     class _Search:
         def text(self, query, max_results):
