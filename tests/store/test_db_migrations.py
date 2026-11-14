@@ -88,7 +88,9 @@ def test_table_names_include_candidate_archives():
     from agentic_fx.store.db import TABLE_NAMES
 
     assert TABLE_NAMES == frozenset({
-        "ohlcv_cache", "ohlcv_history", "history_conflicts", "data_migrations", "missions", "trade_intents", "orders",
+        "ohlcv_cache", "ohlcv_history", "history_conflicts", "history_sync_runs",
+    "history_sync_series", "history_sync_series_state", "history_sync_gaps",
+    "history_revisions", "data_migrations", "missions", "trade_intents", "orders",
         "reflections", "account_snapshots", "improvement_backlog",
         "improvement_runs", "econ_events", "approval_requests", "news_sources",
         "backtest_runs", "analysis_runs", "signals", "reflection_attempts",

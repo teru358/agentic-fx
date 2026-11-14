@@ -71,12 +71,12 @@ def test_fourteen_answers_change_exactly_twelve_lines_without_reformatting():
         27: "  trade: {backend: claude, model: claude-sonnet}          # [init] 取引判断は local または claude",
         28: "  improve: {backend: local, model: different-model}                 # [init] 改善は local / opencode / claude / codex。ローカル LLM は opencode を使う (2026-08-30 裁定)、codex は chatgpt 専用",
         43: "  initial_balance: 2000000",
-        49: "  timeout_sec: 120",
-        58: "  freshness_max_min: 10        # これより古い quote/bar は不健全扱い",
-        77: "  improve: daily               # [init] weekly | daily",
-        78: "  improve_at: 03:00            # [init] weekly は \"<weekday> HH:MM\"、daily は \"HH:MM\" (表示 TZ)",
-            122: "  level: DEBUG",
-            131: "  max_connections: 5           # 同時接続。超えた接続は 503",
+        50: "  timeout_sec: 120",
+        59: "  freshness_max_min: 10        # これより古い quote/bar は不健全扱い",
+        78: "  improve: daily               # [init] weekly | daily",
+        79: "  improve_at: 03:00            # [init] weekly は \"<weekday> HH:MM\"、daily は \"HH:MM\" (表示 TZ)",
+            123: "  level: DEBUG",
+            132: "  max_connections: 5           # 同時接続。超えた接続は 503",
     }
     assert b"".join(
         line.encode() for number, line in enumerate(after, 1) if number not in changed

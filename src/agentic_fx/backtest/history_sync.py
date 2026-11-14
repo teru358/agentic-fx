@@ -280,7 +280,6 @@ def run_sync(conn, settings, *, now: datetime, no_bars: NoBarsList = EMPTY_NO_BA
     gate = RequestGate(fetch or _default_fetch, spacing=spacing, monotonic=monotonic,
                        sleep=sleep)
     tail_k = inspection_tail_bars(int(width.total_seconds()))
-    stamp = store.iso
     run_id = run_id or uuid.uuid4().hex
     result = SyncResult(run_id, "running", RC_OK, now, boundary, limit)
     state = _Run(conn=conn, settings=settings, dataset=dataset, width=width, grace=grace,

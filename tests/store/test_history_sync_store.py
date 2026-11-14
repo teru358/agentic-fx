@@ -377,3 +377,16 @@ def test_interrupted_recovery_marks_only_runs_whose_owner_is_gone(tmp_path):
     series = {r["run_id"]: r["status"] for r in conn.execute(
         "SELECT run_id, status FROM history_sync_series")}
     assert series == {"dead": "failed", "live": "running"}
+
+
+def test_a_day_whose_end_equals_b_is_expired_and_one_ending_after_b_is_not(tmp_path):
+    conn = _conn(tmp_path)
+    _observe(conn, "2026-10-10")
+    boundary = datetime(2026, 10, 11, 0, 0, tzinfo=timezone.utc)          # 10-10 の終端ちょうど
+    assert _txn(conn, lambda c: hs.expire_gaps(c, source=SRC, interval=IV,
+                                               boundary=boundary, now=NOW)) == 1
+    conn2 = _conn(tmp_path, "b.db")
+    _observe(conn2, "2026-10-10")
+    just_before = boundary - timedelta(minutes=15)
+    assert _txn(conn2, lambda c: hs.expire_gaps(c, source=SRC, interval=IV,
+                                                boundary=just_before, now=NOW)) == 0

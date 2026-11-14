@@ -681,3 +681,29 @@ def test_the_sync_writes_no_in_sample_rows_before_b_even_with_a_deep_lookback(tm
     assert conn.execute("SELECT COUNT(*) FROM ohlcv_history WHERE bar_time < ?",
                         (B1.isoformat(),)).fetchone()[0] == 0
     assert all(start >= B1 - timedelta(hours=3) for _s, start, _e in bridge.calls)
+
+
+def test_the_recent_operation_is_deferred_before_any_request_when_it_would_exceed_the_window_budget(
+        tmp_path, monkeypatch):
+    conn, settings = _seeded(tmp_path)
+    from agentic_fx.backtest import history_sync_plan as plan
+    # 後ろ窓が想定より長く決まってしまっても、D+1 窓の上限を超える操作は要求 0 で後送りにする
+    monkeypatch.setattr(plan, "lookback_start", lambda limit, days, boundary: limit - timedelta(days=6))
+    bridge = FakeBridge()
+    result = _run(conn, settings, bridge)
+    recent = next(o for o in result.ops if o.operation == "recent")
+    assert (recent.status, recent.reason, recent.requests) == ("deferred", "request_budget", 0)
+    assert bridge.calls == [] and result.cursors[SYMBOL] is None
+
+
+def test_the_final_scan_stops_at_e_so_the_margin_slot_is_never_observed(tmp_path, monkeypatch):
+    conn, settings = _seeded(tmp_path)
+    ends = []
+    real = hs.primary_day_missing
+
+    def spy(*args, **kwargs):
+        ends.append(kwargs["end"])
+        return real(*args, **kwargs)
+    monkeypatch.setattr(hs, "primary_day_missing", spy)
+    result = _run(conn, settings)
+    assert ends and set(ends) == {result.e}

@@ -194,3 +194,18 @@ def test_a_three_open_hour_lag_catches_up_with_two_open_hour_prefixes_in_consecu
         assert step.end - step.cursor <= 2 * H
         cursor, steps = step.end, steps + 1
     assert steps == 2                                          # 3 時間の遅れは 2 回の 2 時間 prefix で追いつく
+
+
+def test_the_tail_limits_are_pinned_to_three_open_hours_and_180_grid_slots():
+    assert plan.TAIL_MAX_OPEN == 3 * H and plan.TAIL_MAX_GRID == 180
+    assert plan.TAIL_BASE_OPEN == 2 * H and plan.PREFIX_OPEN == 2 * H
+    assert plan.BACKLOG_MAX_OPEN == 24 * H
+    w = timedelta(minutes=1)
+    anchor = dt(2026, 11, 11, 12)
+    exactly = [anchor - timedelta(minutes=m) for m in range(1, 121)] + [anchor - 3 * H]
+    ok = plan.select_tail(sorted(exactly), anchor, width=w)
+    assert ok.ok is True and ok.tail.slots <= plan.TAIL_MAX_GRID
+    # 1m で 3 開場時間ちょうどの尾は 180 格子で、それより長い尾は作らない
+    assert plan.open_duration(ok.tail.start, anchor) <= plan.TAIL_MAX_OPEN
+    over = [anchor - timedelta(minutes=m) for m in range(1, 120)] + [anchor - 3 * H - w]
+    assert plan.select_tail(sorted(over), anchor, width=w).reason == plan.REASON_TAIL_LIMIT
