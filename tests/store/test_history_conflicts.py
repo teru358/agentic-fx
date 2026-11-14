@@ -521,26 +521,119 @@ def test_import_sources_only(tmp_path):
         _cls(conn, [_row(0)], source="yfinance")
 
 
+# ---- 系列の混在 / unchanged の並行変更 ----------------------------------------
+
+
+def test_mixed_series_input_is_rejected_before_classification(tmp_path):
+    conn = _conn(tmp_path)
+    rows = [_row(i) for i in range(200)]
+    _seed(conn, rows)
+    bad_b = [_row(i, symbol="EURUSD", close=1.1, opn=1.0) for i in range(2)]
+    _seed(conn, [(r[0], r[1], r[2], 1.0, 1.2, 0.9, 1.05, 10.0, 0.01) for r in bad_b])
+    incoming = [_row(i) for i in range(200)] + [
+        (r[0], r[1], r[2], 1.0, 1.2, 0.9, 1.07, 10.0, 0.01) for r in bad_b]
+    with pytest.raises(ohlcv.InconsistentInputError):
+        _cls(conn, incoming)
+    # 系列ごとに分ければ B は 2/2 で遮断される
+    only_b = _cls(conn, incoming[200:])
+    assert only_b.circuit_open
+    mixed_interval = [_row(0), ("USDJPY", "5m", _t(0), 148.0, 148.2, 147.9, 148.1, 1.0, None)]
+    with pytest.raises(ohlcv.InconsistentInputError):
+        _cls(conn, mixed_interval)
+
+
+def _unchanged_apply_setup(tmp_path):
+    conn = _conn(tmp_path)
+    _seed(conn, [_row(0), _row(1), _row(2)])
+    cls = _cls(conn, [_row(0), _row(1), _row(2), _row(3)])
+    return conn, cls
+
+
+def test_unchanged_row_deleted_before_apply_rolls_back_the_batch(tmp_path):
+    conn, cls = _unchanged_apply_setup(tmp_path)
+    conn.execute("DELETE FROM ohlcv_history WHERE bar_time=?", (_t(1),))
+    conn.commit()
+    seen = []
+    res = _apply(conn, cls, on_batch=lambda c, p: seen.append(p))
+    assert (res.status, res.failure) == ("failed", "concurrent_change")
+    assert seen == [] or res.last_committed_bar_time is None
+    assert _count(conn, "ohlcv_history") == 2
+
+
+def test_unchanged_row_modified_before_apply_rolls_back_the_batch(tmp_path):
+    conn, cls = _unchanged_apply_setup(tmp_path)
+    conn.execute("UPDATE ohlcv_history SET close=149.5 WHERE bar_time=?", (_t(1),))
+    conn.commit()
+    res = _apply(conn, cls)
+    assert (res.status, res.failure) == ("failed", "concurrent_change")
+    assert _count(conn, "ohlcv_history") == 3        # bar 3 は書かれていない
+    assert _count(conn, "history_conflicts") == 0
+
+
+def test_before_batch_can_stop_with_a_failure_code(tmp_path):
+    conn, cls = _unchanged_apply_setup(tmp_path)
+    calls = iter([None, "stage_expired"])
+    res = _apply(conn, cls, max_rows=2, before_batch=lambda: next(calls))
+    assert (res.status, res.failure) == ("partial", "stage_expired")
+    assert res.resume_from is not None
+
+
 # ---- agent への非露出 ------------------------------------------------------
+# 公開境界 (agent の tool・prompt・改善記録の投影) が衝突の内部に触れないこと。
+# store 内の呼出し (import・CLI) は妨げない。
 
-_ALLOWED = {"store/db.py", "store/ohlcv.py", "store/history_conflicts.py"}
+_INTERNALS = re.compile(
+    r"history_conflicts|conflict_circuit|ClassifiedRow|classify_history_rows|"
+    r"apply_classified_history|existing_json|incoming_json|existing_digest|"
+    r"incoming_digest|reason_ref")
 
 
-def test_history_conflicts_is_referenced_only_by_the_store_core():
+def test_agent_facing_boundaries_never_reference_conflict_internals():
     root = Path(ohlcv.__file__).resolve().parents[1]
     offenders = []
-    for path in root.rglob("*.py"):
-        rel = path.relative_to(root).as_posix()
-        if rel in _ALLOWED:
-            continue
-        if re.search(r"history_conflicts|conflict_circuit|ClassifiedRow", path.read_text()):
-            offenders.append(rel)
+    for pkg in ("tools", "runners", "loops", "plugin"):
+        for path in (root / pkg).rglob("*"):
+            if path.is_file() and path.suffix in {".py", ".md", ".txt", ".j2", ".yaml"}:
+                if _INTERNALS.search(path.read_text(errors="ignore")):
+                    offenders.append(path.relative_to(root).as_posix())
     assert offenders == []
 
 
-def test_agent_facing_packages_never_read_the_conflict_columns():
-    root = Path(ohlcv.__file__).resolve().parents[1]
-    columns = re.compile(r"existing_json|incoming_json|existing_digest|incoming_digest|reason_ref")
-    for pkg in ("tools", "runners", "loops", "plugin"):
-        for path in (root / pkg).rglob("*.py"):
-            assert not columns.search(path.read_text()), path
+def test_conflict_canaries_do_not_reach_the_improve_prompt_or_context(tmp_path):
+    from agentic_fx.loops.improve_context import build_improve_context
+    from agentic_fx.loops.improve_loop import ImproveLoop
+    from agentic_fx.config import load_settings
+    import json
+
+    canary_value = 7654321.125
+    canary_reason = "CANARY-REASON-5d1f"
+    conn = _conn(tmp_path)
+    _seed(conn, [_row(0, volume=canary_value)])
+    conn.commit()
+    res = _apply(conn, _cls(conn, [_row(0, volume=canary_value + 5, close=148.15)]))
+    assert res.conflicted_new == 1
+    conn.execute("UPDATE history_conflicts SET reason_ref=?", (canary_reason,))
+    conn.commit()
+    digest = conn.execute("SELECT existing_digest FROM history_conflicts").fetchone()[0]
+    assert digest
+    settings = load_settings(Path(__file__).resolve().parents[2]
+                             / "config" / "settings.yaml.example")
+    root = tmp_path / "root"
+    root.mkdir()
+    ctx_data = build_improve_context(
+        conn, settings=settings, now=datetime(2026, 11, 14, 12, 0), root=root,
+        allowed_backlog_ids=None,
+        inventory_view={"plugins": [], "pin_broken_strategies": []})
+
+    class _Ctx:
+        staging_dir = tmp_path / "staging"
+        source_snapshot_dir = tmp_path / "source"
+        inventory_view = {"plugins": [], "pin_broken_strategies": []}
+        baseline_gate_mode = "off"
+
+    loop = ImproveLoop.__new__(ImproveLoop)
+    loop._settings = settings
+    rendered = loop._render_improve_mission_prompt(ctx_data, ctx=_Ctx())
+    blob = rendered + json.dumps(ctx_data, ensure_ascii=False, default=str)
+    for canary in (str(canary_value), str(canary_value + 5), canary_reason, digest):
+        assert canary not in blob

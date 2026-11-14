@@ -43,7 +43,7 @@ def test_history_import_stops_with_rc1_and_no_rows_when_the_bridge_refuses(
     _install_settings(tmp_path)
     with patch("agentic_fx.backtest.cli.ensure_initialized"), \
          patch.object(mt5_import.httpx, "get", return_value=_response(503, detail)), \
-         patch.object(mt5_import, "import_history_bars") as store:
+         patch("agentic_fx.store.ohlcv.apply_classified_history") as store:
         rc = main(["history", "import", "--source", "mt5", "--symbol", "USDJPY",
                    "--from", "2026-11-04", "--to", "2026-11-05"])
 

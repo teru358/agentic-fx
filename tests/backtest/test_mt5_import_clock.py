@@ -172,8 +172,9 @@ def test_window_capacity_check_is_bounded_by_the_effective_end(tmp_path):
     def fetch(url):
         return {"symbol": "USDJPY", "interval": "5m",
                 "bars": [_bar(start + i * timedelta(minutes=5)) for i in range(20)]}
-    with pytest.raises(ValueError, match="capacity"):
-        _run(conn, start, start + timedelta(days=2), T2, fetch=fetch)
+    out = _run(conn, start, start + timedelta(days=2), T2, fetch=fetch)
+    assert (out.status, out.failure) == ("failed", "invalid_response")
+    assert "capacity" in out.detail
     assert _stored(conn) == []
 
 
@@ -207,8 +208,9 @@ def test_naive_bridge_time_is_rejected_and_nothing_is_written(tmp_path):
             _bar(NOON - timedelta(hours=1)),
             _bar(NOON - timedelta(minutes=55),
                  time=(NOON - timedelta(minutes=55)).replace(tzinfo=None).isoformat())]}
-    with pytest.raises(ValueError, match="naive"):
-        _run(conn, NOON - timedelta(hours=1), NOON, T2 + timedelta(hours=3), fetch=fetch)
+    out = _run(conn, NOON - timedelta(hours=1), NOON, T2 + timedelta(hours=3), fetch=fetch)
+    assert (out.status, out.failure) == ("failed", "invalid_response")
+    assert "naive" in out.detail
     assert _stored(conn) == []
 
 
@@ -255,7 +257,7 @@ def test_cli_rejects_a_nonzero_offset_before_touching_anything(tmp_path, monkeyp
     monkeypatch.chdir(tmp_path)
     _install_settings(tmp_path)
     with patch("agentic_fx.backtest.cli.ensure_initialized"), \
-         patch.object(mt5_import, "import_history_bars") as store, \
+         patch("agentic_fx.store.ohlcv.apply_classified_history") as store, \
          pytest.raises(SystemExit) as exc:
         main(["history", "import", "--source", "mt5", "--symbol", "USDJPY",
               "--from", "2026-11-04T00:00+09:00", "--to", "2026-11-05"])

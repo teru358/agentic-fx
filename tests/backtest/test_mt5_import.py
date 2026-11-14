@@ -6,12 +6,22 @@ import pytest
 
 from agentic_fx.backtest import mt5_import
 from agentic_fx.backtest.mt5_import import (
-    ImportConflictError, _default_fetch, compare_sources, import_mt5)
+    _default_fetch, compare_sources, import_mt5 as _import_mt5)
 from agentic_fx.core.contracts import Bar
 from agentic_fx.datafeed.sources import BridgeTimeRuleMismatch, BridgeTimeUnverified
 from agentic_fx.datafeed.closed_bars import normalize_closed_range
 from agentic_fx.store import ohlcv
 from tests.backtest.factories import H, SETTINGS, _conn
+
+
+def import_mt5(*args, **kwargs):
+    """検証系の test 用。取得・検証の拒否は結果の failure (履歴 0 件) になるので、
+    ここでは ValueError に読み替えて、拒否の理由を `match` で確かめる。
+    結果の契約そのものは下の test が `_import_mt5` で直接見る。"""
+    outcome = _import_mt5(*args, **kwargs)
+    if outcome.status == "failed" and outcome.failure in ("invalid_response", "too_large"):
+        raise ValueError(outcome.detail or outcome.failure)
+    return outcome
 
 
 def test_import_mt5_pages_daily_and_imports(tmp_path):
@@ -643,14 +653,12 @@ def test_import_mt5_validation_error_reports_failed_window_and_that_nothing_was_
             return _payload(_bar(H))
         return _payload(_bar(start, open=0))
 
-    with pytest.raises(ValueError) as raised:
-        import_mt5(conn, "USDJPY", H, H + timedelta(days=2),
-                   base_url="http://x", fetch=fetch)
-    message = str(raised.value)
-    assert f"failed window [{(H + timedelta(days=1)).isoformat()}" in message
-    assert "何も書き込んでいません" in message
-    assert f"開始 {H.isoformat()} から取り直" in message
-    assert "last successful" not in message
+    out = _import_mt5(conn, "USDJPY", H, H + timedelta(days=2),
+                      base_url="http://x", fetch=fetch)
+    assert (out.status, out.failure) == ("failed", "invalid_response")
+    assert f"failed window [{(H + timedelta(days=1)).isoformat()}" in out.detail
+    assert out.resume_from == H.isoformat()
+    assert _stored_row_count(conn) == 0
 
 
 def test_import_mt5_same_payload_rerun_is_unchanged_only(tmp_path):
@@ -661,144 +669,113 @@ def test_import_mt5_same_payload_rerun_is_unchanged_only(tmp_path):
     second = import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
                         base_url="http://x", fetch=fetch)
     assert first.inserted == 1
-    assert second == ohlcv.ImportResult(inserted=0, unchanged=1, conflicted=0)
+    assert (second.inserted, second.unchanged, second.conflicted) == (0, 1, 0)
 
 
-def test_import_mt5_conflict_raises_with_existing_and_incoming_and_stops(tmp_path):
+def _seed_mt5(conn, *rows):
+    ohlcv.import_history_bars(conn, list(rows), source="mt5")
+
+
+def _mt5_row(ts, o=148.0, h=148.2, low=147.9, c=148.1, v=10, spread=None):
+    return ("USDJPY", "1m", ts.isoformat(), o, h, low, c, v, spread)
+
+
+def _unchanged_fillers(conn, n, start=1):
+    """遮断の分母 (unchanged) を作る既存行。"""
+    _seed_mt5(conn, *[_mt5_row(H + timedelta(minutes=i)) for i in range(start, start + n)])
+
+
+def test_import_mt5_isolated_conflict_is_recorded_and_import_continues(tmp_path):
     conn = _conn(tmp_path)
-    ohlcv.import_history_bars(
-        conn, [("USDJPY", "1m", H.isoformat(), 148.0, 148.2, 147.9,
-                148.1, 10, None)], source="mt5")
+    _seed_mt5(conn, _mt5_row(H))
     calls = []
 
     def fetch(url):
         calls.append(url)
         start = datetime.fromisoformat(_query_param(url, "from"))
-        return _payload(_bar(start, open=149.0, high=149.2, low=148.9,
-                                 close=149.1, volume=20))
+        bars = [_bar(start, open=149.0, high=149.2, low=148.9, close=149.1, volume=20)]
+        if start != H:
+            bars = [_bar(start)]
+        return _payload(*bars)
 
-    with pytest.raises(ImportConflictError) as raised:
-        import_mt5(conn, "USDJPY", H, H + timedelta(days=2),
-                   base_url="http://x", fetch=fetch)
+    out = _import_mt5(conn, "USDJPY", H, H + timedelta(days=2),
+                      base_url="http://x", fetch=fetch)
     assert len(calls) == 2
-    assert raised.value.conflicts == (
-        ("USDJPY", "1m", H.isoformat(),
-         (148.0, 148.2, 147.9, 148.1, 10.0, None),
-         (149.0, 149.2, 148.9, 149.1, 20, None)),
-    )
+    assert out.status == "completed_with_conflicts"
+    assert (out.inserted, out.unchanged, out.conflicted_new) == (1, 0, 1)
     stored = ohlcv.load_history_bars(conn, "USDJPY", "1m", source="mt5")
-    assert [b.ts for b in stored] == [H]
-    assert stored[0].close == 148.1
+    assert [b.ts for b in stored] == [H, H + timedelta(days=1)]
+    assert stored[0].close == 148.1                       # 既存値は不変
+    line = out.conflict_lines[0]
+    assert line.existing == (148.0, 148.2, 147.9, 148.1, 10.0, None)
+    assert line.incoming == (149.0, 149.2, 148.9, 149.1, 20, None)
+    assert (line.id, line.state, line.known) == (1, "open", False)
+    assert conn.execute("SELECT COUNT(*) FROM history_conflicts").fetchone()[0] == 1
 
 
-def test_import_mt5_spread_only_conflict_is_reported(tmp_path):
+def test_import_mt5_spread_only_conflict_is_recorded(tmp_path):
     conn = _conn(tmp_path)
-    conn.execute(
-        "INSERT INTO ohlcv_history "
-        "(symbol, interval, bar_time, open, high, low, close, volume, "
-        "source, spread) VALUES (?,?,?,?,?,?,?,?,?,?)",
-        ("USDJPY", "1m", H.isoformat(), 148.0, 148.2, 147.9, 148.1,
-         10, "mt5", 0.001))
-    conn.commit()
-
-    with pytest.raises(ImportConflictError) as raised:
-        import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
-                   base_url="http://x", fetch=lambda _url: _payload(_bar(H)))
-
-    assert raised.value.conflicts == (
-        ("USDJPY", "1m", H.isoformat(),
-         (148.0, 148.2, 147.9, 148.1, 10.0, 0.001),
-         (148.0, 148.2, 147.9, 148.1, 10, None)),
-    )
+    _seed_mt5(conn, _mt5_row(H, spread=0.001))
+    out = _import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
+                      base_url="http://x", fetch=lambda _url: _payload(_bar(H)))
+    assert out.conflicted_new == 1
+    assert out.conflict_lines[0].existing == (148.0, 148.2, 147.9, 148.1, 10.0, 0.001)
+    assert out.conflict_lines[0].incoming == (148.0, 148.2, 147.9, 148.1, 10, None)
 
 
-def test_import_mt5_mixed_new_and_conflicting_rows_reports_only_conflict(
-        tmp_path):
+def test_import_mt5_mixed_new_and_conflicting_rows_records_only_the_conflict(tmp_path):
     conn = _conn(tmp_path)
     conflict_time = H + timedelta(minutes=1)
-    ohlcv.import_history_bars(
-        conn, [("USDJPY", "1m", conflict_time.isoformat(), 148.0, 148.2,
-                147.9, 148.1, 10, None)], source="mt5")
-
-    with pytest.raises(ImportConflictError) as raised:
-        import_mt5(
-            conn, "USDJPY", H, H + timedelta(minutes=2),
-            base_url="http://x",
-            fetch=lambda _url: _payload(
-                _bar(H),
-                _bar(conflict_time, open=149.0, high=149.2, low=148.9,
-                     close=149.1, volume=20)))
-
-    assert [item[2] for item in raised.value.conflicts] == [
-        conflict_time.isoformat()]
-    assert ohlcv.load_history_bars(
-        conn, "USDJPY", "1m", source="mt5")[0].ts == H
+    _seed_mt5(conn, _mt5_row(conflict_time))
+    out = _import_mt5(
+        conn, "USDJPY", H, H + timedelta(minutes=2), base_url="http://x",
+        fetch=lambda _url: _payload(
+            _bar(H), _bar(conflict_time, open=149.0, high=149.2, low=148.9,
+                          close=149.1, volume=20)))
+    assert [line.bar_time for line in out.conflict_lines] == [conflict_time.isoformat()]
+    assert out.inserted == 1
+    assert [b.ts for b in ohlcv.load_history_bars(conn, "USDJPY", "1m", source="mt5")] \
+        == [H, conflict_time]
 
 
 @pytest.mark.parametrize("delta,conflicted", [
     (5e-10, False),
     (2e-9, True),
 ], ids=["below-tolerance", "above-tolerance"])
-def test_import_mt5_conflicts_use_store_float_tolerance(
-        tmp_path, delta, conflicted):
+def test_import_mt5_conflicts_use_store_float_tolerance(tmp_path, delta, conflicted):
     conn = _conn(tmp_path)
-    ohlcv.import_history_bars(
-        conn, [("USDJPY", "1m", H.isoformat(), 148.0, 148.2, 147.9,
-                148.1, 10, None)], source="mt5")
-    fetch = lambda _url: _payload(_bar(H, close=148.1 + delta))
-
-    if conflicted:
-        with pytest.raises(ImportConflictError) as raised:
-            import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
-                       base_url="http://x", fetch=fetch)
-        assert len(raised.value.conflicts) == 1
-    else:
-        result = import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
-                            base_url="http://x", fetch=fetch)
-        assert result == ohlcv.ImportResult(0, 1, 0)
+    _seed_mt5(conn, _mt5_row(H))
+    out = _import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1), base_url="http://x",
+                      fetch=lambda _url: _payload(_bar(H, close=148.1 + delta)))
+    assert (out.conflicted, out.unchanged) == ((1, 0) if conflicted else (0, 1))
 
 
-def test_import_mt5_reports_each_conflict_in_same_window(tmp_path):
+def test_import_mt5_systematic_shift_is_blocked_with_zero_writes(tmp_path):
     conn = _conn(tmp_path)
-    second = H + timedelta(minutes=1)
-    ohlcv.import_history_bars(
-        conn, [
-            ("USDJPY", "1m", H.isoformat(), 148.0, 148.2, 147.9,
-             148.1, 10, None),
-            ("USDJPY", "1m", second.isoformat(), 149.0, 149.2, 148.9,
-             149.1, 20, None),
-        ], source="mt5")
-
-    with pytest.raises(ImportConflictError) as raised:
-        import_mt5(
-            conn, "USDJPY", H, H + timedelta(minutes=2),
-            base_url="http://x",
-            fetch=lambda _url: _payload(
-                _bar(H, open=150.0, high=150.2, low=149.9, close=150.1),
-                _bar(second, open=151.0, high=151.2, low=150.9,
-                     close=151.1)))
-
-    assert len(raised.value.conflicts) == 2
+    _seed_mt5(conn, *[_mt5_row(H + timedelta(minutes=i)) for i in range(30)])
+    shifted = [_bar(H + timedelta(minutes=i), close=148.15) for i in range(30)]
+    shifted += [_bar(H + timedelta(minutes=i)) for i in range(30, 40)]    # 新規の正常な足
+    out = _import_mt5(conn, "USDJPY", H, H + timedelta(minutes=40), base_url="http://x",
+                      fetch=lambda _url: _payload(*shifted))
+    assert out.status == "conflict_circuit_open"
+    assert (out.conflicted_new, out.n_test) == (30, 30)
+    assert _stored_row_count(conn) == 30
+    assert conn.execute("SELECT COUNT(*) FROM history_conflicts").fetchone()[0] == 0
+    assert len(out.conflict_lines) == 30
 
 
-def test_import_mt5_second_window_conflict_exposes_committed_partial_result(
-        tmp_path):
+def test_import_mt5_second_window_conflict_keeps_running_and_counts_both_windows(tmp_path):
     conn = _conn(tmp_path)
     second_start = H + timedelta(days=1)
-    ohlcv.import_history_bars(
-        conn, [("USDJPY", "1m", second_start.isoformat(), 149.0, 149.2,
-                148.9, 149.1, 20, None)], source="mt5")
+    _seed_mt5(conn, _mt5_row(second_start, o=149.0, h=149.2, low=148.9, c=149.1, v=20))
 
     def fetch(url):
-        start = datetime.fromisoformat(_query_param(url, "from"))
-        return _payload(_bar(start))
+        return _payload(_bar(datetime.fromisoformat(_query_param(url, "from"))))
 
-    with pytest.raises(ImportConflictError) as raised:
-        import_mt5(conn, "USDJPY", H, H + timedelta(days=2),
-                   base_url="http://x", fetch=fetch)
-
-    assert raised.value.partial == ohlcv.ImportResult(
-        inserted=1, unchanged=0, conflicted=1)
+    out = _import_mt5(conn, "USDJPY", H, H + timedelta(days=2),
+                      base_url="http://x", fetch=fetch)
+    assert (out.inserted, out.unchanged, out.conflicted) == (1, 0, 1)
+    assert out.status == "completed_with_conflicts"
 
 
 def test_import_mt5_normalizes_aware_non_utc_bar_time_for_join(tmp_path):
@@ -925,12 +902,12 @@ def _stored_row_count(conn) -> int:
     return conn.execute("SELECT COUNT(*) FROM ohlcv_history").fetchone()[0]
 
 
-@pytest.mark.parametrize("error", [
-    BridgeTimeRuleMismatch("time_rule_mismatch"),
-    BridgeTimeUnverified("time_rule_unverified"),
-    ValueError("broken window"),
+@pytest.mark.parametrize("error,expected_failure", [
+    (BridgeTimeRuleMismatch("time_rule_mismatch"), "time_rule_mismatch"),
+    (BridgeTimeUnverified("time_rule_unverified"), "time_rule_unverified"),
+    (ValueError("broken window"), "fetch_failed"),
 ], ids=["mismatch", "unverified", "invalid"])
-def test_import_mt5_keeps_nothing_when_a_later_window_fails(tmp_path, error):
+def test_import_mt5_keeps_nothing_when_a_later_window_fails(tmp_path, error, expected_failure):
     conn = _conn(tmp_path)
     calls = []
 
@@ -941,16 +918,16 @@ def test_import_mt5_keeps_nothing_when_a_later_window_fails(tmp_path, error):
         start = datetime.fromisoformat(_query_param(url, "from"))
         return _payload(_bar(start))
 
-    with pytest.raises(type(error)):
-        import_mt5(conn, "USDJPY", H, H + timedelta(days=3),
-                   base_url="http://x", fetch=fetch)
+    out = _import_mt5(conn, "USDJPY", H, H + timedelta(days=3),
+                      base_url="http://x", fetch=fetch)
 
+    assert (out.status, out.failure) == ("failed", expected_failure)
     assert len(calls) == 2
     assert _stored_row_count(conn) == 0
     assert not conn.in_transaction
 
 
-def test_import_mt5_commits_once_after_every_window_succeeds(tmp_path):
+def test_import_mt5_commits_the_whole_stage_in_one_batch(tmp_path):
     conn = _conn(tmp_path)
     commits = []
 

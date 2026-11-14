@@ -6,7 +6,10 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from agentic_fx.backtest.dukascopy import Tick, decode_bi5, hour_url, point_of
-from agentic_fx.store.ohlcv import ImportResult, import_history_bars
+from agentic_fx._safe_error import safe_error_text
+from agentic_fx.store.history_import import (
+    MAX_IMPORT_ROWS, ImportTooLargeError, SeriesFetchError, SeriesOutcome, SeriesSpec,
+    empty_outcome, run_series)
 
 _log = logging.getLogger(__name__)
 
@@ -45,7 +48,7 @@ def ticks_to_1m(ticks: list[Tick], symbol: str) -> list[tuple]:
     """Aggregate ticks to 1-minute bars.
 
     Converts mid=(bid+ask)/2 prices to OHLC, calculates mean spread,
-    and returns import_history_bars row tuples.
+    and returns history row tuples.
 
     Args:
         ticks: List of Tick(ts, bid, ask) objects
@@ -105,15 +108,16 @@ def ticks_to_1m(ticks: list[Tick], symbol: str) -> list[tuple]:
 
 def import_dukascopy(conn, symbol: str, start: datetime, end: datetime, *,
                      fetch=None, progress=None, sleep=None,
-                     max_requests: int = _MAX_REQUESTS) -> ImportResult:
+                     max_requests: int = _MAX_REQUESTS, **run_kw) -> SeriesOutcome:
     """Import Dukascopy tick data and aggregate to 1-minute bars.
 
-    Fetches hourly tick data files from Dukascopy, decodes them, aggregates
-    to 1-minute OHLC bars, and imports into database. Empty hours (404 or
-    empty payload) are skipped.
+    時間単位のファイルを全範囲取得・復号・1 分足へ集約してから、共通の取込の流れ
+    (`store.history_import`: 履歴 mutation lease の下で事前遮断 → batch 確定) で書く。
+    取得・復号の失敗は当該系列の履歴 0 件で、返す `SeriesOutcome` の status / failure に
+    畳む。空の時間 (404・空 payload) は飛ばす。
 
     Args:
-        conn: sqlite3 connection
+        conn: sqlite3 connection (transaction の外)
         symbol: Trading pair symbol
         start: Start time (inclusive) — aware UTC datetime on hour boundary
         end: End time (exclusive) — aware UTC datetime on hour boundary
@@ -124,18 +128,16 @@ def import_dukascopy(conn, symbol: str, start: datetime, end: datetime, *,
                time.sleep. 連続リクエストの**間**にのみ挟む (先頭の前には入れない)。
         max_requests: この呼び出しで投げる上限 (既定 500 ≈ 3 週間分)。
                長期取得は**明示的に引き上げて意図を表明する**。
-
-    Returns:
-        ImportResult with inserted, unchanged, conflicted counts.
+        run_kw: `history_import.run_series` へ渡す。
 
     Raises:
         ValueError: start/end が naive・非 UTC・正時境界でない場合。
             または要求範囲が `max_requests` を超える場合 (**1 本も投げずに拒否**)。
-        RuntimeError: 相手が 429/503 を返した場合。**再試行せず即座に中止**する
-            — 既に絞られている相手に再試行を重ねると状況を悪化させる
-            (リトライ/バックオフの設計は本設計の担当)。
+        ImportTooLargeError: 要求範囲の 1 分足の数が MAX_IMPORT_ROWS を超える場合 (何も投げない)。
+
+    相手が 429/503 を返した場合は**再試行せず即座に中止**し、failure=throttled の
+    結果にする。既に絞られている相手に再試行を重ねると状況を悪化させる。
     """
-    # F2: Validate start/end are aware UTC and on hour boundary
     for dt, name in [(start, "start"), (end, "end")]:
         if dt.tzinfo is None:
             raise ValueError(f"{name} must be timezone-aware; got naive datetime")
@@ -160,63 +162,58 @@ def import_dukascopy(conn, symbol: str, start: datetime, end: datetime, *,
             f"意図的なら max_requests を明示的に引き上げてください "
             f"(相手は無料公開サービスです — {_MIN_INTERVAL_SEC}s 間隔で "
             f"{planned} 本なら約 {planned * _MIN_INTERVAL_SEC / 60:.0f} 分かかります)")
+    if planned * 60 > MAX_IMPORT_ROWS:
+        raise ImportTooLargeError(
+            f"import_dukascopy: 期間が最大 {planned * 60} 本分で多すぎます "
+            f"(上限 {MAX_IMPORT_ROWS} 行)。何も書き込んでいません。期間を分けてください")
 
-    # Get point value for the symbol
     point = point_of(symbol)
 
-    # Initialize ImportResult counters
-    total_inserted = 0
-    total_unchanged = 0
-    total_conflicted = 0
-    sent = 0
-
-    # Iterate through hours in [start, end)
-    current = start
-    while current < end:
-        # Progress callback
-        if progress is not None:
-            progress(current)
-
-        # Fetch hourly data
-        url = hour_url(symbol, current)
-        if sent > 0:
-            # 連続リクエストの**間**にのみ挟む (先頭の前に待つ意味は無い)
-            sleep(_MIN_INTERVAL_SEC)
-        try:
-            payload = fetch(url)
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code in _THROTTLE_STATUS:
-                raise RuntimeError(
-                    f"import_dukascopy: HTTP {e.response.status_code} — "
-                    "相手にリクエストを絞られています。**再試行しません**。"
-                    f"{sent} 本目で中止しました。時間を空けてから、範囲を狭めて "
-                    "再開してください (連射すると遮断が長引きます)") from e
-            raise
-        sent += 1
-
-        # Skip empty payloads (404, no data) — only legitimate skip reasons
-        if not payload:
+    def fetch_rows() -> list[tuple]:
+        rows: list[tuple] = []
+        sent = 0
+        current = start
+        while current < end:
+            if progress is not None:
+                progress(current)
+            url = hour_url(symbol, current)
+            if sent > 0:
+                # 連続リクエストの**間**にのみ挟む (先頭の前に待つ意味は無い)
+                sleep(_MIN_INTERVAL_SEC)
+            try:
+                payload = fetch(url)
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in _THROTTLE_STATUS:
+                    raise SeriesFetchError(
+                        "throttled",
+                        f"HTTP {e.response.status_code} — 相手にリクエストを絞られています。"
+                        f"**再試行しません**。{sent} 本目で中止しました。時間を空けてから、"
+                        "範囲を狭めて再開してください (連射すると遮断が長引きます)",
+                        type(e).__name__) from e
+                raise SeriesFetchError(
+                    "fetch_failed", safe_error_text(e), type(e).__name__) from e
+            except Exception as e:
+                raise SeriesFetchError(
+                    "fetch_failed", safe_error_text(e), type(e).__name__) from e
+            sent += 1
+            current_hour = current
             current += timedelta(hours=1)
-            continue
+            # 空 payload (404・データ無し) だけが正当に飛ばせる
+            if not payload:
+                continue
+            try:
+                ticks = decode_bi5(payload, point=point, hour_start_utc=current_hour)
+            except Exception as e:      # 壊れたデータは黙って飛ばさず、この系列の失敗にする
+                raise SeriesFetchError(
+                    "invalid_response", f"decode failed at {current_hour.isoformat()}",
+                    type(e).__name__) from e
+            if ticks:
+                rows.extend(ticks_to_1m(ticks, symbol))
+                if len(rows) > MAX_IMPORT_ROWS:
+                    raise SeriesFetchError("too_large")
+        return rows
 
-        # F1: Decode bi5 payload — exceptions propagate (corrupt data should fail, not silently skip)
-        ticks = decode_bi5(payload, point=point, hour_start_utc=current)
-
-        # Skip if no valid ticks (all records rejected or incomplete)
-        if not ticks:
-            current += timedelta(hours=1)
-            continue
-
-        # Aggregate to 1-minute bars
-        rows = ticks_to_1m(ticks, symbol)
-
-        # Import bars into database
-        if rows:
-            result = import_history_bars(conn, rows, source="dukascopy")
-            total_inserted += result.inserted
-            total_unchanged += result.unchanged
-            total_conflicted += result.conflicted
-
-        current += timedelta(hours=1)
-
-    return ImportResult(total_inserted, total_unchanged, total_conflicted)
+    spec = SeriesSpec("dukascopy", "1m", symbol, start, end, end, fetch_rows)
+    if start >= end:
+        return empty_outcome(spec)
+    return run_series(conn, spec, **run_kw)

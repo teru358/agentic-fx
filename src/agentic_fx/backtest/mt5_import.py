@@ -1,7 +1,8 @@
 """MT5 bridge 一括インポータ + 価格系差照合。
 
 MT5 bridge (`GET {base}/ohlcv/{sym}?from=ISO&to=ISO&interval=1m`) から
-1 分足を 1 日窓でページングして取り込み (`import_history_bars(source="mt5")`)、
+1 分足を 1 日窓でページングして全取得し、共通の取込の流れ
+(`store.history_import`: 事前遮断 → batch 確定) で取り込む。
 Dukascopy 等の他 source と重複期間の close 差を照合する。
 
 MT5 は bid 系列 — mid 近似としてそのまま保存する (spec §6 の但し書きどおり。
@@ -21,29 +22,15 @@ import httpx
 from agentic_fx.datafeed.price_provider import _SPECS
 from agentic_fx.datafeed.closed_bars import normalize_closed_range
 from agentic_fx.core.contracts import Bar
-from agentic_fx.datafeed.sources import _mt5_headers, _raise_mt5_time_rule_error
-from agentic_fx.store.ohlcv import ImportResult, import_history_bars
+from agentic_fx._safe_error import safe_error_text
+from agentic_fx.datafeed.sources import (
+    BridgeTimeRuleMismatch, BridgeTimeUnverified, _mt5_headers,
+    _raise_mt5_time_rule_error)
+from agentic_fx.store.history_import import (
+    MAX_IMPORT_ROWS, ImportTooLargeError, SeriesFetchError, SeriesOutcome, SeriesSpec,
+    empty_outcome, run_series)
 
 _log = logging.getLogger(__name__)
-
-
-class ImportConflictError(ValueError):
-    """An MT5 window contained values conflicting with immutable history."""
-
-    def __init__(self, conflicts, partial: ImportResult, message=None):
-        self.conflicts = conflicts
-        self.partial = partial
-        super().__init__(message or f"MT5 import conflicts: {len(conflicts)} row(s)")
-
-
-# 1 回の取り込みでメモリに溜める行数の上限。全窓を取得・検証してから 1 回で書くため、
-# 行はすべて書込み前に保持される。1 行 (9 要素の tuple、float 5 個、ISO 文字列) は
-# 約 0.4 KB なので、100 万行で約 0.4 GB。1m の 1 年分 (約 37 万行) の 2.7 倍にあたる。
-MAX_IMPORT_ROWS = 1_000_000
-
-
-class ImportTooLargeError(ValueError):
-    """The requested import would hold more rows than MAX_IMPORT_ROWS."""
 
 
 def _too_large_message(start: datetime, end: datetime, detail: str) -> str:
@@ -225,40 +212,79 @@ def _validated_window_rows(payload, *, symbol: str, interval: str,
     return rows, right_edge_count
 
 
+def _fetch_all_windows(*, symbol, interval, start, end, base_url, fetch, now, grace):
+    """全窓を取得・検証して行を返す。DB には触れない。失敗は SeriesFetchError。"""
+    rows: list[tuple] = []
+    right_edge_drops = 0
+    current = start
+    while current < end:
+        window_end = min(current + timedelta(days=1), end)
+        url = _window_url(base_url, symbol, current, window_end, interval)
+        try:
+            payload = fetch(url)
+        except BridgeTimeRuleMismatch as exc:
+            raise SeriesFetchError("time_rule_mismatch", error_type=type(exc).__name__)
+        except BridgeTimeUnverified as exc:
+            raise SeriesFetchError("time_rule_unverified", error_type=type(exc).__name__)
+        except Exception as exc:
+            raise SeriesFetchError(
+                "fetch_failed", safe_error_text(exc), type(exc).__name__) from exc
+        try:
+            window_rows, window_right_edges = _validated_window_rows(
+                payload, symbol=symbol, interval=interval, current=current,
+                window_end=window_end, now=now, grace=grace)
+        except ValueError as exc:
+            raise SeriesFetchError(
+                "invalid_response",
+                f"failed window [{current.isoformat()}, {window_end.isoformat()}): {exc}",
+                type(exc).__name__) from exc
+        right_edge_drops += window_right_edges
+        rows.extend(window_rows)
+        if len(rows) > MAX_IMPORT_ROWS:
+            raise SeriesFetchError("too_large")
+        current = window_end
+    if right_edge_drops > 0:
+        # 期待どおりの挙動なので debug。ただし件数は残す — bridge が exclusive へ変われば
+        # ここが 0 になり、窓数より大きく増えれば bridge 側の異常を疑える。
+        _log.debug(
+            "import_mt5: dropped %d right-edge bar(s) at window_end for "
+            "symbol=%s (bridge returns \"to\" inclusive; picked up by the "
+            "next window)", right_edge_drops, symbol)
+    return rows
+
+
 def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
                base_url: str, fetch=None, interval: str = "1m",
                clock: Callable[[], datetime] | None = None,
-               grace: timedelta = DEFAULT_GRACE) -> ImportResult:
-    """MT5 bridge から 1 分足を 1 日窓でページングして取り込む。
+               grace: timedelta = DEFAULT_GRACE, **run_kw) -> SeriesOutcome:
+    """MT5 bridge から足を 1 日窓でページングして全取得し、遮断判定のうえ取り込む。
 
     Args:
-        conn: sqlite3 connection
+        conn: sqlite3 connection (transaction の外)
         symbol: 取引ペア
-        start: 開始 (inclusive) — aware UTC 必須 (naive は ValueError)
-        end: 終了 (exclusive) — aware UTC 必須 (naive は ValueError)
+        start: 開始 (inclusive) — aware UTC 必須
+        end: 終了 (exclusive) — aware UTC 必須
         base_url: bridge のベース URL
-        fetch: Optional fetch function (url: str) -> dict。既定は
-            `_default_fetch` (httpx + raise_for_status)。
+        fetch: (url: str) -> dict。既定は `_default_fetch` (httpx + raise_for_status)。
         clock: 現在時刻 (aware) を返す関数。処理の最初に 1 回だけ読み、全窓の
             確定判定と実効終端に同じ値を使う。既定は実時計。
         grace: 確定判定の猶予。ライブの closed_bar_grace_sec と同じ値を渡す。
+        run_kw: `history_import.run_series` へ渡す (origin / run_id / admission 等)。
 
     終端: 保存するのは ``start <= t < E`` かつ ``t + 幅 + grace <= T`` の足だけ。
-    ``E = effective_import_end(end, T, ...)`` なので、未来の ``end`` は切り詰められ、
+    ``E = effective_import_end(end, T, ...)`` なので未来の ``end`` は切り詰められ、
     確定済みでも直近 1 本分は余裕として保存しない。``start >= E`` なら
-    HTTP 取得も書込みもせず ImportResult(0, 0, 0) を返す。
+    取得も書込みもせず ok の結果 (全件 0) を返す。
 
-    Returns:
-        ImportResult (inserted/unchanged/conflicted 合算)。
+    全窓の取得・検証が終わってから、履歴 mutation lease の下で分類・遮断判定・batch 確定を行う。
+    取得・検証・遮断・書込みの失敗は例外にせず、返す `SeriesOutcome` の status / failure に
+    畳む (確定済みの batch は残る)。窓終端ちょうどの 1 本 (bridge の ``to`` は inclusive) は
+    次の窓が取り直すので黙って落とす。
 
     Raises:
-        ValueError: start/end が naive、または UTC 以外の場合。bridge 応答の
-            time が naive の場合も拒否する。
-            または bridge が返したバーの time が要求窓の外にある場合
-            (F5, 最終レビュー codex I2 — fail loud)。**窓終端ちょうどは
-            例外にせず黙って落とす** — bridge の `to` は inclusive で
-            (実機実測)、その 1 本は次のページング窓が取り直すため欠損しない。
-            最終窓の右端だけは落ちるが `end` は exclusive なのでそれが正しい。
+        ValueError: start/end が naive・UTC 以外・格子外・start >= end、interval 不正、
+            clock が naive の場合 (何も取得しない)。
+        ImportTooLargeError: 期間の格子数が MAX_IMPORT_ROWS を超える場合 (何も取得しない)。
     """
     for dt, name in [(start, "start"), (end, "end")]:
         if dt.tzinfo is None:
@@ -282,84 +308,29 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
     if now.tzinfo is None:
         raise ValueError("clock must return a timezone-aware datetime")
     now = now.astimezone(timezone.utc)
-    end = effective_import_end(end, now, grace=grace,
-                               interval=interval)
-    if start >= end:
-        _log.info("import_mt5: no confirmed bars to import for symbol=%s "
-                  "(effective end %s)", symbol, end.isoformat())
-        return ImportResult(0, 0, 0)
+    requested_end = end
+    end = effective_import_end(end, now, grace=grace, interval=interval)
 
     # 窓ごとの行数は窓の格子数を超えられない (検証済み) ので、期間の格子数で保持行数の上限が決まる。
-    slots = int((end - start).total_seconds()) // width_sec
-    if slots > MAX_IMPORT_ROWS:
-        raise ImportTooLargeError(_too_large_message(
-            start, end, f"期間が最大 {slots} 本分で多すぎます"))
+    if start < end:
+        slots = int((end - start).total_seconds()) // width_sec
+        if slots > MAX_IMPORT_ROWS:
+            raise ImportTooLargeError(_too_large_message(
+                start, end, f"期間が最大 {slots} 本分で多すぎます"))
+    else:
+        _log.info("import_mt5: no confirmed bars to import for symbol=%s "
+                  "(effective end %s)", symbol, end.isoformat())
 
-    total_inserted = 0
-    total_unchanged = 0
-    total_conflicted = 0
-    right_edge_drops = 0
+    def fetch_rows() -> list[tuple]:
+        return _fetch_all_windows(
+            symbol=symbol, interval=interval, start=start, end=end,
+            base_url=base_url, fetch=fetch, now=now, grace=grace)
 
-    # 全窓を先に取得して検証し、メモリに溜める (HTTP を待つ間は DB の書き込み
-    # lock を握らない)。どれかの窓で bridge が拒否したり応答が不正だったり
-    # したら、何も書かずに止める。書込みは最後に 1 回の短い transaction で行い、
-    # 既存行との食い違い (conflict) だけは、人が確認する停止としてそこまでの
-    # 窓を確定してから上げる。
-    pending: list[list[tuple]] = []
-    current = start
-    while current < end:
-        window_end = min(current + timedelta(days=1), end)
-        url = _window_url(base_url, symbol, current, window_end, interval)
-        payload = fetch(url)
-        try:
-            rows, window_right_edges = _validated_window_rows(
-                payload, symbol=symbol, interval=interval, current=current,
-                window_end=window_end, now=now, grace=grace)
-        except ValueError as exc:
-            raise ValueError(
-                f"import_mt5: failed window [{current.isoformat()}, "
-                f"{window_end.isoformat()}): {exc}. 何も書き込んでいません。"
-                f"開始 {start.isoformat()} から取り直してください") from exc
-        right_edge_drops += window_right_edges
-        if rows:
-            pending.append(rows)
-        current = window_end
-
-    owns_transaction = not conn.in_transaction
-    if owns_transaction:
-        conn.execute("BEGIN")
-    try:
-        for rows in pending:
-            result = import_history_bars(
-                conn, rows, source="mt5", commit=False)
-            total_inserted += result.inserted
-            total_unchanged += result.unchanged
-            total_conflicted += result.conflicted
-            if result.conflicted > 0:
-                partial = ImportResult(
-                    total_inserted, total_unchanged, total_conflicted)
-                if owns_transaction:
-                    conn.commit()
-                raise ImportConflictError(result.conflicts, partial=partial)
-    except ImportConflictError:
-        raise
-    except BaseException:
-        if owns_transaction and conn.in_transaction:
-            conn.rollback()
-        raise
-    if owns_transaction:
-        conn.commit()
-
-    if right_edge_drops > 0:
-        # 期待どおりの挙動なので debug。ただし**件数は残す** — bridge が
-        # exclusive へ変わればここが 0 になり、逆に窓数より大きく増えれば
-        # bridge 側の異常を疑える。
-        _log.debug(
-            "import_mt5: dropped %d right-edge bar(s) at window_end for "
-            "symbol=%s (bridge returns \"to\" inclusive; picked up by the "
-            "next window)", right_edge_drops, symbol)
-
-    return ImportResult(total_inserted, total_unchanged, total_conflicted)
+    spec = SeriesSpec("mt5", interval, symbol, start, requested_end,
+                      max(start, end), fetch_rows)
+    if start >= end:
+        return empty_outcome(spec)
+    return run_series(conn, spec, now=lambda: now, **run_kw)
 
 
 def compare_sources(conn, symbol: str, settings, *,

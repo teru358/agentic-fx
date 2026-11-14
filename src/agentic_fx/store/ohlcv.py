@@ -244,14 +244,7 @@ class ImportResult:
 
 
 def _close_enough(a: float | None, b: float | None) -> bool:
-    # /code-review 2 周目 CR6 是正 (2026-09-12): `db._values_match`
-    # (公開名 `db.values_match`) へ委譲する — このモジュールの独自複製を
-    # 廃止する。`db._values_match` は frozen `_FLOAT_TOL` (import 時点の
-    # 値) を閉じているため、`ohlcv._FLOAT_TOL` (同じく frozen、モジュール
-    # 冒頭で束縛済み) と挙動は完全に一致する
-    # (`test_store_float_tolerance_is_shared_and_has_the_same_boundaries`
-    # が `db.FLOAT_TOL` を monkeypatch しても両者の判定境界が変わらない
-    # ことを pin している — この委譲後も成立する)。
+    # 許容差の判定は `db.values_match` が唯一の定義。ここに独自の複製を持たない。
     return db.values_match(a, b)
 
 
@@ -309,8 +302,12 @@ def _validate_and_normalize_row(idx: int, row: tuple) -> tuple:
 
 def import_history_bars(conn: sqlite3.Connection, rows: list[tuple], *,
                         source: str, commit: bool = True) -> ImportResult:
-    """一括インポータ用。既存行は不変 — 同一キー同一値は無変更 (unchanged)、
-    値が異なる既存行は入力をスキップして件数だけ計上する (conflicted)。
+    """衝突を記録しない低水準の投入。履歴取込の経路ではない。
+
+    取込 (MT5 / Dukascopy の import) は `history_import.run_series` を通り、衝突の記録・
+    事前遮断・batch 確定は `classify_history_rows` / `apply_classified_history` が担う。
+    この関数は既存行を変えず (同値は unchanged、異値は入力を捨てて conflicted と数える)、
+    異値の記録も遮断もしない。fixture の下地など、記録が要らない投入だけに使う。
 
     rows: (symbol, interval, bar_time_iso, o, h, l, c, volume, spread|None)
 
@@ -318,13 +315,12 @@ def import_history_bars(conn: sqlite3.Connection, rows: list[tuple], *,
     source 名 (例: "yfinance") をここから書くと `ohlcv_history` の
     「削除しない」保証をライブキャッシュの上書きセマンティクスで穢すため。
 
-    バッチ原子性: (1) 書き込み前に全行を検証・正規化し、(2) 実際の書き込みは
-    `SAVEPOINT` で明示的に囲み、例外時は `ROLLBACK TO SAVEPOINT` してから
-    再送出する。
+    原子性: 書き込み前に全行を検証・正規化し、書き込みは `SAVEPOINT` で囲んで、
+    例外時は `ROLLBACK TO SAVEPOINT` してから再送出する。
 
-    `commit=False` は呼び出し側の transaction の中で複数回に分けて書くとき
-    の指定で、commit も rollback もしない (呼び出し側が決める)。transaction
-    の外で指定すると最外の SAVEPOINT の RELEASE が commit になるので拒否する。
+    `commit=False` は呼び出し側の transaction の中で書くときの指定で、commit も
+    rollback もしない。transaction の外で指定すると最外の SAVEPOINT の RELEASE が
+    commit になるので拒否する。
     """
     if source not in IMPORT_SOURCES:
         raise ValueError(
@@ -344,10 +340,7 @@ def import_history_bars(conn: sqlite3.Connection, rows: list[tuple], *,
     conn.execute("SAVEPOINT import_history_bars")
     try:
         # 行単位ループは意図的 — inserted/unchanged/conflicted の三分計上は
-        # 集合演算 (executemany + 一括 diff) では再現できない。migration 側を
-        # 集合演算にしたのはロック保持時間の制約によるもので、ここはプロファイル
-        # が別 (前景・窓分割済み・SAVEPOINT 直後に commit)。1 コールで 10 万行
-        # 超を流す呼び出し元が生まれたら再評価する (実測 10 万行 0.33s)。
+        # 集合演算 (executemany + 一括 diff) では再現できない。fixture 用の小さな投入が前提。
         for (symbol, interval, bar_time_iso, o, h, l, c, volume,  # noqa: E741
              spread) in normalized_rows:
             cur = conn.execute(
@@ -521,6 +514,9 @@ def classify_history_rows(conn: sqlite3.Connection, rows: list[tuple], *,
             f"classify_history_rows: source={source!r} は IMPORT_SOURCES "
             f"{sorted(IMPORT_SOURCES)} に含まれません")
     normalized = [_validate_and_normalize_row(i, row) for i, row in enumerate(rows)]
+    if len({(row[0], row[1]) for row in normalized}) > 1:
+        raise InconsistentInputError(
+            "classify_history_rows: input mixes more than one (symbol, interval) series")
     seen: dict[tuple, tuple] = {}
     for symbol, interval, bar_time, o, h, l, c, volume, spread in normalized:  # noqa: E741
         key = (symbol, interval, bar_time)
@@ -584,13 +580,19 @@ def apply_classified_history(conn: sqlite3.Connection,
                              max_rows: int = BATCH_MAX_ROWS,
                              budget_seconds: float = BATCH_BUDGET_SECONDS,
                              clock=time.monotonic,
-                             on_batch=None) -> ApplyResult:
+                             on_batch=None, admission=None,
+                             before_batch=None) -> ApplyResult:
     """分類済みの系列を短い BEGIN IMMEDIATE batch に分けて確定する。
 
     各 batch で履歴 INSERT と衝突 upsert を同じ transaction で確定する。
     `on_batch(conn, BatchProgress)` は commit 直前の同じ transaction で呼ばれ、
     進捗の永続化に使う。失敗した batch は全て rollback し、確定済みの batch は残す。
     遮断条件に当たる分類は書込み 0 件のまま拒否する。
+
+    `admission` (WriterAdmission) があれば batch ごとに BEGIN の前から commit / rollback の
+    後まで lease を取る。通らなければ database_busy で止める。`before_batch()` は各 batch の
+    前に呼ばれ、失敗コードの文字列を返すとそこで新しい batch を始めずに止める。
+    unchanged 行も適用時に既存値を再照合し、変わっていれば concurrent_change で batch を戻す。
     """
     if origin not in ORIGINS:
         raise ValueError(f"apply_classified_history: origin={origin!r} is not in {ORIGINS}")
@@ -607,11 +609,23 @@ def apply_classified_history(conn: sqlite3.Connection,
     done = 0
     failure = error_type = None
     while done < total:
+        if before_batch is not None:
+            stop = before_batch()
+            if stop is not None:
+                failure = stop
+                break
         started = clock()
         batch_end = done
         b_ins = b_unc = b_new = b_known = 0
+        admitted = False
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            if admission is not None:
+                admitted = admission.admit(lambda: conn.execute("BEGIN IMMEDIATE"))
+                if not admitted:
+                    failure = "database_busy"
+                    break
+            else:
+                conn.execute("BEGIN IMMEDIATE")
             if history_epoch(conn) != classification.epoch:
                 raise _EpochChanged()
             while batch_end < total:
@@ -627,8 +641,6 @@ def apply_classified_history(conn: sqlite3.Connection,
                     if cur.rowcount != 1:
                         raise _ConcurrentChange()
                     b_ins += 1
-                elif entry.kind == "unchanged":
-                    b_unc += 1
                 else:
                     current = conn.execute(
                         "SELECT open, high, low, close, volume, spread FROM ohlcv_history "
@@ -638,6 +650,9 @@ def apply_classified_history(conn: sqlite3.Connection,
                     if current is None or tuple(current[n] for n in _VALUE_COLUMNS) \
                             != entry.existing:
                         raise _ConcurrentChange()
+                if entry.kind == "unchanged":
+                    b_unc += 1
+                elif entry.kind == "conflict":
                     history_conflicts.upsert(
                         conn, source=classification.source, interval=entry.interval,
                         symbol=entry.symbol, bar_time=entry.bar_time,
@@ -670,6 +685,9 @@ def apply_classified_history(conn: sqlite3.Connection,
             except sqlite3.Error:
                 pass
             raise
+        finally:
+            if admitted:
+                admission.end()
         inserted += b_ins
         unchanged += b_unc
         new_c += b_new

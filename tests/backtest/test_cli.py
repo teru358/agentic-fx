@@ -22,7 +22,7 @@ import pytest
 import agentic_fx.backtest.cli as cli
 from agentic_fx.backtest import runner as runner_module
 from agentic_fx.backtest.dataset import HistoryDataset
-from agentic_fx.backtest.mt5_import import ImportConflictError
+from agentic_fx.store.history_import import ConflictLine, SeriesOutcome
 from agentic_fx.backtest.runner import BacktestResult
 from tests.backtest.factories import DATASET_1M
 from tests.fixtures.fs_tree import tree_snapshot
@@ -155,7 +155,7 @@ def test_cli_history_import_calls_importer(tmp_path, monkeypatch):
     _install_settings(tmp_path)
     with patch("agentic_fx.backtest.cli.ensure_initialized"), \
          patch("agentic_fx.backtest.cli.import_dukascopy") as imp:
-        imp.return_value = MagicMock(inserted=10, unchanged=0, conflicted=0)
+        imp.return_value = _series(inserted=10)
         rc = main(["history", "import", "--source", "dukascopy",
                    "--symbol", "USDJPY",
                    "--from", "2026-07-01", "--to", "2026-07-02"])
@@ -201,7 +201,7 @@ def test_cli_history_import_mt5_dispatches_to_import_mt5(tmp_path, monkeypatch):
     with patch("agentic_fx.backtest.cli.ensure_initialized"), \
          patch("agentic_fx.backtest.cli.import_dukascopy") as duka, \
          patch("agentic_fx.backtest.cli.import_mt5") as mt5imp:
-        mt5imp.return_value = MagicMock(inserted=1, unchanged=0, conflicted=0)
+        mt5imp.return_value = _series(inserted=1)
         # settings.yaml.example の datafeed.mt5.bridge_url は設定済み
         rc = main(["history", "import", "--source", "mt5",
                    "--symbol", "USDJPY",
@@ -219,7 +219,7 @@ def test_cli_history_import_mt5_passes_explicit_interval(tmp_path, monkeypatch):
     _install_settings(tmp_path)
     with patch("agentic_fx.backtest.cli.ensure_initialized"), \
          patch("agentic_fx.backtest.cli.import_mt5") as mt5imp:
-        mt5imp.return_value = MagicMock(inserted=1, unchanged=0, conflicted=0)
+        mt5imp.return_value = _series(inserted=1)
         rc = main(["history", "import", "--source", "mt5",
                    "--symbol", "USDJPY", "--interval", "5m",
                    "--from", "2026-07-01", "--to", "2026-07-02"])
@@ -275,27 +275,77 @@ def test_cli_history_import_rejects_far_future_microsecond_misalignment(
     assert "格子" in capsys.readouterr().err
 
 
-def test_cli_history_import_conflict_prints_details_and_returns_3(
-        tmp_path, monkeypatch, capsys):
+def _series(status="ok", **kw):
+    return SeriesOutcome("mt5", "5m", "USDJPY", status, "2026-07-01T00:00:00+00:00",
+                         "2026-07-02T00:00:00+00:00", "2026-07-02T00:00:00+00:00", "op", **kw)
+
+
+def _conflict_line(known=False):
+    return ConflictLine(1, "open", known, "2026-07-01T00:00:00+00:00", "none",
+                        (148.0, 148.2, 147.9, 148.1, 10.0, None),
+                        (149.0, 149.2, 148.9, 149.1, 20.0, None))
+
+
+def _run_import(tmp_path, monkeypatch, outcome, *, source="mt5", target="import_mt5"):
     monkeypatch.chdir(tmp_path)
     _install_settings(tmp_path)
-    conflict = ("USDJPY", "5m", "2026-07-01T00:00:00+00:00",
-                (148.0, 148.2, 147.9, 148.1, 10.0),
-                (149.0, 149.2, 148.9, 149.1, 20.0))
     with patch("agentic_fx.backtest.cli.ensure_initialized"), \
-         patch("agentic_fx.backtest.cli.import_mt5",
-               side_effect=ImportConflictError(
-                   [conflict], MagicMock(
-                       inserted=7, unchanged=8, conflicted=1))):
-        rc = main(["history", "import", "--source", "mt5",
-                   "--symbol", "USDJPY", "--interval", "5m",
-                   "--from", "2026-07-01", "--to", "2026-07-02"])
+         patch(f"agentic_fx.backtest.cli.{target}", return_value=outcome):
+        return main(["history", "import", "--source", source, "--symbol", "USDJPY",
+                     "--from", "2026-07-01", "--to", "2026-07-02"])
+
+
+def test_cli_history_import_conflict_prints_details_and_returns_3(
+        tmp_path, monkeypatch, capsys):
+    outcome = _series("completed_with_conflicts", inserted=7, unchanged=8,
+                      conflicted_new=1, conflict_lines=(_conflict_line(),))
+    assert _run_import(tmp_path, monkeypatch, outcome) == 3
+    captured = capsys.readouterr()
+    assert ("conflict id=1 state=open new source=mt5 symbol=USDJPY interval=5m "
+            "bar_time=2026-07-01T00:00:00+00:00 epoch=none") in captured.err
+    assert "existing=(148.0, 148.2, 147.9, 148.1, 10.0, None)" in captured.err
+    assert "incoming=(149.0, 149.2, 148.9, 149.1, 20.0, None)" in captured.err
+    assert "result=completed_with_conflicts rc=3" in captured.out
+    assert "inserted=7 unchanged=8 conflicted=1" in captured.out
+
+
+def test_cli_history_import_dukascopy_conflict_now_returns_3(tmp_path, monkeypatch, capsys):
+    outcome = _series("completed_with_conflicts", conflicted_new=1,
+                      conflict_lines=(_conflict_line(),))
+    rc = _run_import(tmp_path, monkeypatch, outcome, source="dukascopy",
+                     target="import_dukascopy")
     assert rc == 3
+
+
+def test_cli_history_import_circuit_open_returns_4_and_says_nothing_was_persisted(
+        tmp_path, monkeypatch, capsys):
+    outcome = _series("conflict_circuit_open", conflicted_new=30, n_overlap=30, n_test=30,
+                      conflict_lines=(_conflict_line(),) * 30)
+    assert _run_import(tmp_path, monkeypatch, outcome) == 4
     err = capsys.readouterr().err
-    assert "conflict symbol=USDJPY interval=5m bar_time=" + conflict[2] in err
-    assert "existing=(148.0, 148.2, 147.9, 148.1, 10.0)" in err
-    assert "incoming=(149.0, 149.2, 148.9, 149.1, 20.0)" in err
-    assert "partial inserted=7 unchanged=8 conflicted=1" in err
+    assert "persisted=false" in err and "omitted=25" in err
+
+
+@pytest.mark.parametrize("failure,fragment", [
+    ("time_rule_mismatch", "time_rule_mismatch"),
+    ("time_rule_unverified", "time_rule_unverified"),
+])
+def test_cli_history_import_time_rule_failures_return_1(
+        tmp_path, monkeypatch, capsys, failure, fragment):
+    outcome = _series("failed", failure=failure)
+    assert _run_import(tmp_path, monkeypatch, outcome) == 1
+    assert fragment in capsys.readouterr().err
+
+
+def test_cli_history_import_partial_failure_returns_1_and_names_the_rerun(
+        tmp_path, monkeypatch, capsys):
+    outcome = _series("partial", inserted=3, failure="database_busy", error_type=None,
+                      last_committed_bar_time="2026-07-01T00:10:00+00:00",
+                      resume_from="2026-07-01T00:15:00+00:00")
+    assert _run_import(tmp_path, monkeypatch, outcome) == 1
+    err = capsys.readouterr().err
+    assert "reason=database_busy" in err and "remaining=[2026-07-01T00:15:00+00:00," in err
+    assert "再実行" in err
 
 
 def test_cli_history_import_mt5_requires_bridge_url(tmp_path, monkeypatch):

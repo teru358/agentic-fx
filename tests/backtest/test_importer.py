@@ -175,9 +175,10 @@ def test_import_dukascopy_aborts_on_429_without_retrying(tmp_path):
             "429", request=httpx.Request("GET", url),
             response=httpx.Response(429, request=httpx.Request("GET", url)))
 
-    with pytest.raises(RuntimeError, match="429"):
-        import_dukascopy(conn, "USDJPY", H, H + timedelta(hours=5),
-                         fetch=fetch, sleep=lambda s: None)
+    out = import_dukascopy(conn, "USDJPY", H, H + timedelta(hours=5),
+                           fetch=fetch, sleep=lambda s: None)
+    assert (out.status, out.failure) == ("failed", "throttled")
+    assert "429" in out.detail
 
     assert len(calls) == 1, "429 の後も叩き続けている"
 
@@ -193,9 +194,10 @@ def test_import_dukascopy_aborts_on_503_without_retrying(tmp_path):
             "503", request=httpx.Request("GET", url),
             response=httpx.Response(503, request=httpx.Request("GET", url)))
 
-    with pytest.raises(RuntimeError, match="503"):
-        import_dukascopy(conn, "USDJPY", H, H + timedelta(hours=5),
-                         fetch=fetch, sleep=lambda s: None)
+    out = import_dukascopy(conn, "USDJPY", H, H + timedelta(hours=5),
+                           fetch=fetch, sleep=lambda s: None)
+    assert (out.status, out.failure) == ("failed", "throttled")
+    assert "503" in out.detail
 
     assert len(calls) == 1
 

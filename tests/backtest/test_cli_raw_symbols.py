@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from agentic_fx.entry import main
+from agentic_fx.store.history_import import SeriesOutcome
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -24,7 +25,8 @@ def test_history_import_coverage_and_corr_keep_their_contract_for_a_raw_symbol(
          patch("agentic_fx.backtest.cli.import_mt5") as importer, \
          patch("agentic_fx.backtest.cli.coverage_report") as coverage, \
          patch("agentic_fx.backtest.cli.corr_matrix") as corr:
-        importer.return_value = MagicMock(inserted=1, unchanged=0, conflicted=0)
+        importer.return_value = SeriesOutcome(
+            "mt5", "1m", "JP225", "ok", "a", "b", "c", "op", inserted=1)
         coverage.return_value = {"bars": 1, "expected_open_bars": 1, "gap_pct": 0.0}
         corr.return_value = {("JP225", "US500"): 0.5}
         assert main(["history", "import", "--source", "mt5", "--symbol", "JP225",
