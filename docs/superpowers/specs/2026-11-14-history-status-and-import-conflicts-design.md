@@ -1,7 +1,7 @@
-# 評価用履歴の表示と import 衝突継続 — 設計 C2.1
+# 評価用履歴の表示と import 衝突継続 — 設計 C2.2
 
 日付: 2026-11-14。対象: `status-history-hidden-while-daemon-runs` / `history-import-stops-at-first-conflict`。
-状態: C2.1。2026-11-14 利用者承認、実装中。関連原本仕様・コードの変更は task とする。
+状態: C2.2。2026-11-14 利用者承認 (C2.1)、遮断器の既知除外を技術判断で追加。実装中。関連原本仕様・コードの変更は task とする。
 基準: 設計レビュー opus 1 周目と terra の閉鎖確認 2 回 (非公開の記録)。参照: 段1a `docs/superpowers/specs/2026-11-11-backtest-history-freshness-guard-design.md`、同期の設計 (段 2・3、レビュー中)、評価区間の設計 (レビュー中)。
 
 ## 1. 動作目線
@@ -63,9 +63,9 @@ unknown の DB 接続は **URI `mode=ro` を強制し、sidecar の有無にか�
 
 各操作・系列の全取得・検証と事前判定を終えてから batch 書込みする。遮断されたgenerationは履歴・衝突表とも書込み0件。再開前の確定prefixは維持し別表示する。他の正常銘柄の処理は進める。遮断時は永続衝突が保存されたと表示しない。
 
-通常の衝突は時刻順に全件 (最大20件、§2.3) を人間向け stderr に旧新の OHLC/volume/spread、source、symbol、interval、bar_time、epoch、conflict id、state とともに表示する。完走結果には `processed=[start,effective_end)` と requested/effective_end、inserted/unchanged/conflicted を出す。gap があれば処理済みと充足済みを混同しない。`remaining_due_to_conflict=none` は出さない。
+通常の衝突は新規・既知を分け、時刻順に最大20件 (§2.3) を人間向け stderr に旧新の OHLC/volume/spread、source、symbol、interval、bar_time、epoch、conflict id、state とともに表示する。完走結果には `processed=[start,effective_end)` と requested/effective_end、inserted/unchanged/conflicted を出す。gap があれば処理済みと充足済みを混同しない。`remaining_due_to_conflict=none` は出さない。
 
-遮断時は `conflict_circuit_open`、重複行数N、衝突数C、割合、閾値、時刻順先頭5件の旧新値、`omitted=C-shown`、`persisted=false` を出す。全件の永続保存のために遮断を迂回して再実行しない。人間が取り直して比較する手順を案内する。
+遮断時は `conflict_circuit_open`、重複行数 `N_overlap`、`N_test`、`C_new / C_known`、新規割合と閾値、時刻順先頭5件の旧新値、`omitted=(C_new+C_known)-shown`、`persisted=false` を出す。全件の永続保存のために遮断を迂回して再実行しない。人間が取り直して比較する手順を案内する。
 
 ## 2. 仕組み
 
@@ -99,17 +99,25 @@ C0の「配備4 strategy版」と評価区間C2の「strategy名2件」は単位
 
 判定単位は固定された取得操作の1系列 `(source, interval, symbol)` と、その要求区間集合 (admission generation) とする。日窓やbatchで分母をリセットしない。同期の recent と独立した古いgap日窓は別操作としてよいが、閾値を通すための分割は禁止する。複数gapを一操作で取得するなら全窓を一括判定する。要求を確定済みの実効終端へ切り詰め、全窓を取得・検証し、同一bar keyを正規化・重複除去する。同一keyで入力内の値が異なれば応答不正として書込み0件で失敗する。
 
-N = 入力のうち既存keyと重なる行数 (unchanged + conflicted)、C = `values_match` で異値の行数。新規行はNに入れない。N=0なら割合0とする。
+**C2.2 の判定契約 (同期 r2 I-4 の正本)**。`values_match` による分類後、同じ mutation lease 下で現在の系列・bar key・history_epoch・existing_digest・incoming_digest が完全一致する `open / kept` を探す。その再観測だけが `C_known`。値・epoch・旧新いずれかのdigestが変われば `C_new`、`replaced / superseded` は既知扱いしない。許容差だけの差は従来どおり unchanged であり、digest比較を先行させない。
 
-**初期固定規則: `C > 20 OR (C >= 2 AND 100*C > N)` なら遮断する。** 割合は整数比較による1%超。ちょうど1%は通すが件数制限は別に効く。1本だけの孤立衝突は少ない重複で割合が高くても続行し、複数本の高率不一致は小窓でも遮断する。
+`N_overlap = unchanged + C_new + C_known`、遮断用の **`N_test = unchanged + C_new`** とする。新規行はどちらにも入れず、既知異値で割合を希釈しない。監査上の conflicted は `C_new + C_known`。通過したときは既知も seen_count/last_seen_at/last_origin/last_run_id を通常のbatch内で更新し、人間表示を続ける。id/first_seen/初出origin/runと kept の判断は維持し、kept を open に戻さない。遮断・検査不足のgenerationは既知のseenも更新しない。
 
-選定理由: r1の事例は少数の同時刻異値であり、1本で全後続を止める問題を解消したい。一方で1h時刻ずれ・feed変更は重複部分で多数の異値を生むため、1%超を早期の疑いとして扱う。絶対上限20は長期間の正常行で系統的な不一致が希釈されるのを防ぎ、非遮断の監査表示も20件以内に収める。C>=2は1本の例外と系統性の最小の区別である。これらは **設計者の保守的な初期値であり、実分布から推定済みの統計閾値ではない**。通常は0〜数件というレビュー観測と機械的な境界から選んだ。配備前に匿名化fixtureと人間専用の実計測で正常取込・既知衝突・1hずれのN/Cを比較し、変更が必要なら理由・規則版・境界testを同時に改訂する。利用者設定や強制続行optionは今回追加しない。
+**初期固定規則: `C_new > 20 OR (C_new >= 2 AND 100*C_new > N_test)` なら遮断する。** `N_test=0` の割合は算出不能と表示する。1%ちょうどは通す。新規1件だけの孤立衝突は割合条件に掛けない。小 N でも割合判定を外さず、新規2件の高率異値は系統的ずれの疑いとして遮断する。`N_test < 200` なら件数だけを見るという r2 の例示案は採らない。
 
-N=0やC=1しか重ならない系列ずれは検出できない。bridge の time rule 検査 (`time_rule_mismatch/time_rule_unverified`) は維持し、この遮断器を正しい系列である証明にしない。全行1hずれfixtureは十分な重複を持たせ、必ず遮断する。
+件数20は新規異値の遮断閾値である。通常表示上限20件・遮断表示上限5件とは独立した定数とする。既知異値が多数でも件数遮断せず、表示は `C_new/C_known` の総数と omitted を添える。表示省略は監査upsertの省略を意味しない。この初期閾値は保守的な設計値であり、実分布から推定済みの統計閾値ではない。変更は理由・規則版・境界testを伴う設計改訂とし、利用者の強制続行optionは追加しない。
+
+**検査尾の判定契約も本節が所有する。** 同期は追記範囲と同時に、同じ系列・epochの既存区間を検査尾として事前固定し取得する。初期契約は直前2開場時間相当の確定格子を基本とし、足幅wで `K = ceil(2時間/w)` を計算する (1m=120本、5m=24本、15m=8本)。時間をそのまま120本と読み替えない。暦/no-barsで除外した格子、新規行、欠落応答を実際の重複数に数えない。実重複 `N_overlap >= K` かつ `N_test >= 2` を比較可能性の最低条件とする。既知異値は比較尾の存在には数えるが、遮断の分母には入れない。Kは系列正当性の証明ではなく初期の検査量である。
+
+基本尾に既存行が足りない場合は、取得結果を見る**前**にDBの既存key・暦・固定規則から選んだ検査用既存区間を同じgenerationへ追加できる。追加区間・上限・全要求数をadmission前に固定する。結果のC_newや割合を見て正常行を後から足し、通るまで窓を広げる行為は禁止。新規2件の高率異値を見た後の追加取得は別の調査であり、その遮断を解除しない。日窓/batch単位の分割で判定をリセットしない。検査行と書込対象のkeyは重複除去し、seenは一観測一回とする。
+
+同期のrecent・catchup・gap修復は、実重複が最低条件を満たさなければ **`deferred(reason=inspection_insufficient)`「検査不足」** と明示し、当該generationの履歴/監査0件、cursorを進めない。既知だけでN_test=0の場合も同じ。既に遮断条件に当たるなら検査不足へ格下げせず遮断とする。元々比較元のない初回手動importは `comparison_unavailable` を明示した導入として許すが、同期や比較可能な手動再実行の迂回路にはしない。手動もC_newの割合判定を外さず、同じ入力・epoch・digestの再実行では既知のseen更新と表示が続く。
+
+N=0や新規異値1件だけでは系列ずれを検出できない。bridge の time rule 検査 (`time_rule_mismatch/time_rule_unverified`) は維持する。毎時の1hずれfixtureには足幅に応じた実重複尾を含め、日次を待たず遮断する。通常分布・検査尾の検出性能は実機未確認である。
 
 **MT5/Dukascopy共に、一操作の一系列内の全要求窓を取得・検証してから判定・書込みする。** 複数系列は設定の安定順で系列ごとにstage→判定→確定する。全系列一括stage/一括rollbackはしない。取得失敗0件は当該操作・系列の範囲だけであり、先行系列の確定を戻さない。失敗後も独立した他系列を続け、全体rcは§3へ集約する。Dukascopyの逐次HTTP取得・rate limitは維持するが、C0のhour単位network partial案は撤回する。一操作・系列の全範囲の0件遮断は、すでにhourを確定する方式では実現できないためである。検証済み行をメモリまたは権限0600の一時spoolへ保持し、上限MAX_IMPORT_ROWS (現行100万) を厳守する。spoolに認証情報やraw応答を保存せず、操作完了・失敗・中断で削除する。通常cycle間は§2.5の寿命内で保持する。容量・取得・decode・検証失敗は当該操作・系列の履歴/衝突0件。sourceごとの別衝突実装を作らない。
 
-事前読取とbatchの間に別の履歴writerが追加してN/Cが変わる競合を防ぐため、全取得後に **共通のhistory mutation用advisory lease** を取り、preflightから全batch終了まで保持する。SQLite write transactionやinstance lockを長時間保持する方式ではない。共通coreの全取込・time repair・将来置換/live writerがこのleaseを通る。履歴writer同士のみ直列化し、schedulerの通常取引DB書込みとstatus readerは対象外。repairはinstance/deploy lockの後、mutation leaseの後にDB transaction。importはinstance/deploy lockを取らず、mutation leaseの後にbatch DB lockを取る。待たせず取得不能なら `database_busy` で書込み0件とする。段3もmutation lease→WriterAdmission→BEGINの順で逆順取得を禁止する。これにより同じseriesの判定後に新しい衝突が突然増え、途中から遮断になって「0件」を破ることを防ぐ。直接SQL等の契約外writerまで保証しない。
+事前読取とbatchの間に別の履歴writerが追加してN/Cが変わる競合を防ぐため、全取得後に **共通のhistory mutation用advisory lease** を取り、preflightから全batch終了まで保持する。SQLite write transactionを長時間保持する方式ではない。instance lockによる取得経路制限とは別の排他である。共通coreの全取込・time repair・将来置換/live writerがこのleaseを通る。履歴writer同士のみ直列化し、schedulerの通常取引DB書込みとstatus readerは対象外。repairはinstance/deploy lockの後、mutation leaseの後にDB transaction。histbugs単独のimportはinstance/deploy lockを取らず、mutation leaseの後にbatch DB lockを取る。**同期段2からはhistsync C2 §1.2/T2でimportの取得前instance lockを追加し稼働中取得を拒否する**。その段ではinstance lock→取得 (mutation leaseなし)→mutation lease→batch DB lockの順とし、deploy lockは追加しない。待たせず取得不能なら `database_busy` で書込み0件とする。段3もmutation lease→WriterAdmission→BEGINの順で逆順取得を禁止する。これにより同じseriesの判定後に新しい衝突が突然増え、途中から遮断になって「0件」を破ることを防ぐ。直接SQL等の契約外writerまで保証しない。
 
 ### 2.4 最終形の衝突表と同一性
 
@@ -126,7 +134,7 @@ N=0やC=1しか重ならない系列ずれは検出できない。bridge の tim
 | `state` | TEXT NOT NULL DEFAULT `open`、CHECK `open/kept/replaced/superseded` |
 | `first_seen_at, last_seen_at` | TEXT NOT NULL、注入したUTC clock。最初は同値 |
 | `seen_count` | INTEGER NOT NULL DEFAULT 1、CHECK >=1 |
-| `first_run_id, last_run_id` | nullable TEXT。手動importはNULL、同期runのFKは同期schema導入時に整合させる。今は存在しないrun表へFKを張らない |
+| `first_run_id, last_run_id` | nullable TEXT。手動importはNULL、同期導入後もFKは張らない。参照先runの最小identityをtombstoneとして保持し論理参照を保つ (SQLite ALTERでのFK後付けを前提にしない) |
 | `resolved_at, resolved_by, resolution_action, reason_ref, revision_id` | nullable。人間操作の監査用予約列。actionは `keep_existing/replace_with_incoming/supersede` の固定語、価格や自由理由はagentに渡さない |
 
 UNIQUE は **`(source, interval, symbol, bar_time, history_epoch, existing_digest, incoming_digest)`**。同epoch内ではr1の6成分案と同じ同一性であり、epochを加えるのはrepair前の記録が修復後の別足を指さないため (M10)。r1の6成分だけの案はこの点で修正採用する。値の組が変われば別記録、epochが変わっても別記録。originはkeyに入れず、手動と同期の同一観測をまとめる。
@@ -162,7 +170,7 @@ fresh DDL、既存DBの `init_db` による冪等導入、旧DB fixture、`TABLE
 
 確定進捗は `operation_id/generation, committed_prefix_end, next_cursor, last_committed_bar_time` を系列別に持つ。prefixは行番号ではなく要求区間集合の時刻順prefixで、空応答窓も含む。cursorは最初の未確定範囲の先頭、残りは複数区間なら区間一覧とする。同期では履歴+監査+この進捗を同じbatchで確定し、失敗batchのcursorは進めない。readonlyで判明したunchangedだけのprefixも短い進捗transactionを必要とする。run/series終端の失敗はbatch進捗から復元する。
 
-長時間lease占有を防ぐため反映開始後60秒で新batchを止める。正常予算終了は `deferred(reason=apply_budget)` とし、確定prefixを保存してstageを削除、leaseを解放する。stop/異常終了はinterruptedである。次runは **残りだけを新generationとして再取得・検証し、現在DB/epochに対して再preflight** する。Nは新generation入力と既存keyの重なりのみ。確定済みprefixは入力へ戻さず、前回新規行を分母に加えて希釈しない。前generationのN/Cを流用もしない。残りが高率になれば新generationで遮断し、そのsuffixのみ0件、既確定prefixは維持し明示する。元操作全体0件だったかのように表示しない。epoch変更時も同じく残りを新generationへ送り、旧判定を使わない。
+長時間lease占有を防ぐため反映開始後60秒で新batchを止める。正常予算終了は `deferred(reason=apply_budget)` とし、確定prefixを保存してstageを削除、leaseを解放する。stop/異常終了はinterruptedである。次runは **残りだけを新generationとして再取得・検証し、現在DB/epochに対して再preflight** する。N_test/C_new/C_knownは新generation入力と現在DBの分類から求める。確定済みprefixは書込対象へ戻さず、前回新規行を検査尾の比較母集団にも加えて希釈しない。必要な検査尾は元操作開始前から存在したkeyを候補として事前固定し、現epoch/値で再取得・比較する。足りなければ検査不足とし、前回prefixを都合よく追加しない。前generationのN/Cを流用もしない。残りが高率になれば新generationで遮断し、そのsuffixのみ0件、既確定prefixは維持し明示する。元操作全体0件だったかのように表示しない。epoch変更時も同じく残りを新generationへ送り、旧判定を使わない。
 
 これは日窓ごとの恣意的な閾値リセットではなく、確定prefixと未確定suffixの境界でのみ認める再開規則である。日窓取得予算は操作開始前に範囲を固定するための予算であり、取得途中の未検証prefixを書いて進めてはならない。次runの新しいrecent終端も別操作とし、古いsuffixをround-robinで進めて飢餓を防ぐ。
 
@@ -191,7 +199,7 @@ import/syncの語彙は次を共有し、別名のpartial成功を作らない�
 | result | rc | 確定の意味 |
 |---|---:|---|
 | `ok` | 0 | 範囲処理完了、衝突・既知gapなし |
-| `completed_with_gaps` | 3 | 範囲処理完了、再検査でgap/参照の疑いが残る。importが充足を検査しない場合は発行しない |
+| `completed_with_gaps` | 3 | 範囲処理完了、再検査で主pairのopen gap、または今回新たに生じた参照の疑いが残る。既知の商品休場疑いだけでは発行しない。importが充足を検査しない場合は発行しない |
 | `completed_with_conflicts` | 3 | 範囲処理完了、衝突あり。gapもあれば別flagで併記 |
 | `conflict_circuit_open` | 4 | 遮断generationの履歴/衝突書込み0件。旧prefixや他系列の確定を別途表示し、完走成功と呼ばない |
 | `partial` | 1 | DB/取得等の失敗で一部系列/batchのみ確定。原因コード、進捗、再実行範囲を表示 |
@@ -231,7 +239,7 @@ import/syncの語彙は次を共有し、別名のpartial成功を作らない�
 | S8 | 例外へ秘密canary、status stdout/stderr | 固定理由のみ、本文・例外型・秘密を出さない。ctl/web/APIの本件未変更を確認 |
 | H1 | MT5最初の日に1衝突、複数後続窓、Dukascopy同等fixture | 既存不変、非衝突全行と監査確定、completed_with_conflicts rc=3、両source同じcore |
 | H2 | 十分な重複を持つ全行1hずれ + 新規終端/穴 | 遮断、対象系列の履歴/衝突とも0件、rc=4、上位5件/omitted/persisted=false |
-| H3 | C=0/N=0、C=1/N=1、C=2/N=199・200、C=20/N=2000、C=21/N=100000 | 順に通過・通過・遮断/通過・通過・件数遮断。日窓/batch分割でN/Cをリセットしない |
+| H3 | C_new=0/N_test=0、1/1、2/199・200、20/2000、21/100000 | 手動の数値閾値は順に通過・通過・遮断/通過・通過・件数遮断。同期は別途検査尾の最低条件必須。日窓/batch分割でN/Cをリセットしない |
 | H4 | 時間窓重複・入力内異値duplicate、全取得の最終窓失敗 | 重複のC水増しなし、異値duplicate拒否、両source取得失敗0件、spool削除 |
 | H5 | 同epoch/値の再取込、手動と同期の再観測、kept再観測 | inserted=0、id/first_seen/state不変、seen+1、origin不変/last_origin更新。UNIQUE競合でも二重記録なし |
 | H6 | 10/10.0、None、負ゼロ、非有限数、許容差境界、1e-10の差 | 正規化一致、検証拒否、abs差=1e-9は異値。微差だけはunchanged。別成分で両方衝突なら微差で別digest |
@@ -243,8 +251,13 @@ import/syncの語彙は次を共有し、別名のpartial成功を作らない�
 | H10 | repairの移動元/先/無関係key、監査失敗、no-op | 対象openのみsuperseded、旧epoch/key維持、失敗全rollback、no-op無変更。置換は同期側で同等CAS受入 |
 | H11 | fresh DB /旧fixture /init_db2回 /TABLE_NAMES | 最終表・UNIQUE・CHECK・nullable予約列一致、2回目no-op、epoch不変、schema_version新設なし |
 | H12 | 現行CLIのrequested/effective_end・closed-bar・不正引数 | 既存確定条件/上限維持、rc=2、不要な固定remaining文字列なし |
+| H15 | 既知kept 2件の15m gap日、必要な固定検査尾を事前取得 | 新規異値0なら遮断せずgap補完。既知2件のseen+1・kept維持・表示継続。2時間=8格子、実重複も検証 |
+| H16 | 同一手動importの再実行、既知異値多数、表示上限超過 | 同じid/state、seen更新、C_known表示・omitted明示。C_knownだけで20件遮断しない |
+| H17 | 新規2件/小N、既知多数+新規2件 | 1%超なら遮断。既知で分母希釈しない。結果後の窓拡張禁止、事前固定の検査区間のみ使用 |
+| H18 | 毎時recentの1hずれ (1m/5m/15m)、尾の応答欠落 | 当該generation0件で遮断。比較不十分なら検査不足、日次まで盲目的追記しない |
+| H19 | 同bar keyのepoch変更、existing/incoming digestの各変更、replaced/superseded | 各々新規として判定、旧kept判断を流用しない。完全一致open/keptのみ既知 |
 
-性能受入: WAL・1m・最大watch/pair・5,000入力行batchで、daemon稼働中のmanual importとscheduler writerを並走させ、BEGIN〜commitの最大/p95、schedulerの待ち、status全体とcheckpoint遅延を測る。batch50ms目標を超えたら行数を下げ再測定し、目標を緩めて合格させない。mutation leaseを持つがDB write lockを解放しているbatch間にschedulerが進むことも確認する。結果は人間専用の配備記録へ残し、未知の最大時間を「短い」とだけ書かない。C2のgate snapshotによるWAL保持も併せて観測する。
+性能受入: WAL・1m・最大watch/pair・5,000入力行batchで、共有coreの取込とscheduler writerを受入専用harnessで並走させ (同期段2以後のCLI importはinstance lockで稼働中拒否を別途確認し、本番daemon下で迂回しない)、、BEGIN〜commitの最大/p95、schedulerの待ち、status全体とcheckpoint遅延を測る。batch50ms目標を超えたら行数を下げ再測定し、目標を緩めて合格させない。mutation leaseを持つがDB write lockを解放しているbatch間にschedulerが進むことも確認する。結果は人間専用の配備記録へ残し、未知の最大時間を「短い」とだけ書かない。C2のgate snapshotによるWAL保持も併せて観測する。
 
 ## 5. 変更履歴
 
@@ -254,19 +267,20 @@ import/syncの語彙は次を共有し、別名のpartial成功を作らない�
 | 2026-11-14 | C1 | A1/B2/C1を技術確定、unknown限定・強制ro、遮断器、最終表/epoch/rc/batch/DTO、全指摘の裁定と文書task | opus r1と利用者の本改訂指示。Dukascopy衝突rc=0→3、取得失敗は全取得後書込みへ変更 | — (本改訂、未commit) |
 | 2026-11-14 | C2 | 分割再開generation・suffix分母・stage寿命・cursor、系列別取得原子性、空参照文言、同期C1整合 | terra閉鎖確認 Important 2 / Minor 2 | — (本改訂、未commit) |
 | 2026-11-14 | C2.1 | §2.5a に stage の期限到達時の処理 (未確定 batch の rollback、prefix と cursor の維持、lease 解放、`stage_expired`、次 cycle で suffix を新 generation で再取得) と受入を追加 | terra の C2 閉鎖確認 Minor 1 | — |
+| 2026-11-14 | C2.2 | C_new/C_known・N_test、表示と遮断の分離、小N維持、足幅別検査尾と検査不足、段1 T3正本、rc/FK整合 | 同期r2 I-4を利用者指定のsol推奨で閉鎖、m12/m14/m18追随 | — (未commit) |
 
 ## 6. 短い task 表
 
-本改訂では下記の対象を編集しない。実装担当がコード・test・原本仕様を同じ変更として揃える。
+本改訂では下記の対象を編集しない。実装担当がコード・test・原本仕様を同じ変更として揃える。**段1の T3 (実装中) は本 C2.2 を正本にする。** C2.1以前のC/N分類・表示上限との結合を実装済みでも、本節と§2.3へ追随する。
 
 | 順 | task / 対象 | 完了条件 |
 |---|---|---|
 | T1 | locked契約: `status.py`, `store/db.py`, `tests/test_status_locks.py`, observer関連test、cli-surface spec §6.1/golden/AC-18、`docs/operations/first-run-acceptance.md:172` | unknownのみ履歴読取・ro強制、他保持者6行維持、timezoneと固定理由、helper docstringも整合 |
-| T2 | DTO/参照/案内: `status_history.py` と関連test、段1a §7、`docs/operations/reevaluate-deployed-after-history-repair.md` §7手順3、同期C1 §1.3/§2.8、評価区間C2 §2.5との接点 | watch正本、見出し、空文言/期待値、条件付きnext、再評価は具体的結果から案内、共通スロットの所有権を明示 |
+| T2 | DTO/参照/案内: `status_history.py` と関連test、段1a §7、`docs/operations/reevaluate-deployed-after-history-repair.md` §7手順3、同期C2 §1.3/§2.8、評価区間C2 §2.5との接点 | watch正本、見出し、空文言/期待値、条件付きnext、再評価は具体的結果から案内、共通スロットの所有権を明示 |
 | T3 | schema/core: `store/db.py`, `store/ohlcv.py`, 新 `store/history_conflicts.py`, schema/旧DB fixture/`TABLE_NAMES` test | 最終形、二段判定、epoch付きUNIQUE/upsert、closed state維持、agent隔離 |
 | T4 | import両source/CLI: `backtest/mt5_import.py`, Dukascopy `importer.py`, `cli.py`, import test、共通mutation lease | 操作・系列別全取得→遮断→batch、rc/進捗/再実行・stage寿命・generation/cursor、例外契約変更。`ImportConflictError` docstring/全利用箇所、mt5末尾「1回の短いtransaction」コメント、ohlcvの古い件数だけ/窓分割前提コメントを更新または廃止 |
 | T5 | repair: `backtest/time_repair.py`, `core/history_epoch.py`との契約、修復test | 同じlease、移動元/先のsupersede原子性、既存epoch/no-op/backupの意味を維持 |
-| T6 | 原本の前倒し整合: 段1a概要/§2.3/§7/受入表/段の表/変更履歴、同期C1 全文 (run/series status・rc表・失敗表・原子性説明・受入表・task表を含む) | 停止・部分commit維持と段2後送りを本件が置換。同期の二重所有宣言、partial rc=3、全locked読取、表/keyの食い違いを訂正 |
+| T6 | 原本の前倒し整合: 段1a概要/§2.3/§7/受入表/段の表/変更履歴、同期分は C1 で反映済み、C2/C2.2との実装時照合だけ (run/series status・rc・原子性・受入を含む) | 停止・部分commit維持と段2後送りを本件が置換。同期の二重所有宣言、partial rc=3、全locked読取、表/keyの食い違いを訂正 |
 | T7 | runbook/公開変更履歴/性能受入 | 再起動後import、Dukascopy rcと取得原子性変更、失敗時再実行、閾値N/Cとwrite lock実測、§4受入を確認してから完了判断 |
 
 ## 付録A. opus r1 の指摘ごとの採否と理由
@@ -306,7 +320,7 @@ import/syncの語彙は次を共有し、別名のpartial成功を作らない�
 
 A/B/Cの「利用者へ問わず技術で決める」は採用 (§1.1)。本番DBのreadonly/sidecar例外/instance lock非保持は採用 (§1.2)。checkpointが約110msだけ遅れるという上限解釈は採らない。過去のquery実測はcheckpoint/並行writerの上限を証明しないため、§4で測る。
 
-過剰設計への提案は、通常衝突の全件表示と固定remaining削除を採用。遮断時は大量となるため先頭5件の上限だけ残す。永続表を同期側へ先送りする代案は不採用。本件で最終契約を確定する利用者指示があり、共有coreの監査を最初から必要とするため。Dukascopy専用記録も不採用。同じcoreで足りる。
+過剰設計への提案は、通常衝突の詳細表示と固定remaining削除を採用。C2.2では既知異値の増加を許すため、表示件数の上限と省略数を別途設ける。遮断時は大量となるため先頭5件の上限だけ残す。永続表を同期側へ先送りする代案は不採用。本件で最終契約を確定する利用者指示があり、共有coreの監査を最初から必要とするため。Dukascopy専用記録も不採用。同じcoreで足りる。
 
 C0のDukascopy逐次確定維持は不採用。全期間の遮断で0件にできないため、§2.3の全取得stageに変更。r1のUNIQUE6列案はepochを加えて修正採用、解決列後付け案は初期nullable列へ変更して最終形を固定した。
 
@@ -358,4 +372,17 @@ C0のDukascopy逐次確定維持は不採用。全期間の遮断で0件にで�
 | M1 空参照文言 | 採用 | §1.3/T2。主pair除外後の空集合を no reference watch symbols とする。主のみ設定済みのfixtureも必要 |
 | M2 同期の更新対象 | 採用 | T6/付録C。同期C1のstatus・失敗・rc・受入表まで一括照合し、系列全体rollbackや衝突partialの旧文を残さない |
 
-同期側の衝突・書込み正本は本C2である。付録CのC0参照は旧文書の更新箇所を指すもので、旧契約の存続を意味しない。live_compareの値を人の操作で履歴へ入れることも禁止する。originだけでは再観測の由来を判定できないため、将来その記録を作るならincomingのbridge由来検証を別に必須とする。同期C1ではlive比較自体を導入しない。
+同期側の衝突・書込み正本は本C2.2である。付録CのC0参照は旧文書の更新箇所を指すもので、旧契約の存続を意味しない。live_compareの値を人の操作で履歴へ入れることも禁止する。originだけでは再観測の由来を判定できないため、将来その記録を作るならincomingのbridge由来検証を別に必須とする。同期C1ではlive比較自体を導入しない。
+
+## 付録F. 同期 opus r2 と C2.2 の裁定
+
+| 指摘 | 採否 | 理由・反映 |
+|---|---|---|
+| I-4 毎時の盲目・既知の反復遮断 | 修正採用・本書で閉鎖 | §2.3/H15〜H19。C_new/C_knownを分離しN_testから既知を除外。通過時のseen/表示とkeptを維持。同期は尾の供給責務だけを持つ |
+| I-4 小Nの割合免除/後付け窓拡張案 | 不採用 | 新規2件の高率ずれを見逃す。比較区間は事前固定し、検査不足は明示する。遮断後の正常行追加で通さない |
+| m12 rc=3常態化 | 修正採用 | §3。主open gap・今回新規参照疑いに限定し、既知疑いは独立表示。衝突完走rc=3は維持 |
+| m14 run FK | 採用 | §2.4。後付けFKを約束せず、同期のtombstone保持と一致 |
+| I-3 稼働中import | 同期段2で採用 | §2.3/§4。histbugs単独の現状と段2の取得前instance lock導入を区別し、性能はcore harnessで検証 |
+| m18 T6循環 | 採用 | §6。同期C1反映済みとして実装照合へ。段1 T3の正本をC2.2へ更新 |
+
+旧節・付録の N/C はC2.2では N_test/C_new に読み替える。既知の監査数は C_known として別に維持する。再開suffixへ検査尾を付ける場合も確定prefixの新規行を分母へ再投入しない (§2.5a)。本改訂は文書だけであり、受入fixture・実測は未実行。
