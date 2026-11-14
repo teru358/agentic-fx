@@ -99,9 +99,12 @@ class Systemd:
         self._invoke("daemon-reload")
 
     def version(self) -> int:
-        """manager の systemd の major version。読めなければ SystemdError("version")。"""
-        result = self._call("--version")
-        match = re.match(r"systemd (\d+)", result.stdout or "")
+        """稼働中の user manager の systemd の major version。読めなければ SystemdError("version")。
+
+        実行 file の版 (systemctl --version) は、更新後も旧版のままの manager と食い違うので使わない。
+        """
+        result = self._call("show", "--property=Version")
+        match = re.match(r"Version=v?(\d+)", (result.stdout or "").strip())
         if result.returncode or match is None:
             raise SystemdError("version", f"rc={result.returncode} stderr={_stderr_tail(result.stderr)}")
         return int(match.group(1))

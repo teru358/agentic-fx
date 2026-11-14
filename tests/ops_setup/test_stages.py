@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from agentic_fx.ops.keys import Principal, initialize, key_dir
-from agentic_fx.ops_setup.stages import InvalidState, OpsSetup, read_stage
+from agentic_fx.ops_setup.stages import InvalidState, OpsSetup, _write_stage, read_stage
 from agentic_fx.ops_setup.systemd import SystemdError
 from agentic_fx.ops_setup.units import UnitPaths
 from agentic_fx.store.enroll_marker import enroll_marker_path
@@ -986,8 +986,8 @@ def _systemctl_run(fail: dict[str, tuple[int, str]]):
 
     def run(args, **_kwargs):
         action = args[2]
-        if action == "--version":
-            return subprocess.CompletedProcess(args, 0, stdout="systemd 259 (259.9)\n", stderr="")
+        if args[2:] == ["show", "--property=Version"]:
+            return subprocess.CompletedProcess(args, 0, stdout="Version=259.9\n", stderr="")
         if action in fail:
             rc, err = fail[action]
             return subprocess.CompletedProcess(args, rc, stdout="", stderr=err)
@@ -1993,6 +1993,28 @@ def test_bot_enable_on_254_installs_and_records_the_bot_dropin_as_an_artifact(tm
     assert result.stage == "enabled"
     assert setup.paths.bot_dropin_path.read_text().count("RestartPreventExitStatus=2 4 69 70 71 78") == 1
     assert str(setup.paths.bot_dropin_path) in read_stage(setup.root, "bot")["artifacts"]
+
+
+@pytest.mark.parametrize("stage", ["installed", "started", "enabled"])
+def test_a_bot_resume_checks_the_manager_version_before_touching_anything_even_when_installed(tmp_path, monkeypatch, stage):
+    setup, systemd, home = _versioned(tmp_path, 259)
+    _with_home(home, monkeypatch)
+    setup.enable("bot")
+    saved = read_stage(setup.root, "bot")
+    saved["stage"] = stage
+    _write_stage(setup.root, saved)
+    setup.paths.bot_dropin_path.unlink()
+    systemd.reported = 253
+    systemd.calls.clear()
+    _with_home(home, monkeypatch)
+
+    with pytest.raises(SystemdError) as raised:
+        setup.enable("bot")
+
+    assert raised.value.reason == "systemd_too_old"
+    assert not any(call.startswith(("stop", "start", "daemon-reload")) for call in systemd.calls)
+    assert not setup.paths.bot_dropin_path.exists()
+    assert read_stage(setup.root, "bot")["failure"] == "systemd_too_old"
 
 
 def test_web_enable_does_not_consult_the_systemd_version(tmp_path, monkeypatch):

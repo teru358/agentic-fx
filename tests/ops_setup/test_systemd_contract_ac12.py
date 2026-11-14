@@ -38,7 +38,8 @@ with open(root / "ops_starts", "a") as handle:
     handle.write(f"{{time.time()}}\\n")
 mode = spec["mode"]
 if mode == "exit":
-    # READY を送る前に指定の code で終わる。
+    # READY を送る前に、指定があればその秒数だけ待ち、指定の code で終わる。
+    time.sleep(spec.get("after", 0))
     sys.exit(spec["code"])
 if mode == "serve":
     deadline = time.monotonic() + spec["deadline"]
@@ -708,3 +709,57 @@ def test_bot_restart_that_comes_due_while_afx_is_down_is_measured(ac):
     # afx の復帰後は、人の操作なしで ops が戻る (afx の Wants か、待たされていた再起動で)。
     assert recovered, observed
     assert _show(ac.afx, "ActiveState")["ActiveState"] == "active"
+
+
+def test_bot_reset_failed_alone_resets_the_restart_step_is_measured(ac):
+    """reset-failed だけで restart step (NRestarts) が初期化されるかを実 manager で測る。
+
+    手動 start や restart を挟まず、自動 restart を待つ状態の unit に reset-failed を一回だけ送る。"""
+    ac.setup().enable("bot")
+    _scale_bot_dropin(ac, sec="1s", steps=3, maximum="8s")
+    ac.ops_mode(mode="exit", code=79)
+    _kill_ops(ac)
+    assert _wait(lambda: len(ac.ops_starts()) >= 6, seconds=60)
+    grown = _gaps(ac.ops_starts())[-1]
+    before = _show(ac.ops("bot"), "NRestarts")["NRestarts"]
+    mark = len(ac.ops_starts())
+
+    assert _ctl("reset-failed", ac.ops("bot")).returncode == 0
+
+    after = _show(ac.ops("bot"), "NRestarts")["NRestarts"]
+    assert _wait(lambda: len(ac.ops_starts()) >= mark + 3, seconds=60)
+    following = _gaps(ac.ops_starts()[mark - 1:])
+    print("AC12 reset-failed observation:", json.dumps(
+        {"grown_gap": grown, "nrestarts_before": before, "nrestarts_after": after, "gaps_after": following}))
+    assert int(before) > 0
+    assert after == "0", (before, after)
+    assert max(following) <= 8 + 1.5, following
+    # 最初の間隔は既に計時中の待ち。その次から、初期化された短い間隔になる。
+    assert following[1] < grown, following
+
+
+def test_bot_long_outage_recovers_within_monitor_plus_max_wait_scaled(ac):
+    """長期の一時障害 (監視で待った後に 79 で終わる bot) からの回復を、縮小した同じ形で確かめる。
+
+    実 bot は 10 分監視した後に exit 79、systemd の再起動待ちは最大 10 分、回復の上限は合わせて
+    20 分。ここでは監視を 3 秒、最大待ちを 3 秒に縮め、(監視 + 最大待ち) の周期を超えないこと、
+    障害が終われば次の起動で READY に戻ることを観測する。実値の全段は release 条件として別に確かめる。"""
+    monitor, maximum = 3.0, 3
+    ac.setup().enable("bot")
+    _scale_bot_dropin(ac, sec="1s", steps=2, maximum=f"{maximum}s")
+    ac.ops_mode(mode="exit", code=79, after=monitor)
+    before = len(ac.ops_starts())
+    _kill_ops(ac)
+
+    assert _wait(lambda: len(ac.ops_starts()) >= before + 5, seconds=90)
+
+    cycles = _gaps(ac.ops_starts()[before - 1:])
+    props = _show(ac.ops("bot"), "ActiveState", "Result")
+    print("AC12 long outage cycles (monitor 3s, max wait 3s):", cycles, props)
+    assert props["Result"] != "start-limit-hit" and props["ActiveState"] != "failed"
+    assert all(cycle <= monitor + maximum + 1.5 for cycle in cycles), cycles
+    # 障害が終わった時点から、次の起動で READY に戻るまでが (監視 + 最大待ち) 以内。
+    ac.ops_mode(mode="ready")
+    assert _wait(lambda: _show(ac.ops("bot"), "ActiveState")["ActiveState"] == "active",
+                 seconds=monitor + maximum + 3)
+

@@ -343,7 +343,7 @@ class OpsSetup:
 
         version を答えられない port (試験の代役) は検査しない。実 manager は常に答える。"""
         read_version = getattr(self.systemd, "version", None)
-        if feature != "bot" or read_version is None or state["stage"] not in {"staged", "stopped", "enrolled"}:
+        if feature != "bot" or read_version is None:
             return
         try:
             problem = bot_systemd_problem(read_version())

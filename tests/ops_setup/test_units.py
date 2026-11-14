@@ -633,16 +633,34 @@ def test_bot_requires_systemd_254_with_a_fixed_reason(version, ok):
 
 
 @pytest.mark.parametrize("out,rc,expected", [
-    ("systemd 259 (259.9-0ubuntu0.1)\n+PAM +AUDIT\n", 0, 259),
-    ("systemd 253 (253.5-1)\n", 0, 253),
+    ("Version=259.9-0ubuntu0.1\n", 0, 259),
+    ("Version=253.5-1\n", 0, 253),
+    ("Version=v254\n", 0, 254),
 ])
-def test_systemd_version_reads_the_major_number(out, rc, expected):
+def test_systemd_version_reads_the_running_managers_major_number(out, rc, expected):
     from agentic_fx.ops_setup.systemd import Systemd
 
     assert Systemd(run=_completed(out, rc)).version() == expected
 
 
-@pytest.mark.parametrize("out,rc", [("", 0), ("not systemd\n", 0), ("systemd 259 (x)\n", 1), ("systemd\n", 0)])
+def test_systemd_version_asks_the_manager_not_the_executable():
+    import subprocess
+
+    from agentic_fx.ops_setup.systemd import Systemd
+
+    seen = []
+
+    def run(args, **_kwargs):
+        seen.append(list(args))
+        return subprocess.CompletedProcess(args, 0, stdout="Version=259.9\n", stderr="")
+
+    Systemd(run=run).version()
+
+    assert seen == [["systemctl", "--user", "show", "--property=Version"]]
+
+
+@pytest.mark.parametrize("out,rc", [("", 0), ("not systemd\n", 0), ("Version=259.9\n", 1), ("Version=\n", 0),
+                                    ("systemd 259 (259.9)\n", 0)])
 def test_systemd_version_that_cannot_be_read_is_a_systemd_error(out, rc):
     from agentic_fx.ops_setup.systemd import Systemd, SystemdError
 

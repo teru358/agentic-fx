@@ -145,3 +145,101 @@ def test_a_clean_return_is_zero(tmp_path, monkeypatch):
         return None
     monkeypatch.setattr(runtime, "_main", main)
     assert runtime.run(_isolated(tmp_path), client=object(), stderr=_Out()) == 0
+
+
+# --- bot unit の入口から accept 系 (72 / 74) と probe (73) が返らないこと ----------------------
+
+_OUTSIDE = {accept_loop.RC_ACCEPT_EXHAUSTED, probe.RC_PROBE_FAILED, accept_loop.RC_ACCEPT_FAILED}
+
+
+def test_the_outside_codes_are_72_73_74():
+    assert _OUTSIDE == {72, 73, 74}
+
+
+def test_no_bot_reason_maps_to_an_outside_code():
+    codes = {exits.rc_for_reason(reason) for reason in (*exits.REASONS, "made_up", None)}
+    assert codes == {78, 79} and not (codes & _OUTSIDE)
+
+
+def test_the_bot_sources_never_name_the_accept_loop_or_the_probe_codes():
+    names = ("accept_loop", "RC_ACCEPT_EXHAUSTED", "RC_ACCEPT_FAILED", "RC_PROBE_FAILED", "afx_ops.probe")
+    for path in sorted(Path(runtime.__file__).parent.glob("*.py")):
+        if path.name == "probe.py":
+            # bot の疎通確認の部品。`afx-ops probe` 経由でだけ呼ばれ、bot unit の入口からは呼ばれない。
+            continue
+        text = path.read_text(encoding="utf-8")
+        for name in names:
+            assert name not in text, (path.name, name)
+
+
+class _Entry:
+    """cli.main(["bot"]) の通常経路を、起動の各段の失敗で通す。
+
+    設定の読込み、隔離、server 認証、body の返り値と例外のそれぞれで返る rc を集める。"""
+
+    def __init__(self, monkeypatch, tmp_path) -> None:
+        self.monkeypatch = monkeypatch
+        self.tmp_path = tmp_path
+
+    def run(self, *, config=None, plan=None, isolate=None, ready=None, body=None) -> int:
+        import os
+
+        fd = os.open(self.tmp_path, os.O_RDONLY)
+        self.monkeypatch.setattr(cli, "read_config",
+                                 config or (lambda feature: SimpleNamespace(config_dir_fd=fd, port=None,
+                                                                          web_bind=None, auth=None)))
+        self.monkeypatch.setattr(startup.StartupPlan, "for_feature", plan or (lambda *a, **k: object()))
+        self.monkeypatch.setattr(startup, "isolate",
+                                 isolate or (lambda *a, **k: (SimpleNamespace(endpoint=None), None)))
+        self.monkeypatch.setattr(startup, "announce_ready", ready or (lambda *a, **k: None))
+        self.monkeypatch.setattr(cli, "PRELOADS", {"bot": lambda: None})
+        self.monkeypatch.setattr(cli, "RUNTIMES", {"bot": body or (lambda isolated: 0)})
+        try:
+            return cli.main(["bot"])
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _raises(exc):
+    def raiser(*args, **kwargs):
+        raise exc
+    return raiser
+
+
+def _entry_cases():
+    from afx_ops.config import ConfigError
+
+    return [
+        ("normal", {}, 0),
+        ("config invalid", {"config": _raises(ConfigError("x"))}, 71),
+        ("config unexpected", {"config": _raises(RuntimeError("x"))}, 71),
+        ("plan unexpected", {"plan": _raises(RuntimeError("x"))}, 71),
+        ("isolation failed", {"isolate": _raises(startup.StartupError("self_check_dumpable"))}, 71),
+        ("runtime import", {"isolate": _raises(startup.StartupError("runtime_import_failed"))}, 70),
+        ("isolation unexpected", {"isolate": _raises(RuntimeError("x"))}, 71),
+        ("server auth rejected", {"ready": _raises(ApiError("unreachable"))}, 3),
+        ("body unexpected", {"body": _raises(RuntimeError("x"))}, 1),
+        ("body permanent", {"body": lambda isolated: 78}, 78),
+        ("body transient", {"body": lambda isolated: 79}, 79),
+        ("body loop stalled", {"body": lambda isolated: 80}, 80),
+    ]
+
+
+@pytest.mark.parametrize("name, kwargs, expected", _entry_cases(), ids=[case[0] for case in _entry_cases()])
+def test_the_bot_entrance_never_returns_72_73_or_74_on_its_normal_paths(tmp_path, monkeypatch, name, kwargs,
+                                                                         expected):
+    got = _Entry(monkeypatch, tmp_path).run(**kwargs)
+
+    assert got == expected and got not in _OUTSIDE
+
+
+def test_the_bot_entrance_does_not_route_to_the_probe(tmp_path, monkeypatch):
+    called = []
+    monkeypatch.setattr(probe, "main", lambda feature: called.append(feature) or probe.RC_PROBE_FAILED)
+
+    assert _Entry(monkeypatch, tmp_path).run() == 0
+
+    assert called == []

@@ -483,6 +483,8 @@ daemon が新 event を出す前に afx-ops を配る。event schema 自体は�
 - 当時 user manager に load されていた unit properties、restart count、DNS inode 置換との因果。
 - 他配備先の systemd version。確認済みはこのホストの 259だけである。
 - systemd restart step の正確な reset 条件と、daemon 停止中の Requisite start job 失敗後の再試行。実 manager smoke で確かめる。
+- 長期障害 (bot の 10 分監視 + 最大 10 分の restart 待ち) の 20 分以内の回復は、実値では測っていない。縮小した同じ形の unit (監視 3 秒、最大待ち 3 秒) で、周期が (監視 + 最大待ち) を超えないことと障害後の READY への復帰だけを確かめた。実値の全段は release 条件の未確認項目として残す。`reset-failed` 単独は、自動 restart を待つ unit で NRestarts を 0 に戻し、以後の間隔が初期値から伸び直すことを、このホストの manager で観測した (他の版では未確認)。
+- bot の enable は稼働中の user manager の `Version` で systemd 254 以上を確かめる (`systemctl --user show --property=Version`)。取得できなければ `systemd_too_old` で拒否し、実行 file の版 (`systemctl --version`) は使わない。既存 stage が installed / started / enabled でも、再開・修復の前に検査する。
 - discord.py 2.7.1 の失敗した login を同じ Client で再試行できるか。実装時に session 後始末を確認し、成立しなければ一試行ごとに Client を作り直す（同じ 10 分窓を維持）。
 - daemon が bot 鍵を恒久拒否した際に ApiError が rc 3 へ来るか。実装時に経路を確認し、決定的拒否を 78 に写像する。
 - notify endpoint が Discord から独立しているか。status は独立を主張しない。
@@ -511,6 +513,7 @@ daemon が新 event を出す前に afx-ops を配る。event schema 自体は�
 | C4.1 | 2026-11-14 | §4.4 shell は直接 mutation の前にも公開 wrapper を一回呼ぶ。§9.1 に対応 test を追加 | 実装で見つかった shell の前 sweep の欠落 (ラッチ後最初の tick より前の shell 解除で latched も released も出ない) | — |
 | C4.2 | 2026-11-14 | 初回 poll の窓を login 後の起動 reconcile の開始から数える、fetch / history / connect の一時失敗を保留 + backoff にする、cleanup の恒久判定で code を先に見る、symlink の state file を恒久 78 の明示例外にする | 実装レビューで見つかった初回 poll の窓の起点と一時失敗の再試行の欠落 | — |
 | C4.3 | 2026-11-14 | gateway の窓は login を含み、起動 reconcile の間は止めて connect の開始から数え直す。送信の 400 + 50035 は固定の代替文 1 回、JSON code 無しの 403 / 408 は一時。state dir の symlink / 無い / dir でないは恒久。致命的な gateway close code は恒久。login の再試行ごとに HTTP session を閉じる | /code-review high の指摘（窓の起点、1 通知の拒否での全停止、再試行しても直らない失敗の再起動ループ、session の滞留） | — |
+| C4.4 | 2026-11-14 | systemd の版は稼働中の manager の `Version` で確かめ、既存 stage の再開でも検査する。`reset-failed` 単独の観測と縮小した長期障害の回復観測を足し、実値の全段を §11.1 の未確認に残す | T3 の実装レビュー (manager と実行 file の版の食い違い、再開時の検査の欠落、reset-failed と長期回復の未測定) | — |
 
 ## 13. task 表
 
