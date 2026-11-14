@@ -45,7 +45,8 @@ def _record(**changes):
 
 
 def _not_found() -> discord.NotFound:
-    return discord.NotFound(SimpleNamespace(status=404, reason="Not Found"), "gone")
+    return discord.NotFound(SimpleNamespace(status=404, reason="Not Found"),
+                            {"code": 10008, "message": "Unknown Message"})
 
 
 class _Partial:

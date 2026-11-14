@@ -45,6 +45,9 @@ from afx_ops.gate.service import GateService
 from afx_ops.gate.state import ApprovalRecord, StateError
 from afx_ops.notify.payload import PayloadError
 from afx_ops.gate.types import CustomIdError, GateResult, Interaction, SideEffect, decode_custom_id
+from afx_ops.bot.progress import ProgressTracker
+from afx_ops.bot.rest import (PERMANENT, REST_ERRORS, classify, is_message_gone,
+                              is_shared_rejection)
 from afx_ops.bot.views import GateView
 
 EVENTS_LIMIT = 100
@@ -54,11 +57,17 @@ APPROVALS_LIMIT = 20
 EDIT_RETRY_LIMIT = 8
 EDIT_BACKOFF_SECONDS = 2.0
 EDIT_BACKOFF_MAX_SECONDS = 60.0
+# fetch / history の一時失敗は、操作を保留して倍々の待ちで再試行する。上限は起動 reconcile と poll
+# 周回の監視窓 (runtime の monitor) が持つ
+REST_RETRY_SECONDS = 2.0
+REST_RETRY_MAX_SECONDS = 60.0
 # 正本が 429 / 503 を返した承認の次の問合せまでの待ち。Retry-After があればそれ (上限つき)、
 # 無ければ既定
 THROTTLE_DEFAULT_SECONDS = 10.0
 THROTTLE_MAX_SECONDS = 300.0
 NAME_LOOKUP_TIMEOUT_SECONDS = 3.0
+# 利用者の操作一回に対する応答 (defer / followup) と、単発の後始末 edit の await の打切り
+RESPONSE_DEADLINE_SECONDS = 10.0
 # 改善通知の詳細取得は、接続から本文の読込までの合計をこの秒数で打ち切る
 IMPROVE_DETAIL_DEADLINE_SECONDS = 3.0
 # 投稿済みの改善通知 (ref, state) をこの process で覚える件数の上限 (古いものから捨てる)
@@ -170,13 +179,20 @@ def _event_content(plan) -> str:
 
 class BotAdapter:
     def __init__(self, *, gate: GateService, client, dir_fd: int, settings: BotSettings,
-                 discord_client: discord.Client, now: Callable[[], float] = time.time) -> None:
+                 discord_client: discord.Client, now: Callable[[], float] = time.time,
+                 progress: ProgressTracker | None = None,
+                 response_deadline: float = RESPONSE_DEADLINE_SECONDS,
+                 sleep: Callable[[float], object] = asyncio.sleep) -> None:
         self.gate = gate
+        self._sleep = sleep
         self.client = client
         self.settings = settings
         self.discord = discord_client
         self._dir_fd = dir_fd
         self._now = now
+        # gateway / 配送 / poller の進捗。10 分の判定は runtime の monitor が行う
+        self.progress = progress if progress is not None else ProgressTracker()
+        self._response_deadline = response_deadline
         # 投稿に成功した改善通知の (ref, state)。同じ event の重複を 1 通に畳む。この process の
         # 中だけで持ち、永続化しない
         self._posted_improve: OrderedDict[tuple[str, str], None] = OrderedDict()
@@ -210,8 +226,8 @@ class BotAdapter:
     def _save(self) -> None:
         try:
             gate_state.save(self._dir_fd, self.gate.state)
-        except StateError:
-            raise BotFailure("bot_state_invalid") from None
+        except StateError as exc:
+            raise BotFailure(exc.reason) from None
 
     def _fail(self, failure: BotFailure) -> None:
         if self.failure is None:
@@ -244,8 +260,8 @@ class BotAdapter:
         """
         try:
             self.gate.state = gate_state.load(self._dir_fd)
-        except StateError:
-            raise BotFailure("bot_state_invalid") from None
+        except StateError as exc:
+            raise BotFailure(exc.reason) from None
         self._reconcile_in_flight()
         self.gate.state = gate_reconcile.invalidate_restart(self.gate.state)
         self._save()
@@ -377,7 +393,8 @@ class BotAdapter:
         committed = await self._run(commit)
         if committed is None:
             # footer の世代と record の意図が食い違った: この投稿は採用せず、View を外した表示にする
-            await self._edit(message_id, content=gate_reconcile.NO_LONGER_ACTIVE, view=None)
+            await self._edit(message_id, cleanup=True, deadline=self._response_deadline,
+                             content=gate_reconcile.NO_LONGER_ACTIVE, view=None)
             return False
         if committed.message_id != current.message_id:
             self._unregister(current.message_id)
@@ -402,13 +419,20 @@ class BotAdapter:
     # ------------------------------------------------------------------ Discord REST
 
     async def _fetch(self, message_id: int) -> MessageMetadata | None:
-        try:
-            message = await self._channel.fetch_message(message_id)
-        except discord.NotFound:
-            return None
-        except (discord.HTTPException, OSError, asyncio.TimeoutError):
-            raise BotFailure("discord_unavailable") from None
-        return self._metadata(message)
+        delay = REST_RETRY_SECONDS
+        while True:
+            try:
+                message = await self._channel.fetch_message(message_id)
+            except REST_ERRORS as exc:
+                if is_message_gone(exc):
+                    return None
+                if classify(exc) == PERMANENT:
+                    raise BotFailure("discord_rejected") from None
+                # 一時の障害は投稿の消失とみなして出し直さず、保留して再試行する
+                await self._sleep(delay)
+                delay = min(delay * 2, REST_RETRY_MAX_SECONDS)
+                continue
+            return self._metadata(message)
 
     def _metadata(self, message: discord.Message) -> MessageMetadata:
         text = None
@@ -423,18 +447,28 @@ class BotAdapter:
             guild_id=self.settings.guild_id if channel_id == self.settings.channel_id else 0,
             channel_id=channel_id, footer=text)
 
-    async def _edit(self, message_id: int, **kwargs) -> str:
+    async def _edit(self, message_id: int, *, cleanup: bool = False,
+                    deadline: float | None = None, **kwargs) -> str:
         """bot token の edit。結果は ok、gone (投稿が無い)、failed (一時的な失敗)。
 
         gone は edit の成功ではない。呼び出し側が、終端なら表示の削除済み、pending なら再投稿として扱う。
+        gone は 404 かつ code 10008 だけ。channel・認証・権限の拒否 (10003 / 50001 / 50013 は status によらず、
+        401 / 403、その他の 404) は恒久で ``BotFailure("discord_rejected")``。cleanup (View の取り外しや不採用の
+        投稿の後始末) は、投稿一つに閉じた 400 等だけ failed にする。deadline があれば await を打ち切る。
         """
         if "content" in kwargs:
             kwargs.setdefault("allowed_mentions", discord.AllowedMentions.none())
         try:
-            await self._channel.get_partial_message(message_id).edit(**kwargs)
-        except discord.NotFound:
-            return "gone"
-        except (discord.HTTPException, OSError, asyncio.TimeoutError):
+            request = self._channel.get_partial_message(message_id).edit(**kwargs)
+            if deadline is not None:
+                await asyncio.wait_for(request, deadline)
+            else:
+                await request
+        except REST_ERRORS as exc:
+            if is_message_gone(exc):
+                return "gone"
+            if classify(exc) == PERMANENT and (not cleanup or is_shared_rejection(exc)):
+                raise BotFailure("discord_rejected") from None
             return "failed"
         return "ok"
 
@@ -447,8 +481,10 @@ class BotAdapter:
             return await self._channel.send(
                 content, embed=discord.Embed().set_footer(text=effect.footer), view=view,
                 allowed_mentions=discord.AllowedMentions.none())
-        except (discord.HTTPException, OSError, asyncio.TimeoutError):
+        except REST_ERRORS as exc:
             view.stop()
+            if classify(exc) == PERMANENT:
+                raise BotFailure("discord_rejected") from None
             return None
 
     # ------------------------------------------------------------------ View の dispatch 表
@@ -505,8 +541,12 @@ class BotAdapter:
         custom_id = (interaction.data or {}).get("custom_id")
         if interaction.user is None or type(custom_id) is not str:
             return
-        # API・gate の前に一度だけ。以後の応答は followup だけ
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        # API・gate の前に一度だけ。以後の応答は followup だけ。ACK できなければこの操作で終え、
+        # gate も daemon も触らない (bot は止めない)
+        acked, _ = await self._respond_within(interaction.response.defer(ephemeral=True,
+                                                                         thinking=True))
+        if not acked:
+            return
         request = Interaction(custom_id=custom_id, guild_id=interaction.guild_id,
                               channel_id=interaction.channel_id, user_id=interaction.user.id,
                               message_id=message_id, display_generation=generation)
@@ -519,7 +559,22 @@ class BotAdapter:
             self._fail(BotFailure("bot_internal_error"))
             result = GateResult(_FAILED_TEXT)
         await self._respond(interaction, result)
-        await self._sync_views()
+        try:
+            await self._sync_views()
+        except BotFailure as failure:
+            # interaction の callback の例外は discord.py が握るので、bot の停止として記録する
+            self._fail(failure)
+
+    async def _respond_within(self, request):
+        """interaction の応答一回を deadline 内で待つ。失敗は (False, None) で返し、bot は止めない。
+
+        期限切れ interaction / 二重の ACK 等の 4xx、429 / 5xx / network / timeout を区別しない
+        (一操作の失効であり、channel 規則の恒久拒否ではない)。同じ応答は再送しない。
+        """
+        try:
+            return True, await asyncio.wait_for(request, self._response_deadline)
+        except (*REST_ERRORS, discord.ClientException):
+            return False, None
 
     def _decide(self, request: Interaction) -> GateResult:
         approval_id = _approval_of(request.custom_id)
@@ -605,15 +660,13 @@ class BotAdapter:
             if record is not None:
                 view = GateView(result.confirm_view,
                                 self._click_handler(approval_id, record.display_generation))
-        try:
-            if view is None:
-                await interaction.followup.send(result.text, ephemeral=True)
-                return
-            message = await interaction.followup.send(result.text, ephemeral=True, view=view,
-                                                      wait=True)
-        except (discord.HTTPException, OSError, asyncio.TimeoutError):
-            if view is not None:
-                view.stop()
+        if view is None:
+            await self._respond_within(interaction.followup.send(result.text, ephemeral=True))
+            return
+        sent, message = await self._respond_within(
+            interaction.followup.send(result.text, ephemeral=True, view=view, wait=True))
+        if not sent:
+            view.stop()
             return
         # gate に結べた確認 message だけを dispatch 表に載せる (結べない claim の View は残さない)
         if await self._run(self.gate.bind_confirm, record.approval_id, message.id):
@@ -666,7 +719,8 @@ class BotAdapter:
                 # 正本の一時障害: 固定文で確定せず、次の周回で読み直す
                 outcome = "failed"
             else:
-                outcome = await self._edit(record.message_id, content=content, view=None)
+                outcome = await self._edit(record.message_id, cleanup=True, content=content,
+                                           view=None)
             if outcome == "gone":
                 # 外す View を載せた表示が既に無い
                 outcome = "ok"
@@ -778,6 +832,7 @@ class BotAdapter:
                     print(f"afx-ops bot: improve_event_invalid event={event['id']}",
                           file=sys.stderr)
                     await self._run(self._commit_skip, event["id"], max(high, event["id"]))
+                    self.progress.delivery_committed(event["id"], delivered=False)
                     progressed = True
                 continue
             except Exception:
@@ -788,6 +843,7 @@ class BotAdapter:
             if isinstance(plan, SkipKnown):
                 # 設定で出さない既知の event は、投稿せずに cursor と high watermark を進める
                 await self._run(self._commit_skip, plan.event_id, max(high, plan.event_id))
+                self.progress.delivery_committed(plan.event_id, delivered=False)
                 progressed = True
                 continue
             improve_key = None
@@ -796,6 +852,7 @@ class BotAdapter:
                 if improve_key in self._posted_improve:
                     # 投稿済みの event の重複 (at-least-once)。投稿せずに確定する
                     await self._run(self._commit_skip, plan.event_id, max(high, plan.event_id))
+                    self.progress.delivery_committed(plan.event_id, delivered=False)
                     progressed = True
                     continue
                 plan = await self._improve_plan(event)
@@ -813,14 +870,20 @@ class BotAdapter:
             content = _event_content(plan)
             allowed = (self._allowed_mentions() if plan.allow_mentions
                        else discord.AllowedMentions.none())
+            # 先頭の event の最初の試行から数える。例外を捕まえた時点ではなく送信の直前
+            self.progress.delivery_begin(plan.event_id)
             try:
                 await self._channel.send(content, allowed_mentions=allowed)
-            except (discord.HTTPException, OSError, asyncio.TimeoutError):
-                # 投稿できなかった event から先は確定しない。次の周回で同じ event から再送する
+            except REST_ERRORS as exc:
+                if classify(exc) == PERMANENT:
+                    # cursor はこの event より先へ進めない。設定の修復後に同じ event から再送する
+                    raise BotFailure("discord_rejected") from None
+                # 一時の失敗: 投稿できなかった event から先は確定しない。次の周回で同じ event から再送する
                 return
             if improve_key is not None:
                 self._remember_improve(improve_key)
             await self._run(self._commit_post, plan.event_id, max(high, plan.event_id))
+            self.progress.delivery_committed(plan.event_id)
             progressed = True
             if approval_id is not None:
                 await self._settle(approval_id, detail=detail if _detail_status(detail) not in {None, "pending"} else None)
@@ -874,31 +937,31 @@ class BotAdapter:
     def _initialize_cursor(self, high: int) -> None:
         try:
             self.gate.initialize_event_cursor(high)
-        except StateError:
-            raise BotFailure("bot_state_invalid") from None
+        except StateError as exc:
+            raise BotFailure(exc.reason) from None
 
     def _observe_high(self, high: int) -> None:
         self._regression_guard(high)
         try:
             self.gate.observe_high_watermark(high)
-        except StateError:
-            raise BotFailure("bot_state_invalid") from None
+        except StateError as exc:
+            raise BotFailure(exc.reason) from None
 
     def _commit_post(self, event_id: int, high: int) -> None:
         """投稿が成功した後にだけ cursor と high watermark を 1 回の置換で確定する。"""
         self._regression_guard(high)
         try:
             self.gate.commit_event(event_id, high_watermark=high)
-        except StateError:
-            raise BotFailure("bot_state_invalid") from None
+        except StateError as exc:
+            raise BotFailure(exc.reason) from None
 
     def _commit_skip(self, event_id: int, high: int) -> None:
         """配信しない既知の event の確定 (投稿の成功を待たない)。"""
         self._regression_guard(high)
         try:
             self.gate.commit_skip(event_id, high_watermark=high)
-        except StateError:
-            raise BotFailure("bot_state_invalid") from None
+        except StateError as exc:
+            raise BotFailure(exc.reason) from None
 
     def _regression_guard(self, high: int) -> None:
         if high < self.gate.state.high_watermark:
@@ -992,16 +1055,24 @@ class BotAdapter:
         exclude は record が今指している (消えた) 投稿。
         """
         expected = gate_footer(draft.approval_id, draft.payload_sha256, generation)
-        try:
-            async for message in self._channel.history(limit=100):
-                meta = self._metadata(message)
-                if (meta.message_id != exclude and meta.author_is_bot
-                        and meta.guild_id == draft.guild_id
-                        and meta.channel_id == draft.channel_id and meta.footer == expected):
-                    return meta.message_id
-        except (discord.HTTPException, OSError, asyncio.TimeoutError):
-            raise BotFailure("discord_unavailable") from None
-        return None
+        delay = REST_RETRY_SECONDS
+        while True:
+            try:
+                async for message in self._channel.history(limit=100):
+                    meta = self._metadata(message)
+                    if (meta.message_id != exclude and meta.author_is_bot
+                            and meta.guild_id == draft.guild_id
+                            and meta.channel_id == draft.channel_id and meta.footer == expected):
+                        return meta.message_id
+            except REST_ERRORS as exc:
+                # 権限の拒否も一時の失敗も、履歴が空だったとは読み替えない (重複して投稿しない)。
+                # 一時の失敗は履歴の読み直しを保留して再試行する
+                if classify(exc) == PERMANENT:
+                    raise BotFailure("discord_rejected") from None
+                await self._sleep(delay)
+                delay = min(delay * 2, REST_RETRY_MAX_SECONDS)
+                continue
+            return None
 
 
 def _page(reply) -> tuple[list[dict], int, int]:
@@ -1012,4 +1083,5 @@ def open_state_dir(path: os.PathLike) -> int:
     try:
         return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError:
-        raise BotFailure("bot_state_invalid") from None
+        # state dir を開けない OS の失敗。内容の不正 (bot_state_invalid) とは別で、一時として再試行する
+        raise BotFailure("bot_state_unavailable") from None

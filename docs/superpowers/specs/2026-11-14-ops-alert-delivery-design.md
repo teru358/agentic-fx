@@ -203,9 +203,9 @@ health 判定は monotonic clock、表示時刻は UTC wall clock を使う。�
 |---|---|---|
 | event の channel send、`deliver_events`:817 | 恒久終了 / 一時 | 固定通知先で繰り返す配送。429 以外の 4xx は恒久拒否、特に 401、403、404 / 10003 は設定修復が必要。失敗 event 以後へ cursor を進めない。一時失敗は先頭 event の 10 分窓を維持 |
 | 承認 send、`_send_approval`:447（新規 / 再投稿で共有） | 恒久終了 / 一時 | 同じ bot token / 通知先への承認投稿。event send と同じ拒否規則。失敗時 View を stop し、record を投稿成功として確定しない |
-| `fetch_message`、`_fetch`:406（現行 :407 catch） | 有限の応答失敗として除外 / 恒久終了 / 一時 | **404 + code 10008** のみ既知 message の消失として `None` を返し、既存の起動時 reconcile / 再投稿へ渡す。channel 消失・権限拒否は下記共通規則で恒久。一時障害は投稿消失に変換しない |
+| `fetch_message`、`_fetch`:406（現行 :407 catch） | 有限の応答失敗として除外 / 恒久終了 / 一時 | **404 + code 10008** のみ既知 message の消失として `None` を返し、既存の起動時 reconcile / 再投稿へ渡す。channel 消失・権限拒否は下記共通規則で恒久。一時障害は投稿消失に変換せず、対象操作を保留して backoff で再試行する。上限は起動 reconcile か poll 周回の監視窓 (10 分) |
 | bot-token edit、`_edit`:434（現行 :435 catch） | 有限の応答失敗として除外 / 恒久終了 / 一時 | **404 + code 10008** は `gone`。pending 表示は再投稿、terminal 表示は既に無いとして完了。通常 pending edit のその他 4xx は恒久。終端 View 除去 (:669)、不採用再投稿の cleanup (:380) は message 局所の 400 等を有限失敗として除外し、前者は既存 `EDIT_RETRY_LIMIT=8` / abandon、後者は一回で終了。ただし下記共有 channel / 認証 / 権限拒否は cleanup でも恒久に優先する。一時障害は `failed` 等の既存経路へ |
-| `history(limit=100)`、`_find_posted`:996 | 恒久終了 / 一時 | 投稿後・保存前 crash の回収。429 以外の 4xx は channel / 権限等の恒久拒否。10008 を履歴「空」に読み替えない。一時失敗でも履歴無しと決めて重複投稿しない |
+| `history(limit=100)`、`_find_posted`:996 | 恒久終了 / 一時 | 投稿後・保存前 crash の回収。429 以外の 4xx は channel / 権限等の恒久拒否。10008 を履歴「空」に読み替えない。一時失敗でも履歴無しと決めて重複投稿せず、履歴の読み直しを保留して backoff で再試行する。上限は起動 reconcile か poll 周回の監視窓 (10 分) |
 | `interaction.response.defer`、`on_component`:509 | 有限の応答失敗として除外 | 利用者操作一回への ACK。期限切れ / 二重 ACK 等の 4xx、一時 HTTP 障害、network / timeout はその操作で終了。gate / daemon mutation は defer 成功後だけ行い、失敗時は行わない。bot を止めず、同じ interaction を自動再試行しない |
 | `interaction.followup.send`（View 無し）、`_respond`:610 | 有限の応答失敗として除外 | 期限切れ interaction / webhook 等の 4xx も当該利用者応答だけの失敗。gate の決定済み結果を戻さず bot は継続。429 / 5xx / network / timeout も当該応答で終了し再送 loop を作らない |
 | `interaction.followup.send`（確認 View 有り、wait=True）、`_respond`:612 | 有限の応答失敗として除外 | 同上。失敗時 View を stop、`bind_confirm` と route 追加を行わない。成功した場合だけ既存の bind を行う |
@@ -213,11 +213,11 @@ health 判定は monotonic clock、表示時刻は UTC wall clock を使う。�
 | adapter 外: `bot.connect(reconnect=True)`、`runtime.py`:183 | 恒久終了 / 一時（REST 部分） | gateway 接続処理で内部 REST が失敗した場合も status / code が判別できる 4xx は上記恒久規則を優先。一時 REST / 接続失敗は gateway の同じ 10 分窓。WebSocket 自体は REST ではなく §5.1 の対象 |
 | adapter 外: `bot.close`、`runtime.py`:177 | 有限の応答失敗として除外（終了処理） | 新たな配送はしない。内部 REST の有無は未確認。close の失敗で既定の終了理由を上書きせず、停止が戻らなければ §5.3 の shutdown 60 秒上限で終了 |
 
-**404 / 権限の優先規則（bot-token の永続 channel 操作）:** `status=404, code=10008` は上表の fetch / edit に限り message 消失。`10003` (Unknown channel)、`50001` (Missing access)、`50013` (Missing permissions)、HTTP 401 / 403 は共有配送先 / 認証の恒久拒否であり、cleanup 除外より優先する。fetch / 通常 edit の未知・欠落 code の 404 は消失と推測せず恒久拒否とする。cleanup でも 10008 以外の 404 は恒久拒否。interaction token に依存する defer / followup にはこの channel 規則を適用しない。例えば `10062` (Unknown interaction)、`10015` (Unknown webhook)、`50027` (Invalid webhook token)、`40060` (Interaction has already been acknowledged) は一操作の失効として bot を止めない。code / body / ID / 例外文は出力せず、分類結果の固定 code だけを使う。
+**404 / 権限の優先規則（bot-token の永続 channel 操作）:** `status=404, code=10008` は上表の fetch / edit に限り message 消失。code を HTTP status より先に見る: `10003` (Unknown channel)、`50001` (Missing access)、`50013` (Missing permissions)、HTTP 401 / 403 は共有配送先 / 認証の恒久拒否であり、status が message 局所の 400 であっても、cleanup 除外より優先する。有限の失敗にするのは、これらに当たらない message 局所の 400 等だけである。fetch / 通常 edit の未知・欠落 code の 404 は消失と推測せず恒久拒否とする。cleanup でも 10008 以外の 404 は恒久拒否。interaction token に依存する defer / followup にはこの channel 規則を適用しない。例えば `10062` (Unknown interaction)、`10015` (Unknown webhook)、`50027` (Invalid webhook token)、`40060` (Interaction has already been acknowledged) は一操作の失効として bot を止めない。code / body / ID / 例外文は出力せず、分類結果の固定 code だけを使う。
 
 error code の意味は [Discord 公式 HTTP / JSON error codes](https://docs.discord.com/developers/topics/opcodes-and-status-codes#json-json-error-codes) と照合した。実環境で各 status / code の組合せが返ること、discord.py 2.7.1 内部の全 endpoint、各 deadline の cancellation 完了は未確認であり、§9.2 の fixture / 実装時確認対象である。
 
-poller には `poll_started_at` と `last_poll_completed_at` を持たせる。process 開始から最初の完了まで、又は一周開始から 10 分完了しなければ `poller_stalled` の一時 exit にする。これにより、event page / gate executor / disk I/O / send 以外の await が戻らない経路も拾う。
+poller には `poll_started_at` と `last_poll_completed_at` を持たせる。最初の窓は login 後の起動 reconcile の開始時から数え (login 前は §5.1 の gateway の窓が担当する)、通常の poll が始まってからは各周回の開始から数える。起動 reconcile も一周も、始めてから 10 分完了しなければ `poller_stalled` の一時 exit にする。これにより、event page / gate executor / disk I/O / send 以外の await が戻らない経路も拾う。
 
 初回・snapshot 欠損・v4 cursor 0 の backlog skip と、破損 snapshot で停止する規則は変えない。
 
@@ -312,7 +312,7 @@ bot 未設定は `not_configured`、file 無し又は読取不能は `unknown`�
 | `events_invalid` | 78 | 恒久 | event page 契約を直し明示 restart |
 | `high_watermark_regressed` | 78 | 恒久 | daemon / DB を調査し明示 restart |
 | `discord_rejected`（§5.2 表の恒久対象 4xx。投稿消失・有限応答の除外を先に判定） | 78 | 恒久 | cursor を保ち、権限 / channel / payload を直し明示 restart |
-| bot cursor state / `open_state_dir` の OSError | 79 | 一時 | backoff 再起動。内容不正とは例外型を分ける。health 表示専用 snapshot の I/O は非致命 |
+| bot cursor state / `open_state_dir` の OSError | 79 | 一時 | backoff 再起動。内容不正とは例外型を分ける。health 表示専用 snapshot の I/O は非致命。ただし state file が symlink のとき (`O_NOFOLLOW` の ELOOP) は、人が直すまで再試行しても直らないので内容不正と同じ `bot_state_invalid` の恒久 78 にする（明示的な例外） |
 | `discord_unavailable`、`gateway_failed`、`gateway_unhealthy` | 79 | 一時 | process 内の 10 分監視後に backoff 再起動 |
 | `delivery_stalled`、`poller_stalled` | 79 | 一時 | cursor を保ち backoff 再起動 |
 | `bot_internal_error` | 79 | 一時 | 固定語だけ出し backoff 再起動 |
@@ -435,12 +435,13 @@ daemon が新 event を出す前に afx-ops を配る。event schema 自体は�
 ### 9.2 bot / systemd / 秘密
 
 - fake monotonic clock で starting / READY / RESUMED / disconnect / disconnect 連打 / login retry / RECONNECT を試す。9分59秒は生存、10分で rc 79。disconnect 連打で起点を動かさない。
+- 初回 poll の窓は login 後の起動 reconcile の開始から数える。login に 9 分半かかった後でも最初の poll は開始から 10 分生存し、10 分で `poller_stalled` になる。通常 poll の開始後は各周回の開始から 10 分。起動 reconcile の hang も rc 79 で止める。fetch / history の 429・一時失敗は保留して backoff で再試行し、消失・履歴空に読み替えず、窓の上限で止める。`connect()` の一時的な REST / 接続例外は backoff で再接続して既存の不健全の起点を動かさず、恒久 4xx は先に判定して rc 78 にする。test 自身も実時間の期限を持ち、超過を明示的な失敗として報告する。
 - finite / NaN / inf latency を試し、health 判定には使わず、非有限値は snapshot の null になる。
 - send が永遠に返らない、429 の内部 sleep、retryable 例外、別 REST 成功、send 成功後 cursor 保存停止を試す。期限は先頭 event の最初の試行からで、send + cursor 保存時だけ回復する。
 - gate executor の関数を block し、poll 周回が 10 分で rc 79 になる。gateway と loop ack が正常でも検知する。
 - §5.2 表の adapter 内 REST 全 8 箇所と adapter 外 login / connect / close を fixture に対応させる。event send と承認 send を別々に 400 / 401 / 403 / 404（10003）→ rc 78、429 / 5xx / network / timeout → 一時として試す。history の権限拒否も rc 78 とし、失敗を履歴空にしない。login 認証拒否と一時 failure の 10 分窓も確認する。cursor は拒否 event より先へ進めない。
 - fetch の 404 / 10008 は `None` を返し起動時 reconcile が既存の再投稿 / adopt に進む。pending edit の 404 / 10008 は `gone` から repost intent 保存 → 再投稿 → record 付替えへ進む。terminal edit の同じ消失は完了扱いで再投稿しない。いずれも rc 78 にせず、既存の世代 / footer / cursor 契約を保つ回帰 test を置く。
-- 同じ fetch / edit に 404 / 10003、403 / 50001、403 / 50013、401 を注入し rc 78 とする。`None` / `gone` / 再投稿へ進めず、cleanup でも恒久拒否を握らない。code 欠落 / 未知の 404 も恒久、429 / 5xx / network は消失にしない。有限の message 局所 cleanup 失敗は既存 8 回上限又は単発で終わり、無限 retry に変えない。
+- 同じ fetch / edit に 404 / 10003、403 / 50001、403 / 50013、401 と、status 400 の 10003 / 50001 / 50013 を注入し rc 78 とする。`None` / `gone` / 再投稿へ進めず、cleanup でも恒久拒否を握らない。code 欠落 / 未知の 404 も恒久、429 / 5xx / network は消失にしない。有限の message 局所 cleanup 失敗は既存 8 回上限又は単発で終わり、無限 retry に変えない。
 - defer と followup 二経路に 10062 / 10015 / 50027 / 40060 等の 4xx、429 / 5xx / network / timeout を注入し bot が生存して次の poll / interaction を処理できる。defer 失敗時は gate / daemon 操作無し、followup 失敗時は成立済み操作を戻さず再送しない。View 有り失敗では stop、bind_confirm / route 追加無しを確認する。返らない await は各 10 秒で打切り、成功した REST / poll の進捗を損なわない。
 - `payload_invalid`、`events_invalid`、`high_watermark_regressed`、state 内容不正は rc 78。cursor state / open_state_dir の一時 I/O は rc 79、health 表示専用 I/O は非致命。
 - loop を停止し、watchdog が F_GETFL → 既存 flags と O_NONBLOCK の OR → F_SETFL の順で他の flags を保持し、`poll(POLLOUT,0)` 後に rc 80 で `os._exit` する。F_GETFL / F_SETFL 失敗、fd 2 書込み不能でも出力を捨てて exit へ進む。
@@ -508,6 +509,7 @@ daemon が新 event を出す前に afx-ops を配る。event schema 自体は�
 | C3 | 2026-11-14 | sweep 例外境界、全 REST 分類、終了後 watchdog、terminal snapshot、shell 直接経路維持、周辺作業分割、実データ反映 | opus 3 周目 I1〜I6 / m1〜m14 と今回の指示に基づき、通知欠落と無言停止に範囲を絞る | —（c3.md、未 commit） |
 | C4 | 2026-11-14 | REST 呼出し全数表、message 消失回復と恒久拒否の分離、lane 再入即時拒否、XDG の古い表示と導入確認、fcntl flags 保持、完了条件縮小を明示 | terra C3 閉鎖確認 I1〜I3 / Minor 2 件とチケット成功条件の指摘を採用。コード・C3 は未変更、実装検証は未実施 | —（c4.md、未 commit） |
 | C4.1 | 2026-11-14 | §4.4 shell は直接 mutation の前にも公開 wrapper を一回呼ぶ。§9.1 に対応 test を追加 | 実装で見つかった shell の前 sweep の欠落 (ラッチ後最初の tick より前の shell 解除で latched も released も出ない) | — |
+| C4.2 | 2026-11-14 | 初回 poll の窓を login 後の起動 reconcile の開始から数える、fetch / history / connect の一時失敗を保留 + backoff にする、cleanup の恒久判定で code を先に見る、symlink の state file を恒久 78 の明示例外にする | 実装レビューで見つかった初回 poll の窓の起点と一時失敗の再試行の欠落 | — |
 
 ## 13. task 表
 

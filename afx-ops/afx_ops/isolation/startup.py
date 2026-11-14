@@ -1086,6 +1086,12 @@ def run(plan: StartupPlan, config: OpsConfig, body: Callable[[Isolated], int], *
     `plan_check` と `wait` は試験だけが差し替える (unit の外・一時領域・短い待ちで起動する
     ため)。production の起動口は渡さず、設定からも変えられない。server 認証の失敗は要求経路
     の失敗と同じ終了コード (`RC_UNREACHABLE`) で、process 内では再試行しない。
+
+    終了コードは、起動の失敗が `RC_RUNTIME_IMPORT_FAILED` / `RC_ISOLATION_FAILED` / `RC_UNREACHABLE`、
+    body の想定外の例外が `RC_BODY_FAILED`。body が返す値はそのまま返す。bot の body は、進捗の
+    監視 (gateway / 配送 / poll 周回が 10 分止まる)・Discord の一時障害・想定外を一時 (`RC_BOT_TRANSIENT`、
+    再起動対象)、token・state の内容・payload・event・Discord の配送拒否を恒久 (`RC_BOT_PERMANENT`、
+    再起動しない) として返す (`afx_ops.bot.exits`)。起動の失敗は bot の unit では恒久として扱う。
     """
     owner = _ConfigDirOwner(config.config_dir_fd)
     try:
