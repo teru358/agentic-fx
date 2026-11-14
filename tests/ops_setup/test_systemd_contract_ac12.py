@@ -759,9 +759,13 @@ def test_bot_long_outage_recovers_within_monitor_plus_max_wait_scaled(ac):
     assert props["Result"] != "start-limit-hit" and props["ActiveState"] != "failed"
     assert all(cycle <= monitor + maximum + 1.5 for cycle in cycles), cycles
     # 障害が終わった時点から、次の起動で READY に戻るまでが (監視 + 最大待ち) 以内。
+    # 許す誤差は systemd と試験 process の起動の揺れとして 1.5 秒。
     ac.ops_mode(mode="ready")
+    started = time.monotonic()
     assert _wait(lambda: _show(ac.ops("bot"), "ActiveState")["ActiveState"] == "active",
-                 seconds=monitor + maximum + 3)
+                 seconds=monitor + maximum + 10)
+    recovered = time.monotonic() - started
+    assert recovered <= monitor + maximum + 1.5, recovered
 
 
 def test_bot_runs_without_notify_and_the_status_shows_the_fixed_warning_only(ac):

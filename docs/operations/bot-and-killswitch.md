@@ -18,7 +18,7 @@
 
 - start-limit は bot では無効です。一時障害が続いても failed に倒れず、間隔だけが伸びます。web と notify の再起動方針は変わりません。
 - 恒久 (78 / 71 など) で止まったときは、人が原因を直してから明示的に再起動します。原因は `journalctl --user -u afx-ops@bot` の固定語と `afx ops bot status` で確かめます。71 は設定不正のほか、secret の一時的な読取り失敗や隔離の環境失敗も含みます。直した後も明示 restart が要ります。
-- failed から戻すときは `systemctl --user reset-failed afx-ops@bot` の後に start します。reset-failed は再起動の段階も初期値に戻します。
+- failed から戻すときは `systemctl --user reset-failed afx-ops@bot` の後に start します。開発機 (systemd 259) では reset-failed で再起動の段階も初期値に戻ることを観測しましたが、他の版では確かめていません。版を変えたときは `systemctl --user show afx-ops@bot -p NRestarts` を reset-failed の前後で見て確かめてください。
 - 再起動の待ちが段階的に伸びるのは、自動再起動が続く間です。手動の restart や READY で段階が初期化されるかは systemd の版で変わり得るので、断定しません。長期の障害では、最悪の回復は検知の 10 分と再起動待ちの最大 10 分の合計までを見込みます。
 - bot の recovery drop-in は systemd 254 以上を前提とします。`afx ops bot enable` は稼働中の user manager の版を照会し、254 未満か、版を取得できなければ `systemd_too_old` で拒否します。
 - bot の unit は `Requisite=afx.service` です。afx が止まっている間は bot も立ち上がりません。afx を戻した後は、`afx ops bot status` と `systemctl --user is-active afx-ops@bot` で bot が active に戻ったことを確かめます。戻らなければ start します。
@@ -49,7 +49,8 @@ bot は state dir の `gateway.snapshot` に最新の状態を置き、daemon �
 
 ## 4. kill switch の通知と reset
 
-- drawdown でラッチすると、次の scheduler tick の末尾までに `guard_state_changed` (latched) が出て、bot と設定済みの notify に届きます。通常の遅れは最大でおよそ 1 分に tick の処理時間を足した程度です。ラッチ自体の判定時点は変わりません。
+- drawdown でラッチすると、通常は次の scheduler tick の末尾で `guard_state_changed` (latched) の event が出ます。event になるまでの通常の遅れは、最大でおよそ 1 分に tick の処理時間を足した程度です。ラッチ自体の判定時点は変わりません。
+- event になることと、届くことは別です。ops lane が取れない、DB が一時的に使えないといったときは、event 化が次の起動か tick に延びます。journal に固定語 `guard_notice_deferred` が出て、`afx status` の `guard_notice_pending` が立ちます。次の tick で自動的に再試行するので、通常は待つだけで足ります。続くときは DB と daemon の状態を確かめます。event が出た後の配送も、Discord や notify の障害で遅れたり止まったりします。届かないときは `afx ops bot status` と bot の health を確かめます。
 - reset と reconcile の event も同じ経路で出ます。解除済みで event が無い世代 (導入前の世代) には後から通知しません。導入後の最初の起動で `guard_notice_backfill_skipped` が journal に出ることがありますが、閉じた世代を飛ばした正常な動作です。
 - reset は `afx ctl --as approver killswitch reset <世代>` (または shell の `killswitch reset <世代>`) です。成功すると、どちらも次の固定文を 1 回出します。
 
