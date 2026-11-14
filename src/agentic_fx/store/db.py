@@ -607,6 +607,34 @@ CREATE TABLE IF NOT EXISTS account_snapshots (
   hwm REAL NOT NULL, cashflow REAL NOT NULL DEFAULT 0,
   source TEXT NOT NULL DEFAULT 'paper'
 );
+CREATE TABLE IF NOT EXISTS kill_switch_hwm_rebases (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  applied_at TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  latched_at TEXT,
+  source_snapshot_id INTEGER NOT NULL UNIQUE REFERENCES account_snapshots(id),
+  rebase_snapshot_id INTEGER NOT NULL UNIQUE REFERENCES account_snapshots(id),
+  accepted_audit_id INTEGER NOT NULL UNIQUE REFERENCES ops_requests(id),
+  digest_version INTEGER NOT NULL,
+  preview_token TEXT NOT NULL,
+  hwm_before REAL NOT NULL,
+  hwm_after REAL NOT NULL,
+  equity REAL NOT NULL,
+  balance REAL NOT NULL,
+  drawdown_pct REAL NOT NULL,
+  threshold_pct REAL NOT NULL,
+  cut REAL NOT NULL,
+  cut_pct REAL NOT NULL,
+  additional_headroom REAL NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS kill_switch_hwm_rebases_no_update
+BEFORE UPDATE ON kill_switch_hwm_rebases BEGIN
+  SELECT RAISE(ABORT, 'kill_switch_hwm_rebases is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS kill_switch_hwm_rebases_no_delete
+BEFORE DELETE ON kill_switch_hwm_rebases BEGIN
+  SELECT RAISE(ABORT, 'kill_switch_hwm_rebases is append-only');
+END;
 -- Task 12 Fix Round 1 (ユーザー裁定): snapshots.latest() の
 -- `ORDER BY ts DESC, id DESC LIMIT 1` が無索引で全表スキャンになり、tick
 -- 毎に呼ばれる実運用・バックテスト双方で行数に対し劣化する (O(n^2) 実測 —
@@ -810,6 +838,7 @@ TABLE_NAMES = frozenset({
     "improve_run_notices",
     "improve_run_summaries", "signal_decisions", "signal_shadow", "ohlcv_slice_sets", "ohlcv_slices",
     "ohlcv_slice_generations", "econ_reaction_keys", "econ_reaction_values",
+    "kill_switch_hwm_rebases",
 })
 
 
