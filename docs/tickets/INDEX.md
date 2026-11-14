@@ -1,17 +1,15 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 176 件。完了分は closed/。
+未完了: 174 件。完了分は closed/。
 
-## 実装中 (7)
+## 実装中 (5)
 
-### 不具合 (5)
+### 不具合 (3)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [live-confirmed-bars-into-history](open/live-confirmed-bars-into-history.md) | 高 | 2026-09-21 | backtest の履歴が自動で更新されず、評価が古い入力で通る |
-| [auto-killswitch-latch-emits-no-event](open/auto-killswitch-latch-emits-no-event.md) | 高 | 2026-11-13 | drawdown による kill switch の自動作動が通知されない |
-| [bot-gateway-disconnect-is-silent](open/bot-gateway-disconnect-is-silent.md) | 高 | 2026-11-13 | bot が Discord から切断されたまま黙って生き続ける |
 | [history-import-stops-at-first-conflict](open/history-import-stops-at-first-conflict.md) | 中 | 2026-11-13 | history import は食い違う足 1 本で partial 停止し後続を取り込まない |
 | [status-history-hidden-while-daemon-runs](open/status-history-hidden-while-daemon-runs.md) | 中 | 2026-11-13 | daemon 稼働中は評価用履歴の状態を見る面が無い |
 
