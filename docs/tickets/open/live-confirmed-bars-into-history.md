@@ -5,7 +5,7 @@ status: 実装中
 priority: 高
 opened: 2026-09-21
 closed: null
-related: [killswitch-reset-hwm-rebase]
+related: [history-import-stops-at-first-conflict, status-history-hidden-while-daemon-runs, improve-eval-window-reference-availability]
 backfilled: true
 source_section: 完了ログ
 kind: 不具合
@@ -26,3 +26,4 @@ kind: 不具合
 - 2026-11-13: 関連: [improve-eval-window-reference-availability] — 段 1a を main へ merge (2026-11-13)。履歴の鮮度・充足を共有 gate で検査し、主 pair が古い・穴ありなら採用判定と承認を止める。承認・再評価・rollback は承認時の証跡を照合し、rollback の強行は人間専用で、開始の監査を activity に、op との関連付けを DB に token で記録する (設計 C2.2)。評価区間の設計 (improve-eval-window-reference-availability) はこの上に乗せる。残り: 配備、task 6 (配備中 4 版の再評価)、段 1b (非配備 7 版の監査)、段 2 (afx history sync)、段 3 (daemon の定期同期)。
 - 2026-11-13: 関連: [history-import-stops-at-first-conflict] — 段 1a の配備と task 6 を完了 (2026-11-13)。履歴を 11-13 12:05Z まで補充 (参照 4 銘柄が取り込めなかった真因は import の衝突停止、history-import-stops-at-first-conflict に起票)。配備中 4 版を再評価し #122〜#125 を作成、利用者が 4 件とも承認。manifest に記録し validate・verify_against_db とも問題 0 件。残り: 段 1b (非配備 7 版の監査)、段 2 (afx history sync)、段 3 (daemon の定期同期)、status-history-hidden-while-daemon-runs。
 - 2026-11-13: 関連: [killswitch-reset-hwm-rebase] — 2026-11-13 22:20: 利用者判断で asym_shock_breakout (#122、holdout PF 0.81) と ichimoku_rsi_cloud_reentry (#124、PF 0.92) を afx plugin disable --revoke で配備から外し、版を rejected にした (追記 #126・#127)。配備中は close_pressure_followthrough と volume_close_pressure の 2 版。manifest の human_decision は再評価依頼 #122・#124 自体の決定 (approved) のままで、後の失効は DB の #126・#127 が記録する。
+- 2026-11-14: 関連: [history-import-stops-at-first-conflict, status-history-hidden-while-daemon-runs, improve-eval-window-reference-availability] — 段 1b の設計 C2 を 2026-11-14 に利用者承認 (docs/superpowers/specs/2026-11-14-stage1b-non-deployed-audit-design.md)。非配備 7 版のうち 4 版 (#21・#25・#23・#24) は既に失効済みで rollback の恩恵は無いが、既存裁定どおり 7 版すべてを監査する (J0)。方式 D: 7 版を配備せず現在の条件で各 1 回 warn / compare off で評価し、人間専用 report と manifest (最小 v2、従来の v1 は受理を維持) に 4 軸 (実行完了 / 床合否 / 履歴検証 / 未実行 scope) で記録する。rollback が要るときは既存の人間専用強行を使い、段 1a 設計 §8.4 の「後続実装で通常 rollback」は需要まで延期 (J1)。7 版の実行は実行前に利用者が確認する。関連を段 1 の後続チケットに付け直した。
