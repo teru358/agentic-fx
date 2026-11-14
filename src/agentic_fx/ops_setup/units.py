@@ -13,6 +13,16 @@ from pathlib import Path
 
 
 _FEATURES = frozenset({"bot", "web", "notify"})
+BOT_DROPIN_NAME = "bot-recovery.conf"
+# 恒久の終了 (unit / argv 不正・key 不正・未実装・runtime import・共通 startup 失敗・bot の恒久判断) は
+# 再起動で直らないので、無期限の再起動から外す。値は bot の exit 表と一致させる。
+BOT_PERMANENT_EXIT_STATUS = (2, 4, 69, 70, 71, 78)
+# RestartSteps / RestartMaxDelaySec は systemd 254 で入った。
+BOT_MIN_SYSTEMD_VERSION = 254
+BOT_DROPIN = (
+    "[Unit]\nStartLimitIntervalSec=0\n\n"
+    "[Service]\nRestart=on-failure\nRestartSec=30s\nRestartSteps=5\nRestartMaxDelaySec=10m\n"
+    "RestartPreventExitStatus=" + " ".join(str(code) for code in BOT_PERMANENT_EXIT_STATUS) + "\n")
 # 試験で探索結果を差し替えられるよう、module の名前として持つ。
 _which = shutil.which
 _find_spec = importlib.util.find_spec
@@ -46,6 +56,18 @@ class UnitPaths:
     @property
     def dropin_path(self) -> Path:
         return self.unit_dir / f"{self.afx_unit}.d" / "afx-ops.conf"
+
+    @property
+    def bot_dropin_path(self) -> Path:
+        """bot instance だけに効く recovery の drop-in。template 全体の drop-in にはしない。"""
+        return self.unit_dir / f"{self.feature_unit('bot')}.d" / BOT_DROPIN_NAME
+
+    def artifact_paths(self, features: set[str]) -> list[Path]:
+        """features に対して install が置く資材の全 path。"""
+        paths = [self.template_path, self.dropin_path]
+        if "bot" in features:
+            paths.append(self.bot_dropin_path)
+        return paths
 
 
 def _template_text() -> str:
@@ -185,6 +207,18 @@ def resolve_ops_exec(paths: UnitPaths) -> UnitPaths:
     raise OpsExecNotFound("afx-ops が PATH に無く、afx_ops module も import できない")
 
 
+def bot_systemd_problem(version: int | None) -> str:
+    """bot の recovery drop-in を使えない systemd なら固定の理由を返す。使えるなら空文字。
+
+    古い systemd で drop-in の一部だけが効くと、無期限の固定間隔再起動になり得る。
+    暗黙の fallback は作らず、bot の enable を拒否する。"""
+    if version is None:
+        return "systemd の version を確認できない"
+    if version < BOT_MIN_SYSTEMD_VERSION:
+        return f"systemd {version} は {BOT_MIN_SYSTEMD_VERSION} 未満 (RestartSteps が使えない)"
+    return ""
+
+
 def _rendered(paths: UnitPaths, features: set[str]) -> tuple[str, str]:
     if paths.ops_exec is None or _syntax_problem(_split_exec(paths.ops_exec)):
         raise OpsExecNotFound(f"ops_exec={paths.ops_exec!r} unit に書けない")
@@ -201,12 +235,31 @@ def install_units(paths: UnitPaths, features: set[str]) -> None:
     template, dropin = _rendered(paths, features)
     _write_if_changed(paths.template_path, template)
     _write_if_changed(paths.dropin_path, dropin)
+    if "bot" in features:
+        _write_if_changed(paths.bot_dropin_path, BOT_DROPIN)
+    else:
+        _remove_bot_dropin(paths)
+
+
+def _remove_bot_dropin(paths: UnitPaths) -> None:
+    remove_durably(paths.bot_dropin_path)
+    try:
+        paths.bot_dropin_path.parent.rmdir()
+    except OSError:
+        # 無い・他の file が残っている dir は触らない。
+        return
+    fsync_dir(paths.unit_dir)
 
 
 def units_match(paths: UnitPaths, features: set[str]) -> bool:
     """設置済みの template と drop-in が、features に対して書くはずの内容と一致するか。"""
     template, dropin = _rendered(paths, features)
     try:
+        if "bot" in features:
+            if paths.bot_dropin_path.read_text() != BOT_DROPIN:
+                return False
+        elif os.path.lexists(paths.bot_dropin_path):
+            return False
         return (paths.template_path.read_text() == template
                 and paths.dropin_path.read_text() == dropin)
     except (OSError, UnicodeDecodeError):
@@ -217,6 +270,7 @@ def units_match(paths: UnitPaths, features: set[str]) -> bool:
 def uninstall_feature(paths: UnitPaths, remaining_features: set[str]) -> None:
     """対象 feature を Wants 集合から外し、最後なら資材全体を除去する。"""
     if not remaining_features:
+        _remove_bot_dropin(paths)
         remove_durably(paths.dropin_path)
         remove_durably(paths.template_path)
         return

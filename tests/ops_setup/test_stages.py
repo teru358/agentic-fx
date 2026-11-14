@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from agentic_fx.ops.keys import Principal, initialize, key_dir
-from agentic_fx.ops_setup.stages import InvalidState, OpsSetup, read_stage
+from agentic_fx.ops_setup.stages import InvalidState, OpsSetup, _write_stage, read_stage
 from agentic_fx.ops_setup.systemd import SystemdError
 from agentic_fx.ops_setup.units import UnitPaths
 from agentic_fx.store.enroll_marker import enroll_marker_path
@@ -986,6 +986,8 @@ def _systemctl_run(fail: dict[str, tuple[int, str]]):
 
     def run(args, **_kwargs):
         action = args[2]
+        if args[2:] == ["show", "--property=Version"]:
+            return subprocess.CompletedProcess(args, 0, stdout="Version=259.9\n", stderr="")
         if action in fail:
             rc, err = fail[action]
             return subprocess.CompletedProcess(args, rc, stdout="", stderr=err)
@@ -1942,3 +1944,205 @@ def test_ops_status_stays_quiet_when_the_database_cannot_be_read(tmp_path, monke
 
     assert stages.run_ops_command(setup.root, "status", "bot") == 0
     assert "配備操作" not in capsys.readouterr().out
+
+
+class _VersionedSystemd(FakeSystemd):
+    def __init__(self, paths, version):
+        super().__init__(paths)
+        self.reported = version
+
+    def version(self) -> int:
+        self.calls.append("version")
+        if isinstance(self.reported, Exception):
+            raise self.reported
+        return self.reported
+
+
+def _versioned(tmp_path, version):
+    setup, systemd, home = _setup(tmp_path)
+    systemd = _VersionedSystemd(setup.paths, version)
+    systemd.active.add(setup.paths.afx_unit)
+    setup.systemd = systemd
+    return setup, systemd, home
+
+
+@pytest.mark.parametrize("version", [253, 200, SystemdError("version", "rc=1")])
+def test_bot_enable_is_refused_on_old_or_unknown_systemd_before_touching_anything(tmp_path, monkeypatch, version):
+    setup, systemd, home = _versioned(tmp_path, version)
+    _with_home(home, monkeypatch)
+
+    with pytest.raises(SystemdError) as raised:
+        setup.enable("bot")
+
+    assert raised.value.reason == "systemd_too_old"
+    assert "254" in raised.value.detail or "確認できない" in raised.value.detail
+    # afx を止めず、資材も鍵も作らない。
+    assert not any(call.startswith(("stop", "start", "daemon-reload")) for call in systemd.calls)
+    assert not setup.paths.template_path.exists() and not setup.paths.bot_dropin_path.exists()
+    assert not enroll_marker_path(setup.root).exists()
+    saved = read_stage(setup.root, "bot")
+    assert saved["stage"] == "staged" and saved["failure"] == "systemd_too_old"
+
+
+def test_bot_enable_on_254_installs_and_records_the_bot_dropin_as_an_artifact(tmp_path, monkeypatch):
+    setup, _systemd, home = _versioned(tmp_path, 254)
+    _with_home(home, monkeypatch)
+
+    result = setup.enable("bot")
+
+    assert result.stage == "enabled"
+    assert setup.paths.bot_dropin_path.read_text().count("RestartPreventExitStatus=2 4 69 70 71 78") == 1
+    assert str(setup.paths.bot_dropin_path) in read_stage(setup.root, "bot")["artifacts"]
+
+
+@pytest.mark.parametrize("stage", ["installed", "started", "enabled"])
+def test_a_bot_resume_checks_the_manager_version_before_touching_anything_even_when_installed(tmp_path, monkeypatch, stage):
+    setup, systemd, home = _versioned(tmp_path, 259)
+    _with_home(home, monkeypatch)
+    setup.enable("bot")
+    saved = read_stage(setup.root, "bot")
+    saved["stage"] = stage
+    _write_stage(setup.root, saved)
+    setup.paths.bot_dropin_path.unlink()
+    systemd.reported = 253
+    systemd.calls.clear()
+    _with_home(home, monkeypatch)
+
+    with pytest.raises(SystemdError) as raised:
+        setup.enable("bot")
+
+    assert raised.value.reason == "systemd_too_old"
+    assert not any(call.startswith(("stop", "start", "daemon-reload")) for call in systemd.calls)
+    assert not setup.paths.bot_dropin_path.exists()
+    assert read_stage(setup.root, "bot")["failure"] == "systemd_too_old"
+
+
+@pytest.mark.parametrize("feature", ["web", "notify"])
+@pytest.mark.parametrize("version", [253, SystemdError("version", "rc=1")])
+def test_enabling_another_feature_while_bot_is_enabled_is_refused_on_an_old_manager(
+        tmp_path, monkeypatch, feature, version):
+    setup, systemd, home = _versioned(tmp_path, 259)
+    _with_home(home, monkeypatch)
+    setup.enable("bot")
+    setup.paths.bot_dropin_path.unlink()
+    systemd.reported = version
+    systemd.calls.clear()
+    _with_home(home, monkeypatch)
+
+    with pytest.raises(SystemdError) as raised:
+        setup.enable(feature)
+
+    assert raised.value.reason == "systemd_too_old"
+    assert not any(call.startswith(("stop", "start", "daemon-reload")) for call in systemd.calls)
+    assert not setup.paths.bot_dropin_path.exists()
+    assert read_stage(setup.root, feature)["failure"] == "systemd_too_old"
+    assert read_stage(setup.root, "bot")["stage"] == "enabled"
+    assert "failure" not in read_stage(setup.root, "bot") or not read_stage(setup.root, "bot")["failure"]
+
+
+def test_a_failed_install_rollback_never_asks_for_the_version_again(tmp_path, monkeypatch):
+    setup, systemd, home = _versioned(tmp_path, 259)
+    _with_home(home, monkeypatch)
+    setup.enable("bot")
+    before = setup.paths.bot_dropin_path.read_text()
+    systemd.fail.add("daemon-reload")
+    systemd.calls.clear()
+    _with_home(home, monkeypatch)
+
+    with pytest.raises(SystemdError):
+        setup.enable("web")
+
+    assert systemd.calls.count("version") == 1
+    assert setup.paths.bot_dropin_path.read_text() == before
+
+
+def test_re_enabling_an_enabled_bot_survives_a_transient_version_failure(tmp_path, monkeypatch):
+    setup, systemd, home = _versioned(tmp_path, 259)
+    _with_home(home, monkeypatch)
+    setup.enable("bot")
+    systemd.reported = SystemdError("version", "rc=1")
+    setup.notices.clear()
+    _with_home(home, monkeypatch)
+
+    result = setup.enable("bot")
+
+    assert result.stage == "enabled"
+    saved = read_stage(setup.root, "bot")
+    assert saved["stage"] == "enabled" and not saved.get("failure")
+    assert any("確認できない" in note for note in setup.notices)
+
+
+def test_re_enabling_an_enabled_bot_on_a_known_old_manager_is_still_refused(tmp_path, monkeypatch):
+    setup, systemd, home = _versioned(tmp_path, 259)
+    _with_home(home, monkeypatch)
+    setup.enable("bot")
+    systemd.reported = 253
+    _with_home(home, monkeypatch)
+
+    with pytest.raises(SystemdError) as raised:
+        setup.enable("bot")
+
+    assert raised.value.reason == "systemd_too_old"
+
+
+def test_an_enabled_bot_whose_dropin_is_missing_is_not_waved_through_on_a_failed_version_query(
+        tmp_path, monkeypatch):
+    setup, systemd, home = _versioned(tmp_path, 259)
+    _with_home(home, monkeypatch)
+    setup.enable("bot")
+    setup.paths.bot_dropin_path.unlink()
+    systemd.reported = SystemdError("version", "rc=1")
+    _with_home(home, monkeypatch)
+
+    with pytest.raises(SystemdError) as raised:
+        setup.enable("bot")
+
+    assert raised.value.reason == "systemd_too_old"
+    assert not setup.paths.bot_dropin_path.exists()
+
+
+def test_the_uninstall_check_rejects_a_leftover_bot_dropin_when_no_feature_remains(tmp_path, monkeypatch):
+    setup, systemd, home = _versioned(tmp_path, 259)
+    _with_home(home, monkeypatch)
+    setup.enable("bot")
+    setup.disable("bot")
+    assert setup._uninstall_gap("bot") is None
+    setup.paths.bot_dropin_path.parent.mkdir(parents=True, exist_ok=True)
+    setup.paths.bot_dropin_path.write_text("[Service]\nRestart=always\n")
+
+    assert setup._uninstall_gap("bot") == "stopping-ops"
+
+
+def test_web_enable_does_not_consult_the_systemd_version(tmp_path, monkeypatch):
+    setup, systemd, home = _versioned(tmp_path, 100)
+    _with_home(home, monkeypatch)
+
+    assert setup.enable("web").stage == "enabled"
+
+    assert "version" not in systemd.calls
+    assert not setup.paths.bot_dropin_path.exists()
+
+
+def test_disable_bot_removes_the_bot_dropin_and_keeps_web(tmp_path, monkeypatch):
+    setup, _systemd, home = _versioned(tmp_path, 259)
+    _with_home(home, monkeypatch)
+    setup.enable("bot")
+    setup.enable("web")
+
+    setup.disable("bot")
+
+    assert not setup.paths.bot_dropin_path.exists()
+    assert setup.paths.template_path.exists()
+    assert read_stage(setup.root, "web")["stage"] == "enabled"
+
+
+def test_a_bot_enable_resumes_and_repairs_a_missing_bot_dropin(tmp_path, monkeypatch):
+    setup, _systemd, home = _versioned(tmp_path, 259)
+    _with_home(home, monkeypatch)
+    setup.enable("bot")
+    setup.paths.bot_dropin_path.unlink()
+    _with_home(home, monkeypatch)
+
+    setup.enable("bot")
+
+    assert setup.paths.bot_dropin_path.exists()

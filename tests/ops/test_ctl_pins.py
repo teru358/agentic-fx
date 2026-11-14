@@ -833,6 +833,19 @@ class _Typed:
         return True
 
 
+def test_killswitch_reset_success_prints_the_fixed_warning_once_without_numbers(tmp_path):
+    api = _StubApi(tmp_path, [_latched_status(), _ok({"generation": 3})], principal=Principal.APPROVER)
+    out = io.StringIO()
+    runner = client.Runner(api, stdin=io.StringIO(""), stdout=out)
+
+    assert runner._op_killswitch_reset(3, terminal=_Typed("reset")) == 0
+
+    lines = out.getvalue().splitlines()
+    assert lines[-2] == "kill switch ラッチを解除しました (gen=3)"
+    assert lines[-1] == "DD が閾値以上のままなら、次の新規判断で kill switch が再びラッチします。"
+    assert out.getvalue().count("閾値以上のまま") == 1
+
+
 @pytest.mark.parametrize("replies,call,text", [
     ([_latched_status(), client.Reply(409, None, "generation_mismatch")],
      lambda runner: runner._op_killswitch_reset(3, terminal=_Typed("reset")),

@@ -1,6 +1,7 @@
 """state dir の fd だけで JSON snapshot を交換する。"""
 from __future__ import annotations
 
+import errno
 import json
 import os
 import secrets
@@ -12,11 +13,19 @@ _CLEANED_TEMP_DIRS: set[tuple[int, int, str]] = set()
 
 
 class SnapshotError(Exception):
-    """snapshot が正本として読めない。"""
+    """snapshot が正本として読み書きできない。型で I/O の失敗と内容の不正を分ける。"""
 
     def __init__(self) -> None:
         super().__init__(REASON_SNAPSHOT_CORRUPT)
         self.reason = REASON_SNAPSHOT_CORRUPT
+
+
+class SnapshotIOError(SnapshotError):
+    """OS の I/O が失敗した。内容は判定できていない (再試行で直り得る)。"""
+
+
+class SnapshotContentError(SnapshotError):
+    """読めた内容や形が契約に反する (再試行しても同じ)。"""
 
 
 def _checked_name(name: str) -> str:
@@ -42,14 +51,14 @@ def _remove_stale_temps(dir_fd: int, name: str) -> None:
             if entry.startswith(prefix):
                 os.unlink(entry, dir_fd=dir_fd)
     except OSError:
-        raise SnapshotError() from None
+        raise SnapshotIOError() from None
 
 
 def _remove_stale_temps_once(dir_fd: int, name: str) -> None:
     try:
         st = os.fstat(dir_fd)
     except OSError:
-        raise SnapshotError() from None
+        raise SnapshotIOError() from None
     identity = (st.st_dev, st.st_ino, name)
     if identity not in _CLEANED_TEMP_DIRS:
         _remove_stale_temps(dir_fd, name)
@@ -65,14 +74,14 @@ def write_snapshot(dir_fd: int, name: str, obj: Any) -> None:
     try:
         encoded = json.dumps(obj, sort_keys=True, ensure_ascii=True, allow_nan=False).encode("ascii")
     except (TypeError, ValueError):
-        raise SnapshotError() from None
+        raise SnapshotContentError() from None
     _remove_stale_temps_once(dir_fd, name)
     temp = f".{name}.tmp-{secrets.token_hex(16)}"
     try:
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                      0o600, dir_fd=dir_fd)
     except OSError:
-        raise SnapshotError() from None
+        raise SnapshotIOError() from None
     committed = False
     try:
         try:
@@ -84,7 +93,7 @@ def write_snapshot(dir_fd: int, name: str, obj: Any) -> None:
         os.fsync(dir_fd)
         committed = True
     except OSError:
-        raise SnapshotError() from None
+        raise SnapshotIOError() from None
     finally:
         if not committed:
             try:
@@ -108,25 +117,26 @@ def read_snapshot(dir_fd: int, name: str, schema_version: int, *,
                      dir_fd=dir_fd)
     except FileNotFoundError:
         return None
-    except OSError:
-        raise SnapshotError() from None
+    except OSError as exc:
+        # O_NOFOLLOW が拒む symlink は、置かれた物の不正であって I/O の失敗ではない
+        raise (SnapshotContentError() if exc.errno == errno.ELOOP else SnapshotIOError()) from None
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise SnapshotError()
+            raise SnapshotContentError()
         chunks = []
         while chunk := os.read(fd, 4096):
             chunks.append(chunk)
     except SnapshotError:
         raise
     except OSError:
-        raise SnapshotError() from None
+        raise SnapshotIOError() from None
     finally:
         os.close(fd)
     try:
         obj = json.loads(b"".join(chunks).decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        raise SnapshotError() from None
+        raise SnapshotContentError() from None
     if (type(obj) is not dict or type(obj.get("version")) is not type(schema_version)
             or (obj["version"] != schema_version and obj["version"] not in older)):
-        raise SnapshotError()
+        raise SnapshotContentError()
     return obj

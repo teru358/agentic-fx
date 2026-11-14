@@ -109,3 +109,27 @@ def child_env(home) -> dict[str, str]:
     """子 process 用の環境。実 HOME を渡さない。"""
     return {"PATH": os.environ.get("PATH", ""), "HOME": str(home),
             "XDG_CONFIG_HOME": str(home / ".config")}
+
+
+@pytest.fixture(autouse=True)
+def _no_real_bot_watchdog_thread(request, monkeypatch):
+    """process 内で bot の `run` を回す test が、終了開始後 60 秒で pytest ごと落とす thread を残さない。
+
+    本番の既定の factory そのものを確かめる test は `real_watchdog` の印で差し替えを外す。
+    """
+    if request.node.get_closest_marker("real_watchdog") is not None:
+        yield
+        return
+    try:
+        from afx_ops.bot import runtime
+        from afx_ops.bot.watchdog import Watchdog
+    except ImportError:
+        yield
+        return
+
+    class _Unstarted(Watchdog):
+        def start(self) -> None:
+            pass
+
+    monkeypatch.setattr(runtime, "new_watchdog", _Unstarted)
+    yield

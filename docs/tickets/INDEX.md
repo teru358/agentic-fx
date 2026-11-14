@@ -1,15 +1,17 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 173 件。完了分は closed/。
+未完了: 176 件。完了分は closed/。
 
-## 実装中 (5)
+## 実装中 (7)
 
-### 不具合 (3)
+### 不具合 (5)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [live-confirmed-bars-into-history](open/live-confirmed-bars-into-history.md) | 高 | 2026-09-21 | backtest の履歴が自動で更新されず、評価が古い入力で通る |
+| [auto-killswitch-latch-emits-no-event](open/auto-killswitch-latch-emits-no-event.md) | 高 | 2026-11-13 | drawdown による kill switch の自動作動が通知されない |
+| [bot-gateway-disconnect-is-silent](open/bot-gateway-disconnect-is-silent.md) | 高 | 2026-11-13 | bot が Discord から切断されたまま黙って生き続ける |
 | [history-import-stops-at-first-conflict](open/history-import-stops-at-first-conflict.md) | 中 | 2026-11-13 | history import は食い違う足 1 本で partial 停止し後続を取り込まない |
 | [status-history-hidden-while-daemon-runs](open/status-history-hidden-while-daemon-runs.md) | 中 | 2026-11-13 | daemon 稼働中は評価用履歴の状態を見る面が無い |
 
@@ -78,16 +80,14 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (149)
+## 設計待ち (150)
 
-### 不具合 (81)
+### 不具合 (80)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [gate-pytest-dev-writable-and-ldso-exec](open/gate-pytest-dev-writable-and-ldso-exec.md) | 高 | 2026-10-03 | gate の pytest は /dev 全体が書き込み可で ld.so 経由で任意の ELF を起動できる |
 | [ops-bot-exits-not-lock-holder](open/ops-bot-exits-not-lock-holder.md) | 高 | 2026-10-22 | afx-ops bot が稼働中に not_lock_holder で終了し systemd が再起動する |
-| [auto-killswitch-latch-emits-no-event](open/auto-killswitch-latch-emits-no-event.md) | 高 | 2026-11-13 | drawdown による kill switch の自動作動が通知されない |
-| [bot-gateway-disconnect-is-silent](open/bot-gateway-disconnect-is-silent.md) | 高 | 2026-11-13 | bot が Discord から切断されたまま黙って生き続ける |
 | [human-corridor-gate-rows-null-outcome](open/human-corridor-gate-rows-null-outcome.md) | 中 | 2026-09-12 | 人間回廊 (`submit_candidate` / `bless_candidate` → `_run_full_g… |
 | [backtest-worker-cpu-budget-shrinks-with-timeframe](open/backtest-worker-cpu-budget-shrinks-with-timeframe.md) | 中 | 2026-09-20 | strategy の backtest は plugin worker 1 プロセスを再生全体で使い回すので、`plu… |
 | [backtest-rpc-timeout-does-not-stop-parent-work](open/backtest-rpc-timeout-does-not-stop-parent-work.md) | 中 | 2026-09-21 | backtest の待ち時間超過後も親の処理と worker が走り続ける |
@@ -152,6 +152,7 @@
 | [datafeed-no-tick-minutes-counted-as-gap](open/datafeed-no-tick-minutes-counted-as-gap.md) | 低 | 2026-11-02 | 週明けの tick 無し時間を欠損と数え 15m 取得が約 1 日失敗 |
 | [first-run-acceptance-doc-quotes-drift](open/first-run-acceptance-doc-quotes-drift.md) | 低 | 2026-11-03 | 初回受入手順書の逐語引用 test 3 件が main で落ちる |
 | [mission-worker-improve-rpc-frame-test-fails](open/mission-worker-improve-rpc-frame-test-fails.md) | 低 | 2026-11-03 | mission_worker の improve RPC frame test が main で落ちる |
+| [killswitch-latched-activity-repeats](open/killswitch-latched-activity-repeats.md) | 低 | 2026-11-14 | 同一 kill switch 世代で繰り返される latch activity を一件にする |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backtest-scheduler-log-leak](open/backtest-scheduler-log-leak.md) | 低 |  | backtest 内部 Scheduler の `maintain_reservations failed: no c… |
 | [graceful-stop-waits-mission](open/graceful-stop-waits-mission.md) | 低 |  | graceful stop が走行中 improve mission の timeout (最大 60 分) を待つ … |
@@ -213,7 +214,7 @@
 | [legacy-e2e-model](open/legacy-e2e-model.md) | 低 |  | backend を切り替えるたびにモデル名の手編集が要る |
 | [legacy-oc-qwen3-8-toolcall](open/legacy-oc-qwen3-8-toolcall.md) | 低 |  | モデルが壊れた引数でツールを連打し予算を焼く |
 
-### 保守 (26)
+### 保守 (28)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -233,7 +234,9 @@
 | [time-repair-generalize-beyond-known-fingerprint](open/time-repair-generalize-beyond-known-fingerprint.md) | 低 | 2026-11-03 | repair と cache 誤り行検出を他の利用者の履歴へ一般化する |
 | [improve-e2e-floor-test-flakes-on-wallclock-seconds](open/improve-e2e-floor-test-flakes-on-wallclock-seconds.md) | 低 | 2026-11-07 | improve e2e の床 test が activity 行の時刻の秒に数字が当たると落ちる |
 | [opencode-subreaper-real-cli-test-red](open/opencode-subreaper-real-cli-test-red.md) | 低 | 2026-11-13 | 実 opencode CLI の subreaper test が main で赤 |
+| [bot-discord-log-template-inventory](open/bot-discord-log-template-inventory.md) | 低 | 2026-11-14 | discord.py 内部の log を安全な固定 code に写す保守契約を作る |
 | [improve-admission-host-leaks-across-tests](open/improve-admission-host-leaks-across-tests.md) | 低 | 2026-11-14 | tests/service の後で improve admission の test が落ちる |
+| [killswitch-generation-floor-on-state-recreate](open/killswitch-generation-floor-on-state-recreate.md) | 低 | 2026-11-14 | state を作り直したときの kill switch 世代の再利用を防ぐ |
 | [backend-descriptor](open/backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
 | [credentials-file-copied-unused](open/credentials-file-copied-unused.md) | 低 |  | `ClaudeRunner.__init__(credentials_file_copied)` が未使用 |
 | [db-rebuild-helper](open/db-rebuild-helper.md) | 低 |  | DB の table rebuild migration が 7 本重複している |

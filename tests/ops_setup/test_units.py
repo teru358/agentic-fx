@@ -6,7 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from agentic_fx.ops_setup.units import UnitPaths, install_units, uninstall_feature
+from agentic_fx.ops_setup.units import (BOT_PERMANENT_EXIT_STATUS, UnitPaths, bot_systemd_problem,
+                                          install_units, uninstall_feature, units_match)
 
 _EXEC = "/opt/afx/bin/afx-ops"
 
@@ -98,8 +99,8 @@ def test_unit_write_fsyncs_the_file_and_its_directory(tmp_path, monkeypatch):
 
     install_units(paths, {"bot"})
 
-    # template と drop-in のそれぞれで、中身を fsync してから rename 後の dir を fsync する。
-    assert kinds == ["file", "dir", "file", "dir"]
+    # template・Wants の drop-in・bot の drop-in のそれぞれで、中身を fsync してから rename 後の dir を fsync する。
+    assert kinds == ["file", "dir", "file", "dir", "file", "dir"]
 
 
 def _completed(stdout: str = "", returncode: int = 0, stderr: str = ""):
@@ -483,3 +484,186 @@ def test_stages_comments_no_longer_claim_bindsto():
     test_stages = Path(__file__).with_name("test_stages.py")
     assert "BindsTo" not in Path(stages.__file__).read_text(encoding="utf-8")
     assert "BindsTo" not in test_stages.read_text(encoding="utf-8")
+
+
+_BOT_DROPIN = (
+    "[Unit]\nStartLimitIntervalSec=0\n\n"
+    "[Service]\nRestart=on-failure\nRestartSec=30s\nRestartSteps=5\nRestartMaxDelaySec=10m\n"
+    "RestartPreventExitStatus=2 4 69 70 71 78\n")
+
+
+def _bot_paths(tmp_path):
+    return UnitPaths(unit_dir=tmp_path / "units", afx_unit="afx-sample.service", ops_exec=_EXEC)
+
+
+def test_bot_gets_its_own_instance_dropin_with_the_exact_recovery_policy(tmp_path):
+    paths = _bot_paths(tmp_path)
+
+    install_units(paths, {"bot"})
+
+    assert paths.bot_dropin_path == tmp_path / "units" / "afx-ops@bot.service.d" / "bot-recovery.conf"
+    assert paths.bot_dropin_path.read_text() == _BOT_DROPIN
+    assert stat.S_IMODE(paths.bot_dropin_path.stat().st_mode) == 0o644
+    # 恒久の終了 code は exact。足りなくても余っても、決定的な不正が無期限に再起動される。
+    prevent = [line for line in _BOT_DROPIN.splitlines() if line.startswith("RestartPreventExitStatus=")]
+    assert prevent == ["RestartPreventExitStatus=2 4 69 70 71 78"]
+    assert f"RestartPreventExitStatus={' '.join(map(str, BOT_PERMANENT_EXIT_STATUS))}" in paths.bot_dropin_path.read_text()
+
+
+def test_web_and_notify_policy_is_unchanged_and_template_has_no_bot_policy(tmp_path):
+    paths = _bot_paths(tmp_path)
+
+    install_units(paths, {"web", "notify"})
+
+    assert not paths.bot_dropin_path.exists() and not paths.bot_dropin_path.parent.exists()
+    template = paths.template_path.read_text()
+    assert "StartLimitIntervalSec=60s" in template and "RestartSec=5s" in template
+    assert "RestartSteps" not in template and "RestartPreventExitStatus" not in template
+
+
+# bot unit の入口での exit 表。True は RestartPreventExitStatus に含まれ再起動されない。
+# 0 は Restart=on-failure で再起動されない正常終了。72 / 73 / 74 は bot unit の通常経路外で、
+# 恒久の分類には含めない (到達しないことは afx-ops 側の test が pin する)。
+_EXIT_TABLE = {
+    0: "normal", 1: "restart", 2: "permanent", 3: "restart", 4: "permanent", 69: "permanent",
+    70: "permanent", 71: "permanent", 72: "restart", 73: "restart", 74: "restart", 78: "permanent",
+    79: "restart", 80: "restart", 120: "restart",
+}
+
+
+@pytest.mark.parametrize("code,kind", sorted(_EXIT_TABLE.items()))
+def test_exit_table_row_matches_the_dropin_prevent_set(code, kind):
+    prevented = int(code) in BOT_PERMANENT_EXIT_STATUS
+    assert prevented == (kind == "permanent")
+    parsed = [line.split("=", 1)[1].split() for line in _BOT_DROPIN.splitlines()
+              if line.startswith("RestartPreventExitStatus=")]
+    assert (str(code) in parsed[0]) == prevented
+
+
+def test_units_match_requires_exact_bot_dropin_and_its_absence_without_bot(tmp_path):
+    paths = _bot_paths(tmp_path)
+    install_units(paths, {"bot", "web"})
+    assert units_match(paths, {"bot", "web"})
+
+    paths.bot_dropin_path.write_text(_BOT_DROPIN.replace("78", "79"))
+    assert not units_match(paths, {"bot", "web"})
+    paths.bot_dropin_path.unlink()
+    assert not units_match(paths, {"bot", "web"})
+
+    install_units(paths, {"bot", "web"})
+    assert not units_match(paths, {"web"})
+    install_units(paths, {"web"})
+    assert units_match(paths, {"web"})
+    assert not paths.bot_dropin_path.parent.exists()
+
+
+def test_units_match_rejects_a_bot_dropin_that_is_not_a_regular_file(tmp_path):
+    paths = _bot_paths(tmp_path)
+    install_units(paths, {"bot"})
+    paths.bot_dropin_path.unlink()
+    paths.bot_dropin_path.mkdir()
+
+    assert not units_match(paths, {"bot"})
+    assert not units_match(paths, {"web"})
+
+
+def test_removing_bot_keeps_foreign_files_in_the_dropin_dir(tmp_path):
+    paths = _bot_paths(tmp_path)
+    install_units(paths, {"bot", "web"})
+    other = paths.bot_dropin_path.parent / "local.conf"
+    other.write_text("[Service]\nNice=5\n")
+
+    uninstall_feature(paths, {"web"})
+
+    assert not paths.bot_dropin_path.exists()
+    assert other.read_text() == "[Service]\nNice=5\n"
+
+
+def test_uninstall_last_feature_removes_bot_dropin_and_its_dir(tmp_path):
+    paths = _bot_paths(tmp_path)
+    install_units(paths, {"bot"})
+
+    uninstall_feature(paths, set())
+
+    assert not paths.bot_dropin_path.parent.exists()
+    assert not paths.template_path.exists() and not paths.dropin_path.exists()
+    # 無い資材への再実行は何もしない。
+    uninstall_feature(paths, set())
+
+
+def test_removing_bot_while_another_feature_remains_rewrites_the_wants_only(tmp_path):
+    paths = _bot_paths(tmp_path)
+    install_units(paths, {"bot", "web"})
+
+    uninstall_feature(paths, {"web"})
+
+    assert not paths.bot_dropin_path.parent.exists()
+    assert paths.dropin_path.read_text() == "[Unit]\nWants=afx-ops@web.service\n"
+    assert paths.template_path.exists()
+
+
+def test_artifact_paths_list_the_bot_dropin_only_when_bot_is_active(tmp_path):
+    paths = _bot_paths(tmp_path)
+
+    assert paths.artifact_paths({"web"}) == [paths.template_path, paths.dropin_path]
+    assert paths.artifact_paths({"bot", "web"}) == [paths.template_path, paths.dropin_path,
+                                                    paths.bot_dropin_path]
+
+
+def test_bot_dropin_write_ignores_a_symlink_planted_at_a_temp_name(tmp_path):
+    paths = _bot_paths(tmp_path)
+    paths.bot_dropin_path.parent.mkdir(parents=True)
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"untouched")
+    paths.bot_dropin_path.with_name(f".{paths.bot_dropin_path.name}.tmp").symlink_to(victim)
+
+    install_units(paths, {"bot"})
+
+    assert victim.read_bytes() == b"untouched"
+    assert paths.bot_dropin_path.read_text() == _BOT_DROPIN
+
+
+@pytest.mark.parametrize("version,ok", [(253, False), (200, False), (254, True), (259, True), (None, False)])
+def test_bot_requires_systemd_254_with_a_fixed_reason(version, ok):
+    problem = bot_systemd_problem(version)
+
+    assert (problem == "") == ok
+    if not ok and version is not None:
+        assert "254" in problem and str(version) in problem
+
+
+@pytest.mark.parametrize("out,rc,expected", [
+    ("Version=259.9-0ubuntu0.1\n", 0, 259),
+    ("Version=253.5-1\n", 0, 253),
+    ("Version=v254\n", 0, 254),
+])
+def test_systemd_version_reads_the_running_managers_major_number(out, rc, expected):
+    from agentic_fx.ops_setup.systemd import Systemd
+
+    assert Systemd(run=_completed(out, rc)).version() == expected
+
+
+def test_systemd_version_asks_the_manager_not_the_executable():
+    import subprocess
+
+    from agentic_fx.ops_setup.systemd import Systemd
+
+    seen = []
+
+    def run(args, **_kwargs):
+        seen.append(list(args))
+        return subprocess.CompletedProcess(args, 0, stdout="Version=259.9\n", stderr="")
+
+    Systemd(run=run).version()
+
+    assert seen == [["systemctl", "--user", "show", "--property=Version"]]
+
+
+@pytest.mark.parametrize("out,rc", [("", 0), ("not systemd\n", 0), ("Version=259.9\n", 1), ("Version=\n", 0),
+                                    ("systemd 259 (259.9)\n", 0)])
+def test_systemd_version_that_cannot_be_read_is_a_systemd_error(out, rc):
+    from agentic_fx.ops_setup.systemd import Systemd, SystemdError
+
+    with pytest.raises(SystemdError) as raised:
+        Systemd(run=_completed(out, rc)).version()
+    assert raised.value.reason == "version"

@@ -37,6 +37,10 @@ root = Path(spec["root"])
 with open(root / "ops_starts", "a") as handle:
     handle.write(f"{{time.time()}}\\n")
 mode = spec["mode"]
+if mode == "exit":
+    # READY を送る前に、指定があればその秒数だけ待ち、指定の code で終わる。
+    time.sleep(spec.get("after", 0))
+    sys.exit(spec["code"])
 if mode == "serve":
     deadline = time.monotonic() + spec["deadline"]
     while True:
@@ -62,7 +66,7 @@ notify.sendall(b"READY=1")
 notify.close()
 if mode == "readycrash":
     time.sleep(spec["crash_after"])
-    sys.exit(1)
+    sys.exit(spec.get("code", 1))
 time.sleep(600)
 """
 
@@ -140,10 +144,11 @@ def _ticks_advance(e: Ac12Env, pid: int) -> bool:
     return first_pid == second_pid == pid and second >= first + 3
 
 
+# bot 以外 (web / notify) の既定 policy。bot は専用 drop-in を持つ (下の bot の試験)。
 def test_one_enabled_feature_has_one_ops_unit_and_expected_properties(ac):
-    assert ac.setup().enable("bot").stage == "enabled"
+    assert ac.setup().enable("notify").stage == "enabled"
 
-    props = _show(ac.ops("bot"), "Type", "Requisite", "PartOf", "After", "Restart", "RestartUSec",
+    props = _show(ac.ops("notify"), "Type", "Requisite", "PartOf", "After", "Restart", "RestartUSec",
                   "StartLimitIntervalUSec", "StartLimitBurst", "NoNewPrivileges", "KillMode",
                   "ExecStart", "BindsTo", "ActiveState")
     assert props["Type"] == "notify"
@@ -158,27 +163,28 @@ def test_one_enabled_feature_has_one_ops_unit_and_expected_properties(ac):
     assert props["NoNewPrivileges"] == "yes"
     assert props["KillMode"] == "control-group"
     assert f"path={ac.fake_ops} ;" in props["ExecStart"]
-    assert f"argv[]={ac.fake_ops} bot ;" in props["ExecStart"]
+    assert f"argv[]={ac.fake_ops} notify ;" in props["ExecStart"]
     assert props["ActiveState"] == "active"
     listed = _ctl("list-units", "--user", "--type=service", "--all", "--no-legend", "--plain",
                   f"{ac.prefix}@*").stdout.split()
-    assert [name for name in listed if name.endswith(".service")] == [ac.ops("bot")]
+    assert [name for name in listed if name.endswith(".service")] == [ac.ops("notify")]
 
 
+# 既定 policy (RestartSec=5s) の試験。bot は専用 drop-in で 30s になるので notify で見る。
 def test_stopping_or_crashing_ops_does_not_stop_afx_tick(ac):
-    ac.setup().enable("bot")
+    ac.setup().enable("notify")
     pid, _ = ac.tick()
     assert _ticks_advance(ac, pid)
 
-    assert _ctl("stop", ac.ops("bot")).returncode == 0
-    assert _show(ac.ops("bot"), "ActiveState")["ActiveState"] == "inactive"
+    assert _ctl("stop", ac.ops("notify")).returncode == 0
+    assert _show(ac.ops("notify"), "ActiveState")["ActiveState"] == "inactive"
     assert _ticks_advance(ac, pid)
 
-    assert _ctl("start", ac.ops("bot")).returncode == 0
-    ops_pid = int(_show(ac.ops("bot"), "MainPID")["MainPID"])
+    assert _ctl("start", ac.ops("notify")).returncode == 0
+    ops_pid = int(_show(ac.ops("notify"), "MainPID")["MainPID"])
     os.kill(ops_pid, signal.SIGKILL)
     assert _wait(lambda: (lambda p: p["ActiveState"] == "active" and p["MainPID"] not in (str(ops_pid), "0"))(
-        _show(ac.ops("bot"), "ActiveState", "MainPID")), seconds=20)
+        _show(ac.ops("notify"), "ActiveState", "MainPID")), seconds=20)
     assert _ticks_advance(ac, pid)
     assert _show(ac.afx, "ActiveState", "MainPID") == {"ActiveState": "active", "MainPID": str(pid)}
 
@@ -236,18 +242,19 @@ def test_afx_stop_restart_and_crash_restarts_ops(ac):
 
 
 def test_ops_restart_delay_and_start_limit(ac):
-    ac.setup().enable("bot")
+    # bot 以外 (web / notify) の policy は変えていない。bot は専用 drop-in の試験が担う。
+    ac.setup().enable("notify")
     pid, _ = ac.tick()
     # 以降の起動は ready の後 0.5 秒で自分で落ちる。最初の 1 回は外から殺す
     ac.ops_mode(mode="readycrash", crash_after=0.5)
     before_count = len(ac.ops_starts())
-    ops_pid = int(_show(ac.ops("bot"), "MainPID")["MainPID"])
+    ops_pid = int(_show(ac.ops("notify"), "MainPID")["MainPID"])
     killed_at = time.time()
     os.kill(ops_pid, signal.SIGKILL)
 
     # enable 時の start (1 回目) + 殺した後 2 回の再起動で 60 秒窓の burst 3 に達し、次は拒否される
-    assert _wait(lambda: _show(ac.ops("bot"), "ActiveState")["ActiveState"] == "failed", seconds=40)
-    props = _show(ac.ops("bot"), "ActiveState", "SubState", "Result", "NRestarts")
+    assert _wait(lambda: _show(ac.ops("notify"), "ActiveState")["ActiveState"] == "failed", seconds=40)
+    props = _show(ac.ops("notify"), "ActiveState", "SubState", "Result", "NRestarts")
     starts = ac.ops_starts()
     restarts = starts[before_count:]
     assert len(restarts) == 2, starts
@@ -259,7 +266,7 @@ def test_ops_restart_delay_and_start_limit(ac):
     assert props["Result"] in {"exit-code", "start-limit-hit"}
     time.sleep(6)
     assert ac.ops_starts() == starts
-    assert _show(ac.ops("bot"), "ActiveState")["ActiveState"] == "failed"
+    assert _show(ac.ops("notify"), "ActiveState")["ActiveState"] == "failed"
     assert _ticks_advance(ac, pid)
     assert _show(ac.afx, "ActiveState")["ActiveState"] == "active"
 
@@ -471,3 +478,307 @@ def test_real_web_fails_closed_when_socket_holder_is_not_the_instance_lock_holde
     # 偽の server が受け取った鍵 bytes は 0。鍵は ops の出力にも出ていない
     assert sent == 0
     assert web.token not in web.stderr()
+
+
+# --- bot instance 専用 drop-in -------------------------------------------------------------
+
+_BOT_SCALED = {"RestartSec=30s": "RestartSec={sec}", "RestartSteps=5": "RestartSteps={steps}",
+               "RestartMaxDelaySec=10m": "RestartMaxDelaySec={maximum}"}
+
+
+def _scale_bot_dropin(e: Ac12Env, *, sec: str = "1s", steps: int = 3, maximum: str = "4s") -> None:
+    """実 drop-in の間隔だけを縮める。形 (StartLimit 無効・prevent の一覧) は実物のまま。
+
+    実時間では 30 秒から 10 分の backoff を待てないので、同じ形で間隔を縮めた drop-in で観測する。"""
+    path = e.paths.bot_dropin_path
+    text = path.read_text()
+    for old, new in _BOT_SCALED.items():
+        assert old in text
+        text = text.replace(old, new.format(sec=sec, steps=steps, maximum=maximum))
+    assert "StartLimitIntervalSec=0" in text and "RestartPreventExitStatus=2 4 69 70 71 78" in text
+    path.write_text(text)
+    assert _ctl("daemon-reload").returncode == 0
+    shown = _show(e.ops("bot"), "RestartUSec", "RestartSteps")
+    assert shown["RestartSteps"] == str(steps), shown
+
+
+def _kill_ops(e: Ac12Env, sig: int = signal.SIGKILL) -> None:
+    os.kill(int(_show(e.ops("bot"), "MainPID")["MainPID"]), sig)
+
+
+def _gaps(starts: list[float]) -> list[float]:
+    return [round(b - a, 2) for a, b in zip(starts, starts[1:])]
+
+
+def test_bot_dropin_is_loaded_by_the_real_manager_and_web_is_not_affected(ac):
+    ac.setup().enable("bot")
+    ac.setup().enable("web")
+
+    bot = _show(ac.ops("bot"), "Restart", "RestartUSec", "RestartSteps", "RestartMaxDelayUSec",
+                "StartLimitIntervalUSec", "StartLimitBurst", "RestartPreventExitStatus", "DropInPaths")
+    web = _show(ac.ops("web"), "Restart", "RestartUSec", "RestartSteps", "StartLimitIntervalUSec",
+                "RestartPreventExitStatus", "DropInPaths")
+    print("AC12 bot drop-in props:", json.dumps(bot, sort_keys=True), "web:", json.dumps(web, sort_keys=True))
+    assert bot["Restart"] == "on-failure"
+    assert bot["RestartUSec"] == "30s"
+    assert bot["RestartSteps"] == "5"
+    assert bot["RestartMaxDelayUSec"] == "10min"
+    assert bot["StartLimitIntervalUSec"] == "0"
+    assert sorted(bot["RestartPreventExitStatus"].split()) == sorted("2 4 69 70 71 78".split())
+    assert str(ac.paths.bot_dropin_path) in bot["DropInPaths"]
+    assert web["RestartUSec"] == "5s" and web["RestartSteps"] == "0"
+    assert web["StartLimitIntervalUSec"] == "1min"
+    assert str(ac.paths.bot_dropin_path) not in web["DropInPaths"]
+
+
+def test_bot_first_automatic_restart_waits_the_real_30_seconds(ac):
+    ac.setup().enable("bot")
+    ac.ops_mode(mode="ready")
+    before = len(ac.ops_starts())
+    killed_at = time.time()
+    _kill_ops(ac)
+
+    assert _wait(lambda: len(ac.ops_starts()) > before, seconds=60)
+
+    gap = ac.ops_starts()[before] - killed_at
+    print("AC12 bot real first restart gap:", gap)
+    assert 28 <= gap <= 40, gap
+    assert _wait(lambda: _show(ac.ops("bot"), "ActiveState")["ActiveState"] == "active", seconds=10)
+
+
+def test_bot_backoff_grows_to_the_cap_and_start_limit_is_off(ac):
+    ac.setup().enable("bot")
+    _scale_bot_dropin(ac, sec="1s", steps=3, maximum="4s")
+    # 以降の起動は READY の前に一時 exit (79) で落ちる。start-limit (template の burst 3 / 60s) が
+    # 効いていれば、4 回目の起動前に failed で止まる。
+    ac.ops_mode(mode="exit", code=79)
+    before = len(ac.ops_starts())
+    _kill_ops(ac)
+
+    assert _wait(lambda: len(ac.ops_starts()) >= before + 8, seconds=60)
+
+    starts = ac.ops_starts()[before:]
+    gaps = _gaps(starts)
+    props = _show(ac.ops("bot"), "ActiveState", "Result", "NRestarts")
+    print("AC12 bot scaled backoff gaps:", gaps, props)
+    assert props["ActiveState"] != "failed" and props["Result"] != "start-limit-hit"
+    assert gaps[0] < gaps[2], gaps
+    assert all(later >= earlier - 0.5 for earlier, later in zip(gaps, gaps[1:])), gaps
+    assert max(gaps) <= 4 + 1.5, gaps
+    assert gaps[-1] >= 3, gaps
+
+
+@pytest.mark.parametrize("code", [2, 4, 69, 70, 71, 78])
+def test_bot_permanent_exit_after_ready_is_not_restarted(ac, code):
+    ac.setup().enable("bot")
+    _scale_bot_dropin(ac, sec="1s", steps=3, maximum="4s")
+    ac.ops_mode(mode="readycrash", crash_after=0.3, code=code)
+    before = len(ac.ops_starts())
+    _kill_ops(ac)
+
+    assert _wait(lambda: len(ac.ops_starts()) > before, seconds=15)
+    assert _wait(lambda: _show(ac.ops("bot"), "ActiveState")["ActiveState"] == "failed", seconds=15)
+
+    starts = ac.ops_starts()
+    time.sleep(4)
+    props = _show(ac.ops("bot"), "ActiveState", "Result", "ExecMainStatus")
+    print("AC12 bot permanent", code, props)
+    assert ac.ops_starts() == starts
+    assert props["Result"] == "exit-code" and props["ExecMainStatus"] == str(code)
+    assert _show(ac.afx, "ActiveState")["ActiveState"] == "active"
+
+
+@pytest.mark.parametrize("code", [71, 78])
+def test_bot_permanent_exit_before_ready_is_not_restarted(ac, code):
+    ac.setup().enable("bot")
+    _scale_bot_dropin(ac, sec="1s", steps=3, maximum="4s")
+    ac.ops_mode(mode="exit", code=code)
+    before = len(ac.ops_starts())
+    _kill_ops(ac)
+
+    assert _wait(lambda: len(ac.ops_starts()) > before, seconds=15)
+    assert _wait(lambda: _show(ac.ops("bot"), "ActiveState")["ActiveState"] == "failed", seconds=15)
+
+    starts = ac.ops_starts()
+    time.sleep(4)
+    assert ac.ops_starts() == starts
+    assert _show(ac.ops("bot"), "ExecMainStatus")["ExecMainStatus"] == str(code)
+
+
+@pytest.mark.parametrize("code", [1, 3, 72, 73, 74, 79, 80, 120])
+def test_bot_transient_or_unclassified_exit_is_restarted(ac, code):
+    ac.setup().enable("bot")
+    _scale_bot_dropin(ac, sec="1s", steps=3, maximum="4s")
+    ac.ops_mode(mode="readycrash", crash_after=0.3, code=code)
+    before = len(ac.ops_starts())
+    _kill_ops(ac)
+
+    assert _wait(lambda: len(ac.ops_starts()) >= before + 4, seconds=30)
+
+    assert _show(ac.ops("bot"), "ActiveState")["ActiveState"] != "failed"
+
+
+def test_bot_normal_exit_and_clean_signals_are_not_restarted(ac):
+    ac.setup().enable("bot")
+    _scale_bot_dropin(ac, sec="1s", steps=3, maximum="4s")
+    ac.ops_mode(mode="readycrash", crash_after=0.3, code=0)
+    before = len(ac.ops_starts())
+    _kill_ops(ac)
+    assert _wait(lambda: len(ac.ops_starts()) > before, seconds=15)
+    assert _wait(lambda: _show(ac.ops("bot"), "ActiveState")["ActiveState"] == "inactive", seconds=15)
+    time.sleep(3)
+    assert len(ac.ops_starts()) == before + 1
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        ac.ops_mode(mode="ready")
+        assert _ctl("start", ac.ops("bot")).returncode == 0
+        count = len(ac.ops_starts())
+        _kill_ops(ac, sig)
+        assert _wait(lambda: _show(ac.ops("bot"), "ActiveState")["ActiveState"] == "inactive", seconds=15), sig
+        time.sleep(3)
+        assert len(ac.ops_starts()) == count, sig
+
+    ac.ops_mode(mode="ready")
+    assert _ctl("start", ac.ops("bot")).returncode == 0
+    count = len(ac.ops_starts())
+    assert _ctl("stop", ac.ops("bot")).returncode == 0
+    time.sleep(3)
+    assert len(ac.ops_starts()) == count
+    assert _show(ac.ops("bot"), "ActiveState")["ActiveState"] == "inactive"
+
+
+def test_bot_restart_step_reset_conditions_are_measured(ac):
+    """READY・手動 start・自動 restart が restart step を初期化するかを実 manager で測る。
+
+    systemd の version で変わり得るので、結果は出力に残し、assert は間隔が上限を超えないことと
+    起動が続くことだけに留める。断定は運用文書へ記録する。"""
+    ac.setup().enable("bot")
+    _scale_bot_dropin(ac, sec="1s", steps=3, maximum="8s")
+    observed: dict[str, list[float] | list[int]] = {}
+
+    def run_phase(name: str, count: int) -> None:
+        mark = len(ac.ops_starts())
+        assert _wait(lambda: len(ac.ops_starts()) >= mark + count, seconds=60), name
+        observed[name] = _gaps(ac.ops_starts()[mark - 1:mark + count])
+
+    # 1: READY 前の一時失敗が続くと間隔が伸びる。
+    ac.ops_mode(mode="exit", code=79)
+    _kill_ops(ac)
+    run_phase("not_ready_growth", 5)
+    # 2: READY を送ってから落ちる起動に切り替えた直後の間隔 (READY が step を初期化するか)。
+    ac.ops_mode(mode="readycrash", crash_after=0.3, code=79)
+    run_phase("after_switch_to_ready_then_crash", 4)
+    # 3: 伸びた状態で手動 restart し、その後の失敗の間隔 (手動 start が step を初期化するか)。
+    ac.ops_mode(mode="exit", code=79)
+    run_phase("regrow", 4)
+    mark = len(ac.ops_starts())
+    # READY 前に落ちる起動なので restart の start job 自体は失敗で返る。その後の自動再起動を測る。
+    observed["manual_restart_rc"] = [_ctl("restart", ac.ops("bot")).returncode]
+    run_phase("after_manual_restart", 3)
+    print("AC12 restart step observations:", json.dumps({**observed, "restart_mark": mark}, sort_keys=True))
+    assert all(max(gaps) <= 8 + 1.5 for name, gaps in observed.items() if name != "manual_restart_rc"), observed
+    assert observed["not_ready_growth"][-1] > observed["not_ready_growth"][0]
+
+
+def test_bot_restart_that_comes_due_while_afx_is_down_is_measured(ac):
+    """Requisite=afx と自動再起動の組合せ。afx が止まっている間に再起動時刻が来た後の挙動を測る。"""
+    ac.setup().enable("bot")
+    _scale_bot_dropin(ac, sec="4s", steps=1, maximum="4s")
+    (ac.root / "afx_mode.json").write_text(json.dumps({"mode": "exit75"}))
+    afx_pid = int(_show(ac.afx, "MainPID")["MainPID"])
+    os.kill(afx_pid, signal.SIGKILL)
+    # afx の代役は再起動後に即 75 で終わり、再起動の対象外なので failed のまま止まる。
+    assert _wait(lambda: _show(ac.afx, "ActiveState")["ActiveState"] == "failed", seconds=20)
+    ops_state = _show(ac.ops("bot"), "ActiveState")["ActiveState"]
+    observed = {"ops_state_when_afx_failed": ops_state}
+    before = len(ac.ops_starts())
+    if ops_state == "active":
+        _kill_ops(ac)
+    time.sleep(10)
+    observed["ops_after_due"] = _show(ac.ops("bot"), "ActiveState", "SubState", "Result")
+    observed["starts_while_afx_down"] = len(ac.ops_starts()) - before
+    (ac.root / "afx_mode.json").write_text(json.dumps({"mode": "none"}))
+    assert _ctl("start", ac.afx).returncode == 0
+    assert _wait(lambda: not _lock_free(ac.root))
+    recovered = _wait(lambda: _show(ac.ops("bot"), "ActiveState")["ActiveState"] == "active", seconds=30)
+    observed["ops_recovered_after_afx_start"] = recovered
+    observed["ops_after_recovery"] = _show(ac.ops("bot"), "ActiveState", "SubState", "Result")
+    print("AC12 requisite observations:", json.dumps(observed, sort_keys=True))
+    # afx が止まっている間に依存で再起動を重ねない (起動の嵐を作らない)。
+    assert observed["starts_while_afx_down"] <= 1
+    # afx の復帰後は、人の操作なしで ops が戻る (afx の Wants か、待たされていた再起動で)。
+    assert recovered, observed
+    assert _show(ac.afx, "ActiveState")["ActiveState"] == "active"
+
+
+def test_bot_reset_failed_alone_resets_the_restart_step_is_measured(ac):
+    """reset-failed だけで restart step (NRestarts) が初期化されるかを実 manager で測る。
+
+    手動 start や restart を挟まず、自動 restart を待つ状態の unit に reset-failed を一回だけ送る。"""
+    ac.setup().enable("bot")
+    _scale_bot_dropin(ac, sec="1s", steps=3, maximum="8s")
+    ac.ops_mode(mode="exit", code=79)
+    _kill_ops(ac)
+    assert _wait(lambda: len(ac.ops_starts()) >= 6, seconds=60)
+    grown = _gaps(ac.ops_starts())[-1]
+    before = _show(ac.ops("bot"), "NRestarts")["NRestarts"]
+    mark = len(ac.ops_starts())
+
+    assert _ctl("reset-failed", ac.ops("bot")).returncode == 0
+
+    after = _show(ac.ops("bot"), "NRestarts")["NRestarts"]
+    assert _wait(lambda: len(ac.ops_starts()) >= mark + 3, seconds=60)
+    following = _gaps(ac.ops_starts()[mark - 1:])
+    print("AC12 reset-failed observation:", json.dumps(
+        {"grown_gap": grown, "nrestarts_before": before, "nrestarts_after": after, "gaps_after": following}))
+    assert int(before) > 0
+    assert after == "0", (before, after)
+    assert max(following) <= 8 + 1.5, following
+    # 最初の間隔は既に計時中の待ち。その次から、初期化された短い間隔になる。
+    assert following[1] < grown, following
+
+
+def test_bot_long_outage_recovers_within_monitor_plus_max_wait_scaled(ac):
+    """長期の一時障害 (監視で待った後に 79 で終わる bot) からの回復を、縮小した同じ形で確かめる。
+
+    実 bot は 10 分監視した後に exit 79、systemd の再起動待ちは最大 10 分、回復の上限は合わせて
+    20 分。ここでは監視を 3 秒、最大待ちを 3 秒に縮め、(監視 + 最大待ち) の周期を超えないこと、
+    障害が終われば次の起動で READY に戻ることを観測する。実値の全段は release 条件として別に確かめる。"""
+    monitor, maximum = 3.0, 3
+    ac.setup().enable("bot")
+    _scale_bot_dropin(ac, sec="1s", steps=2, maximum=f"{maximum}s")
+    ac.ops_mode(mode="exit", code=79, after=monitor)
+    before = len(ac.ops_starts())
+    _kill_ops(ac)
+
+    assert _wait(lambda: len(ac.ops_starts()) >= before + 5, seconds=90)
+
+    cycles = _gaps(ac.ops_starts()[before - 1:])
+    props = _show(ac.ops("bot"), "ActiveState", "Result")
+    print("AC12 long outage cycles (monitor 3s, max wait 3s):", cycles, props)
+    assert props["Result"] != "start-limit-hit" and props["ActiveState"] != "failed"
+    assert all(cycle <= monitor + maximum + 1.5 for cycle in cycles), cycles
+    # 障害が終わった時点から、次の起動で READY に戻るまでが (監視 + 最大待ち) 以内。
+    # 許す誤差は systemd と試験 process の起動の揺れとして 1.5 秒。
+    ac.ops_mode(mode="ready")
+    started = time.monotonic()
+    assert _wait(lambda: _show(ac.ops("bot"), "ActiveState")["ActiveState"] == "active",
+                 seconds=monitor + maximum + 10)
+    recovered = time.monotonic() - started
+    assert recovered <= monitor + maximum + 1.5, recovered
+
+
+def test_bot_runs_without_notify_and_the_status_shows_the_fixed_warning_only(ac):
+    """notify を一度も enable していなくても、afx と bot は動き、警告は固定の 2 値の表示だけになる。"""
+    from agentic_fx.ops import bot_health
+
+    ac.setup().enable("bot")
+
+    assert _wait(lambda: _show(ac.ops("bot"), "ActiveState")["ActiveState"] == "active", seconds=15)
+    assert _show(ac.afx, "ActiveState")["ActiveState"] == "active"
+    assert _show(ac.ops("notify"), "ActiveState")["ActiveState"] != "active"
+    assert read_stage(ac.root, "notify", missing_ok=True) is None
+    health = bot_health.collect(ac.root, time.time())
+    assert health["alternate_push"] == "none"
+    assert "warning: alternate_push=none" in bot_health.lines(health)
+    assert health["state"] != "unhealthy"

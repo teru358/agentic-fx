@@ -177,11 +177,12 @@ def _wait(predicate, seconds: float = 15.0) -> bool:
     return predicate()
 
 
+# 既定 policy (RestartSec=5s) の試験。bot は専用 drop-in で 30s になるので notify で見る。
 def test_enabled_unit_has_real_properties(env):
-    result = env.setup().enable("bot")
+    result = env.setup().enable("notify")
 
     assert result.stage == "enabled"
-    props = _show(env.ops("bot"), "Type", "Requisite", "BindsTo", "PartOf", "After", "Restart",
+    props = _show(env.ops("notify"), "Type", "Requisite", "BindsTo", "PartOf", "After", "Restart",
                   "RestartUSec", "StartLimitBurst", "StartLimitIntervalUSec", "ActiveState",
                   "NoNewPrivileges")
     assert props["Type"] == "notify"
@@ -195,10 +196,10 @@ def test_enabled_unit_has_real_properties(env):
     assert props["StartLimitIntervalUSec"] == "1min"
     assert props["ActiveState"] == "active"
     afx = _show(env.afx, "Wants", "ActiveState", "LoadState")
-    assert env.ops("bot") in afx["Wants"].split()
+    assert env.ops("notify") in afx["Wants"].split()
     assert afx["ActiveState"] == "active" and afx["LoadState"] == "loaded"
     # 偽 afx は RestartPreventExitStatus=75 を持つので、実 manager の答えでも警告は出ない。
-    assert "warn" not in read_stage(env.root, "bot")
+    assert "warn" not in read_stage(env.root, "notify")
 
 
 def _lock_free(root: Path) -> bool:
@@ -522,14 +523,15 @@ def test_afx_stop_takes_ops_down_and_start_pulls_it_back(env):
     assert _wait(lambda: _show(env.ops("bot"), "ActiveState")["ActiveState"] == "active")
 
 
+# 既定 policy (RestartSec=5s) の試験。bot は専用 drop-in で 30s になるので notify で見る。
 def test_ops_crash_is_restarted_without_stopping_afx(env):
-    env.setup().enable("bot")
-    pid = _show(env.ops("bot"), "MainPID")["MainPID"]
+    env.setup().enable("notify")
+    pid = _show(env.ops("notify"), "MainPID")["MainPID"]
     afx_before = _show(env.afx, "ActiveEnterTimestampMonotonic")
     os.kill(int(pid), 9)
 
     assert _wait(lambda: (lambda p: p["ActiveState"] == "active" and p["MainPID"] not in (pid, "0"))(
-        _show(env.ops("bot"), "ActiveState", "MainPID")), seconds=20)
+        _show(env.ops("notify"), "ActiveState", "MainPID")), seconds=20)
     assert _show(env.afx, "ActiveEnterTimestampMonotonic") == afx_before
 
 

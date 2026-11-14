@@ -58,9 +58,10 @@ from agentic_fx.datafeed.health import DataUnhealthy
 from agentic_fx.datafeed.news_collector import NewsCollector
 from agentic_fx.datafeed.price_provider import PriceProvider
 from agentic_fx.logging_setup import setup_technical_logging
+from agentic_fx.ops import bot_health
 from agentic_fx.ops import keys as ops_keys
 from agentic_fx.ops.api_server import ApiLimits, ApiServer, ApiStartError
-from agentic_fx.ops.service import OpsLimits, OpsService
+from agentic_fx.ops.service import OpsLimits, OpsService, plan_kill_switch_notice
 from agentic_fx.ops.trade_event_sink import BUSY_RETRY_SEC, TradeEventEmitter, TradeEventSink
 from agentic_fx.loops import econ_signal_report, reflection_cycle
 from agentic_fx.loops.mission_watch import MissionWatch
@@ -1941,9 +1942,9 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             open_conn=lambda: connect_readonly(root / "data" / "agentic.db"),
             capacity=capacity_reader, worker=econ_health,
             admission_status=admission.status, pair_currencies=pair_currencies))
-        # 取りこぼした改善通知の event を、listener を開く前・supervisor の開始前に出す。
-        ops_service.emit_pending_improve_notices(
-            enabled=settings.notify.improve_events)
+        # 取りこぼした改善通知と kill switch 遷移の event を、listener を開く前・
+        # supervisor の開始前に出す。失敗は固定語で保留し、起動は続ける。
+        ops_service.emit_pending_notices(improve_enabled=settings.notify.improve_events)
         commands.use_ops_service(ops_service)
         commands.use_econ_status_source(econ_status_cache.get)
         ops_recovered = _recover_ops(ops_service, conn_ops, activity)
@@ -2128,6 +2129,30 @@ def _compute_econ_signal(root: Path, clock, capacity_reader, econ_health,
         conn.close()
 
 
+class _GuardNoticeProbe:
+    """status 用に、現世代の kill switch event の欠けを読取接続で照合する。
+
+    補助表示なので失敗しても status を止めない。失敗の warning は正常から失敗へ移ったときの
+    1 行だけにし、status を頻繁に読まれても log を埋めない。
+    """
+
+    def __init__(self) -> None:
+        self._failing = False
+
+    def __call__(self, conn, state):
+        try:
+            shown = state.load(deadline=time.monotonic() + 2.0)
+            pending_state, pending_generation, _ = plan_kill_switch_notice(conn, shown)
+        except Exception as exc:  # noqa: BLE001 — 補助表示は status を止めない
+            if not self._failing:
+                self._failing = True
+                _log.warning("status guard notice unavailable: %s", type(exc).__name__)
+            return None
+        self._failing = False
+        return (pending_state is not None,
+                pending_generation if pending_state is not None else None)
+
+
 def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity,
                        health_latch, supervisor, improve_supervisor, plugins_dir,
                        outage, trade_event_sink=None, ingest=None,
@@ -2146,6 +2171,8 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
                 return None
         return landlock_cache[0]
 
+    guard_notice_probe = _GuardNoticeProbe()
+
     def status_provider() -> dict:
         # API thread から呼ばれる。core_lock も scheduler / ops の接続も使わず、
         # 読み取り専用の短命な接続だけで読む (outage の状態もその接続で読む)。
@@ -2162,6 +2189,7 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
                     if ingest is not None else None)
                 admission_status = (admission.status(conn, clock.now())
                                     if admission is not None else None)
+            guard_notice = guard_notice_probe(conn, state)
             try:
                 landlock_ok = landlock_state()
                 # 配備先が無いときは approved_plugins の存在しない旨の log を出さない。
@@ -2195,6 +2223,8 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
                   "data": {"state": data_state}, "setup": setup}
         if references:
             status["references"] = references
+        if guard_notice is not None:
+            status["guard_notice_pending"], status["guard_notice_generation"] = guard_notice
         if admission_status is not None:
             status.update(admission_status)
         if econ_signal is not None:
@@ -2202,6 +2232,8 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
         if trade_event_sink is not None:
             # 理由別の件数だけ。理由の文言や event の中身は載せない
             status["trade_events"] = trade_event_sink.counters()
+        # bot の health は検査済みの非機密値だけ。読めなくても status を落とさず unknown
+        status["bot_health"] = bot_health.collect(root, clock.now().timestamp())
         return status
 
     def ask_submitter(question: str):
@@ -2514,13 +2546,13 @@ def _scheduler_tick_body(app: App) -> None:
 
 
 def _sweep_improve_notices(app: App) -> None:
-    """終端 snapshot があるのに `finished` event が無い改善 mission を、tick ごとに拾う
-    (起動時の回収と同じ関数)。失敗は tick を止めない。"""
+    """終端 snapshot があるのに `finished` event が無い改善 mission と、kill switch の
+    遷移 event を、tick ごとに拾う (起動時の回収と同じ関数)。失敗は tick を止めない。
+    kill switch 側は改善通知の設定にかかわらず回る。"""
     if app.ops is None:
         return
     try:
-        app.ops.emit_pending_improve_notices(
-            enabled=app.settings.notify.improve_events)
+        app.ops.emit_pending_notices(improve_enabled=app.settings.notify.improve_events)
     except Exception:  # noqa: BLE001
         _log.warning("improve_notice_skipped reason=sweep_failed")
 

@@ -485,7 +485,7 @@ rollback は逆順で、**必ず daemon の emitter を止めてから afx-ops �
 
 - 戦略別の成績: 帰属 (チケット `strategy-attribution-and-shadow-evaluation`) の後に `strategy_code` を足す。
 - 日次・週次の損益サマリ、損益グラフ、通知のまとめ送信。
-- 異常系 (送信結果不明・クローズ結果不明・取消結果不明・換算 degraded) の event 化。現状は daemon 直送で、2 経路の統合は別設計。executor の自動 kill switch ラッチも event を出さない (`guard_state_changed` は ops の reset 操作だけ)。運用上の重要度は高めで、別チケットにする。
+- 異常系 (送信結果不明・クローズ結果不明・取消結果不明・換算 degraded) の event 化。現状は daemon 直送で、2 経路の統合は別設計。kill switch の自動ラッチ・reset・reconcile の `guard_state_changed` は、単一の guard sweep (`OpsService.emit_pending_guard_notices`) だけが出す (設計 `2026-11-14-ops-alert-delivery-design.md` §4.3)。sweep は次の判断・tick・reset / reconcile のときに動くので、ラッチ時点との間に遅れが出得る。
 - 実発注 (live) の broker が入るときの `mode` の導出と `[実発注]` 文面の見直し。通知の設定を `afx init` の対象にするか。
 - event 専用 DB への分離 (同一 DB の書き込み競合を完全に消したくなったとき。§4.5)。
 - `service_health_changed` の既存の emit 欠落 (sink 以外の component)。本件は `trade_event_sink` だけを使い、他は別。

@@ -192,10 +192,10 @@ def test_failed_finished_emit_is_logged_once_and_the_tick_sweep_announces_it_onc
     sup = _supervisor(app, root, _loop(app, root))
     real = EventStore.emit
 
-    def flaky(self, code, ref, fields):
+    def flaky(self, code, ref, fields, **kwargs):
         if fields["state"] == "finished":
             raise sqlite3.OperationalError("database is locked")
-        return real(self, code, ref, fields)
+        return real(self, code, ref, fields, **kwargs)
 
     result = MissionResult(status="completed", output=_plugin_artifact("cand"),
                            transcript=[], tool_calls=5)

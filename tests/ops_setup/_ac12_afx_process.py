@@ -5,6 +5,7 @@ usage: python _ac12_afx_process.py <instance_root> [<mode>]
 mode は ``<instance_root>/afx_mode.json`` (``{"mode": ..., "delay": 秒, "key_dir": ...}``) か
 2 番目の引数。無ければ ``none``。
 
+- exit75: 何もせず 75 で終わる (unit の RestartPreventExitStatus により再起動されず failed に留まる)。
 - none: instance lock を握って tick するだけ (UDS を出さない)。
 - stub: 遅れて ``srv.sock`` を出し、接続ごとに受け取った byte 数を ``token_bytes`` に追記する。
 - api: 遅れて本物の ``ApiServer`` を ``data/run/api.sock`` に出す (鍵 dir の鍵で認証する)。
@@ -28,6 +29,8 @@ spec_file = root / "afx_mode.json"
 spec = json.loads(spec_file.read_text()) if spec_file.exists() else {}
 mode = sys.argv[2] if len(sys.argv) > 2 else spec.get("mode", "none")
 delay = float(spec.get("delay", 0.0))
+if mode == "exit75":
+    sys.exit(75)
 
 
 class _StubOps:

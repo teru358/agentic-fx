@@ -404,6 +404,31 @@ def test_killswitch_reset(tmp_path):
     assert any("kill_switch_reset" in r for r in records)
 
 
+def test_killswitch_reset_success_prints_the_fixed_warning_once_without_numbers(tmp_path):
+    conn, state, activity, cmds = _commands(tmp_path)
+    state.update(kill_switch_latched=True)
+    gen = state.load().kill_switch_generation
+
+    out = cmds.dispatch(f"killswitch reset {gen}")
+
+    assert out == "kill switch ラッチを解除しました\nDD が閾値以上のままなら、次の新規判断で kill switch が再びラッチします。"
+    assert out.count("DD が閾値以上のままなら、次の新規判断で kill switch が再びラッチします。") == 1
+
+
+def test_killswitch_reset_that_does_not_release_prints_no_warning(tmp_path):
+    conn, state, activity, cmds = _commands(tmp_path)
+    state.update(kill_switch_latched=True)
+    seen = state.load().kill_switch_generation
+    state.reset_kill_switch(seen)
+    state.update(kill_switch_latched=True)
+
+    outs = [cmds.dispatch("killswitch reset"), cmds.dispatch(f"killswitch reset {seen}")]
+    state.reset_kill_switch(state.load().kill_switch_generation)
+    outs.append(cmds.dispatch(f"killswitch reset {seen}"))
+
+    assert all("閾値以上のまま" not in out for out in outs)
+
+
 def test_killswitch_reset_when_not_latched_says_so(tmp_path):
     conn, state, activity, cmds = _commands(tmp_path)
     out = cmds.dispatch("killswitch reset")

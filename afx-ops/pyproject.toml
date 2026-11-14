@@ -28,3 +28,6 @@ packages = ["afx_ops"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "real_watchdog: bot の watchdog の既定の factory を差し替えずに使う",
+]
