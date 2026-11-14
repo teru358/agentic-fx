@@ -502,6 +502,59 @@ class ApplyResult:
         return self.conflicted_new + self.conflicted_known
 
 
+# 1 回の問い合わせに渡す key の数 (SQLite の変数上限に十分収まる)。
+_QUERY_CHUNK = 400
+
+
+def _existing_values(conn: sqlite3.Connection, keys: list[tuple], source: str,
+                     ) -> dict[tuple, tuple]:
+    """(symbol, interval, bar_time) の列について、既存行の値を (key → 値) で返す。"""
+    found: dict[tuple, tuple] = {}
+    groups: dict[tuple, list[str]] = {}
+    for symbol, interval, bar_time in keys:
+        groups.setdefault((symbol, interval), []).append(bar_time)
+    for (symbol, interval), times in groups.items():
+        marks = ",".join("?" * len(times))
+        for row in conn.execute(
+                "SELECT bar_time, open, high, low, close, volume, spread FROM ohlcv_history "
+                f"WHERE symbol=? AND interval=? AND source=? AND bar_time IN ({marks})",
+                (symbol, interval, source, *times)):
+            found[(symbol, interval, row["bar_time"])] = tuple(
+                row[name] for name in _VALUE_COLUMNS)
+    return found
+
+
+def _upcoming_keys(entries, start: int) -> list[tuple]:
+    """start 以降の、適用時に再照合が要る (new 以外の) 行の key を最大 1 chunk 分。"""
+    keys = []
+    for entry in entries[start:]:
+        if entry.kind != "new":
+            keys.append((entry.symbol, entry.interval, entry.bar_time))
+            if len(keys) >= _QUERY_CHUNK:
+                break
+    return keys
+
+
+def _known_conflict_keys(conn: sqlite3.Connection, source: str, epoch: str,
+                         pending: list[tuple]) -> set[tuple]:
+    """現在の epoch で open / kept の衝突記録の (symbol, interval, bar_time, 両 digest)。"""
+    known: set[tuple] = set()
+    groups: dict[tuple, list[str]] = {}
+    for _index, symbol, interval, bar_time, _incoming, _existing in pending:
+        groups.setdefault((symbol, interval), []).append(bar_time)
+    for (symbol, interval), times in groups.items():
+        marks = ",".join("?" * len(times))
+        for row in conn.execute(
+                "SELECT bar_time, existing_digest, incoming_digest FROM history_conflicts "
+                "WHERE source=? AND interval=? AND symbol=? AND history_epoch=? "
+                f"AND state IN ('open','kept') AND bar_time IN ({marks})",
+                (source, interval, symbol, epoch, *times)):
+            known.add((symbol, interval, row["bar_time"],
+                       row["existing_digest"], row["incoming_digest"]))
+    return known
+
+
+
 def classify_history_rows(conn: sqlite3.Connection, rows: list[tuple], *,
                           source: str) -> HistoryClassification:
     """書込みなしで入力を new / unchanged / conflict に分ける。
@@ -529,27 +582,30 @@ def classify_history_rows(conn: sqlite3.Connection, rows: list[tuple], *,
                 f"classify_history_rows: input has differing values for one bar key "
                 f"({symbol} {interval} {bar_time})")
     epoch = history_epoch(conn)
+    ordered = sorted(seen.items(), key=lambda kv: (kv[0][2], kv[0][0], kv[0][1]))
     entries = []
-    for (symbol, interval, bar_time), incoming in sorted(
-            seen.items(), key=lambda kv: (kv[0][2], kv[0][0], kv[0][1])):
-        row = conn.execute(
-            "SELECT open, high, low, close, volume, spread FROM ohlcv_history "
-            "WHERE symbol=? AND interval=? AND bar_time=? AND source=?",
-            (symbol, interval, bar_time, source)).fetchone()
-        if row is None:
-            entries.append(ClassifiedRow("new", symbol, interval, bar_time, incoming))
-            continue
-        existing = tuple(row[name] for name in _VALUE_COLUMNS)
-        if history_conflicts.values_equal(existing, incoming):
-            entries.append(ClassifiedRow("unchanged", symbol, interval, bar_time,
-                                         incoming, existing))
-            continue
-        known = history_conflicts.is_known(
-            conn, source=source, interval=interval, symbol=symbol,
-            bar_time=bar_time, history_epoch=epoch, existing=existing,
-            incoming=incoming)
-        entries.append(ClassifiedRow("conflict", symbol, interval, bar_time,
-                                     incoming, existing, known))
+    for start in range(0, len(ordered), _QUERY_CHUNK):
+        chunk = ordered[start:start + _QUERY_CHUNK]
+        existing_by_key = _existing_values(conn, [key for key, _ in chunk], source)
+        pending = []
+        for (symbol, interval, bar_time), incoming in chunk:
+            existing = existing_by_key.get((symbol, interval, bar_time))
+            if existing is None:
+                entries.append(ClassifiedRow("new", symbol, interval, bar_time, incoming))
+            elif history_conflicts.values_equal(existing, incoming):
+                entries.append(ClassifiedRow("unchanged", symbol, interval, bar_time,
+                                             incoming, existing))
+            else:
+                pending.append((len(entries), symbol, interval, bar_time, incoming, existing))
+                entries.append(None)
+        if pending:
+            known = _known_conflict_keys(conn, source, epoch, pending)
+            for index, symbol, interval, bar_time, incoming, existing in pending:
+                _ej, existing_digest = history_conflicts.canonical_values(existing)
+                _ij, incoming_digest = history_conflicts.canonical_values(incoming)
+                entries[index] = ClassifiedRow(
+                    "conflict", symbol, interval, bar_time, incoming, existing,
+                    (symbol, interval, bar_time, existing_digest, incoming_digest) in known)
     return HistoryClassification(source, epoch, tuple(entries))
 
 
@@ -636,6 +692,8 @@ def apply_classified_history(conn: sqlite3.Connection,
                 conn.execute("BEGIN IMMEDIATE")
             if history_epoch(conn) != classification.epoch:
                 raise _EpochChanged()
+            current_values: dict = {}
+            loaded: set = set()
             while batch_end < total:
                 entry = entries[batch_end]
                 if entry.kind == "new":
@@ -650,13 +708,13 @@ def apply_classified_history(conn: sqlite3.Connection,
                         raise _ConcurrentChange()
                     b_ins += 1
                 else:
-                    current = conn.execute(
-                        "SELECT open, high, low, close, volume, spread FROM ohlcv_history "
-                        "WHERE symbol=? AND interval=? AND bar_time=? AND source=?",
-                        (entry.symbol, entry.interval, entry.bar_time,
-                         classification.source)).fetchone()
-                    if current is None or tuple(current[n] for n in _VALUE_COLUMNS) \
-                            != entry.existing:
+                    key = (entry.symbol, entry.interval, entry.bar_time)
+                    if key not in loaded:
+                        upcoming = _upcoming_keys(entries, batch_end)
+                        current_values.update(_existing_values(
+                            conn, upcoming, classification.source))
+                        loaded.update(upcoming)
+                    if current_values.get(key) != entry.existing:
                         raise _ConcurrentChange()
                 if entry.kind == "unchanged":
                     b_unc += 1

@@ -162,9 +162,9 @@ fresh DDL、既存DBの `init_db` による冪等導入、旧DB fixture、`TABLE
 
 ### 2.5a 同期の分割再開・stage・cursor (terra I1)
 
-一runは複数の取得操作・cycleを持つ。取得操作開始時に `operation_id, generation, dataset, epoch, requested_ranges, T, E` を固定する。stageは正規化済み行のみ、最大100万行、作成から最大10分。memoryまたは0600 spoolを使い、認証情報/raw応答は持たない。全取得完了前のcursorは進めない。stage期限切れ・process終了時は削除し、古いstageを次processで再利用しない。
+一runは複数の取得操作・cycleを持つ。取得操作開始時に `operation_id, generation, dataset, epoch, requested_ranges, T, E` を固定する。stageは正規化済み行のみ、最大100万行、作成 (取得の完了) から最大10分。取得そのものの長さは各sourceの要求予算が抑え、stageの寿命には数えない。memoryまたは0600 spoolを使い、認証情報/raw応答は持たない。全取得完了前のcursorは進めない。stage期限切れ・process終了時は削除し、古いstageを次processで再利用しない。
 
-取得中または反映中に stage が期限 (10 分) に達したら、未確定の batch を rollback して stage を破棄し、確定済み prefix と確定 cursor はそのまま保ち、mutation lease を解放する。operation の結果は `stage_expired` (技術失敗、rc は §3 の技術失敗と同じ) とし、残りの範囲は次の cycle で新しい generation として再取得・再判定する (prefix は新しい N/C に含めない)。受入: 期限到達を fake clock で注入し、prefix が残る・lease が解放される・次 cycle が suffix だけを取る・旧 stage を再利用しない、を確かめる。
+stage の作成後、反映中に期限 (10 分) に達したら、未確定の batch を rollback して stage を破棄し、確定済み prefix と確定 cursor はそのまま保ち、mutation lease を解放する。operation の結果は `stage_expired` (技術失敗、rc は §3 の技術失敗と同じ) とし、残りの範囲は次の cycle で新しい generation として再取得・再判定する (prefix は新しい N/C に含めない)。受入: 期限到達を fake clock で注入し、prefix が残る・lease が解放される・次 cycle が suffix だけを取る・旧 stage を再利用しない、を確かめる。
 
 同じgenerationの通常cycle間はstage・N/C・分類を維持する。mutation lease下でreadonly分類を一度済ませ、unchanged行は書込みSQLを省く。新規行と衝突だけをbatchへ渡す。INSERT競合時はrowcount=0の行だけ再比較し、契約外変更ならbatchをrollbackして技術失敗とする。全unchangedでも進捗を確定する。分類済みsuffixを先頭から再処理しない。
 

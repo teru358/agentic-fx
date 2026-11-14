@@ -377,18 +377,11 @@ def _cache_changes(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], list
 @contextmanager
 def _mutation_lease(conn: sqlite3.Connection):
     """履歴 writer の排他。取れなければ待たず RepairError(rc=1)。"""
-    lease = history_mutation_lease(conn)
     try:
-        lease.__enter__()
+        with history_mutation_lease(conn):
+            yield
     except HistoryLeaseBusy as exc:
         raise RepairError(str(exc), 1) from exc
-    try:
-        yield
-    except BaseException as exc:
-        if not lease.__exit__(type(exc), exc, exc.__traceback__):
-            raise
-    else:
-        lease.__exit__(None, None, None)
 
 
 def _supersede_open_conflicts(conn: sqlite3.Connection, rows, *, at: datetime) -> int:

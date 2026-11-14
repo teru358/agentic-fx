@@ -13,6 +13,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from contextlib import ExitStack
 from typing import Callable
 
 from agentic_fx.store import history_conflicts, ohlcv
@@ -22,6 +23,7 @@ from agentic_fx.store.history_lease import HistoryLeaseBusy, history_mutation_le
 # 1 行 (9 要素の tuple、float 5 個、ISO 文字列) は約 0.4 KB なので、100 万行で約 0.4 GB。
 MAX_IMPORT_ROWS = 1_000_000
 
+# stage の寿命。取得が終わって stage ができた時点から数える (取得の長さは各 source の要求予算が抑える)。
 STAGE_TTL_SEC = 600.0
 BUSY_BUDGET_SEC = 0.25
 BUSY_RETRY_SLEEP_SEC = 0.025
@@ -123,7 +125,7 @@ class ImportOutcome:
 
 
 def summarize(series: list[SeriesOutcome] | tuple[SeriesOutcome, ...]) -> ImportOutcome:
-    """§3 の優先順位: 技術失敗 > 遮断 > 衝突 > ok。"""
+    """系列結果から全体の結果を決める。優先順位は 技術失敗 > 遮断 > 衝突 > ok。"""
     series = tuple(series)
     if any(s.technical_failure for s in series):
         confirmed = any(s.confirmed for s in series)
@@ -197,7 +199,6 @@ def run_series(conn: sqlite3.Connection, spec: SeriesSpec, *,
         raise ValueError("run_series: connection must not be inside a transaction")
     op = uuid.uuid4().hex
     clock_now = now or (lambda: datetime.now(timezone.utc))
-    stage_started = monotonic()
     try:
         rows = spec.fetch()
     except SeriesFetchError as exc:
@@ -206,44 +207,57 @@ def run_series(conn: sqlite3.Connection, spec: SeriesSpec, *,
         return _failed(spec, op, "fetch_failed", error_type=type(exc).__name__)
     if len(rows) > MAX_IMPORT_ROWS:
         return _failed(spec, op, "too_large")
-    if monotonic() - stage_started >= stage_ttl:
-        return _failed(spec, op, "stage_expired")
+    stage_started = monotonic()
 
     previous_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
-    try:
-        with history_mutation_lease(conn):
-            conn.execute("PRAGMA busy_timeout=0")
-            try:
-                return _classify_and_apply(
-                    conn, spec, op, rows, origin=origin, run_id=run_id,
-                    seen_at=clock_now(), monotonic=monotonic, sleep=sleep,
-                    stage_started=stage_started, stage_ttl=stage_ttl,
-                    busy_budget=busy_budget, admission=admission, max_rows=max_rows,
-                    budget_seconds=budget_seconds)
-            finally:
-                conn.execute(f"PRAGMA busy_timeout={int(previous_timeout)}")
-    except HistoryLeaseBusy:
-        return _failed(spec, op, "database_busy")
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(history_mutation_lease(conn))
+        except HistoryLeaseBusy:
+            return _failed(spec, op, "database_busy")
+        except OSError as exc:
+            return _failed(spec, op, "lease_unavailable", error_type=type(exc).__name__)
+        conn.execute("PRAGMA busy_timeout=0")
+        try:
+            return _classify_and_apply(
+                conn, spec, op, rows, origin=origin, run_id=run_id,
+                seen_at=clock_now(), monotonic=monotonic, sleep=sleep,
+                stage_started=stage_started, stage_ttl=stage_ttl,
+                busy_budget=busy_budget, admission=admission, max_rows=max_rows,
+                budget_seconds=budget_seconds)
+        finally:
+            conn.execute(f"PRAGMA busy_timeout={int(previous_timeout)}")
 
 
 def _classify_and_apply(conn, spec, op, rows, *, origin, run_id, seen_at, monotonic,
                         sleep, stage_started, stage_ttl, busy_budget, admission,
                         max_rows, budget_seconds) -> SeriesOutcome:
-    try:
-        classification = ohlcv.classify_history_rows(conn, rows, source=spec.source)
-    except ohlcv.InconsistentInputError as exc:
-        return _failed(spec, op, "invalid_response", detail=str(exc),
-                       error_type=type(exc).__name__)
-    except Exception as exc:
-        code = "database_busy" if _is_busy(exc) else "classify_failed"
-        return _failed(spec, op, code, error_type=type(exc).__name__)
+    busy_spent = 0.0
+    while True:
+        try:
+            classification = ohlcv.classify_history_rows(conn, rows, source=spec.source)
+            break
+        except ohlcv.InconsistentInputError as exc:
+            return _failed(spec, op, "invalid_response", detail=str(exc),
+                           error_type=type(exc).__name__)
+        except Exception as exc:
+            if _is_busy(exc) and busy_spent + 1e-9 < busy_budget:
+                sleep(BUSY_RETRY_SLEEP_SEC)
+                busy_spent += BUSY_RETRY_SLEEP_SEC
+                continue
+            code = "database_busy" if _is_busy(exc) else "classify_failed"
+            return _failed(spec, op, code, error_type=type(exc).__name__)
     common = dict(
         source=spec.source, interval=spec.interval, symbol=spec.symbol,
         requested_start=_iso(spec.requested_start), requested_end=_iso(spec.requested_end),
         effective_end=_iso(spec.effective_end), operation_id=op,
         n_overlap=classification.n_overlap, n_test=classification.n_test)
     if classification.circuit_open:
-        lines = _conflict_lines(conn, classification, upto=None)
+        try:
+            lines = _conflict_lines(conn, classification, upto=None)
+        except Exception as exc:
+            code = "database_busy" if _is_busy(exc) else "conflict_lines_failed"
+            return _failed(spec, op, code, error_type=type(exc).__name__)
         return SeriesOutcome(
             status="conflict_circuit_open",
             conflicted_new=classification.conflicts_new,
@@ -254,7 +268,6 @@ def _classify_and_apply(conn, spec, op, rows, *, origin, run_id, seen_at, monoto
     totals = dict(inserted=0, unchanged=0, new=0, known=0)
     last_committed = None
     failure = error_type = None
-    busy_spent = 0.0
 
     def before_batch():
         if monotonic() - stage_started >= stage_ttl:
@@ -287,8 +300,16 @@ def _classify_and_apply(conn, spec, op, rows, *, origin, run_id, seen_at, monoto
             continue
         break
 
-    lines = _conflict_lines(conn, classification, upto=last_committed) \
-        if (totals["new"] + totals["known"]) else ()
+    lines: tuple[ConflictLine, ...] = ()
+    lines_failed = False
+    if totals["new"] + totals["known"]:
+        try:
+            lines = _conflict_lines(conn, classification, upto=last_committed)
+        except Exception as exc:
+            lines_failed = True
+            if failure is None:
+                failure = "database_busy" if _is_busy(exc) else "conflict_lines_failed"
+                error_type = type(exc).__name__
     if failure is None:
         status = "completed_with_conflicts" if (totals["new"] + totals["known"]) else "ok"
         return SeriesOutcome(
@@ -300,7 +321,8 @@ def _classify_and_apply(conn, spec, op, rows, *, origin, run_id, seen_at, monoto
         status="partial" if committed else "failed", inserted=totals["inserted"],
         unchanged=totals["unchanged"], conflicted_new=totals["new"],
         conflicted_known=totals["known"], last_committed_bar_time=last_committed,
-        resume_from=entries[0].bar_time if entries else None, failure=failure,
+        resume_from=None if lines_failed and res.status == "ok"
+        else (entries[0].bar_time if entries else None), failure=failure,
         error_type=error_type, conflict_lines=lines, **common)
 
 

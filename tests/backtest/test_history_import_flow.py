@@ -334,6 +334,7 @@ def test_busy_timeout_is_zero_during_the_import_and_restored(tmp_path, monkeypat
 
 def test_stage_expired_after_fetch_writes_nothing(tmp_path):
     conn = _conn(tmp_path)
+    # stage の作成 (取得の完了) 0 → 最初の batch の前 601
     ticks = iter([0.0, 601.0, 602.0, 603.0])
     out = _run(conn, _spec([_row(0)]), monotonic=lambda: next(ticks))
     assert (out.status, out.failure) == ("failed", "stage_expired")
@@ -350,17 +351,31 @@ def test_stage_reaching_exactly_the_ttl_after_fetch_is_expired(tmp_path):
     assert _count(conn, "ohlcv_history") == 0
 
 
+def test_long_fetch_does_not_count_against_the_stage_ttl(tmp_path):
+    conn = _conn(tmp_path)
+    clock = [0.0]
+
+    def fetch():
+        clock[0] += 5000.0                   # 取得だけで TTL を大きく超える
+        return [_row(0), _row(1)]
+
+    out = _run(conn, _spec(fetch, n=2), monotonic=lambda: clock[0])
+    assert out.failure is None and out.status == "ok"
+    assert _count(conn, "ohlcv_history") == 2
+
+
 def test_stage_just_under_the_ttl_after_fetch_is_written(tmp_path):
     conn = _conn(tmp_path)
-    out = _run(conn, _spec([_row(0)]), monotonic=lambda: 599.0)
+    ticks = iter([0.0, 599.0])
+    out = _run(conn, _spec([_row(0)]), monotonic=lambda: next(ticks, 599.0))
     assert out.failure is None and _count(conn, "ohlcv_history") == 1
 
 
 def test_stage_expiring_between_batches_keeps_the_prefix_and_releases_the_lease(tmp_path):
     conn = _conn(tmp_path)
     rows = [_row(i) for i in range(6)]
-    # 取得開始 0 → 取得後 1 → batch 1 の前 2・commit 直前 3 → batch 2 の前 700
-    ticks = iter([0.0, 1.0, 2.0, 3.0, 700.0] + [700.0] * 20)
+    # stage 作成 0 → batch 1 の前 1・commit 直前 2 → batch 2 の前 700
+    ticks = iter([0.0, 1.0, 2.0, 700.0] + [700.0] * 20)
     out = _run(conn, _spec(rows, n=6), max_rows=2, monotonic=lambda: next(ticks))
     assert (out.status, out.failure) == ("partial", "stage_expired")
     assert out.inserted == 2 and out.resume_from == _t(2)
@@ -375,9 +390,8 @@ def test_stage_expiring_between_batches_keeps_the_prefix_and_releases_the_lease(
 def test_stage_expiring_inside_a_batch_rolls_that_batch_back(tmp_path):
     conn = _conn(tmp_path)
     rows = [_row(i) for i in range(4)]
-    # 取得開始 0 → 取得後 1 → batch 1 前 2 → batch 1 内 (row 0, row 1 で停止判定は
-    # clock 不使用) → batch 1 の commit 直前 700
-    seq = iter([0.0, 1.0, 2.0, 700.0])
+    # stage 作成 0 → batch 1 前 1 → batch 1 の commit 直前 700
+    seq = iter([0.0, 1.0, 700.0])
     out = _run(conn, _spec(rows, n=4), max_rows=2,
                monotonic=lambda: next(seq, 700.0))
     assert (out.status, out.failure) == ("failed", "stage_expired")
@@ -390,7 +404,7 @@ def test_stage_expiring_before_the_last_batch_commit_keeps_only_earlier_batches(
     conn = _conn(tmp_path)
     rows = [_row(i) for i in range(4)]
     # batch 1 は前後とも期限内、batch 2 の前は期限内で commit 直前に越える
-    seq = iter([0.0, 1.0, 2.0, 3.0, 4.0, 700.0])
+    seq = iter([0.0, 2.0, 3.0, 4.0, 700.0])
     out = _run(conn, _spec(rows, n=4), max_rows=2,
                monotonic=lambda: next(seq, 700.0))
     assert (out.status, out.failure) == ("partial", "stage_expired")
@@ -471,3 +485,112 @@ def test_circuit_open_shows_five_rows_omitted_and_persisted_false(tmp_path, caps
     assert "omitted=25" in captured.err and "persisted=false" in captured.err
     assert "C_new=30" in captured.err and "N_overlap=3030" in captured.err
     assert "result=conflict_circuit_open rc=4" in captured.out
+
+
+# ---- lease の取得失敗・衝突行の取得失敗・分類の busy ------------------------
+
+def test_lease_open_failure_folds_into_the_outcome(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+
+    def broken(_conn):
+        raise PermissionError("read-only directory")
+
+    monkeypatch.setattr(hi, "history_mutation_lease", broken)
+    out = _run(conn, _spec([_row(0)]))
+    assert (out.status, out.failure, out.error_type) == (
+        "failed", "lease_unavailable", "PermissionError")
+    assert _count(conn, "ohlcv_history") == 0
+    assert hi.summarize([out]).rc == 1
+
+
+def test_conflict_lines_failure_keeps_the_committed_counts(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    _seed(conn, [_row(0), _row(1)])
+    rows = [_row(0, close=148.15), _row(1), _row(2)]
+
+    def broken(*_a, **_k):
+        raise RuntimeError("query failed")
+
+    monkeypatch.setattr(hi, "_conflict_lines", broken)
+    out = _run(conn, _spec(rows, n=3))
+    assert out.status == "partial" and out.failure == "conflict_lines_failed"
+    assert (out.inserted, out.unchanged, out.conflicted_new) == (1, 1, 1)
+    assert out.last_committed_bar_time == _t(2)
+    assert out.resume_from is None
+    assert hi.summarize([out]).rc == 1
+
+
+def test_conflict_lines_busy_is_reported_as_database_busy(tmp_path, monkeypatch):
+    import sqlite3
+    conn = _conn(tmp_path)
+    _seed(conn, [_row(0)])
+
+    def busy(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(hi, "_conflict_lines", busy)
+    out = _run(conn, _spec([_row(0, close=148.15)]))
+    assert (out.status, out.failure) == ("partial", "database_busy")
+    assert out.conflicted_new == 1
+
+
+def test_classification_busy_retries_within_the_same_budget(tmp_path, monkeypatch):
+    import sqlite3
+    conn = _conn(tmp_path)
+    real = ohlcv.classify_history_rows
+    calls = []
+
+    def flaky(c, rows, *, source):
+        calls.append(1)
+        if len(calls) <= 2:
+            raise sqlite3.OperationalError("database is locked")
+        return real(c, rows, source=source)
+
+    monkeypatch.setattr(ohlcv, "classify_history_rows", flaky)
+    slept = []
+    out = _run(conn, _spec([_row(0)]), sleep=slept.append)
+    assert out.status == "ok" and out.inserted == 1
+    assert len(calls) == 3 and len(slept) == 2
+
+
+def test_classification_busy_gives_up_after_the_budget(tmp_path, monkeypatch):
+    import sqlite3
+
+    def always(c, rows, *, source):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(ohlcv, "classify_history_rows", always)
+    slept = []
+    out = _run(conn := _conn(tmp_path), _spec([_row(0)]), sleep=slept.append)
+    assert (out.status, out.failure) == ("failed", "database_busy")
+    assert len(slept) == 10 and abs(sum(slept) - 0.25) < 1e-9
+    assert _count(conn, "ohlcv_history") == 0
+
+
+# ---- 分類・再照合の query 数 -------------------------------------------------
+
+def test_classification_and_recheck_queries_do_not_scale_with_rows(tmp_path):
+    conn = _conn(tmp_path)
+    n = 1200
+    _seed(conn, [_row(i) for i in range(n)])
+    for i in range(0, n, 10):
+        hc.upsert(conn, source="mt5", interval="1m", symbol="USDJPY", bar_time=_t(i),
+                  history_epoch="none", existing=(148.0, 148.2, 147.9, 148.1, 10.0, None),
+                  incoming=(148.0, 148.2, 147.9, 148.15, 10.0, None), origin="import",
+                  seen_at=SEEN.isoformat())
+    conn.execute("UPDATE history_conflicts SET state='kept'")
+    conn.commit()
+    rows = [_row(i, close=148.15) if i % 10 == 0 else _row(i) for i in range(n)]
+    statements = []
+    conn.set_trace_callback(statements.append)
+    out = _run(conn, _spec(rows, n=n), max_rows=n)
+    conn.set_trace_callback(None)
+    assert out.status == "completed_with_conflicts"
+    assert (out.unchanged, out.conflicted_known) == (1080, 120)
+    reads = [t for t in statements
+             if t.lstrip().upper().startswith("SELECT") and "FROM ohlcv_history" in t]
+    known = [t for t in statements
+             if t.lstrip().upper().startswith("SELECT") and "FROM history_conflicts" in t
+             and "existing_digest" in t and "bar_time IN" in t]
+    assert len(reads) <= 2 * (n // 400 + 1) + 2
+    assert known and len(known) <= n // 400 + 1

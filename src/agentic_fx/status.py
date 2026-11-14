@@ -192,7 +192,7 @@ def _locked_history(root: Path, now: datetime | None) -> tuple[str, tuple[str, .
         history = status_history.collect(root, settings, conn, tz, when, unavailable_reason=reason)
         return tz, status_history.render(history, tz)
     except Exception:  # noqa: BLE001 - history is fail-soft; locked info is always shown
-        return tz, status_history.render(status_history._unavailable(
+        return tz, status_history.render(status_history.unavailable(
             when, status_history.ReasonCode.HISTORY_CHECK_UNAVAILABLE), tz)
     finally:
         if conn is not None:

@@ -226,7 +226,7 @@ def _references(conn: sqlite3.Connection, settings: Any, health: hh.HistoryHealt
     return References(kind, observed_at, start, end, False, None, tuple(symbols))
 
 
-def _unavailable(now: datetime, reason: ReasonCode) -> HistoryStatus:
+def unavailable(now: datetime, reason: ReasonCode) -> HistoryStatus:
     return HistoryStatus(now, EvaluationHistory(State.UNAVAILABLE, reason))
 
 
@@ -247,14 +247,14 @@ def collect(root: Path, settings: Any, conn: sqlite3.Connection | None, tz: str,
     root = Path(root)
     try:
         if settings is None:
-            return _unavailable(now, ReasonCode.SETTINGS_UNAVAILABLE)
+            return unavailable(now, ReasonCode.SETTINGS_UNAVAILABLE)
         dataset = settings.backtest.dataset()
         if dataset.unconfigured:
             return HistoryStatus(now, EvaluationHistory(
                 State.NOT_CONFIGURED, None, source=dataset.source,
                 base_interval=dataset.base_interval))
         if conn is None:
-            return _unavailable(now, unavailable_reason or ReasonCode.DATABASE_UNAVAILABLE)
+            return unavailable(now, unavailable_reason or ReasonCode.DATABASE_UNAVAILABLE)
         grace = timedelta(seconds=settings.datafeed.closed_bar_grace_sec)
         path = history_evidence.no_bars_path(root)
         health = hh.evaluate_history(
@@ -283,7 +283,7 @@ def collect(root: Path, settings: Any, conn: sqlite3.Connection | None, tz: str,
             hh.threshold_snapshot(), pairs, dataset.width.total_seconds() / 60,
             _no_bars_info(root, health, load_error), references, _next_actions(state)))
     except Exception:  # noqa: BLE001 - the block alone becomes unavailable
-        return _unavailable(now, ReasonCode.HISTORY_CHECK_UNAVAILABLE)
+        return unavailable(now, ReasonCode.HISTORY_CHECK_UNAVAILABLE)
 
 
 _NEXT_TEXT = {
