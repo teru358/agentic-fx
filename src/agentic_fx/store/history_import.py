@@ -206,7 +206,7 @@ def run_series(conn: sqlite3.Connection, spec: SeriesSpec, *,
         return _failed(spec, op, "fetch_failed", error_type=type(exc).__name__)
     if len(rows) > MAX_IMPORT_ROWS:
         return _failed(spec, op, "too_large")
-    if monotonic() - stage_started > stage_ttl:
+    if monotonic() - stage_started >= stage_ttl:
         return _failed(spec, op, "stage_expired")
 
     previous_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
@@ -257,7 +257,7 @@ def _classify_and_apply(conn, spec, op, rows, *, origin, run_id, seen_at, monoto
     busy_spent = 0.0
 
     def before_batch():
-        if monotonic() - stage_started > stage_ttl:
+        if monotonic() - stage_started >= stage_ttl:
             return "stage_expired"
         return None
 

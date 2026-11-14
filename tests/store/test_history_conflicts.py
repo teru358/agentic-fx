@@ -650,17 +650,40 @@ def test_conflict_canaries_do_not_reach_the_improve_prompt_or_context(tmp_path):
 
 
 def test_production_code_never_calls_the_low_level_import_history_bars():
+    import ast
+
     root = Path(__file__).resolve().parents[2] / "src"
     offenders = []
     for path in root.rglob("*.py"):
-        text = path.read_text(errors="ignore")
-        for m in re.finditer(r"\bimport_history_bars\s*\(", text):
-            line_start = text.rfind("\n", 0, m.start()) + 1
-            line = text[line_start:text.find("\n", m.start())]
-            if line.lstrip().startswith(("def ", "#")) or "import_history_bars:" in line:
+        tree = ast.parse(path.read_text(errors="ignore"))
+        names = {"import_history_bars"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name == "import_history_bars":
+                        names.add(alias.asname or alias.name)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
                 continue
-            offenders.append(f"{path.relative_to(root).as_posix()}: {line.strip()}")
+            func = node.func
+            called = (func.id if isinstance(func, ast.Name)
+                      else func.attr if isinstance(func, ast.Attribute) else None)
+            if called in names:
+                offenders.append(f"{path.relative_to(root).as_posix()}:{node.lineno}")
     assert offenders == []
+
+
+def test_the_low_level_call_scan_sees_an_aliased_call(tmp_path):
+    import ast
+
+    tree = ast.parse("from agentic_fx.store.ohlcv import import_history_bars as put\nput(c, rows)\n")
+    names = {"import_history_bars"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            names |= {a.asname or a.name for a in node.names if a.name == "import_history_bars"}
+    calls = [n.func.id for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+    assert "put" in names and "put" in calls
 
 
 def test_conflict_canaries_do_not_reach_agent_tool_responses(tmp_path):

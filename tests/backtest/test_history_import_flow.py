@@ -342,6 +342,20 @@ def test_stage_expired_after_fetch_writes_nothing(tmp_path):
         pass
 
 
+def test_stage_reaching_exactly_the_ttl_after_fetch_is_expired(tmp_path):
+    conn = _conn(tmp_path)
+    ticks = iter([0.0, 600.0, 601.0, 602.0])
+    out = _run(conn, _spec([_row(0)]), monotonic=lambda: next(ticks))
+    assert (out.status, out.failure) == ("failed", "stage_expired")
+    assert _count(conn, "ohlcv_history") == 0
+
+
+def test_stage_just_under_the_ttl_after_fetch_is_written(tmp_path):
+    conn = _conn(tmp_path)
+    out = _run(conn, _spec([_row(0)]), monotonic=lambda: 599.0)
+    assert out.failure is None and _count(conn, "ohlcv_history") == 1
+
+
 def test_stage_expiring_between_batches_keeps_the_prefix_and_releases_the_lease(tmp_path):
     conn = _conn(tmp_path)
     rows = [_row(i) for i in range(6)]
