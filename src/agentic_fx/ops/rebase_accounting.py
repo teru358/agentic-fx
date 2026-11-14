@@ -21,7 +21,13 @@ class RebaseOutcomeUnknown(RuntimeError):
 
 
 def read_rebase_totals(conn: sqlite3.Connection) -> dict[str, float | int | None]:
-    """Read ledger SUM/COUNT and last id, joining an existing read transaction."""
+    """Read ledger SUM/COUNT and last id.
+
+    With no open transaction this opens and closes its own read transaction.
+    Otherwise it reads inside the caller's transaction as is, including rows
+    that transaction has written but not committed; the caller owns which
+    transaction that is.
+    """
     owns_transaction = not conn.in_transaction
     if owns_transaction:
         conn.execute("BEGIN")
@@ -42,8 +48,14 @@ def read_rebase_totals(conn: sqlite3.Connection) -> dict[str, float | int | None
 
 
 def _commit_rebase(conn: sqlite3.Connection) -> None:
-    """Isolated commit boundary, intentionally replaceable for fault injection."""
     conn.commit()
+
+
+def _rollback_quietly(conn: sqlite3.Connection) -> None:
+    try:
+        conn.rollback()
+    except Exception:
+        pass
 
 
 def paper_equity(conn: sqlite3.Connection, settings: Settings,
@@ -64,13 +76,21 @@ def apply_rebase(
     """Atomically insert a rebase snapshot and its ledger row.
 
     ``validate`` rechecks caller-owned broker/source/flat/freshness, generation,
-    DD threshold and token conditions while BEGIN IMMEDIATE is held. Exceptions
-    roll back without writing. This function also checks source/latest and daily
-    invariants before committing.
+    DD threshold and token conditions while BEGIN IMMEDIATE is held. It must
+    only read: ending the transaction (commit / rollback) is rejected before
+    anything is written. Exceptions roll back without writing. This function
+    also checks source/latest and daily invariants before committing.
+
+    An ``Exception`` from COMMIT becomes ``RebaseOutcomeUnknown`` (the caller
+    resolves it from the ledger). A ``BaseException`` that is not an
+    ``Exception`` (an interrupt) propagates unchanged after a best-effort
+    rollback, so its outcome is equally unknown to the caller.
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
         validate(conn)
+        if not conn.in_transaction:
+            raise RuntimeError("validate must not end the rebase transaction")
         source = conn.execute(
             "SELECT * FROM account_snapshots WHERE id=?",
             (source_snapshot_id,)).fetchone()
@@ -117,16 +137,10 @@ def apply_rebase(
             "generation": generation, "latched": latched_at is not None}
         try:
             _commit_rebase(conn)
-        except BaseException as exc:
-            try:
-                conn.rollback()
-            except BaseException:
-                pass
+        except Exception as exc:
+            _rollback_quietly(conn)
             raise RebaseOutcomeUnknown("rebase COMMIT outcome is unknown") from exc
         return result
     except BaseException:
-        try:
-            conn.rollback()
-        except BaseException:
-            pass
+        _rollback_quietly(conn)
         raise

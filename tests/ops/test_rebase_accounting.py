@@ -1,3 +1,4 @@
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -163,29 +164,78 @@ def test_precommit_faults_leave_both_rows_unchanged(tmp_path, monkeypatch, fault
     assert reopened.execute("SELECT COUNT(*) FROM kill_switch_hwm_rebases").fetchone()[0] == 0
 
 
-@pytest.mark.parametrize("committed", [False, True])
-def test_commit_exceptions_are_outcome_unknown_and_resolvable(tmp_path, monkeypatch, committed):
-    conn = connect(tmp_path / f"commit-{committed}.db")
+class _CommitFaultConnection(sqlite3.Connection):
+    """commit() itself fails; the module's real commit boundary runs unchanged."""
+    fault = None
+
+    def commit(self):
+        if self.fault == "after":
+            super().commit()
+            raise OSError("commit injected after it was durable")
+        if self.fault == "before":
+            raise OSError("commit injected before it was durable")
+        if self.fault == "interrupt":
+            raise KeyboardInterrupt
+        super().commit()
+
+
+def _commit_fault_db(path):
+    conn = sqlite3.connect(path, factory=_CommitFaultConnection)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     init_db(conn)
     now = datetime(2026, 11, 14, 12, tzinfo=timezone.utc)
     source = conn.execute("INSERT INTO account_snapshots(ts,balance,equity,hwm) "
                           "VALUES(?,900,900,1000)", (now.isoformat(),))
     conn.commit()
-    audit_id = _accepted(conn, 1)
+    return conn, now, source.lastrowid, _accepted(conn, 1)
 
-    def injected_commit(db):
-        if committed:
-            db.commit()
-        raise OSError("commit injected")
 
-    monkeypatch.setattr(accounting, "_commit_rebase", injected_commit)
+def _counts(path):
+    reopened = connect(path)
+    try:
+        return (reopened.execute("SELECT COUNT(*) FROM kill_switch_hwm_rebases").fetchone()[0],
+                reopened.execute("SELECT COUNT(*) FROM account_snapshots").fetchone()[0])
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("fault, durable", [("before", False), ("after", True)])
+def test_commit_exceptions_are_outcome_unknown_and_resolvable(tmp_path, fault, durable):
+    path = tmp_path / f"commit-{fault}.db"
+    conn, now, source_id, audit_id = _commit_fault_db(path)
+    conn.fault = fault
     with pytest.raises(RebaseOutcomeUnknown):
-        _apply(conn, source_id=source.lastrowid, audit_id=audit_id, now=now,
+        _apply(conn, source_id=source_id, audit_id=audit_id, now=now,
                hwm=1000, equity=900, balance=900)
+    conn.fault = None
     conn.close()
-    reopened = connect(tmp_path / f"commit-{committed}.db")
-    assert reopened.execute("SELECT COUNT(*) FROM kill_switch_hwm_rebases").fetchone()[0] == int(committed)
-    assert reopened.execute("SELECT COUNT(*) FROM account_snapshots").fetchone()[0] == 1 + int(committed)
+    assert _counts(path) == (int(durable), 1 + int(durable))
+
+
+def test_an_interrupt_during_commit_propagates_unchanged(tmp_path):
+    path = tmp_path / "commit-interrupt.db"
+    conn, now, source_id, audit_id = _commit_fault_db(path)
+    conn.fault = "interrupt"
+    with pytest.raises(KeyboardInterrupt):
+        _apply(conn, source_id=source_id, audit_id=audit_id, now=now,
+               hwm=1000, equity=900, balance=900)
+    conn.fault = None
+    conn.close()
+    assert _counts(path) == (0, 1)
+
+
+@pytest.mark.parametrize("end", ["commit", "rollback"])
+def test_a_validator_that_ends_the_transaction_writes_nothing(tmp_path, end):
+    path = tmp_path / f"validator-{end}.db"
+    conn, now, source_id, audit_id = _commit_fault_db(path)
+    with pytest.raises(RuntimeError, match="validate"):
+        _apply(conn, source_id=source_id, audit_id=audit_id, now=now,
+               hwm=1000, equity=900, balance=900,
+               validate=lambda db: getattr(db, end)())
+    conn.close()
+    assert _counts(path) == (0, 1)
 
 
 def test_same_timestamp_rebase_is_latest_and_next_mtm_inherits_its_hwm(tmp_path):
