@@ -291,6 +291,7 @@ class Commands:
                     generation = int(args[1])
                 if generation is None:
                     return "usage: killswitch reset [<世代>]"
+                self._emit_guard_notices(None)
                 try:
                     before = self.state.load()
                     after = self.state.reset_kill_switch(generation)
@@ -597,11 +598,12 @@ class Commands:
     def _emit_guard_notices(self, get_after) -> None:
         """kill switch の遷移 event を出す。通知の失敗は操作の結果へ伝えない。
 
-        ops_service が無い構成 (test など) では何もしない。"""
+        ops_service が無い構成 (test など) では何もしない。get_after が None のときは
+        操作の前の呼出しで、after を渡さず現 state だけを照合する。"""
         if self.ops_service is None:
             return
         try:
-            after = get_after()
+            after = None if get_after is None else get_after()
             self.ops_service.emit_pending_guard_notices(after=after)
         except Exception:  # noqa: BLE001
             _log.warning("guard_notice_deferred")
@@ -613,6 +615,7 @@ class Commands:
         if marker is None:
             return "確認が必要な状態はありません (解除の途中で止まった印は無し)"
         if rest == ["confirm"]:
+            self._emit_guard_notices(None)
             try:
                 state = self.state.confirm_latched()
             except Exception as e:  # noqa: BLE001 — 確定に失敗しても印は残る

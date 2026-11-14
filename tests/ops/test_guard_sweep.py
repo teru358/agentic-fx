@@ -732,3 +732,78 @@ def test_every_guard_event_literal_lives_in_events_or_service():
         if "guard_state_changed" in path.read_text(encoding="utf-8"):
             hits.add(path.name)
     assert hits <= {"events.py", "service.py"}
+
+
+# ------------------------------------------------------------------ shell の前 sweep
+
+class _Recorder:
+    """公開 wrapper を実 service へ委譲しつつ、呼出し時点の state と event を記録する。"""
+
+    def __init__(self, rig, error=None) -> None:
+        self.rig = rig
+        self.error = error
+        self.calls = []
+
+    def emit_pending_guard_notices(self, after=None, **kwargs):
+        self.calls.append((after, self.rig.state.load().kill_switch_latched,
+                           _events(self.rig.conn)))
+        if self.error is not None:
+            raise self.error
+        return self.rig.service.emit_pending_guard_notices(after=after, **kwargs)
+
+
+def _shell(rig, recorder=None):
+    from unittest.mock import MagicMock
+    from agentic_fx.activity import ActivityLog
+    from agentic_fx.commands import Commands
+    cmds = Commands(conn=rig.conn, state_store=rig.state, broker=MagicMock(),
+                    trade_loop=MagicMock(), activity=ActivityLog(rig.env.activity_path),
+                    log_dir=rig.env.root / "logs", clock=rig.clock)
+    cmds.ops_service = recorder if recorder is not None else rig.service
+    return cmds
+
+
+def test_shell_reset_before_the_first_tick_emits_latched_then_released(rig):
+    _latch(rig)
+    rec = _Recorder(rig)
+    out = _shell(rig, rec).dispatch("killswitch reset 1")
+    assert out == "kill switch ラッチを解除しました"
+    assert _events(rig.conn) == [("latched", 1), ("released", 1)]
+    (before_after, before_latched, before_events), (post_after, _, _) = rec.calls
+    assert before_after is None and before_latched is True and before_events == []
+    assert post_after is not None and post_after.kill_switch_latched is False
+
+
+def test_shell_reconcile_confirm_emits_the_unsent_latched_before_the_new_generation(rig):
+    _latch(rig)
+    _clear(rig)
+    (rig.env.root / "data" / "app_state.json.reset-in-progress").write_text(
+        json.dumps({"kind": "kill_switch_reset", "requested_generation": 1,
+                    "started_at": "T"}))
+    rec = _Recorder(rig)
+    out = _shell(rig, rec).dispatch("killswitch reconcile confirm")
+    assert "ラッチ中として確定しました" in out
+    assert _events(rig.conn) == [("latched", 1), ("latched", 2)]
+    assert rec.calls[0][0] is None and rec.calls[0][2] == []
+    assert rec.calls[1][0].kill_switch_generation == 2
+
+
+def test_shell_reset_survives_a_failing_before_call(rig, caplog):
+    plain = _shell(rig)
+    _latch(rig)
+    base_out = plain.dispatch("killswitch reset 1")
+    base_acts = rig.env.activity_path.read_text()
+    rig.env.activity_path.write_text("")
+    _latch(rig)
+    rec = _Recorder(rig, OpsError(ErrorCode.REQUEST_TIMEOUT))
+    with caplog.at_level(logging.WARNING):
+        out = _shell(rig, rec).dispatch("killswitch reset 2")
+    assert out == base_out == "kill switch ラッチを解除しました"
+    assert rig.state.load().kill_switch_latched is False
+    new_acts = rig.env.activity_path.read_text()
+    def _reset_lines(text):
+        return [l.split(" ", 2)[-1].replace("gen=2", "gen=1") for l in text.splitlines()
+                if "kill_switch_reset" in l]
+    assert _reset_lines(new_acts) == _reset_lines(base_acts) != []
+    assert len(rec.calls) == 2
+    assert _warnings(caplog, "guard_notice_deferred") == ["guard_notice_deferred"] * 2

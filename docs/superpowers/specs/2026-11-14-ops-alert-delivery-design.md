@@ -134,7 +134,7 @@ sweep は次で呼ぶ。
 - daemon 起動時: event store 構築後、listener と supervisor の開始前。失敗は固定 code で保留し、取引起動を妨げない。
 - scheduler tick 後: 一回の ops lane 取得内で improve と guard の helper を別々の try に入れる。guard は `settings.notify.improve_events` の値にかかわらず実行し、improve 側の例外でも飛ばさない。lane 取得失敗は次の tick へ回す。
 - ops reset / reconcile: action 内で mutation 前の現 state を sweep する。mutation 後は戻り値 state を明示的に sweep し、次に現 state を sweep する。reset の clear 戻り値で旧世代の release を扱ってから次世代を見る。
-- shell reset 成功 / `ResetNotApplied` / reconcile confirm 後: 現行の直接 StateStore mutation を残し、lane を取る公開 wrapper `emit_pending_guard_notices(after=state)` を一回呼ぶ。成功時は mutation の戻り値を捕捉する。`ResetNotApplied` のように戻り値が無い場合は `load()` の marker 投影済み state を best-effort で取得する。wrapper 内では after、現 state の順に処理する。
+- shell reset / reconcile confirm: 現行の直接 StateStore mutation を残し、直接 mutation の前と後に公開 wrapper を一回ずつ呼ぶ。前の呼出し `emit_pending_guard_notices()` (after なし) は、ラッチ後最初の tick より前の解除で latched を失わないためである。後の呼出しは成功 / `ResetNotApplied` / reconcile confirm 後に `emit_pending_guard_notices(after=state)` とする。成功時は mutation の戻り値を捕捉する。`ResetNotApplied` のように戻り値が無い場合は `load()` の marker 投影済み state を best-effort で取得する。wrapper 内では after、現 state の順に処理する。
 
 **例外境界:** pre-sweep、戻り値の post-sweep、現 state の post-sweep をそれぞれ独立した通知専用 try で囲み、SELECT の busy、INSERT 失敗、state 読取失敗を操作結果へ伝播させない。pre-sweep が失敗しても mutation は続ける。通知失敗は一操作につき固定 `guard_notice_deferred` を一行だけ残し、元の成功 / 例外 / error 写像 / 監査終端結果を保つ。lane を保持した action から公開 wrapper を再入呼出ししない。前後の sweep が共に失敗すると、clear + event 無しは §4.3 により skip される。この履歴欠落は受容する。
 
@@ -426,6 +426,7 @@ daemon が新 event を出す前に afx-ops を配る。event schema 自体は�
 - improve 無効時も guard が動き、improve 例外でも guard を実行する。lane は一回だけ取得する。
 - lane を持つ reset / reconcile / scheduler の action から公開 wrapper を意図的に再入させ、`guard_lane_reentry` が即時に返ることを確認する。再入時に `_acquire` / sleep / deadline 待ちを呼ばず、二重 INSERT も無いことを spy で検証する。通知境界で捕捉されても mutation 結果・監査終端を保つ。例外後の所有フラグ解除、次の通常 wrapper 成功、所有無し private helper の拒否、別 thread の通常競合と timeout を別々に確認し、単なる全呼出し拒否で test が通らないようにする。
 - wall clock 後退は `not_before` で clamp し、timezone 表記違いも datetime 比較する。
+- ラッチ直後 (tick 前、event 無し) の shell reset で latched と released がこの順に一件ずつ出ること、reconcile confirm で前の世代の未送出 latched が先に出ること、前の wrapper が失敗しても reset が成功し文面と activity が変わらないことを確認する。前の呼出しを外す変異で赤になること。
 - shell の直接 mutation、既存 test、error 写像、activity、Discord の ops_request_terminal が増えないことを確認する。成功 / ResetNotApplied / reconcile confirm 後の wrapper は通知失敗を握る。未注入 test も従来どおり通る。R4 の警告追加だけを別途検査する。
 - source scan は kill-switch INSERT の helper 一元化だけを固定し、data_feed の `_guard_event` を誤検知しない。`_decide_events` と improve supervisor の別接続も対象に含める。
 - pending status は短命 read-only connection を使い、閉じた世代は false。本番と同じ released 世代 1 のみ + clear fixture は追加通知無しとなる。
@@ -506,6 +507,7 @@ daemon が新 event を出す前に afx-ops を配る。event schema 自体は�
 | C2 | 2026-11-13 | R1〜R5 を確定。R5 任意化、closed generation backfill、全 exit 分類、send / poller / shutdown 監視、安全 reader / logger、metadata 削除、replay fixture、task 分割を確定 | opus 2 周目 Important 8 / Minor 14 と利用者裁定を絶対基準で再判定 | 未確認（C2 の commit は本改訂で確認していない） |
 | C3 | 2026-11-14 | sweep 例外境界、全 REST 分類、終了後 watchdog、terminal snapshot、shell 直接経路維持、周辺作業分割、実データ反映 | opus 3 周目 I1〜I6 / m1〜m14 と今回の指示に基づき、通知欠落と無言停止に範囲を絞る | —（c3.md、未 commit） |
 | C4 | 2026-11-14 | REST 呼出し全数表、message 消失回復と恒久拒否の分離、lane 再入即時拒否、XDG の古い表示と導入確認、fcntl flags 保持、完了条件縮小を明示 | terra C3 閉鎖確認 I1〜I3 / Minor 2 件とチケット成功条件の指摘を採用。コード・C3 は未変更、実装検証は未実施 | —（c4.md、未 commit） |
+| C4.1 | 2026-11-14 | §4.4 shell は直接 mutation の前にも公開 wrapper を一回呼ぶ。§9.1 に対応 test を追加 | 実装で見つかった shell の前 sweep の欠落 (ラッチ後最初の tick より前の shell 解除で latched も released も出ない) | — |
 
 ## 13. task 表
 
