@@ -806,4 +806,57 @@ def test_shell_reset_survives_a_failing_before_call(rig, caplog):
                 if "kill_switch_reset" in l]
     assert _reset_lines(new_acts) == _reset_lines(base_acts) != []
     assert len(rec.calls) == 2
-    assert _warnings(caplog, "guard_notice_deferred") == ["guard_notice_deferred"] * 2
+    assert _warnings(caplog, "guard_notice_deferred") == ["guard_notice_deferred"]
+
+
+@pytest.mark.parametrize("code", [ErrorCode.REQUEST_TIMEOUT, ErrorCode.UNAVAILABLE])
+def test_startup_lane_failure_logs_and_next_tick_retries(rig, caplog, monkeypatch, code):
+    _latch(rig)
+    real = rig.service._ops_lane
+    calls = []
+    def lane(deadline):
+        calls.append(deadline)
+        if len(calls) == 1:
+            raise OpsError(code)
+        return real(deadline)
+    monkeypatch.setattr(rig.service, "_ops_lane", lane)
+    with caplog.at_level(logging.WARNING):
+        rig.service.emit_pending_notices(improve_enabled=False)
+        rig.service.emit_pending_notices(improve_enabled=False)
+    assert _warnings(caplog, "guard_notice_deferred") == ["guard_notice_deferred"]
+    assert _events(rig.conn) == [("latched", 1)]
+
+
+@pytest.mark.parametrize("operation", ["reset", "reconcile"])
+@pytest.mark.parametrize("failures", [{0}, {1}, {0, 1}, {0, 1, 2}])
+def test_api_sweep_failures_are_aggregated(rig, caplog, monkeypatch, operation, failures):
+    _latch(rig)
+    if operation == "reconcile":
+        _write_marker(rig)
+    real = service_mod.plan_kill_switch_notice
+    calls = []
+    def flaky(conn, state):
+        index = len(calls)
+        calls.append(index)
+        if index in failures:
+            raise sqlite3.OperationalError("database is locked")
+        return real(conn, state)
+    monkeypatch.setattr(service_mod, "plan_kill_switch_notice", flaky)
+    with caplog.at_level(logging.WARNING):
+        if operation == "reset":
+            rig.service.reset_kill_switch(APPROVER, 1)
+        else:
+            rig.service.reconcile_kill_switch(APPROVER)
+    assert len(calls) == 3
+    assert _warnings(caplog, "guard_notice_deferred") == ["guard_notice_deferred"]
+
+
+def test_shell_aggregates_failures_swallowed_by_real_wrapper(rig, caplog, monkeypatch):
+    _latch(rig)
+    def busy(conn, state):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(service_mod, "plan_kill_switch_notice", busy)
+    with caplog.at_level(logging.WARNING):
+        result = _shell(rig, _Recorder(rig)).dispatch("killswitch reset 1")
+    assert result == "kill switch ラッチを解除しました"
+    assert _warnings(caplog, "guard_notice_deferred") == ["guard_notice_deferred"]

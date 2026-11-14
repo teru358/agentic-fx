@@ -1838,16 +1838,17 @@ class OpsService:
             raise _GuardNoticeFailed()
         return 1
 
-    def emit_pending_guard_notices(self, after=None, *, deadline: float | None = None) -> int:
+    def emit_pending_guard_notices(self, after=None, *, deadline: float | None = None,
+                                   on_failure=None) -> int:
         """lane の外から呼ぶ公開入口。`after` (あれば) を先に、次に現 state を照合する。
 
         lane を持つ thread からの呼出しは待たずに ``GuardLaneReentry`` で拒否する。
         lane を取れなかったときは ``OpsError``。照合・保存の失敗は固定語を 1 行残して握る。"""
         self._reject_lane_reentry()
         with self._ops_lane(self._deadline(deadline)):
-            return self._guard_notices_in_lane(after)
+            return self._guard_notices_in_lane(after, on_failure=on_failure)
 
-    def _guard_notices_in_lane(self, after=None) -> int:
+    def _guard_notices_in_lane(self, after=None, *, on_failure=None) -> int:
         if not self._lane_owned():
             raise GuardLaneNotHeld()
         if self._state_store is None:
@@ -1866,7 +1867,10 @@ class OpsService:
         if after is not None:
             step(lambda: after)
         step(self._current_state)
-        self._finish_notices(notices)
+        if notices.failed and on_failure is not None:
+            on_failure()
+        else:
+            self._finish_notices(notices)
         return emitted[0]
 
     def emit_pending_notices(self, *, improve_enabled: bool) -> None:
@@ -1887,6 +1891,7 @@ class OpsService:
                 except Exception:  # noqa: BLE001
                     _log.warning("guard_notice_deferred")
         except OpsError:
+            _log.warning("guard_notice_deferred")
             return  # lane が空かなかった。次の周期に回す
         except GuardLaneReentry:
             raise

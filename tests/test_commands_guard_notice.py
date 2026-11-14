@@ -139,7 +139,7 @@ def test_wrapper_failure_is_swallowed_with_a_fixed_line(tmp_path, caplog, error)
     with caplog.at_level(logging.WARNING):
         out = cmds.dispatch(f"killswitch reset {gen}")
     assert out == "kill switch ラッチを解除しました"
-    assert [r.getMessage() for r in caplog.records] == ["guard_notice_deferred"] * 2
+    assert [r.getMessage() for r in caplog.records] == ["guard_notice_deferred"]
     assert all(r.exc_info is None for r in caplog.records)
 
 
@@ -149,3 +149,27 @@ def test_no_ops_service_means_no_notice_call_and_normal_behaviour(tmp_path):
     state.update(kill_switch_latched=True)
     out = cmds.dispatch(f"killswitch reset {state.load().kill_switch_generation}")
     assert out == "kill switch ラッチを解除しました"
+
+
+@pytest.mark.parametrize("failures", [{0}, {1}, {0, 1}])
+@pytest.mark.parametrize("operation", ["reset", "reconcile"])
+def test_operation_logs_once_for_failed_wrapper_calls(tmp_path, caplog, failures, operation):
+    conn, state, activity, cmds = _commands(tmp_path)
+    state.update(kill_switch_latched=True)
+    if operation == "reconcile":
+        state._write_marker(1)
+    class Flaky(_Wrapper):
+        def emit_pending_guard_notices(self, after=None, **kwargs):
+            index = len(self.calls)
+            self.calls.append(after)
+            if index in failures:
+                raise RuntimeError("secret")
+            return 0
+    wrapper = Flaky()
+    cmds.ops_service = wrapper
+    command = (f"killswitch reset {state.load().kill_switch_generation}"
+               if operation == "reset" else "killswitch reconcile confirm")
+    with caplog.at_level(logging.WARNING):
+        cmds.dispatch(command)
+    assert len(wrapper.calls) == 2
+    assert [r.getMessage() for r in caplog.records] == ["guard_notice_deferred"]

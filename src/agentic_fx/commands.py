@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from contextvars import ContextVar
 import logging
 import math
 import sqlite3
@@ -43,6 +44,7 @@ POLICY_WRITE_ERRORS = (sqlite3.Error, OSError, ValueError, ProjectionReconcileBl
                        MigrationRecordUnknown)
 
 _log = logging.getLogger(__name__)
+_notice_failures = ContextVar("shell_guard_notice_failures", default=None)
 
 _APPROVED_OUTCOMES = ("deployed", "deployed_after_rollback", "reevaluation_confirmed")
 
@@ -146,6 +148,16 @@ class Commands:
         self.ops_service = ops_service
 
     def dispatch(self, line: str) -> str:
+        failures = []
+        token = _notice_failures.set(failures)
+        try:
+            return self._dispatch(line)
+        finally:
+            _notice_failures.reset(token)
+            if failures:
+                _log.warning("guard_notice_deferred")
+
+    def _dispatch(self, line: str) -> str:
         parts = line.strip().split()
         if not parts:
             return ""
@@ -604,9 +616,14 @@ class Commands:
             return
         try:
             after = None if get_after is None else get_after()
-            self.ops_service.emit_pending_guard_notices(after=after)
+            self.ops_service.emit_pending_guard_notices(
+                after=after, on_failure=lambda: _notice_failures.get().append(True))
         except Exception:  # noqa: BLE001
-            _log.warning("guard_notice_deferred")
+            failures = _notice_failures.get()
+            if failures is None:
+                _log.warning("guard_notice_deferred")
+            else:
+                failures.append(True)
 
     def _killswitch_reconcile(self, rest: list[str]) -> str:
         if rest not in ([], ["confirm"]):
