@@ -382,6 +382,83 @@ CREATE TABLE IF NOT EXISTS history_conflicts (
 );
 """
 
+_HISTORY_SYNC_DDL = """
+-- 評価用履歴の同期。run への参照は論理参照で、FK は張らない (詳細の保持 GC 後も識別子を残す)。
+CREATE TABLE IF NOT EXISTS history_sync_runs (
+  id TEXT PRIMARY KEY,
+  request_id TEXT,
+  owner TEXT NOT NULL,
+  trigger TEXT NOT NULL CHECK(trigger IN ('manual','startup','scheduled','preclose','retry')),
+  status TEXT NOT NULL CHECK(status IN ('running','ok','completed_with_gaps',
+    'completed_with_conflicts','conflict_circuit_open','partial','failed','deferred',
+    'interrupted')),
+  rc INTEGER,
+  source TEXT NOT NULL, interval TEXT NOT NULL,
+  calendar_version TEXT NOT NULL, lookback_days INTEGER NOT NULL,
+  history_epoch TEXT NOT NULL,
+  t_utc TEXT NOT NULL, b_utc TEXT NOT NULL, e_utc TEXT NOT NULL,
+  started_at TEXT NOT NULL, finished_at TEXT,
+  series_total INTEGER NOT NULL DEFAULT 0, series_failed INTEGER NOT NULL DEFAULT 0,
+  inserted INTEGER NOT NULL DEFAULT 0, unchanged INTEGER NOT NULL DEFAULT 0,
+  conflicted_new INTEGER NOT NULL DEFAULT 0, conflicted_known INTEGER NOT NULL DEFAULT 0,
+  requests INTEGER NOT NULL DEFAULT 0,
+  failure_code TEXT, deferred_reason TEXT, unprocessed_json TEXT,
+  unrecorded_series INTEGER NOT NULL DEFAULT 0,
+  health TEXT,
+  tombstone INTEGER NOT NULL DEFAULT 0 CHECK(tombstone IN (0,1))
+);
+CREATE INDEX IF NOT EXISTS idx_history_sync_runs_started ON history_sync_runs(started_at);
+CREATE TABLE IF NOT EXISTS history_sync_series (
+  id INTEGER PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  op_seq INTEGER NOT NULL,
+  operation TEXT NOT NULL CHECK(operation IN ('recent','gap')),
+  generation INTEGER NOT NULL DEFAULT 1,
+  symbol TEXT NOT NULL,
+  range_kind TEXT NOT NULL,
+  range_start TEXT NOT NULL, range_end TEXT NOT NULL,
+  day_utc TEXT,
+  status TEXT NOT NULL CHECK(status IN ('running','ok','completed_with_conflicts',
+    'conflict_circuit_open','partial','failed','deferred')),
+  inserted INTEGER NOT NULL DEFAULT 0, unchanged INTEGER NOT NULL DEFAULT 0,
+  conflicted_new INTEGER NOT NULL DEFAULT 0, conflicted_known INTEGER NOT NULL DEFAULT 0,
+  requests INTEGER NOT NULL DEFAULT 0,
+  committed_prefix_end TEXT, next_cursor TEXT, last_committed_bar_time TEXT,
+  error_code TEXT,
+  started_at TEXT NOT NULL, finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_history_sync_series_run ON history_sync_series(run_id, op_seq);
+CREATE TABLE IF NOT EXISTS history_sync_series_state (
+  source TEXT NOT NULL, interval TEXT NOT NULL, symbol TEXT NOT NULL,
+  last_processed_e TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0, next_retry_at TEXT,
+  rr_cursor TEXT, last_health TEXT, last_error TEXT, last_run_id TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (source, interval, symbol)
+);
+CREATE TABLE IF NOT EXISTS history_sync_gaps (
+  source TEXT NOT NULL, interval TEXT NOT NULL, symbol TEXT NOT NULL,
+  day_utc TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('primary_exact','reference_suspected','unprocessed')),
+  state TEXT NOT NULL DEFAULT 'open' CHECK(state IN ('open','resolved','expired')),
+  missing_count INTEGER, detail_json TEXT,
+  first_seen_at TEXT NOT NULL, last_observed_at TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0, no_improve_count INTEGER NOT NULL DEFAULT 0,
+  next_retry_at TEXT, resolution TEXT,
+  first_run_id TEXT, last_run_id TEXT,
+  PRIMARY KEY (source, interval, symbol, day_utc, kind)
+);
+CREATE TABLE IF NOT EXISTS history_revisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL CHECK(kind IN ('replace_with_incoming')),
+  source TEXT NOT NULL, interval TEXT NOT NULL, symbol TEXT NOT NULL, bar_time TEXT NOT NULL,
+  history_epoch TEXT NOT NULL,
+  conflict_id INTEGER NOT NULL,
+  actor TEXT NOT NULL, created_at TEXT NOT NULL,
+  reason_ref TEXT
+);
+"""
+
 _IMPROVE_WAVES_DDL = """
 -- expected=0 は初期設定が書く消費印 (slot を 1 件も持たない)。通常の wave は
 -- expected>=1 で slot を expected 件持つ。
@@ -554,7 +631,8 @@ CREATE TABLE IF NOT EXISTS candidate_archives (
 );
 """
 
-_SCHEMA = _OHLCV_CACHE_DDL + _OHLCV_HISTORY_DDL + _HISTORY_CONFLICTS_DDL + """
+_SCHEMA = (_OHLCV_CACHE_DDL + _OHLCV_HISTORY_DDL + _HISTORY_CONFLICTS_DDL
+           + _HISTORY_SYNC_DDL) + """
 CREATE TABLE IF NOT EXISTS data_migrations (
   name TEXT PRIMARY KEY, applied_at TEXT NOT NULL
 );
@@ -798,7 +876,9 @@ BEFORE DELETE ON improve_run_summaries BEGIN SELECT RAISE(ABORT, 'improve_run_su
 """
 
 TABLE_NAMES = frozenset({
-    "ohlcv_cache", "ohlcv_history", "history_conflicts", "data_migrations", "missions", "trade_intents", "orders",
+    "ohlcv_cache", "ohlcv_history", "history_conflicts", "history_sync_runs",
+    "history_sync_series", "history_sync_series_state", "history_sync_gaps",
+    "history_revisions", "data_migrations", "missions", "trade_intents", "orders",
     "reflections", "account_snapshots", "improvement_backlog",
     "improvement_runs", "econ_events", "approval_requests", "news_sources",
     "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
