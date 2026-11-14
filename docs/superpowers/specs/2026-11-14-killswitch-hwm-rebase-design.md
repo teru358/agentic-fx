@@ -1,11 +1,11 @@
-# kill switch 解除後の HWM 付け直し設計 C2
+# kill switch 解除後の HWM 付け直し設計 C2.1
 
 - 対象: `docs/tickets/open/killswitch-reset-hwm-rebase.md`
 - コード基準: `main` / `558cb9fd`（2026-11-14 に HEAD を再確認。`afa7819f..HEAD -- src tests afx-ops` の差分は空）
 - 状態: **C2.1。2026-11-14 利用者承認、実装待ち (opsalert の T1b の後)**
 - 改訂日: 2026-11-14 JST
 - 入力: 設計 C1 と opus 2 周目の記録 (非公開、Critical 1 / Important 4 / Minor 12、食い違い 12)、terra の C2 閉鎖確認
-- 関連設計の正本: `docs/superpowers/specs/2026-11-14-ops-alert-delivery-design.md`（opsalert C4、2026-11-14 利用者承認、実装中）。旧 C2/C3 を規範参照にしない
+- 関連設計の正本: `docs/superpowers/specs/2026-11-14-ops-alert-delivery-design.md`（opsalert C4、2026-11-14 利用者承認、実装中。branch opsalert にあり、merge で main に入る）。旧 C2/C3 を規範参照にしない
 - 作業範囲: この C2 の作成のみ。コード、既存 docs、チケット、C1、レビュー原本は変更しない。金額・秘密情報を調査・転記しない
 
 ## 1. 動作目線: 誰が何をどう扱うか
@@ -270,7 +270,7 @@ state file 再作成での世代再利用や履歴削除を修復する保証は
 
 ### 5.1 commit される文書へ残す義務（実装 T3）
 
-本 C2 は gitignore 対象 tmp にあるため、ここへの記載だけで義務の永続化を完了したとはしない。実装 commit で全体設計書 `docs/superpowers/specs/2026-07-25-agentic-fx-design.md` の broker 節へ次を追記する案とする。本 spec を `docs/superpowers/specs/` に正式収載する場合も同文を本文に含め、broker 節から参照する。新たな承認を要する案の放置ではなく、実装時の完了条件である。
+本 spec は docs/ に収載済み (6915548b) だが、義務は全体設計書からも辿れるようにする。実装 commit で全体設計書 `docs/superpowers/specs/2026-07-25-agentic-fx-design.md` の broker 節へ次を追記する案とする。本 spec を `docs/superpowers/specs/` に正式収載する場合も同文を本文に含め、broker 節から参照する。新たな承認を要する案の放置ではなく、実装時の完了条件である。
 
 > 実口座 broker の導入前提として、HWM rebase の硬い累積損失上限と上限到達時の正規の復旧出口、入出金の正本、broker 側 exposure、通貨精度の設計・検証を必須とする。完了するまで実口座の rebase は有効化しない。PaperBroker 限定の上限なし・累積警告は代用にならない。現行 paper.starting_balance の変更は cashflow 履歴に残らず、ledger は入出金調整済み総損失を証明しない。
 
@@ -284,8 +284,8 @@ state file 再作成での世代再利用や履歴削除を修復する保証は
 |---|---|---|---|---|
 | 2026-11-13 | C0 | 独立 rebase、flat-only、snapshot CAS、一世代一回、累積上限/anchor を提案 | ticket と通知設計 R4 に対する初案 | —（tmp 文書、未確認） |
 | 2026-11-14 | C1 | 上限/anchor/同世代一回を削除。PaperBroker 限定、値CAS、source ts、TERMINAL flat、core/state guard、累積3倍警告、実配線/replay byte 一致の受入を確定 | 2026-11-13 確定裁定と opus 1周目を絶対基準で再判定。当時の opsalert C2 reset 固定文と整合 | —（c1.md、未 commit） |
-| 2026-11-14 | C2 | 累積保存/厳密照合を削除、broker.equity 再利用、commit 結果境界、error/試験縮小、live 配線、C4 整合、永続文書への追記案を明文化 | r2 の Critical 1 / Important 4 / Minor 12 と食い違い12を絶対基準で裁定。浮動小数による恒久拒否と成功の誤監査を防ぐ | —（c2.md、未 commit） |
-| 2026-11-14 | C2.1 | §4.3 に資金保護の不変条件の回帰 (config 無効化不可・LLM 等から到達しない・人の明示操作以外で rebase しない) を追加 | terra の C2 閉鎖確認 Important 1 (本文の禁止事項が受入 test として明示されていない) | —（c2.md、未 commit） |
+| 2026-11-14 | C2 | 累積保存/厳密照合を削除、broker.equity 再利用、commit 結果境界、error/試験縮小、live 配線、C4 整合、永続文書への追記案を明文化 | r2 の Critical 1 / Important 4 / Minor 12 と食い違い12を絶対基準で裁定。浮動小数による恒久拒否と成功の誤監査を防ぐ | 6915548b |
+| 2026-11-14 | C2.1 | §4.3 に資金保護の不変条件の回帰 (config 無効化不可・LLM 等から到達しない・人の明示操作以外で rebase しない) を追加 | terra の C2 閉鎖確認 Important 1 (本文の禁止事項が受入 test として明示されていない) | 6915548b |
 
 ## 7. 短い task 表
 
