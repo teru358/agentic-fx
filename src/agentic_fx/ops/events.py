@@ -10,7 +10,7 @@ import re
 import sqlite3
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from agentic_fx import improve_notice_codes
@@ -126,25 +126,51 @@ class EventStore:
         self._failures = _Failures()
         self._failures_lock = threading.Lock()
 
-    def emit(self, code: str, ref: str, fields: dict) -> int:
+    @staticmethod
+    def _check_floor(not_before: datetime | None) -> None:
+        if not_before is None:
+            return
+        if not isinstance(not_before, datetime) or not_before.tzinfo is None \
+                or not_before.utcoffset() != timedelta(0):
+            raise ValueError("not_before must be a UTC aware datetime")
+
+    def _stamp(self, not_before: datetime | None) -> str:
+        """event の時刻。`not_before` があれば UTC の ``max(wall clock, not_before)``。
+
+        wall clock が後退しても、基準時刻より前の event を作らない。
+        受理する下限は UTC の aware datetime だけ。"""
+        self._check_floor(not_before)
+        now = self._wall_clock()
+        if not_before is None:
+            return now.isoformat()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return max(now.astimezone(timezone.utc), not_before.astimezone(timezone.utc)).isoformat()
+
+    def emit(self, code: str, ref: str, fields: dict, *,
+             not_before: datetime | None = None) -> int:
         """1 件を永続化する。schema 違反は呼び出し側の誤りなので例外にする。"""
         validate_fields(code, fields, ref)
+        ts = self._stamp(not_before)
         cur = self._conn.execute(
             "INSERT INTO ops_events(ts,code,ref,fields_json) VALUES (?,?,?,?)",
-            (self._wall_clock().isoformat(), code, ref,
+            (ts, code, ref,
              json.dumps(fields, sort_keys=True, separators=(",", ":"))))
         self._conn.commit()
         return int(cur.lastrowid)
 
-    def emit_best_effort(self, code: str, ref: str, fields: dict) -> int | None:
+    def emit_best_effort(self, code: str, ref: str, fields: dict, *,
+                         not_before: datetime | None = None) -> int | None:
         """INSERT 障害を元操作へ伝えない。失敗はメモリ上で数えるだけにする。
 
         失敗した event には id が割り当てられない。次に INSERT が通ったとき、
         観測できた失敗の件数を ``event_stream_health`` として 1 回だけ試みる。
         """
         validate_fields(code, fields, ref)
+        self._check_floor(not_before)
         try:
-            event_id = self.emit(code, ref, fields)
+            event_id = (self.emit(code, ref, fields) if not_before is None
+                        else self.emit(code, ref, fields, not_before=not_before))
         except Exception:
             try:
                 self._conn.rollback()

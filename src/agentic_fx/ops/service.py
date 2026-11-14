@@ -89,6 +89,77 @@ class PolicyProjectionUnknown(RuntimeError):
     """A committed policy mutation may not have reached its file projection."""
 
 
+class GuardLaneReentry(RuntimeError):
+    """ops lane を持つ thread が、もう一度 lane を取ろうとした。待たずに即時に拒否する。"""
+
+    code = "guard_lane_reentry"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
+
+
+class GuardLaneNotHeld(RuntimeError):
+    """lane を持たずに lane 専用の処理を呼んだ。"""
+
+    code = "guard_lane_not_held"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
+
+
+class _GuardNoticeFailed(RuntimeError):
+    """event の保存に失敗した (固定語だけ。例外文は残さない)。"""
+
+
+@dataclass(slots=True)
+class _NoticeRun:
+    """1 操作の通知専用の失敗記録。失敗は操作の結果へ伝えず、最後に 1 行だけ残す。"""
+    failed: bool = False
+
+
+_KILL_SWITCH_STATES = ("latched", "released")
+_backfill_skip_lock = threading.Lock()
+_backfill_skip_logged = False
+
+
+def _parse_utc(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return _aware(parsed).astimezone(timezone.utc)
+
+
+def plan_kill_switch_notice(conn, state) -> tuple[str | None, int | None, bool]:
+    """現世代の kill switch event の照合。
+
+    返り値は (今出すべき state か None, 世代, released だけがあり latched が無い閉じた世代か)。
+    照合は code / ref / guard_kind / generation の一致と ``event.ts >= latched_at`` (UTC) による。"""
+    generation = state.kill_switch_generation
+    floor = _parse_utc(state.kill_switch_latched_at)
+    if type(generation) is not int or generation <= 0 or not state.kill_switch_latched_at:
+        return None, None, False
+    if floor is None:
+        raise ValueError("kill_switch_latched_at is not a timestamp")
+    rows = conn.execute(
+        "SELECT ts,json_extract(fields_json,'$.state') AS state FROM ops_events "
+        "WHERE code='guard_state_changed' AND ref='instance' "
+        "AND json_extract(fields_json,'$.guard_kind')='kill_switch' "
+        "AND json_extract(fields_json,'$.generation')=?", (generation,)).fetchall()
+    present = set()
+    for row in rows:
+        stamp = _parse_utc(row["ts"])
+        if stamp is not None and stamp >= floor and row["state"] in _KILL_SWITCH_STATES:
+            present.add(row["state"])
+    if "released" in present:
+        return None, generation, "latched" not in present
+    if state.kill_switch_latched:
+        return (None if "latched" in present else "latched"), generation, False
+    return ("released" if "latched" in present else None), generation, False
+
+
 ENDPOINTS: dict[str, Endpoint] = {e.code: e for e in (
     Endpoint("status", "GET /v1/status", Scope.STATUS_READ, False),
     Endpoint("log", "GET /v1/log", Scope.LOGS_READ, False),
@@ -700,6 +771,7 @@ class OpsService:
         self._activity_log = activity_log
         self.jobs = JobRegistry(monotonic=monotonic)
         self._ops_lock = threading.RLock()
+        self._lane_local = threading.local()
         self._decide_lock = threading.Lock()
         self._decision_wakeup = threading.Event()
         self._decision_thread: threading.Thread | None = None
@@ -750,9 +822,18 @@ class OpsService:
                 raise OpsError(ErrorCode.REQUEST_TIMEOUT)
             self._sleep_until(give_up)
 
+    def _lane_owned(self) -> bool:
+        return getattr(self._lane_local, "owned", False)
+
+    def _reject_lane_reentry(self) -> None:
+        if self._lane_owned():
+            raise GuardLaneReentry()
+
     @contextlib.contextmanager
     def _ops_lane(self, deadline: float):
+        self._reject_lane_reentry()
         self._acquire(self._ops_lock, deadline, self.limits.ops_lock_wait_seconds)
+        self._lane_local.owned = True
         try:
             try:
                 with self._conn.waiting_until(deadline):
@@ -765,6 +846,7 @@ class OpsService:
                     self._conn.rollback()
                 raise OpsError(ErrorCode.DATABASE_BUSY) from None
         finally:
+            self._lane_local.owned = False
             self._ops_lock.release()
 
     @contextlib.contextmanager
@@ -1332,6 +1414,8 @@ class OpsService:
                 return self._emit_pending_improve_notices()
         except OpsError:
             return 0  # lane が空かなかった。次の周期に回す
+        except GuardLaneReentry:
+            raise
         except Exception:  # noqa: BLE001
             _log.error("improve_notice_skipped reason=outbox_failed")
             return 0
@@ -1628,19 +1712,26 @@ class OpsService:
                                                 ResetNotApplied, StateUncertain)
             if self._state_store is None:
                 raise OpsError(ErrorCode.INVALID_STATE)
+            notices = _NoticeRun()
             try:
-                state = self._state_store.reset_kill_switch(
-                    expected_generation, deadline=self._foreign(deadline_), stop_event=self.stop_event)
-            except GenerationMismatch:
-                raise OpsError(ErrorCode.GENERATION_MISMATCH) from None
-            except NotLatched:
-                raise OpsError(ErrorCode.NOT_LATCHED) from None
-            except StateUncertain:
-                raise OpsError(ErrorCode.INVALID_STATE) from None
-            except ResetNotApplied:
-                # 保存に失敗してラッチは残った。解除は適用されていない。
-                raise OpsError(ErrorCode.UNAVAILABLE) from None
-            self._guard_event("kill_switch", "released", state.kill_switch_generation)
+                self._guard_step(notices, self._current_state)
+                try:
+                    state = self._state_store.reset_kill_switch(
+                        expected_generation, deadline=self._foreign(deadline_),
+                        stop_event=self.stop_event)
+                except GenerationMismatch:
+                    raise OpsError(ErrorCode.GENERATION_MISMATCH) from None
+                except NotLatched:
+                    raise OpsError(ErrorCode.NOT_LATCHED) from None
+                except StateUncertain:
+                    raise OpsError(ErrorCode.INVALID_STATE) from None
+                except ResetNotApplied:
+                    # 保存に失敗してラッチは残った。解除は適用されていない。
+                    raise OpsError(ErrorCode.UNAVAILABLE) from None
+                self._guard_step(notices, lambda: state)
+                self._guard_step(notices, self._current_state)
+            finally:
+                self._finish_notices(notices)
             return {"latched": state.kill_switch_latched,
                     "generation": state.kill_switch_generation}
 
@@ -1656,9 +1747,15 @@ class OpsService:
         def action(deadline_: float, _accepted: AcceptedRequest) -> dict:
             if self._state_store is None or self._state_store.reconcile_marker() is None:
                 raise OpsError(ErrorCode.INVALID_STATE)
-            state = self._state_store.confirm_latched(deadline=self._foreign(deadline_),
-                                                      stop_event=self.stop_event)
-            self._guard_event("kill_switch", "latched", state.kill_switch_generation)
+            notices = _NoticeRun()
+            try:
+                self._guard_step(notices, self._current_state)
+                state = self._state_store.confirm_latched(
+                    deadline=self._foreign(deadline_), stop_event=self.stop_event)
+                self._guard_step(notices, lambda: state)
+                self._guard_step(notices, self._current_state)
+            finally:
+                self._finish_notices(notices)
             return {"latched": state.kill_switch_latched,
                     "generation": state.kill_switch_generation}
 
@@ -1693,6 +1790,108 @@ class OpsService:
     def _guard_event(self, guard_kind: str, state: str, generation: int | None) -> None:
         self.events.emit_best_effort("guard_state_changed", "instance", {
             "guard_kind": guard_kind, "state": state, "generation": generation})
+
+    # ------------------------------------------------ kill switch の通知 sweep
+
+    def _current_state(self):
+        """marker を投影した現 state (利用者へ示す安全側の値)。"""
+        if self._state_store is None:
+            raise RuntimeError("guard_state_unavailable")
+        return self._state_store.load(deadline=self._foreign(self._deadline(None)),
+                                      stop_event=self.stop_event)
+
+    def _guard_step(self, run: _NoticeRun, get_state: Callable[[], object]) -> None:
+        """通知専用の 1 段。失敗は記録だけで、呼び出し元の操作へ伝えない。"""
+        try:
+            self._sweep_kill_switch(get_state())
+        except Exception:  # noqa: BLE001 -- 通知の失敗で mutation の結果を変えない
+            run.failed = True
+            with contextlib.suppress(Exception):
+                self._conn.rollback()
+
+    @staticmethod
+    def _finish_notices(run: _NoticeRun) -> None:
+        if run.failed:
+            _log.warning("guard_notice_deferred")
+
+    def _sweep_kill_switch(self, state) -> int:
+        """lane の中で 1 つの state を照合し、欠けた event を最大 1 件出す。
+
+        kill switch の guard_state_changed を INSERT するのはここだけ。"""
+        global _backfill_skip_logged
+        if not self._lane_owned():
+            raise GuardLaneNotHeld()
+        emit_state, generation, skipped = plan_kill_switch_notice(self._conn, state)
+        if skipped:
+            with _backfill_skip_lock:
+                first, _backfill_skip_logged = not _backfill_skip_logged, True
+            if first:
+                _log.warning("guard_notice_backfill_skipped")
+        if emit_state is None:
+            return 0
+        floor = _parse_utc(state.kill_switch_latched_at)
+        event_id = self.events.emit_best_effort(
+            "guard_state_changed", "instance",
+            {"guard_kind": "kill_switch", "state": emit_state, "generation": generation},
+            not_before=floor)
+        if event_id is None:
+            raise _GuardNoticeFailed()
+        return 1
+
+    def emit_pending_guard_notices(self, after=None, *, deadline: float | None = None) -> int:
+        """lane の外から呼ぶ公開入口。`after` (あれば) を先に、次に現 state を照合する。
+
+        lane を持つ thread からの呼出しは待たずに ``GuardLaneReentry`` で拒否する。
+        lane を取れなかったときは ``OpsError``。照合・保存の失敗は固定語を 1 行残して握る。"""
+        self._reject_lane_reentry()
+        with self._ops_lane(self._deadline(deadline)):
+            return self._guard_notices_in_lane(after)
+
+    def _guard_notices_in_lane(self, after=None) -> int:
+        if not self._lane_owned():
+            raise GuardLaneNotHeld()
+        if self._state_store is None:
+            return 0
+        notices = _NoticeRun()
+        emitted = [0]
+
+        def step(get_state):
+            try:
+                emitted[0] += self._sweep_kill_switch(get_state())
+            except Exception:  # noqa: BLE001
+                notices.failed = True
+                with contextlib.suppress(Exception):
+                    self._conn.rollback()
+
+        if after is not None:
+            step(lambda: after)
+        step(self._current_state)
+        self._finish_notices(notices)
+        return emitted[0]
+
+    def emit_pending_notices(self, *, improve_enabled: bool) -> None:
+        """起動時と scheduler の tick ごとに、改善通知と kill switch 通知を 1 回の lane 取得で回す。
+
+        2 つは別々の try に入れ、改善側の例外や無効設定で kill switch 側を飛ばさない。"""
+        try:
+            with self._ops_lane(self._deadline(None)):
+                if improve_enabled:
+                    try:
+                        self._emit_pending_improve_notices()
+                    except Exception:  # noqa: BLE001
+                        _log.error("improve_notice_skipped reason=outbox_failed")
+                        with contextlib.suppress(Exception):
+                            self._conn.rollback()
+                try:
+                    self._guard_notices_in_lane()
+                except Exception:  # noqa: BLE001
+                    _log.warning("guard_notice_deferred")
+        except OpsError:
+            return  # lane が空かなかった。次の周期に回す
+        except GuardLaneReentry:
+            raise
+        except Exception:  # noqa: BLE001
+            _log.warning("guard_notice_deferred")
 
     # -------------------------------------------------- ask / improve jobs
 

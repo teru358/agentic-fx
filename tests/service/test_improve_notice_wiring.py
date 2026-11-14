@@ -159,7 +159,7 @@ def test_outbox_runs_right_after_the_ops_service_is_built_and_before_everything_
     order: list[str] = []
     real_build = service._build_ops_service
     real_recover = service._recover_ops
-    real_emit = OpsService.emit_pending_improve_notices
+    real_emit = OpsService.emit_pending_notices
 
     def build(*args, **kwargs):
         order.append("build_ops_service")
@@ -169,9 +169,9 @@ def test_outbox_runs_right_after_the_ops_service_is_built_and_before_everything_
         order.append("recover_ops")
         return real_recover(*args, **kwargs)
 
-    def emit(self, *, enabled):
-        order.append(f"emit_pending:{enabled}")
-        return real_emit(self, enabled=enabled)
+    def emit(self, *, improve_enabled):
+        order.append(f"emit_pending:{improve_enabled}")
+        return real_emit(self, improve_enabled=improve_enabled)
 
     def use(self, ops):
         order.append("use_ops_service")
@@ -180,7 +180,7 @@ def test_outbox_runs_right_after_the_ops_service_is_built_and_before_everything_
     with monkeypatch.context() as patch:
         patch.setattr(service, "_build_ops_service", build)
         patch.setattr(service, "_recover_ops", recover)
-        patch.setattr(OpsService, "emit_pending_improve_notices", emit)
+        patch.setattr(OpsService, "emit_pending_notices", emit)
         patch.setattr(Commands, "use_ops_service", use)
         app = _app(tmp_path)
     app.close()
@@ -196,5 +196,5 @@ def test_build_app_calls_the_outbox_exactly_once():
                         and n.name == "build_app")
     calls = [c for c in ast.walk(build_app_fn) if isinstance(c, ast.Call)
              and isinstance(c.func, ast.Attribute)
-             and c.func.attr == "emit_pending_improve_notices"]
+             and c.func.attr == "emit_pending_notices"]
     assert len(calls) == 1

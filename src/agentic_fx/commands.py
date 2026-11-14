@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import sqlite3
 import uuid
@@ -40,6 +41,8 @@ from agentic_fx.policy_projection import (
 
 POLICY_WRITE_ERRORS = (sqlite3.Error, OSError, ValueError, ProjectionReconcileBlocked,
                        MigrationRecordUnknown)
+
+_log = logging.getLogger(__name__)
 
 _APPROVED_OUTCOMES = ("deployed", "deployed_after_rollback", "reevaluation_confirmed")
 
@@ -290,7 +293,7 @@ class Commands:
                     return "usage: killswitch reset [<世代>]"
                 try:
                     before = self.state.load()
-                    self.state.reset_kill_switch(generation)
+                    after = self.state.reset_kill_switch(generation)
                 except NotLatched:
                     self.activity.write(
                         Category.SYSTEM, "killswitch_release_refused",
@@ -309,6 +312,7 @@ class Commands:
                         Category.SYSTEM, "killswitch_release_not_applied",
                         f"save failed, latch kept (gen={generation}) "
                         f"reconcile_required={pending}")
+                    self._emit_guard_notices(self._projected_state)
                     if pending:
                         return (_RECONCILE_NOTICE + "解除は完了していません。")
                     return ("解除は適用されていません (保存に失敗)。"
@@ -320,6 +324,7 @@ class Commands:
                     return msg
                 self.activity.write(*display_time.kill_switch_reset(
                     generation, before.kill_switch_latched_at))
+                self._emit_guard_notices(lambda: after)
                 return "kill switch ラッチを解除しました"
             if cmd == "reflect" and len(args) == 2 and args[0] == "retry":
                 order_id = int(args[1])
@@ -586,6 +591,21 @@ class Commands:
         suffix = "" if seen["attempts"] > 0 else " (台帳に試行記録なし)"
         return f"order #{order_id} を reflection 再試行対象へ戻しました{suffix}"
 
+    def _projected_state(self):
+        return self.state.load()
+
+    def _emit_guard_notices(self, get_after) -> None:
+        """kill switch の遷移 event を出す。通知の失敗は操作の結果へ伝えない。
+
+        ops_service が無い構成 (test など) では何もしない。"""
+        if self.ops_service is None:
+            return
+        try:
+            after = get_after()
+            self.ops_service.emit_pending_guard_notices(after=after)
+        except Exception:  # noqa: BLE001
+            _log.warning("guard_notice_deferred")
+
     def _killswitch_reconcile(self, rest: list[str]) -> str:
         if rest not in ([], ["confirm"]):
             return "usage: killswitch reconcile [confirm]"
@@ -604,6 +624,7 @@ class Commands:
             self.activity.write(
                 Category.SYSTEM, "kill_switch_reconcile_confirmed",
                 f"latched confirmed gen={state.kill_switch_generation}")
+            self._emit_guard_notices(lambda: state)
             return (f"kill switch をラッチ中として確定しました "
                     f"(gen={state.kill_switch_generation})。解除するには "
                     f"`killswitch reset {state.kill_switch_generation}`")
