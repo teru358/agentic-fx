@@ -758,6 +758,10 @@ class OpsSetup:
                 state["stage"] = back
                 self._failure(state, "uninstall_incomplete")
                 raise SystemdError("uninstall_incomplete")
+            if state.get("warn") == _BOT_DROPIN_WARN and not any(
+                    _BOT_DROPIN_WARN_TEXT in notice for notice in self.notices):
+                # 中断から再開したときも、残っている drop-in の食い違いを成功の出力に出す
+                self.notices.append(f"warning: {_BOT_DROPIN_WARN_TEXT}")
             self._set_stage(state, "disabled", committed=True)
         return StageResult(feature, "disable", str(state["stage"]))
 
