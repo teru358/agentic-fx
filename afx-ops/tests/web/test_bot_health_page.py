@@ -10,7 +10,9 @@ from afx_ops.api_client import Reply
 from afx_ops.web import render
 from afx_ops.web.request import Request, handle_request
 
-SECRETS = (".".join(("MTIzNDU2Nzg5MDEyMzQ1Njc4", "GabCdE", "abcdefghijklmnopqrstuvwxyz0123456789")),
+# Discord の bot token の形をした偽の値。実行時に組み立てて、source に token の形の文字列を残さない
+_CANARY_TOKEN = ".".join(("MTIzNDU2Nzg5MDEyMzQ1Njc4", "GabCdE", "abcdefghijklmnopqrstuvwxyz0123456789"))
+SECRETS = (_CANARY_TOKEN,
            "https://discord.com/api/webhooks/123456789012345678/secret-webhook-token",
            "123456789012345678", "<script>alert(1)</script>")
 STATES = ("healthy", "unhealthy", "stalled", "stale", "unknown", "not_configured", "permanent-failure")

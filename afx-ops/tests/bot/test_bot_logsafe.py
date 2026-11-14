@@ -21,7 +21,9 @@ from afx_ops.bot.logsafe import LoopErrors, SafeLogging
 from afx_ops.bot.progress import ProgressTracker
 from test_bot_progress import Harness
 
-TOKEN = ".".join(("MTIzNDU2Nzg5MDEyMzQ1Njc4", "GabCdE", "abcdefghijklmnopqrstuvwxyz0123456789"))
+# Discord の bot token の形をした偽の値。実行時に組み立てて、source に token の形の文字列を残さない
+_CANARY_TOKEN = ".".join(("MTIzNDU2Nzg5MDEyMzQ1Njc4", "GabCdE", "abcdefghijklmnopqrstuvwxyz0123456789"))
+TOKEN = _CANARY_TOKEN
 CANARIES = (TOKEN, "Authorization", "Bot ", "https://discord.com/api/v10/channels",
             "123456789012345678", "response-body-secret", "Traceback", "secret-line-2")
 FIXED = re.compile(r"(log_record family=(asyncio|aiohttp|discord|other)"

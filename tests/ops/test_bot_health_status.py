@@ -14,9 +14,12 @@ from agentic_fx.ops_setup.stages import run_ops_command
 
 NOW = datetime(2026, 11, 14, 12, 0, 0, tzinfo=timezone.utc).timestamp()
 GOLDEN = json.loads(Path(__file__).resolve().parents[2].joinpath(
-    "tests", "fixtures", "bot_health_contract.json").read_text(encoding="utf-8"))
+    "tests", "fixtures", "bot_health_contract.json").read_text(encoding="utf-8").replace(
+        "@@DISCORD_TOKEN_CANARY@@", ".".join(("MTIzNDU2Nzg5MDEyMzQ1Njc4", "GabCdE", "abcdefghijklmnopqrstuvwxyz0123456789"))))
 VALID = next(case for case in GOLDEN["cases"] if case["name"] == "healthy")["record"]
-SECRETS = (".".join(("MTIzNDU2Nzg5MDEyMzQ1Njc4", "GabCdE", "abcdefghijklmnopqrstuvwxyz0123456789")),
+# Discord の bot token の形をした偽の値。実行時に組み立てて、source に token の形の文字列を残さない
+_CANARY_TOKEN = ".".join(("MTIzNDU2Nzg5MDEyMzQ1Njc4", "GabCdE", "abcdefghijklmnopqrstuvwxyz0123456789"))
+SECRETS = (_CANARY_TOKEN,
            "https://discord.com/api/webhooks/123456789012345678/secret-webhook-token",
            "123456789012345678")
 

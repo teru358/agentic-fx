@@ -16,7 +16,8 @@ from agentic_fx.ops.bot_health import (MAX_BYTES, PERMANENT_CODES, SNAPSHOT_NAME
                             evaluate, parse, read_health, read_raw, resolve_state_dir)
 
 GOLDEN = json.loads(Path(__file__).resolve().parents[2].joinpath(
-    "tests", "fixtures", "bot_health_contract.json").read_text(encoding="utf-8"))
+    "tests", "fixtures", "bot_health_contract.json").read_text(encoding="utf-8").replace(
+        "@@DISCORD_TOKEN_CANARY@@", ".".join(("MTIzNDU2Nzg5MDEyMzQ1Njc4", "GabCdE", "abcdefghijklmnopqrstuvwxyz0123456789"))))
 NOW = datetime.strptime(GOLDEN["now"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
 CASES = GOLDEN["cases"]
 VALID = next(case for case in CASES if case["name"] == "healthy")["record"]
