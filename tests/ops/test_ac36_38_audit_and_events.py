@@ -322,11 +322,11 @@ def test_ac38_stream_health_after_a_failure_is_recorded_against_the_instance(ops
     original = store.emit
     calls = {"n": 0}
 
-    def flaky(code, ref, fields):
+    def flaky(code, ref, fields, **kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
             raise sqlite3.OperationalError("disk I/O error")
-        return original(code, ref, fields)
+        return original(code, ref, fields, **kwargs)
 
     store.emit = flaky
     assert store.emit_best_effort("ops_request_terminal", "audit:1",

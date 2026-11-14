@@ -2128,6 +2128,30 @@ def _compute_econ_signal(root: Path, clock, capacity_reader, econ_health,
         conn.close()
 
 
+class _GuardNoticeProbe:
+    """status 用に、現世代の kill switch event の欠けを読取接続で照合する。
+
+    補助表示なので失敗しても status を止めない。失敗の warning は正常から失敗へ移ったときの
+    1 行だけにし、status を頻繁に読まれても log を埋めない。
+    """
+
+    def __init__(self) -> None:
+        self._failing = False
+
+    def __call__(self, conn, state):
+        try:
+            shown = state.load(deadline=time.monotonic() + 2.0)
+            pending_state, pending_generation, _ = plan_kill_switch_notice(conn, shown)
+        except Exception as exc:  # noqa: BLE001 — 補助表示は status を止めない
+            if not self._failing:
+                self._failing = True
+                _log.warning("status guard notice unavailable: %s", type(exc).__name__)
+            return None
+        self._failing = False
+        return (pending_state is not None,
+                pending_generation if pending_state is not None else None)
+
+
 def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity,
                        health_latch, supervisor, improve_supervisor, plugins_dir,
                        outage, trade_event_sink=None, ingest=None,
@@ -2146,6 +2170,8 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
                 return None
         return landlock_cache[0]
 
+    guard_notice_probe = _GuardNoticeProbe()
+
     def status_provider() -> dict:
         # API thread から呼ばれる。core_lock も scheduler / ops の接続も使わず、
         # 読み取り専用の短命な接続だけで読む (outage の状態もその接続で読む)。
@@ -2162,15 +2188,7 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
                     if ingest is not None else None)
                 admission_status = (admission.status(conn, clock.now())
                                     if admission is not None else None)
-            guard_notice = None
-            try:
-                # 同じ短命の読取接続で、現世代の kill switch event の欠けを照合する。
-                shown = state.load(deadline=time.monotonic() + 2.0)
-                pending_state, pending_generation, _ = plan_kill_switch_notice(conn, shown)
-                guard_notice = (pending_state is not None,
-                                pending_generation if pending_state is not None else None)
-            except Exception as exc:  # noqa: BLE001 — 補助表示は status を止めない
-                _log.warning("status guard notice unavailable: %s", type(exc).__name__)
+            guard_notice = guard_notice_probe(conn, state)
             try:
                 landlock_ok = landlock_state()
                 # 配備先が無いときは approved_plugins の存在しない旨の log を出さない。

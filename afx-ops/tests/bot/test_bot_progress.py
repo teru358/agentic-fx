@@ -338,7 +338,7 @@ def test_login_retries_back_off_doubling_up_to_the_cap():
     assert delays == [2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0, 60.0, 60.0]
 
 
-@pytest.mark.parametrize("failure", [discord.LoginFailure("bad"), http(401), http(403),
+@pytest.mark.parametrize("failure", [discord.LoginFailure("bad"), http(401), http(403, 50001),
                                       http(400), http(404, 10003)])
 def test_a_login_rejection_is_permanent_and_not_retried(failure):
     bot = LoginBot(failure, None)
@@ -497,7 +497,9 @@ def test_main_no_ready_survives_599_seconds_and_dies_at_600(tmp_path, monkeypatc
     other = Harness(tmp_path, monkeypatch)
     with pytest.raises(BotFailure) as failure:
         other.run()
-    assert failure.value.reason == "gateway_unhealthy" and other.clock.t == 1000.0 + 600
+    origin = other.progress.gateway_unhealthy_since
+    assert failure.value.reason == "gateway_unhealthy"
+    assert origin + WINDOW <= other.clock.t < origin + WINDOW + 10
 
 
 def _disconnect_script(harness, *, resume_after: float | None, cap: bool = False):
@@ -733,8 +735,9 @@ def test_main_a_connect_that_keeps_failing_dies_ten_minutes_after_the_unhealthy_
     with pytest.raises(BotFailure) as failure:
         harness.run()
     assert failure.value.reason == "gateway_unhealthy"
-    # 起点は process 開始。再接続の待ちと monitor の間隔の分だけ遅れて検知される
-    assert 1000.0 + WINDOW <= harness.clock.t < 1000.0 + WINDOW + 120 and len(attempts) > 3
+    # 起点は connect の開始。再接続の待ちと monitor の間隔の分だけ遅れて検知される
+    origin = harness.progress.gateway_unhealthy_since
+    assert origin + WINDOW <= harness.clock.t < origin + WINDOW + 180 and len(attempts) > 3
 
 
 def test_main_connect_failures_after_a_disconnect_keep_the_first_unhealthy_origin(
@@ -759,7 +762,7 @@ def test_main_connect_failures_after_a_disconnect_keep_the_first_unhealthy_origi
     assert len(calls) > 3
 
 
-@pytest.mark.parametrize("failure", [discord.LoginFailure("no"), http(401), http(403),
+@pytest.mark.parametrize("failure", [discord.LoginFailure("no"), http(401), http(403, 50001),
                                       http(400), http(404, 10003), http(403, 50013)])
 def test_main_a_permanent_connect_rejection_stops_at_once_as_rejected(
         tmp_path, monkeypatch, failure):
@@ -955,3 +958,139 @@ def test_a_committed_send_clears_the_timer_and_the_next_event_gets_its_own_windo
         adapter.close()
         os.close(fd)
 
+
+
+# ------------------------------------------------------------------ gateway の窓の起点
+
+def test_a_slow_login_plus_a_slow_startup_reconcile_does_not_expire_the_gateway_window(
+        tmp_path, monkeypatch):
+    """login 9.5 分 + 起動 reconcile 30 秒以上でも、connect を始めるまで gateway の窓は数え直される。"""
+    harness = Harness(tmp_path, monkeypatch)
+    seen = {}
+
+    async def login(bot):
+        while harness.clock.t < 1000.0 + 570:
+            await harness.sleeper(10.0)
+        seen["login_end"] = harness.clock.t
+
+    async def reconcile(self):
+        # login の窓 (process 開始から 10 分) を跨ぐまで進める
+        while harness.clock.t < 1000.0 + 640:
+            await harness.sleeper(10.0)
+        seen["reconcile_end"] = harness.clock.t
+
+    async def connect(bot):
+        seen["connect_at"] = harness.clock.t
+        seen["since"] = harness.progress.gateway_unhealthy_since
+        await bot.on_connect()
+        harness.stop.set()
+
+    monkeypatch.setattr(BotAdapter, "reconcile_startup", reconcile)
+    harness.login = login
+    harness.connect = connect
+    harness.run()
+    assert seen["reconcile_end"] > 1000.0 + WINDOW
+    assert seen["since"] == seen["connect_at"] >= seen["reconcile_end"]
+
+
+def test_gateway_pause_and_begin_move_only_a_non_healthy_origin():
+    clock = Clock()
+    progress = tracker(clock)
+    clock.t += 500
+    progress.gateway_pause()
+    assert progress.gateway_unhealthy_since is None
+    clock.t += 5000
+    assert progress.expired() is None
+    progress.gateway_begin()
+    assert progress.gateway_unhealthy_since == clock.t
+    clock.t += 599
+    assert progress.expired() is None
+    clock.t += 1
+    assert progress.expired() == "gateway_unhealthy"
+    # 健全なら begin は起点を作らない
+    healthy = tracker(clock)
+    healthy.gateway_connected()
+    healthy.gateway_begin()
+    assert healthy.gateway_unhealthy_since is None
+
+
+# ------------------------------------------------------------------ gateway の致命的な close
+
+def _closed(code):
+    return discord.ConnectionClosed(SimpleNamespace(close_code=code), shard_id=None, code=code)
+
+
+@pytest.mark.parametrize("code", [4004, 4010, 4011, 4012, 4013, 4014])
+def test_a_fatal_gateway_close_code_is_permanent(tmp_path, monkeypatch, code):
+    harness = Harness(tmp_path, monkeypatch)
+    _flaky_connect(harness, [_closed(code)])
+    with pytest.raises(BotFailure) as info:
+        harness.run()
+    assert info.value.reason == "discord_login_failed" and harness.clock.t < 1000.0 + WINDOW
+
+
+@pytest.mark.parametrize("code", [1000, 1006, 4000, 4003, 4007, 4009])
+def test_other_gateway_close_codes_stay_transient(tmp_path, monkeypatch, code):
+    harness = Harness(tmp_path, monkeypatch)
+    _flaky_connect(harness, [_closed(code)])
+    with pytest.raises(BotFailure) as info:
+        harness.run()
+    assert info.value.reason == "gateway_failed"
+
+
+# ------------------------------------------------------------------ login の再試行と HTTP session
+
+def test_failed_login_attempts_do_not_leave_unclosed_http_sessions():
+    """失敗のたびに session を閉じるので、破棄された session が「未 close」の警告を出さない。"""
+    import gc
+    import warnings
+
+    async def go():
+        bot = discord.Client(intents=discord.Intents.none())
+        attempts = [0]
+
+        async def sleep(delay):
+            attempts[0] += 1
+            if attempts[0] >= 6:
+                raise KeyboardInterrupt
+
+        old = discord.http.Route.BASE
+        discord.http.Route.BASE = "http://127.0.0.1:9"
+        try:
+            await runtime._login(bot, "x" * 24 + "." + "y" * 6 + "." + "z" * 27, sleep)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            discord.http.Route.BASE = old
+            # 破棄された session の判定は、最後の session を閉じる (共有の connector も閉じる) 前に行う
+            gc.collect()
+            await bot.http.close()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        asyncio.run(go())
+        gc.collect()
+    leaked = [w for w in caught if "Unclosed client session" in str(w.message)]
+    assert leaked == []
+
+
+def test_a_delivery_commit_without_a_begin_still_records_the_success_time():
+    clock = Clock()
+    progress = tracker(clock)
+    clock.t += 7
+    progress.delivery_committed(5)
+    assert progress.last_delivery_success_at == clock.t
+    assert progress.delivery_stalled_since is None
+    # 投稿しなかった確定 (skip) は成功時刻を動かさない
+    clock.t += 3
+    progress.delivery_committed(6, delivered=False)
+    assert progress.last_delivery_success_at == clock.t - 3
+
+
+def test_a_commit_before_the_tracked_event_keeps_the_stall_and_the_success_time():
+    clock = Clock()
+    progress = tracker(clock)
+    progress.delivery_begin(9)
+    clock.t += 5
+    progress.delivery_committed(8)
+    assert progress.delivery_stalled_since is not None
+    assert progress.last_delivery_success_at is None

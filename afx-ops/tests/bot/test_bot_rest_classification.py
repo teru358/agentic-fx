@@ -41,7 +41,6 @@ def http(status: int, code: int = 0) -> discord.HTTPException:
 PERMANENT = {
     "400": http(400),
     "401": http(401),
-    "403": http(403),
     "403/50001": http(403, 50001),
     "403/50013": http(403, 50013),
     "404/10003": http(404, 10003),
@@ -60,6 +59,9 @@ TRANSIENT = {
     "oserror": OSError("down"),
     "timeout": asyncio.TimeoutError(),
     "client error": aiohttp.ClientConnectionError(),
+    # Discord の JSON code が無い 403 (前段の proxy や Cloudflare) と 408 は一時
+    "403/no code": http(403),
+    "408": http(408),
 }
 GONE = http(404, 10008)
 
@@ -246,6 +248,65 @@ def test_an_event_send_transient_failure_retries_from_the_same_event(rig, failur
     assert built.progress.delivery_stalled_since is not None
     asyncio.run(built.adapter.deliver_events())
     assert load(built.fd).cursor == 2 and len(built.channel.sent) == 2
+
+
+SUBSTITUTE = "この通知は表示できませんでした (event 1)"
+
+
+def test_a_message_local_400_sends_a_fixed_substitute_once_and_moves_on(rig):
+    built = _delivery_rig(rig, [_page(APPROVED, {**APPROVED, "id": 2})])
+    built.channel.script["send"] = [http(400, 50035)]
+    asyncio.run(built.adapter.deliver_events())
+    # 1 件目は代替文で確定し、2 件目も通常どおり投稿される
+    assert load(built.fd).cursor == 2 and built.channel.calls["send"] == 3
+    assert built.channel.sent[0]["content"] == SUBSTITUTE
+    assert built.channel.sent[0]["allowed_mentions"].to_dict() == {"parse": []}
+    assert built.channel.sent[1]["content"] != SUBSTITUTE
+    assert built.progress.delivery_stalled_since is None
+
+
+@pytest.mark.parametrize("second", [http(400, 50035), http(400), http(403, 50013), http(401)])
+def test_a_rejected_substitute_is_permanent_and_the_cursor_stays(rig, second):
+    built = _delivery_rig(rig, [_page(APPROVED, {**APPROVED, "id": 2})])
+    built.channel.script["send"] = [http(400, 50035), second]
+    with pytest.raises(BotFailure) as info:
+        asyncio.run(built.adapter.deliver_events())
+    assert info.value.reason == "discord_rejected"
+    assert load(built.fd).cursor == 0 and built.channel.calls["send"] == 2
+
+
+@pytest.mark.parametrize("second", transient())
+def test_a_transiently_failed_substitute_retries_from_the_same_event(rig, second):
+    built = _delivery_rig(rig, [_page(APPROVED, {**APPROVED, "id": 2})])
+    built.channel.script["send"] = [http(400, 50035), second]
+    asyncio.run(built.adapter.deliver_events())
+    assert load(built.fd).cursor == 0 and built.channel.calls["send"] == 2
+    assert built.progress.delivery_stalled_since is not None
+
+
+def test_the_substitute_carries_no_event_text_or_exception_text(rig):
+    built = _delivery_rig(rig, [_page(APPROVED)])
+    built.channel.script["send"] = [http(400, 50035)]
+    asyncio.run(built.adapter.deliver_events())
+    assert built.channel.sent[0]["content"] == SUBSTITUTE
+
+
+@pytest.mark.parametrize("failure", [http(403), http(408)])
+def test_a_codeless_403_and_a_408_on_an_event_send_are_retried_not_stopped(rig, failure):
+    built = _delivery_rig(rig, [_page(APPROVED)])
+    built.channel.script["send"] = [failure]
+    asyncio.run(built.adapter.deliver_events())
+    assert load(built.fd).cursor == 0 and built.channel.sent == []
+
+
+def test_an_approval_send_keeps_a_message_local_400_permanent(rig):
+    # 承認の投稿は View が本体で、代わりの文では押せない。固定の組立てが拒否されるのは
+    # 設定か実装の欠陥なので、代替で隠さず停止して知らせる
+    built = _pending_rig(rig)
+    built.channel.script["send"] = [http(400, 50035)]
+    with pytest.raises(BotFailure) as info:
+        asyncio.run(built.adapter.sync_pending())
+    assert info.value.reason == "discord_rejected"
 
 
 # ------------------------------------------------------------------ 承認の send (新規 / 出し直し)

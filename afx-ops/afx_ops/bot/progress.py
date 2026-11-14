@@ -25,7 +25,8 @@ class ProgressTracker:
         self.window = window
         started = clock()
         self.started_at = started
-        # gateway: process 開始から starting。login 前も窓に含める
+        # gateway: process 開始から starting。login 中は窓に含め、起動 reconcile の間は止め、
+        # connect を始めた時点から新たに数える
         self.gateway_state = GATEWAY_STARTING
         self.gateway_unhealthy_since: float | None = started
         self.last_ready_at: float | None = None
@@ -54,6 +55,16 @@ class ProgressTracker:
         self.gateway_unhealthy_since = None
         self.last_resumed_at = self._clock()
 
+    def gateway_pause(self) -> None:
+        """login が済み、起動 reconcile を始める。reconcile の間は gateway の窓を止める。"""
+        if self.gateway_state != GATEWAY_HEALTHY:
+            self.gateway_unhealthy_since = None
+
+    def gateway_begin(self) -> None:
+        """`connect()` を始める直前。ここから gateway の 10 分の窓を新たに数える。"""
+        if self.gateway_state != GATEWAY_HEALTHY and self.gateway_unhealthy_since is None:
+            self.gateway_unhealthy_since = self._clock()
+
     def gateway_disconnected(self) -> None:
         """`on_disconnect`。既に不健全 (starting を含む) なら起点を動かさない。"""
         now = self._clock()
@@ -72,13 +83,13 @@ class ProgressTracker:
 
     def delivery_committed(self, event_id: int, *, delivered: bool = True) -> None:
         """cursor の保存まで済んだ。追っている event 以後まで進んだときだけ消す。"""
-        if self.delivery_stalled_since is None:
+        stalled = self.delivery_stalled_since is not None
+        if stalled and self.delivery_event_id is not None and event_id < self.delivery_event_id:
             return
-        if self.delivery_event_id is None or event_id >= self.delivery_event_id:
-            self.delivery_stalled_since = None
-            self.delivery_event_id = None
-            if delivered:
-                self.last_delivery_success_at = self._clock()
+        self.delivery_stalled_since = None
+        self.delivery_event_id = None
+        if delivered:
+            self.last_delivery_success_at = self._clock()
 
     # ------------------------------------------------------------------ poller
 

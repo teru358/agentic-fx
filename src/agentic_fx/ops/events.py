@@ -169,8 +169,7 @@ class EventStore:
         validate_fields(code, fields, ref)
         self._check_floor(not_before)
         try:
-            event_id = (self.emit(code, ref, fields) if not_before is None
-                        else self.emit(code, ref, fields, not_before=not_before))
+            event_id = self.emit(code, ref, fields, not_before=not_before)
         except Exception:
             try:
                 self._conn.rollback()

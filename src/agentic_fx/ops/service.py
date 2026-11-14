@@ -1800,14 +1800,15 @@ class OpsService:
         return self._state_store.load(deadline=self._foreign(self._deadline(None)),
                                       stop_event=self.stop_event)
 
-    def _guard_step(self, run: _NoticeRun, get_state: Callable[[], object]) -> None:
-        """通知専用の 1 段。失敗は記録だけで、呼び出し元の操作へ伝えない。"""
+    def _guard_step(self, run: _NoticeRun, get_state: Callable[[], object]) -> int:
+        """通知専用の 1 段。出した event の件数を返す。失敗は記録だけで、呼び出し元の操作へ伝えない。"""
         try:
-            self._sweep_kill_switch(get_state())
+            return self._sweep_kill_switch(get_state())
         except Exception:  # noqa: BLE001 -- 通知の失敗で mutation の結果を変えない
             run.failed = True
             with contextlib.suppress(Exception):
                 self._conn.rollback()
+            return 0
 
     @staticmethod
     def _finish_notices(run: _NoticeRun) -> None:
@@ -1854,24 +1855,15 @@ class OpsService:
         if self._state_store is None:
             return 0
         notices = _NoticeRun()
-        emitted = [0]
-
-        def step(get_state):
-            try:
-                emitted[0] += self._sweep_kill_switch(get_state())
-            except Exception:  # noqa: BLE001
-                notices.failed = True
-                with contextlib.suppress(Exception):
-                    self._conn.rollback()
-
+        emitted = 0
         if after is not None:
-            step(lambda: after)
-        step(self._current_state)
+            emitted += self._guard_step(notices, lambda: after)
+        emitted += self._guard_step(notices, self._current_state)
         if notices.failed and on_failure is not None:
             on_failure()
         else:
             self._finish_notices(notices)
-        return emitted[0]
+        return emitted
 
     def emit_pending_notices(self, *, improve_enabled: bool) -> None:
         """起動時と scheduler の tick ごとに、改善通知と kill switch 通知を 1 回の lane 取得で回す。

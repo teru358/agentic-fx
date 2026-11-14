@@ -20,6 +20,7 @@ process を止める (systemd の再起動に委ねる)。Discord の一時的�
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import re
 import sys
@@ -47,7 +48,7 @@ from afx_ops.notify.payload import PayloadError
 from afx_ops.gate.types import CustomIdError, GateResult, Interaction, SideEffect, decode_custom_id
 from afx_ops.bot.progress import ProgressTracker
 from afx_ops.bot.rest import (PERMANENT, REST_ERRORS, classify, is_message_gone,
-                              is_shared_rejection)
+                              is_message_local_rejection, is_shared_rejection)
 from afx_ops.bot.views import GateView
 
 EVENTS_LIMIT = 100
@@ -875,11 +876,17 @@ class BotAdapter:
             try:
                 await self._channel.send(content, allowed_mentions=allowed)
             except REST_ERRORS as exc:
-                if classify(exc) == PERMANENT:
-                    # cursor はこの event より先へ進めない。設定の修復後に同じ event から再送する
-                    raise BotFailure("discord_rejected") from None
-                # 一時の失敗: 投稿できなかった event から先は確定しない。次の周回で同じ event から再送する
-                return
+                if is_message_local_rejection(exc):
+                    # この event だけの不正な body。本文を含まない固定の代替文を 1 回だけ送り、
+                    # 通れば確定して後ろの event を止めない
+                    if not await self._send_substitute(plan.event_id):
+                        return
+                else:
+                    if classify(exc) == PERMANENT:
+                        # cursor はこの event より先へ進めない。設定の修復後に同じ event から再送する
+                        raise BotFailure("discord_rejected") from None
+                    # 一時の失敗: 投稿できなかった event から先は確定しない。次の周回で同じ event から再送する
+                    return
             if improve_key is not None:
                 self._remember_improve(improve_key)
             await self._run(self._commit_post, plan.event_id, max(high, plan.event_id))
@@ -892,6 +899,20 @@ class BotAdapter:
         if not progressed and high > self.gate.state.high_watermark:
             # 確定する event が無い周回でも watermark を進め、daemon の巻戻りを次回以降も検出する
             await self._run(self._observe_high, high)
+
+    async def _send_substitute(self, event_id: int) -> bool:
+        """表示できない event の代わりの固定文を送る。送れたら True、一時の失敗なら False。
+
+        代替文も拒否されたら恒久。event の本文・例外文は含めない。
+        """
+        try:
+            await self._channel.send(f"この通知は表示できませんでした (event {event_id})",
+                                     allowed_mentions=discord.AllowedMentions.none())
+        except REST_ERRORS as exc:
+            if is_message_local_rejection(exc) or classify(exc) == PERMANENT:
+                raise BotFailure("discord_rejected") from None
+            return False
+        return True
 
     async def _plan(self, event: dict, *, plugin_name: str | None = None, **extra):
         """event の扱いを gate の thread で決める。設定の分岐はここだけ。"""
@@ -1082,6 +1103,9 @@ def _page(reply) -> tuple[list[dict], int, int]:
 def open_state_dir(path: os.PathLike) -> int:
     try:
         return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    except OSError:
-        # state dir を開けない OS の失敗。内容の不正 (bot_state_invalid) とは別で、一時として再試行する
+    except OSError as exc:
+        # symlink (ELOOP)・dir でない (ENOTDIR)・無い (ENOENT) は再試行しても直らない恒久。
+        # それ以外の OS の失敗は一時として再試行する
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.ENOENT):
+            raise BotFailure("bot_state_invalid") from None
         raise BotFailure("bot_state_unavailable") from None

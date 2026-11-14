@@ -507,11 +507,11 @@ def _fail_next_emit(monkeypatch, times=1):
     real = EventStore.emit
     left = [times]
 
-    def flaky(self, code, ref, fields):
+    def flaky(self, code, ref, fields, **kwargs):
         if left[0] > 0:
             left[0] -= 1
             raise sqlite3.OperationalError("disk I/O error /secret/path")
-        return real(self, code, ref, fields)
+        return real(self, code, ref, fields, **kwargs)
 
     monkeypatch.setattr(EventStore, "emit", flaky)
 

@@ -17,7 +17,8 @@ bot は listener を持たない (gateway も REST も外向きの接続だけ)�
 6. event と pending 承認を短い間隔で読み、投稿する
 
 進捗の監視 (`progress.ProgressTracker`、monotonic clock、窓は 10 分): gateway は process 開始から
-READY / RESUMED まで・切断から RESUMED までを連続の不健全として数え (login 前も含む)、配送は
+READY / RESUMED まで・切断から RESUMED までを連続の不健全として数え (login 中は含め、起動 reconcile の間は止めて
+connect の開始から数え直す)、配送は
 先頭 event の最初の send の直前から send と cursor の保存が済むまで、poll 周回は一周の開始から
 完了までを数える。loop 上の独立した monitor が期限を見て、超えたら一時の失敗で止まる。
 
@@ -38,6 +39,7 @@ import time
 from collections.abc import Callable
 from typing import TextIO
 
+import aiohttp
 import discord
 
 from afx_ops.api_client import RC_UNREACHABLE, ApiError, BotClient, with_detail
@@ -57,6 +59,9 @@ POLL_INTERVAL = 2.0
 MONITOR_INTERVAL = 5.0
 LOGIN_BACKOFF_SECONDS = 2.0
 LOGIN_BACKOFF_MAX_SECONDS = 60.0
+
+# 再接続しても直らない gateway の close code (認証の失敗、shard・API version・intents の拒否)
+FATAL_CLOSE_CODES = frozenset({4004, 4010, 4011, 4012, 4013, 4014})
 
 # bot token の形 (base64url の 3 区切り)。中身の真偽は login で確かめる
 _TOKEN = re.compile(r"[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{16,}\Z")
@@ -183,7 +188,8 @@ async def _main(isolated, token: str, client, dir_fd: int, *, connector_factory,
     try:
         # monitor は login の前から動かす (login 前も gateway の 10 分の窓に含める)
         monitor = asyncio.create_task(_monitor(progress, monitor_interval, sleep))
-        startup = asyncio.create_task(_startup(adapter, bot, token, sleep))
+        startup = asyncio.create_task(_startup(adapter, bot, token, sleep,
+                                             connector_factory))
         tasks = [monitor, startup]
         await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         if startup.done():
@@ -218,20 +224,24 @@ async def _main(isolated, token: str, client, dir_fd: int, *, connector_factory,
         adapter.close()
 
 
-async def _startup(adapter: BotAdapter, bot: discord.Client, token: str, sleep) -> None:
+async def _startup(adapter: BotAdapter, bot: discord.Client, token: str, sleep,
+                   new_connector=None) -> None:
     await adapter.prepare()
-    await _login(bot, token, sleep)
-    # 起動 reconcile の窓は login の後から数える (login 前は gateway の窓が数える)
+    await _login(bot, token, sleep, new_connector=new_connector)
+    # 起動 reconcile の間は gateway の窓を止め (connect を始めたときから数え直す)、
+    # reconcile 自体は最初の poll の窓が見る
+    adapter.progress.gateway_pause()
     adapter.progress.startup_begin()
     await adapter.reconcile_startup()
 
 
 async def _login(bot: discord.Client, token: str, sleep, *,
                  delay: float = LOGIN_BACKOFF_SECONDS,
-                 limit: float = LOGIN_BACKOFF_MAX_SECONDS) -> None:
+                 limit: float = LOGIN_BACKOFF_MAX_SECONDS, new_connector=None) -> None:
     """login する。認証の拒否は恒久、429 / 5xx / network / timeout は backoff で再試行する。
 
-    再試行の期間の上限は gateway の 10 分の窓 (monitor) が持つ。
+    再試行の期間の上限は gateway の 10 分の窓 (monitor) が持つ。失敗のたびに、その試行が作った
+    HTTP session を閉じてから再試行する (session を溜めない)。
     """
     while True:
         try:
@@ -241,9 +251,28 @@ async def _login(bot: discord.Client, token: str, sleep, *,
             raise BotFailure("discord_login_failed") from None
         except REST_ERRORS as exc:
             if classify(exc) == PERMANENT:
+                await _reset_http(bot, new_connector)
                 raise BotFailure("discord_login_failed") from None
+        await _reset_http(bot, new_connector)
         await sleep(delay)
         delay = min(delay * 2, limit)
+
+
+async def _reset_http(bot, new_connector) -> None:
+    """失敗した login が作った HTTP session を閉じ、次の試行が新しい session と connector を使えるようにする。
+
+    session を閉じると connector も閉じるので、次の試行のために作り直す。
+    """
+    http = getattr(bot, "http", None)
+    if http is None:
+        return
+    try:
+        await http.close()
+        http.clear()
+        http.connector = (new_connector() if new_connector is not None
+                          else aiohttp.TCPConnector(limit=0))
+    except Exception:  # noqa: BLE001 — 後始末の失敗で login の再試行の分類を変えない
+        pass
 
 
 async def _monitor(progress: ProgressTracker, interval: float, sleep) -> None:
@@ -263,6 +292,7 @@ async def _gateway(bot: discord.Client, progress: ProgressTracker, sleep, *,
     再接続の間は不健全の起点を動かさない (gateway の 10 分の窓を monitor が持つ)。
     """
     initial = delay
+    progress.gateway_begin()
     while True:
         try:
             await bot.connect(reconnect=True)
@@ -272,6 +302,9 @@ async def _gateway(bot: discord.Client, progress: ProgressTracker, sleep, *,
             if isinstance(exc, discord.LoginFailure) or (
                     isinstance(exc, discord.HTTPException) and classify(exc) == PERMANENT):
                 raise BotFailure("discord_rejected") from None
+            if isinstance(exc, discord.ConnectionClosed) and exc.code in FATAL_CLOSE_CODES:
+                # 認証の失敗・intents の拒否など、再接続しても直らない close
+                raise BotFailure("discord_login_failed") from None
             if not isinstance(exc, REST_ERRORS):
                 raise BotFailure("gateway_failed") from None
         else:

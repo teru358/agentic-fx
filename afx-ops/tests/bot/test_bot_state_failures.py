@@ -153,9 +153,33 @@ def test_an_io_failure_on_the_cursor_snapshot_is_transient_for_load_and_for_save
         assert exits.rc_for_reason(failure.value.reason) == exits.RC_BOT_TRANSIENT
 
 
-def test_open_state_dir_failure_is_transient_and_distinct_from_content(tmp_path):
+def test_a_missing_state_dir_is_permanent(tmp_path):
     with pytest.raises(BotFailure) as info:
         open_state_dir(tmp_path / "missing")
+    assert info.value.reason == "bot_state_invalid"
+
+
+def test_a_symlinked_state_dir_is_permanent(tmp_path):
+    (tmp_path / "real").mkdir()
+    (tmp_path / "link").symlink_to(tmp_path / "real")
+    with pytest.raises(BotFailure) as info:
+        open_state_dir(tmp_path / "link")
+    assert info.value.reason == "bot_state_invalid"
+
+
+def test_a_state_dir_that_is_a_file_is_permanent(tmp_path):
+    (tmp_path / "file").write_text("x")
+    with pytest.raises(BotFailure) as info:
+        open_state_dir(tmp_path / "file")
+    assert info.value.reason == "bot_state_invalid"
+
+
+def test_other_os_failures_opening_the_state_dir_are_transient(tmp_path, monkeypatch):
+    def deny(*args, **kwargs):
+        raise PermissionError(13, "denied")
+    monkeypatch.setattr(os, "open", deny)
+    with pytest.raises(BotFailure) as info:
+        open_state_dir(tmp_path)
     assert info.value.reason == "bot_state_unavailable"
 
 

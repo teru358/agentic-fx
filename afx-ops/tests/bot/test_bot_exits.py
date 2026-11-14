@@ -134,10 +134,10 @@ def test_a_malformed_token_is_permanent_before_anything_starts(tmp_path, monkeyp
     assert (got, text) == (78, "afx-ops: token_invalid\n")
 
 
-def test_a_state_dir_that_cannot_be_opened_is_a_transient_io_failure(tmp_path, monkeypatch):
+def test_a_missing_state_dir_is_permanent(tmp_path, monkeypatch):
     got, text = _run_failing(tmp_path, monkeypatch, RuntimeError("not reached"),
                              state_dir=tmp_path / "missing")
-    assert (got, text) == (79, "afx-ops: bot_state_unavailable\n")
+    assert (got, text) == (78, "afx-ops: bot_state_invalid\n")
 
 
 def test_a_clean_return_is_zero(tmp_path, monkeypatch):
