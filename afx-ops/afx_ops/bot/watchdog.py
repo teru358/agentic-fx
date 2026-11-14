@@ -75,6 +75,7 @@ class Watchdog:
         self._acknowledged = clock()
         self._shutdown_at: float | None = None
         self._halt = threading.Event()
+        self._wake = threading.Event()
         self._thread: threading.Thread | None = None
 
     # ---------------------------------------------------------------- 状態
@@ -88,6 +89,15 @@ class Watchdog:
         """終了の開始。最初の 1 回の時刻だけを保持し、以後は動かさない。"""
         if self._shutdown_at is None:
             self._shutdown_at = self._clock()
+            # 周期の待ちの途中でも起こし、残り時間を期限として待ち直させる
+            self._wake.set()
+
+    def next_wait(self) -> float:
+        """次の確認までの秒数。終了開始後は、60 秒の期限までの残りを超えない。"""
+        if self._shutdown_at is None:
+            return self._interval
+        remaining = self._shutdown_limit - (self._clock() - self._shutdown_at)
+        return max(0.0, min(self._interval, remaining))
 
     def _acknowledge(self) -> None:
         self._acknowledged = self._clock()
@@ -128,13 +138,18 @@ class Watchdog:
         self._thread.start()
 
     def _run(self) -> None:
-        while not self._halt.wait(self._interval):
+        while not self._halt.is_set():
+            self._wake.wait(self.next_wait())
+            self._wake.clear()
+            if self._halt.is_set():
+                return
             if self.tick():
                 return
 
     def stop(self) -> None:
         """thread を止める (試験の後始末用。本番は process の終了まで止めない)。"""
         self._halt.set()
+        self._wake.set()
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(5)

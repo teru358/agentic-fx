@@ -136,6 +136,10 @@ def run(isolated, *, client=None, connector_factory: Callable[[], object] | None
         watchdog.begin_shutdown()
         _say(out, "bot_internal_error")
         return rc_for_reason("bot_internal_error")
+    except BaseException:
+        # KeyboardInterrupt / SystemExit / 取消し。後始末が詰まっても 60 秒で止まるよう、再送出の前に印を付ける
+        watchdog.begin_shutdown()
+        raise
     watchdog.begin_shutdown()
     return RC_OK
 
@@ -180,6 +184,21 @@ async def _main(isolated, token: str, client, dir_fd: int, *, connector_factory,
                 poll_interval: float, now, progress: ProgressTracker | None = None,
                 sleep=asyncio.sleep, monitor_interval: float = MONITOR_INTERVAL,
                 watchdog: Watchdog | None = None) -> None:
+    # 初期化の途中の中断でも shutdown を記録する (本体の finally に入る前の経路)
+    try:
+        await _main_body(isolated, token, client, dir_fd, connector_factory=connector_factory,
+                         stop=stop, poll_interval=poll_interval, now=now, progress=progress,
+                         sleep=sleep, monitor_interval=monitor_interval, watchdog=watchdog)
+    except BaseException:
+        if watchdog is not None:
+            watchdog.begin_shutdown()
+        raise
+
+
+async def _main_body(isolated, token: str, client, dir_fd: int, *, connector_factory, stop,
+                     poll_interval: float, now, progress: ProgressTracker | None = None,
+                     sleep=asyncio.sleep, monitor_interval: float = MONITOR_INTERVAL,
+                     watchdog: Watchdog | None = None) -> None:
     progress = progress if progress is not None else ProgressTracker()
     if watchdog is not None:
         watchdog.attach(asyncio.get_running_loop())

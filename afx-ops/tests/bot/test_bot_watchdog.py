@@ -507,10 +507,14 @@ def test_a_worker_that_never_returns_cannot_hold_the_shutdown_forever(tmp_path, 
     dog = _shutdown_dog(harness, rcs, gate.set)
     dog.start()
     threading.Timer(0.3, harness.stop.set).start()
+    # watchdog が退行しても無限に待たないよう、独立した期限で gate を解放して明示的に失敗させる
+    backstop = threading.Timer(DEADLINE / 2, gate.set)
+    backstop.start()
     try:
         harness.run(watchdog=dog)  # asyncio.run の default executor の join で詰まる
         assert rcs == [RC_BOT_TRANSIENT]
     finally:
+        backstop.cancel()
         gate.set()
         dog.stop()
 
@@ -524,10 +528,13 @@ def test_a_bot_close_that_never_returns_cannot_hold_the_shutdown_forever(tmp_pat
     dog = _shutdown_dog(harness, rcs, release.set)
     dog.start()
     threading.Timer(0.3, harness.stop.set).start()
+    backstop = threading.Timer(DEADLINE / 2, release.set)
+    backstop.start()
     try:
         harness.run(watchdog=dog)
         assert rcs == [RC_BOT_TRANSIENT]
     finally:
+        backstop.cancel()
         release.set()
         dog.stop()
 
@@ -545,3 +552,100 @@ def test_a_prompt_shutdown_does_not_fire(tmp_path, monkeypatch):
         assert rcs == []
     finally:
         dog.stop()
+
+
+# ------------------------------------------------------------------ 中断・期限・結合
+
+@pytest.mark.parametrize("exc", [KeyboardInterrupt, SystemExit, asyncio.CancelledError])
+def test_run_marks_shutdown_when_the_main_is_interrupted_and_reraises(tmp_path, monkeypatch, exc):
+    spy = _Spy()
+
+    async def main(*args, **kwargs):
+        raise exc()
+    monkeypatch.setattr(runtime, "_main", main)
+    with pytest.raises(BaseException) as caught:
+        runtime.run(_isolated(tmp_path), client=object(), stderr=_Out(), watchdog=spy)
+    assert caught.type in (exc, KeyboardInterrupt, SystemExit, asyncio.CancelledError)
+    assert "shutdown" in spy.events
+
+
+def test_run_marks_shutdown_when_interrupted_before_the_loop_starts(tmp_path, monkeypatch):
+    spy = _Spy()
+
+    def boom(*args, **kwargs):
+        raise KeyboardInterrupt()
+    monkeypatch.setattr(runtime, "open_state_dir", boom)
+    with pytest.raises(KeyboardInterrupt):
+        runtime.run(_isolated(tmp_path), client=object(), stderr=_Out(), watchdog=spy)
+    assert "shutdown" in spy.events
+
+
+def test_main_marks_shutdown_when_interrupted_during_initialisation(tmp_path, monkeypatch):
+    harness = Harness(tmp_path, monkeypatch)
+    spy = _Spy()
+
+    def boom(*args, **kwargs):
+        raise KeyboardInterrupt()
+    monkeypatch.setattr(runtime, "BotAdapter", boom)
+    with pytest.raises(KeyboardInterrupt):
+        harness.run(watchdog=spy)
+    assert "shutdown" in spy.events
+
+
+def test_next_wait_never_exceeds_the_remaining_shutdown_time():
+    clock = Clock()
+    dog = Watchdog(clock=clock, interval=5.0, shutdown_limit=60.0, exit_fn=lambda rc: None)
+    assert dog.next_wait() == 5.0
+    dog.begin_shutdown()
+    clock.t += 57.0
+    assert dog.next_wait() == pytest.approx(3.0)
+    clock.t += 2.5
+    assert dog.next_wait() == pytest.approx(0.5)
+    clock.t += 10
+    assert dog.next_wait() == 0.0
+
+
+def test_shutdown_fires_at_the_limit_not_at_the_next_periodic_check():
+    rcs: list[int] = []
+    fired = threading.Event()
+
+    def record(rc):
+        rcs.append(rc)
+        fired.set()
+    dog = Watchdog(interval=30.0, shutdown_limit=0.3, exit_fn=record, fd=os.dup(2))
+    dog.start()
+    try:
+        time.sleep(0.05)  # 周期 30 秒の待ちに入った後で終了を始める
+        started = time.monotonic()
+        dog.begin_shutdown()
+        assert fired.wait(DEADLINE)
+        assert time.monotonic() - started < 0.3 + 1.0
+        assert rcs == [RC_BOT_TRANSIENT]
+    finally:
+        dog.stop()
+
+
+@pytest.mark.real_watchdog
+def test_the_default_run_starts_a_real_watchdog_thread_and_the_process_ends(tmp_path):
+    code = (
+        "import sys, threading\n"
+        "from types import SimpleNamespace\n"
+        "from afx_ops.bot import runtime\n"
+        "async def main(*a, **k):\n"
+        "    names = [t.name for t in threading.enumerate()]\n"
+        "    assert 'afx-ops-watchdog' in names, names\n"
+        "runtime._main = main\n"
+        "tok = 'A' * 24 + '.' + 'B' * 6 + '.' + 'C' * 27\n"
+        "iso = SimpleNamespace(state_dir=sys.argv[1], secrets={'discord.token': tok.encode()},\n"
+        "                      config=SimpleNamespace())\n"
+        "rc = runtime.run(iso, client=object())\n"
+        "assert rc == 0, rc\n"
+        "assert any(t.name == 'afx-ops-watchdog' and t.daemon for t in threading.enumerate())\n"
+    )
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    started = time.monotonic()
+    done = subprocess.run([sys.executable, "-c", code, str(state)], capture_output=True,
+                          timeout=DEADLINE)
+    assert done.returncode == 0, done.stderr
+    assert time.monotonic() - started < DEADLINE - 1
