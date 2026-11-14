@@ -72,7 +72,7 @@ class SeriesOutcome:
     source: str
     interval: str
     symbol: str
-    status: str            # ok | completed_with_conflicts | conflict_circuit_open | partial | failed
+    status: str            # ok | completed_with_conflicts | conflict_circuit_open | deferred | partial | failed
     requested_start: str
     requested_end: str
     effective_end: str
@@ -90,6 +90,11 @@ class SeriesOutcome:
     n_test: int = 0
     conflict_lines: tuple[ConflictLine, ...] = ()
     generation: int = 1
+    deferred_reason: str | None = None
+
+    @property
+    def deferred(self) -> bool:
+        return self.status == "deferred"
 
     @property
     def conflicted(self) -> int:
@@ -125,7 +130,7 @@ class ImportOutcome:
 
 
 def summarize(series: list[SeriesOutcome] | tuple[SeriesOutcome, ...]) -> ImportOutcome:
-    """系列結果から全体の結果を決める。優先順位は 技術失敗 > 遮断 > 衝突 > ok。"""
+    """系列結果から全体の結果を決める。優先順位は 技術失敗 > 遮断 > 衝突 > 後送り > ok。"""
     series = tuple(series)
     if any(s.technical_failure for s in series):
         confirmed = any(s.confirmed for s in series)
@@ -134,6 +139,8 @@ def summarize(series: list[SeriesOutcome] | tuple[SeriesOutcome, ...]) -> Import
         return ImportOutcome(series, "conflict_circuit_open", RC_CIRCUIT)
     if any(s.status == "completed_with_conflicts" for s in series):
         return ImportOutcome(series, "completed_with_conflicts", RC_CONFLICTS)
+    if any(s.deferred for s in series):
+        return ImportOutcome(series, "deferred", RC_OK)
     return ImportOutcome(series, "ok", RC_OK)
 
 
@@ -193,8 +200,14 @@ def run_series(conn: sqlite3.Connection, spec: SeriesSpec, *,
                stage_ttl: float = STAGE_TTL_SEC,
                busy_budget: float = BUSY_BUDGET_SEC,
                admission=None, max_rows: int = ohlcv.BATCH_MAX_ROWS,
-               budget_seconds: float = ohlcv.BATCH_BUDGET_SECONDS) -> SeriesOutcome:
-    """1 系列を取得 → 遮断判定 → 確定する。失敗は例外にせず結果に畳む。"""
+               budget_seconds: float = ohlcv.BATCH_BUDGET_SECONDS,
+               inspection_tail_bars: int | None = None, on_batch=None) -> SeriesOutcome:
+    """1 系列を取得 → 遮断判定 → 確定する。失敗は例外にせず結果に畳む。
+
+    `inspection_tail_bars` (K) を渡す呼出し (同期) では、遮断に当たらない場合に限り、実重複が
+    K 本未満か比較対象 `N_test` が 2 未満なら `deferred(inspection_insufficient)` とし、
+    履歴・衝突とも 0 件で返す。渡さない呼出し (手動の import) の挙動は変わらない。
+    `on_batch(conn, BatchProgress)` は各 batch の commit 直前の同じ transaction で呼ばれる。"""
     if conn.in_transaction:
         raise ValueError("run_series: connection must not be inside a transaction")
     op = uuid.uuid4().hex
@@ -224,14 +237,16 @@ def run_series(conn: sqlite3.Connection, spec: SeriesSpec, *,
                 seen_at=clock_now(), monotonic=monotonic, sleep=sleep,
                 stage_started=stage_started, stage_ttl=stage_ttl,
                 busy_budget=busy_budget, admission=admission, max_rows=max_rows,
-                budget_seconds=budget_seconds)
+                budget_seconds=budget_seconds, inspection_tail_bars=inspection_tail_bars,
+                on_batch=on_batch)
         finally:
             conn.execute(f"PRAGMA busy_timeout={int(previous_timeout)}")
 
 
 def _classify_and_apply(conn, spec, op, rows, *, origin, run_id, seen_at, monotonic,
                         sleep, stage_started, stage_ttl, busy_budget, admission,
-                        max_rows, budget_seconds) -> SeriesOutcome:
+                        max_rows, budget_seconds, inspection_tail_bars=None,
+                        on_batch=None) -> SeriesOutcome:
     busy_spent = 0.0
 
     def stage_over() -> bool:
@@ -273,6 +288,12 @@ def _classify_and_apply(conn, spec, op, rows, *, origin, run_id, seen_at, monoto
             conflicted_known=classification.conflicts_known,
             resume_from=_iso(spec.requested_start), conflict_lines=lines, **common)
 
+    if inspection_tail_bars is not None and not ohlcv.inspection_sufficient(
+            classification.n_overlap, classification.n_test, inspection_tail_bars):
+        return SeriesOutcome(
+            status="deferred", deferred_reason="inspection_insufficient",
+            resume_from=_iso(spec.requested_start), **common)
+
     entries = list(classification.entries)
     totals = dict(inserted=0, unchanged=0, new=0, known=0)
     last_committed = None
@@ -290,7 +311,7 @@ def _classify_and_apply(conn, spec, op, rows, *, origin, run_id, seen_at, monoto
             conn, sub, origin=origin, seen_at=seen_at, run_id=run_id,
             max_rows=max_rows, budget_seconds=budget_seconds,
             admission=admission, before_batch=before_batch,
-            before_commit=before_batch)
+            before_commit=before_batch, on_batch=on_batch)
         totals["inserted"] += res.inserted
         totals["unchanged"] += res.unchanged
         totals["new"] += res.conflicted_new
