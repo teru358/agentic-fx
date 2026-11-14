@@ -112,8 +112,14 @@ def child_env(home) -> dict[str, str]:
 
 
 @pytest.fixture(autouse=True)
-def _no_real_bot_watchdog_thread(monkeypatch):
-    """process 内で bot の `run` を回す test が、終了開始後 60 秒で pytest ごと落とす thread を残さない。"""
+def _no_real_bot_watchdog_thread(request, monkeypatch):
+    """process 内で bot の `run` を回す test が、終了開始後 60 秒で pytest ごと落とす thread を残さない。
+
+    本番の既定の factory そのものを確かめる test は `real_watchdog` の印で差し替えを外す。
+    """
+    if request.node.get_closest_marker("real_watchdog") is not None:
+        yield
+        return
     try:
         from afx_ops.bot import runtime
         from afx_ops.bot.watchdog import Watchdog

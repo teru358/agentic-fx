@@ -455,6 +455,22 @@ def test_run_uses_a_real_watchdog_by_default_when_not_replaced(tmp_path, monkeyp
     assert len(made) == 1 and made[0].events[0] == "start"
 
 
+@pytest.mark.real_watchdog
+def test_the_production_factory_builds_an_unstarted_watchdog_with_the_spec_limits():
+    dog = runtime.new_watchdog()
+    try:
+        assert type(dog) is Watchdog
+        assert (dog._interval, dog._window, dog._shutdown_limit) == (
+            CHECK_INTERVAL, STALL_WINDOW, SHUTDOWN_LIMIT)
+        assert (CHECK_INTERVAL, STALL_WINDOW, SHUTDOWN_LIMIT) == (5.0, 600.0, 60.0)
+    finally:
+        dog.stop()
+
+
+def test_other_tests_get_the_unstarted_stand_in():
+    assert type(runtime.new_watchdog()) is not Watchdog
+
+
 def test_a_blocked_stderr_write_after_asyncio_run_is_still_bounded(tmp_path, monkeypatch):
     async def main(*args, **kwargs):
         raise BotFailure("discord_rejected")
