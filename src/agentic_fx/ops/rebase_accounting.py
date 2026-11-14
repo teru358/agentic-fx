@@ -6,6 +6,7 @@ snapshot and immutable audit row together.
 """
 from __future__ import annotations
 
+import math
 import sqlite3
 from datetime import datetime
 from typing import Any, Callable
@@ -14,6 +15,7 @@ from agentic_fx.core.accounting import daily_start_equity
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.config import Settings
 from agentic_fx.core.contracts import Clock
+from agentic_fx.core.timeutil import as_utc
 
 
 class RebaseOutcomeUnknown(RuntimeError):
@@ -36,8 +38,8 @@ def read_rebase_totals(conn: sqlite3.Connection) -> dict[str, float | int | None
             "SELECT COALESCE(SUM(cut),0) AS cut_sum, "
             "COALESCE(SUM(cut_pct),0) AS cut_pct_sum, COUNT(*) AS count, "
             "MAX(id) AS last_id FROM kill_switch_hwm_rebases").fetchone()
-        result = {"cut": row["cut_sum"], "cut_pct": row["cut_pct_sum"],
-                  "count": row["count"], "last_id": row["last_id"]}
+        result = {"cut": row[0], "cut_pct": row[1],
+                  "count": row[2], "last_id": row[3]}
         if owns_transaction:
             conn.commit()
         return result
@@ -78,19 +80,48 @@ def apply_rebase(
     ``validate`` rechecks caller-owned broker/source/flat/freshness, generation,
     DD threshold and token conditions while BEGIN IMMEDIATE is held. It must
     only read: ending the transaction (commit / rollback) is rejected before
-    anything is written. Exceptions roll back without writing. This function
+    anything is written. Its SQL authorizer allows only SELECT, READ, FUNCTION,
+    and RECURSIVE actions and is removed even if validation raises. Exceptions
+    roll back without writing. This function
     also checks source/latest and daily invariants before committing.
 
     An ``Exception`` from COMMIT becomes ``RebaseOutcomeUnknown`` (the caller
     resolves it from the ledger). A ``BaseException`` that is not an
-    ``Exception`` (an interrupt) propagates unchanged after a best-effort
-    rollback, so its outcome is equally unknown to the caller.
+    ``Exception`` (an interrupt) propagates unchanged. Before COMMIT completes,
+    it triggers one best-effort rollback. A ``BaseException`` after COMMIT
+    completes but before this function returns loses the result even though
+    the rebase is durable; callers must resolve it from the ledger.
     """
     conn.execute("BEGIN IMMEDIATE")
+    committed = False
     try:
-        validate(conn)
+        def read_only_authorizer(action, _arg1, _arg2, _database, _trigger):
+            allowed = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ,
+                       sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_RECURSIVE}
+            return sqlite3.SQLITE_OK if action in allowed else sqlite3.SQLITE_DENY
+
+        conn.set_authorizer(read_only_authorizer)
+        try:
+            validate(conn)
+        finally:
+            conn.set_authorizer(None)
         if not conn.in_transaction:
             raise RuntimeError("validate must not end the rebase transaction")
+        numeric_values = (hwm_before, equity, balance, drawdown_pct,
+                          threshold_pct, cut, cut_pct, additional_headroom)
+        if not all(math.isfinite(value) for value in numeric_values):
+            raise ValueError("rebase accounting values must be finite")
+        if additional_headroom < 0:
+            raise ValueError("additional headroom must be non-negative")
+        if cut != hwm_before - equity:
+            raise ValueError("cut does not match HWM and equity")
+        if cut <= 0:
+            raise ValueError("cut must be positive")
+        if cut_pct != cut / hwm_before * 100:
+            raise ValueError("cut percentage does not match cut and HWM")
+        if drawdown_pct < threshold_pct:
+            raise ValueError("drawdown is below threshold")
+        applied_at = as_utc(applied_at)
         source = conn.execute(
             "SELECT * FROM account_snapshots WHERE id=?",
             (source_snapshot_id,)).fetchone()
@@ -138,9 +169,10 @@ def apply_rebase(
         try:
             _commit_rebase(conn)
         except Exception as exc:
-            _rollback_quietly(conn)
             raise RebaseOutcomeUnknown("rebase COMMIT outcome is unknown") from exc
+        committed = True
         return result
     except BaseException:
-        _rollback_quietly(conn)
+        if not committed:
+            _rollback_quietly(conn)
         raise

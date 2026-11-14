@@ -164,7 +164,19 @@ def test_rebase_ledger_rejects_each_missing_foreign_key(tmp_path):
 
     conn = connect(tmp_path / "fk.db")
     init_db(conn)
-    values = ("2026-11-14T00:00:00+00:00", 1, 9991, 9992, 9993, 1,
+    now = "2026-11-14T00:00:00+00:00"
+    source_id = conn.execute(
+        "INSERT INTO account_snapshots(ts,balance,equity,hwm) VALUES(?,100,100,100)",
+        (now,)).lastrowid
+    rebase_id = conn.execute(
+        "INSERT INTO account_snapshots(ts,balance,equity,hwm,source) "
+        "VALUES(?,100,100,100,'manual_ks_rebase')", (now,)).lastrowid
+    audit_id = conn.execute(
+        "INSERT INTO ops_requests(request_id,endpoint,authenticated_principal,"
+        "body_sha256,phase,created_at) VALUES('fk','e','p','h','accepted',?)",
+        (now,)).lastrowid
+    conn.commit()
+    values = (now, 1, source_id, rebase_id, audit_id, 1,
               "x", 100, 100, 100, 100, 0, 1, 0, 0, 0)
     sql = ("INSERT INTO kill_switch_hwm_rebases "
            "(applied_at,generation,source_snapshot_id,rebase_snapshot_id,"
@@ -173,7 +185,7 @@ def test_rebase_ledger_rejects_each_missing_foreign_key(tmp_path):
            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
     for missing_index in (2, 3, 4):
         row = list(values)
-        row[missing_index] += 1
+        row[missing_index] = -missing_index
         with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
             conn.execute(sql, row)
         conn.rollback()
