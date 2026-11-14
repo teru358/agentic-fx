@@ -573,6 +573,12 @@ class _ConcurrentChange(RuntimeError):
     pass
 
 
+class _StopBeforeCommit(RuntimeError):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
 def apply_classified_history(conn: sqlite3.Connection,
                              classification: HistoryClassification, *,
                              origin: str, seen_at: datetime | str,
@@ -581,7 +587,7 @@ def apply_classified_history(conn: sqlite3.Connection,
                              budget_seconds: float = BATCH_BUDGET_SECONDS,
                              clock=time.monotonic,
                              on_batch=None, admission=None,
-                             before_batch=None) -> ApplyResult:
+                             before_batch=None, before_commit=None) -> ApplyResult:
     """分類済みの系列を短い BEGIN IMMEDIATE batch に分けて確定する。
 
     各 batch で履歴 INSERT と衝突 upsert を同じ transaction で確定する。
@@ -592,6 +598,8 @@ def apply_classified_history(conn: sqlite3.Connection,
     `admission` (WriterAdmission) があれば batch ごとに BEGIN の前から commit / rollback の
     後まで lease を取る。通らなければ database_busy で止める。`before_batch()` は各 batch の
     前に呼ばれ、失敗コードの文字列を返すとそこで新しい batch を始めずに止める。
+    `before_commit()` は各 batch の commit 直前に呼ばれ、失敗コードを返すとその batch を
+    rollback して止める。
     unchanged 行も適用時に既存値を再照合し、変わっていれば concurrent_change で batch を戻す。
     """
     if origin not in ORIGINS:
@@ -671,7 +679,18 @@ def apply_classified_history(conn: sqlite3.Connection,
                     batch_bar_time_end=entries[batch_end - 1].bar_time,
                     resume_from=(entries[batch_end].bar_time if batch_end < total else None),
                     rows_in_batch=batch_end - done, committed_entries=batch_end))
+            if before_commit is not None:
+                stop = before_commit()
+                if stop is not None:
+                    raise _StopBeforeCommit(stop)
             conn.commit()
+        except _StopBeforeCommit as exc:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            failure = exc.code
+            break
         except Exception as exc:
             try:
                 conn.rollback()

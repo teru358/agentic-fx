@@ -267,7 +267,8 @@ def _classify_and_apply(conn, spec, op, rows, *, origin, run_id, seen_at, monoto
         res = ohlcv.apply_classified_history(
             conn, sub, origin=origin, seen_at=seen_at, run_id=run_id,
             max_rows=max_rows, budget_seconds=budget_seconds,
-            admission=admission, before_batch=before_batch)
+            admission=admission, before_batch=before_batch,
+            before_commit=before_batch)
         totals["inserted"] += res.inserted
         totals["unchanged"] += res.unchanged
         totals["new"] += res.conflicted_new

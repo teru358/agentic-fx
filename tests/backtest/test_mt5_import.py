@@ -166,6 +166,28 @@ def test_import_mt5_last_window_clipped_to_end(tmp_path):
     assert datetime.fromisoformat(to_param) != H + timedelta(days=2)
 
 
+def test_import_mt5_records_each_conflict_in_the_same_window_on_a_normal_run(tmp_path):
+    conn = _conn(tmp_path)
+    n = 400
+    seed = [("USDJPY", "1m", (H + timedelta(minutes=i)).isoformat(),
+             148.0, 148.2, 147.9, 148.1, 10, None) for i in range(n)]
+    ohlcv.import_history_bars(conn, seed, source="mt5")
+    bad = {10, 40, 70}
+    bars = [_bar(H + timedelta(minutes=i), close=(148.15 if i in bad else 148.1))
+            for i in range(n)]
+    result = _import_mt5(conn, "USDJPY", H, H + timedelta(minutes=n),
+                         base_url="http://x", fetch=lambda _url: _payload(*bars))
+    assert result.status == "completed_with_conflicts"
+    assert (result.inserted, result.unchanged, result.conflicted) == (0, n - 3, 3)
+    rows = conn.execute(
+        "SELECT bar_time FROM history_conflicts ORDER BY bar_time").fetchall()
+    assert [r[0] for r in rows] == [
+        (H + timedelta(minutes=i)).isoformat() for i in sorted(bad)]
+    # 既存値は変わらない
+    assert all(b.close == 148.1 for b in
+               ohlcv.load_history_bars(conn, "USDJPY", "1m", source="mt5"))
+
+
 def _query_param(url, name):
     return parse_qs(urlsplit(url).query)[name][0]
 

@@ -578,6 +578,16 @@ def test_before_batch_can_stop_with_a_failure_code(tmp_path):
     assert res.resume_from is not None
 
 
+def test_before_commit_failure_rolls_back_that_batch_only(tmp_path):
+    conn, cls = _unchanged_apply_setup(tmp_path)
+    before = _count(conn, "ohlcv_history")
+    calls = iter([None, "stage_expired"])
+    res = _apply(conn, cls, max_rows=2, before_commit=lambda: next(calls))
+    assert (res.status, res.failure) == ("partial", "stage_expired")
+    assert res.resume_from is not None
+    assert _count(conn, "ohlcv_history") == before + res.inserted
+
+
 # ---- agent への非露出 ------------------------------------------------------
 # 公開境界 (agent の tool・prompt・改善記録の投影) が衝突の内部に触れないこと。
 # store 内の呼出し (import・CLI) は妨げない。
@@ -636,4 +646,79 @@ def test_conflict_canaries_do_not_reach_the_improve_prompt_or_context(tmp_path):
     rendered = loop._render_improve_mission_prompt(ctx_data, ctx=_Ctx())
     blob = rendered + json.dumps(ctx_data, ensure_ascii=False, default=str)
     for canary in (str(canary_value), str(canary_value + 5), canary_reason, digest):
+        assert canary not in blob
+
+
+def test_production_code_never_calls_the_low_level_import_history_bars():
+    root = Path(__file__).resolve().parents[2] / "src"
+    offenders = []
+    for path in root.rglob("*.py"):
+        text = path.read_text(errors="ignore")
+        for m in re.finditer(r"\bimport_history_bars\s*\(", text):
+            line_start = text.rfind("\n", 0, m.start()) + 1
+            line = text[line_start:text.find("\n", m.start())]
+            if line.lstrip().startswith(("def ", "#")) or "import_history_bars:" in line:
+                continue
+            offenders.append(f"{path.relative_to(root).as_posix()}: {line.strip()}")
+    assert offenders == []
+
+
+def test_conflict_canaries_do_not_reach_agent_tool_responses(tmp_path):
+    import json
+    from unittest.mock import MagicMock, patch
+
+    from agentic_fx.config import load_settings
+    from agentic_fx.config import ResearchSettings
+    from agentic_fx.core.contracts import Bar, FixedClock
+    from agentic_fx.datafeed.price_provider import PriceProvider
+    from agentic_fx.tools import market_tools
+    from agentic_fx.tools.research_tools import build_research_tooldefs
+
+    canary_value = 7654321.125
+    canary_reason = "CANARY-REASON-5d1f"
+    conn = _conn(tmp_path)
+    _seed(conn, [_row(0, volume=canary_value)])
+    conn.commit()
+    res = _apply(conn, _cls(conn, [_row(0, volume=canary_value + 5, close=148.15)]))
+    assert res.conflicted_new == 1
+    conn.execute("UPDATE history_conflicts SET reason_ref=?", (canary_reason,))
+    conn.commit()
+    digest = conn.execute("SELECT existing_digest FROM history_conflicts").fetchone()[0]
+    canaries = (str(canary_value), str(canary_value + 5), canary_reason, digest)
+
+    settings = load_settings(Path(__file__).resolve().parents[2]
+                             / "config" / "settings.yaml.example")
+    settings.datafeed.primary = "mt5"
+    settings.datafeed.mt5.enabled = True
+    settings.datafeed.yfinance.enabled = False
+    now = datetime(2026, 1, 2, 0, 5, tzinfo=timezone.utc)
+    last = now.replace(minute=0) - timedelta(hours=1)
+    bars = [Bar("USDJPY", "1h", last - timedelta(hours=199 - i), 1.0, 2.0, 0.5, 1.5, 1)
+            for i in range(200)]
+    provider = PriceProvider(conn, settings, FixedClock(now), readonly=True)
+    tools = {t.name: t for t in market_tools.build(
+        provider, MagicMock(), settings, sandbox_run=lambda *a, **k: {})}
+    with patch("agentic_fx.datafeed.price_provider.sources.mt5_bars", return_value=bars):
+        responses = [tools["get_ohlcv"].func("USDJPY", "1h"),
+                     tools["get_indicators"].func("USDJPY", "1h")]
+    assert responses[0] and "sma_20" in responses[1]
+
+    class _Search:
+        def text(self, query, max_results):
+            return [{"title": "t", "href": "https://example.com/a", "body": "b"}]
+
+    class _Fetch:
+        def fetch(self, url, *, user_agent=None):
+            return 200, "article body"
+
+    research = {t.name: t for t in build_research_tooldefs(
+        settings=ResearchSettings(max_searches=20, max_fetches=30, min_interval_sec=0.01,
+                                  max_per_host=5, fetch_max_bytes=2_097_152,
+                                  user_agent="agentic-fx/test"),
+        search_backend=_Search(), fetch_backend=_Fetch(), monotonic=iter(
+            float(i) for i in range(100000)).__next__)}
+    responses.append(research["web_search"].func(query="q", max_results=3))
+    responses.append(research["fetch_article"].func(url="https://example.com/a"))
+    blob = json.dumps(responses, ensure_ascii=False, default=str)
+    for canary in canaries:
         assert canary not in blob

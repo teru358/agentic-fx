@@ -345,8 +345,8 @@ def test_stage_expired_after_fetch_writes_nothing(tmp_path):
 def test_stage_expiring_between_batches_keeps_the_prefix_and_releases_the_lease(tmp_path):
     conn = _conn(tmp_path)
     rows = [_row(i) for i in range(6)]
-    # 取得開始 0 → 取得後 1 → batch 1 前 2 → batch 2 前 700
-    ticks = iter([0.0, 1.0, 2.0, 700.0] + [700.0] * 20)
+    # 取得開始 0 → 取得後 1 → batch 1 の前 2・commit 直前 3 → batch 2 の前 700
+    ticks = iter([0.0, 1.0, 2.0, 3.0, 700.0] + [700.0] * 20)
     out = _run(conn, _spec(rows, n=6), max_rows=2, monotonic=lambda: next(ticks))
     assert (out.status, out.failure) == ("partial", "stage_expired")
     assert out.inserted == 2 and out.resume_from == _t(2)
@@ -356,6 +356,32 @@ def test_stage_expiring_between_batches_keeps_the_prefix_and_releases_the_lease(
     # 次の実行は元の範囲から再開できる
     again = _run(conn, _spec(rows, n=6))
     assert (again.status, again.inserted, again.unchanged) == ("ok", 4, 2)
+
+
+def test_stage_expiring_inside_a_batch_rolls_that_batch_back(tmp_path):
+    conn = _conn(tmp_path)
+    rows = [_row(i) for i in range(4)]
+    # 取得開始 0 → 取得後 1 → batch 1 前 2 → batch 1 内 (row 0, row 1 で停止判定は
+    # clock 不使用) → batch 1 の commit 直前 700
+    seq = iter([0.0, 1.0, 2.0, 700.0])
+    out = _run(conn, _spec(rows, n=4), max_rows=2,
+               monotonic=lambda: next(seq, 700.0))
+    assert (out.status, out.failure) == ("failed", "stage_expired")
+    assert _count(conn, "ohlcv_history") == 0
+    with history_mutation_lease(conn):
+        pass
+
+
+def test_stage_expiring_before_the_last_batch_commit_keeps_only_earlier_batches(tmp_path):
+    conn = _conn(tmp_path)
+    rows = [_row(i) for i in range(4)]
+    # batch 1 は前後とも期限内、batch 2 の前は期限内で commit 直前に越える
+    seq = iter([0.0, 1.0, 2.0, 3.0, 4.0, 700.0])
+    out = _run(conn, _spec(rows, n=4), max_rows=2,
+               monotonic=lambda: next(seq, 700.0))
+    assert (out.status, out.failure) == ("partial", "stage_expired")
+    assert out.inserted == 2 and out.resume_from == _t(2)
+    assert _count(conn, "ohlcv_history") == 2
 
 
 # ---- Dukascopy も同じ core: 取得失敗は系列 0 件、衝突は rc 3 -----------------
