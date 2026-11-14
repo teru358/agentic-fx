@@ -173,6 +173,36 @@ def test_a_holdout_that_is_not_measured_never_becomes_a_pass(make, monkeypatch):
     assert report["axes"]["floor"]["holdout"]["result"] == "not_run"
 
 
+@pytest.mark.parametrize("strict", [False, True], ids=["default", "strict"])
+@pytest.mark.parametrize("in_sample_ok", [True, False], ids=["in-sample-ok", "in-sample-floor-fail"])
+def test_a_short_holdout_sample_is_unevaluable_never_a_pass_or_a_floor_fail(
+        make, strict, in_sample_ok):
+    """in_sample は十分で holdout の標本が足りない版は、既定でも strict でも評価不能。"""
+    in_sample = ((lambda pair: _metrics(trades=40, pf=1.5)) if in_sample_ok
+                 else (lambda pair: _metrics(trades=40, pf=0.5, avg_r=-0.1)))
+    world = make(replay=Replay(
+        in_sample=in_sample,
+        holdout=lambda pair: _metrics(trades=3, pf=1.5, evaluable=False)))
+    world.settings.improve.gate.require_holdout_evaluable = strict
+    _v, target = world.stored()
+    report = _result(world, target).report
+    assert report["result"] == {"overall": "unevaluable", "reason": "insufficient_trades",
+                                "result_status": "unevaluable"}
+    assert report["axes"]["execution"]["status"] == "completed"
+    # 部分成績は残る
+    assert report["axes"]["floor"]["in_sample"]["pairs"]["USDJPY"]["metrics"]["trades"] == 40
+    assert report["axes"]["floor"]["holdout"]["pairs"]["USDJPY"]["metrics"]["trades"] == 3
+    assert [r["scope"] for r in report["rows"]] == ["in_sample", "holdout"]
+
+
+def test_a_short_in_sample_sample_is_unevaluable_too(make):
+    world = make(replay=Replay(
+        in_sample=lambda pair: _metrics(trades=3, pf=1.5, evaluable=False)))
+    _v, target = world.stored()
+    report = _result(world, target).report
+    assert report["result"]["overall"] == "unevaluable"
+
+
 def test_every_reason_the_audit_can_report_is_in_the_fixed_set():
     from agentic_fx.plugin.switch import GateFailure
     seen = set()

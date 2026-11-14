@@ -576,6 +576,18 @@ def _end_recheck(conn, target, trial, copy_dir, plugins_root, settings, lock_wai
     trial.changed = changed
 
 
+def _sample_shortfall(scope_rows: dict, pairs: list[str]) -> bool:
+    """測定済みの pair・scope のどれかが標本不足か。床判定の取り扱い (既定では holdout の
+    標本不足を除外、strict では床不合格) とは独立に見る。標本不足は評価不能であり、
+    合格にも床不合格にもしない。"""
+    for scope in SCOPES:
+        for pair in pairs:
+            item = scope_rows[scope].get(pair)
+            if item is not None and item["entry"].get("evaluable") is not True:
+                return True
+    return False
+
+
 def _judge_success(trial: _Trial, scopes: dict, pairs: list[str], history: dict, settings,
                    plugins_root) -> tuple[str, str | None]:
     """gate が最後まで進んだ結果を 4 軸から総合結果へ。warn の完走は合格ではない。"""
@@ -596,6 +608,8 @@ def _judge_success(trial: _Trial, scopes: dict, pairs: list[str], history: dict,
     history["result"] = "ready_verified"
     if not outcome.evaluable:
         return UNEVALUABLE, "failed"
+    if _sample_shortfall(trial.scope_rows, pairs):
+        return UNEVALUABLE, "insufficient_trades"
     results = [scopes[s]["result"] for s in SCOPES]
     if any(r in (FLOOR_NOT_RUN, FLOOR_INDETERMINATE) for r in results):
         return UNEVALUABLE, "failed"
