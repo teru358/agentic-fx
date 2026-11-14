@@ -537,7 +537,19 @@ def audit_non_deployed_version(
                     trial.stop(UNEVALUABLE, "interrupted")
                 elif not trial.interrupted:
                     trial.stop(UNEVALUABLE, "failed")
-                if _is_published(Path(report_dir), trial_id, _report_bytes(report)):
+                published = None
+                for _check in range(3):
+                    # 照合の最中にさらに割り込まれても、最初の割込みを保ったまま公開の状態を確定する
+                    try:
+                        published = _is_published(Path(report_dir), trial_id, _report_bytes(report))
+                        break
+                    except (KeyboardInterrupt, SystemExit) as again:
+                        pending = pending or again
+                        trial.interrupted = True
+                if published is None:
+                    written, error = None, "publication_unknown"
+                    break
+                if published:
                     written, error = Path(report_dir) / f"{trial_id}.json", None
                     break
                 error = type(exc).__name__

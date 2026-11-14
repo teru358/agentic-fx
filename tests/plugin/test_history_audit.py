@@ -864,6 +864,35 @@ def test_a_failure_right_after_the_report_was_published_keeps_the_published_resu
     assert list(world.work_root.iterdir()) == []
 
 
+def test_an_interrupt_during_the_publication_check_keeps_the_first_interrupt_and_settles(
+        make, monkeypatch):
+    world = make()
+    _v, target = world.stored()
+    real_link = os.link
+    real_check = audit._is_published
+    checks = []
+
+    def link_then_interrupt(src, dst, **kw):
+        real_link(src, dst, **kw)
+        raise KeyboardInterrupt("first")
+
+    def check_interrupted_once(report_dir, trial_id, data):
+        checks.append(1)
+        if len(checks) == 1:
+            raise KeyboardInterrupt("second")
+        return real_check(report_dir, trial_id, data)
+
+    monkeypatch.setattr(audit.os, "link", link_then_interrupt)
+    monkeypatch.setattr(audit, "_is_published", check_interrupted_once)
+    with pytest.raises(KeyboardInterrupt) as info:
+        world.run(target)
+    assert str(info.value) == "first"
+    assert len(checks) == 2
+    (path,) = [p for p in world.report_dir.iterdir() if not p.name.startswith(".")]
+    assert json.loads(path.read_text())["result"]["overall"] == "pass"
+    assert list(world.work_root.iterdir()) == []
+
+
 def test_an_ordinary_write_failure_leaves_an_unevaluable_report_instead_of_none(
         make, monkeypatch):
     world = make()

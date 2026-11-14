@@ -634,3 +634,26 @@ def test_a_hash_change_during_the_run_is_flagged_independently_of_the_exit_code(
     monkeypatch.setattr(gate_mod, "hashes_of", tampering)
     result = run_gate_pytest(d, settings=settings)
     assert (result.passed, result.returncode, result.hash_changed) == (False, 1, True)
+
+
+def test_an_interrupt_while_waiting_stops_the_worker_and_closes_the_status_pipe(
+        tmp_path, settings, monkeypatch):
+    _skip_if_no_landlock()
+    import subprocess
+    from agentic_fx.plugin import gate_pytest as gp
+
+    candidate = _write_candidate(tmp_path, test_py="def test_x():\n    assert True\n")
+    before = set(os.listdir("/proc/self/fd"))
+    seen = []
+
+    def interrupted(proc, timeout):
+        seen.append(proc)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(gp, "_wait_gate_worker", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        gp.run_gate_pytest(candidate, settings=settings)
+    (proc,) = seen
+    assert proc.returncode is not None          # 子は止められて回収された
+    assert set(os.listdir("/proc/self/fd")) <= before
+
