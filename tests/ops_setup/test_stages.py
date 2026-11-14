@@ -986,6 +986,8 @@ def _systemctl_run(fail: dict[str, tuple[int, str]]):
 
     def run(args, **_kwargs):
         action = args[2]
+        if action == "--version":
+            return subprocess.CompletedProcess(args, 0, stdout="systemd 259 (259.9)\n", stderr="")
         if action in fail:
             rc, err = fail[action]
             return subprocess.CompletedProcess(args, rc, stdout="", stderr=err)
@@ -1942,3 +1944,87 @@ def test_ops_status_stays_quiet_when_the_database_cannot_be_read(tmp_path, monke
 
     assert stages.run_ops_command(setup.root, "status", "bot") == 0
     assert "配備操作" not in capsys.readouterr().out
+
+
+class _VersionedSystemd(FakeSystemd):
+    def __init__(self, paths, version):
+        super().__init__(paths)
+        self.reported = version
+
+    def version(self) -> int:
+        self.calls.append("version")
+        if isinstance(self.reported, Exception):
+            raise self.reported
+        return self.reported
+
+
+def _versioned(tmp_path, version):
+    setup, systemd, home = _setup(tmp_path)
+    systemd = _VersionedSystemd(setup.paths, version)
+    systemd.active.add(setup.paths.afx_unit)
+    setup.systemd = systemd
+    return setup, systemd, home
+
+
+@pytest.mark.parametrize("version", [253, 200, SystemdError("version", "rc=1")])
+def test_bot_enable_is_refused_on_old_or_unknown_systemd_before_touching_anything(tmp_path, monkeypatch, version):
+    setup, systemd, home = _versioned(tmp_path, version)
+    _with_home(home, monkeypatch)
+
+    with pytest.raises(SystemdError) as raised:
+        setup.enable("bot")
+
+    assert raised.value.reason == "systemd_too_old"
+    assert "254" in raised.value.detail or "確認できない" in raised.value.detail
+    # afx を止めず、資材も鍵も作らない。
+    assert not any(call.startswith(("stop", "start", "daemon-reload")) for call in systemd.calls)
+    assert not setup.paths.template_path.exists() and not setup.paths.bot_dropin_path.exists()
+    assert not enroll_marker_path(setup.root).exists()
+    saved = read_stage(setup.root, "bot")
+    assert saved["stage"] == "staged" and saved["failure"] == "systemd_too_old"
+
+
+def test_bot_enable_on_254_installs_and_records_the_bot_dropin_as_an_artifact(tmp_path, monkeypatch):
+    setup, _systemd, home = _versioned(tmp_path, 254)
+    _with_home(home, monkeypatch)
+
+    result = setup.enable("bot")
+
+    assert result.stage == "enabled"
+    assert setup.paths.bot_dropin_path.read_text().count("RestartPreventExitStatus=2 4 69 70 71 78") == 1
+    assert str(setup.paths.bot_dropin_path) in read_stage(setup.root, "bot")["artifacts"]
+
+
+def test_web_enable_does_not_consult_the_systemd_version(tmp_path, monkeypatch):
+    setup, systemd, home = _versioned(tmp_path, 100)
+    _with_home(home, monkeypatch)
+
+    assert setup.enable("web").stage == "enabled"
+
+    assert "version" not in systemd.calls
+    assert not setup.paths.bot_dropin_path.exists()
+
+
+def test_disable_bot_removes_the_bot_dropin_and_keeps_web(tmp_path, monkeypatch):
+    setup, _systemd, home = _versioned(tmp_path, 259)
+    _with_home(home, monkeypatch)
+    setup.enable("bot")
+    setup.enable("web")
+
+    setup.disable("bot")
+
+    assert not setup.paths.bot_dropin_path.exists()
+    assert setup.paths.template_path.exists()
+    assert read_stage(setup.root, "web")["stage"] == "enabled"
+
+
+def test_a_bot_enable_resumes_and_repairs_a_missing_bot_dropin(tmp_path, monkeypatch):
+    setup, _systemd, home = _versioned(tmp_path, 259)
+    _with_home(home, monkeypatch)
+    setup.enable("bot")
+    setup.paths.bot_dropin_path.unlink()
+    _with_home(home, monkeypatch)
+
+    setup.enable("bot")
+
+    assert setup.paths.bot_dropin_path.exists()

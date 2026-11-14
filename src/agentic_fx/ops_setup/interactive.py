@@ -95,7 +95,7 @@ REASON_CODES = frozenset({
     "config_dir_missing", "config_dir_invalid", "config_invalid", "secrets_failed", "url_invalid",
     "token_invalid", "startup_internal_error", "probe_not_implemented", "runtime_unavailable",
     "probe_bind_failed", "invalid_stage", "invalid_state", "material_write_failed",
-    "ops_exec_not_found", "feature_config_invalid", "principal_key_mismatch", "afx_still_running",
+    "ops_exec_not_found", "systemd_too_old", "feature_config_invalid", "principal_key_mismatch", "afx_still_running",
     "marker_corrupt", "marker_foreign", "marker_write_failed", "marker_remove_failed", "ops_not_ready",
     "ops_still_active", "uninstall_incomplete", "unavailable", "stop", "start", "daemon-reload",
     "show", "not_initialized", "key_dir_invalid", "token_dir_in_sandbox", "ready_invalid",

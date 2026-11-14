@@ -1,6 +1,7 @@
 """systemd user manager に対する小さい境界。"""
 from __future__ import annotations
 
+import re
 import subprocess
 from collections.abc import Callable
 
@@ -96,6 +97,14 @@ class Systemd:
 
     def daemon_reload(self) -> None:
         self._invoke("daemon-reload")
+
+    def version(self) -> int:
+        """manager の systemd の major version。読めなければ SystemdError("version")。"""
+        result = self._call("--version")
+        match = re.match(r"systemd (\d+)", result.stdout or "")
+        if result.returncode or match is None:
+            raise SystemdError("version", f"rc={result.returncode} stderr={_stderr_tail(result.stderr)}")
+        return int(match.group(1))
 
     def show(self, unit: str, *props: str) -> dict[str, str]:
         result = self._invoke("show", unit, *[f"--property={prop}" for prop in props])

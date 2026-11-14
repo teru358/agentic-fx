@@ -23,8 +23,8 @@ from .feature_config import InterfaceLookupFailed, collect, web_access_reason
 from .probe import run_probe
 from .systemd import Systemd, SystemdError
 from .write_key import KEY_MISMATCH_CODES, Inconsistent, check_write_key_consistency, stage_mode
-from .units import (OpsExecNotFound, UnitPaths, atomic_write, install_units, remove_durably,
-                    resolve_ops_exec, uninstall_feature, units_match)
+from .units import (OpsExecNotFound, UnitPaths, atomic_write, bot_systemd_problem, install_units,
+                    remove_durably, resolve_ops_exec, uninstall_feature, units_match)
 from .web_setup import access_line
 
 
@@ -338,6 +338,24 @@ class OpsSetup:
             self._failure(state, "ops_exec_not_found", detail)
             raise SystemdError("ops_exec_not_found", detail) from error
 
+    def _check_bot_systemd(self, feature: str, state: dict[str, Any]) -> None:
+        """bot の recovery drop-in を使えない systemd では、afx に触れる前に固定理由で拒否する。
+
+        version を答えられない port (試験の代役) は検査しない。実 manager は常に答える。"""
+        read_version = getattr(self.systemd, "version", None)
+        if feature != "bot" or read_version is None or state["stage"] not in {"staged", "stopped", "enrolled"}:
+            return
+        try:
+            problem = bot_systemd_problem(read_version())
+        except SystemdError as error:
+            problem = bot_systemd_problem(None)
+            detail = f"{problem}; {_describe(error)}"
+        else:
+            detail = problem
+        if problem:
+            self._failure(state, "systemd_too_old", detail)
+            raise SystemdError("systemd_too_old", detail)
+
     def _check_feature_inputs(self, feature: str, state: dict[str, Any]) -> None:
         """staged の前提。feature 専用の入力が使え、疎通 probe が通ること。外部 artifact は作らない。"""
         if not self.config_check(self.root, feature):
@@ -550,6 +568,7 @@ class OpsSetup:
         if fresh:
             _write_stage(self.root, state)
         self._resolve_exec(state)
+        self._check_bot_systemd(feature, state)
         # afx を止める前に鍵の不一致を見つける。不一致は enroll では直らない。
         self._principal_active(feature, state)
         if not fresh:
@@ -603,7 +622,7 @@ class OpsSetup:
                 except (OSError, SystemdError) as error:
                     self._rollback_install(state, error)
                     raise
-                self._set_stage(state, "installed", artifacts=[str(self.paths.template_path), str(self.paths.dropin_path)],
+                self._set_stage(state, "installed", artifacts=[str(path) for path in self.paths.artifact_paths(active)],
                                 wants=sorted(active))
 
             # afx が元々止まっていれば起こさない。ops は afx の Wants で引かれ Requisite で afx の
