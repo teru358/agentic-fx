@@ -18,7 +18,7 @@ from agentic_fx import status_history
 from agentic_fx.config import load_settings_text
 from agentic_fx.core.contracts import SystemClock
 from agentic_fx.core.display_time import convert_or_raw, display_header
-from agentic_fx.display_tz import read_display_timezone, region_name_warning
+from agentic_fx.display_tz import display_timezone_from_text, region_name_warning
 from agentic_fx.ops.contracts import Principal
 from agentic_fx.ops.keys import key_dir, key_file_name
 from agentic_fx.loops import econ_signal_report
@@ -117,6 +117,9 @@ def read_state(root: Path, *, sleep: Callable[[float], None] = time.sleep,
                 os.close(fd)
 
 
+UNKNOWN_HOLDER = "unknown (daemon 稼働中とみられる)"
+
+
 def _locked_by(root: Path) -> str:
     setup = setup_marker_present(root)
     try:
@@ -124,7 +127,7 @@ def _locked_by(root: Path) -> str:
     except Exception:  # noqa: BLE001 - diagnostic marker reader
         marker = {}
     if marker is None:
-        return "setup" if setup else "unknown (daemon 稼働中とみられる)"
+        return "setup" if setup else UNKNOWN_HOLDER
     feature = marker.get("feature") if isinstance(marker, dict) else None
     enroll = f"enroll:{feature}" if isinstance(feature, str) and feature else "enroll:unknown"
     return enroll + "+setup" if setup else enroll
@@ -157,10 +160,43 @@ def _root_line(root: Path | None) -> tuple[str, ...]:
     return () if root is None else (f"root: {os.path.abspath(root)}",)
 
 
-def render_locked(locked_by: str, *, root: Path | None = None) -> str:
-    return "\n".join(("agentic-fx offline status", *_root_line(root), "instance: locked",
-                      f"locked-by: {locked_by}", _NOTE,
+def render_locked(locked_by: str, *, root: Path | None = None, history: tuple[str, ...] = (),
+                  tz: str | None = None) -> str:
+    """locked の固定 6 行。`history` を渡す (保持者が unknown のときだけ) と、表示 tz の行と
+    評価履歴ブロックを `locked-by` と note の間に足す。"""
+    header = () if tz is None else (display_header(tz),)
+    return "\n".join(("agentic-fx offline status", *_root_line(root), *header, "instance: locked",
+                      f"locked-by: {locked_by}", *history, _NOTE,
                       f"next: {_locked_next(root, locked_by)}")) + "\n"
+
+
+def _locked_history(root: Path, now: datetime | None) -> tuple[str, tuple[str, ...]]:
+    """unknown の locked 向けの評価履歴。設定を 1 度読み、now を 1 度固定し、`mode=ro` 強制の
+    履歴専用接続を 1 度だけ開いて必ず閉じる。送出せず、読めなければ固定理由の行になる。"""
+    state, raw = _settings_text(root)
+    tz = display_timezone_from_text(raw)
+    when = SystemClock().now() if now is None else now
+    conn: sqlite3.Connection | None = None
+    try:
+        _state, settings = _parse_settings(state, raw)
+        reason = None
+        if settings is not None:
+            db_path, kind = _observer_db_path(root)
+            if kind == "file":
+                try:
+                    conn = connect_observer_readonly(db_path, force_ro=True)
+                except Exception:  # noqa: BLE001 - not creating or repairing: report only
+                    conn = None
+            if conn is None:
+                reason = status_history.ReasonCode.DATABASE_UNAVAILABLE
+        history = status_history.collect(root, settings, conn, tz, when, unavailable_reason=reason)
+        return tz, status_history.render(history, tz)
+    except Exception:  # noqa: BLE001 - history is fail-soft; locked info is always shown
+        return tz, status_history.render(status_history.unavailable(
+            when, status_history.ReasonCode.HISTORY_CHECK_UNAVAILABLE), tz)
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 @dataclass(frozen=True)
@@ -181,20 +217,35 @@ class StatusData:
     display_timezone: str = "UTC"
     warnings: tuple[str, ...] = ()
     econ: tuple[str, ...] = ()
-    evaluation_history: tuple[str, ...] = ()
+    history: status_history.HistoryStatus | None = None
+
+    @property
+    def evaluation_history(self) -> tuple[str, ...]:
+        return () if self.history is None else status_history.render(
+            self.history, self.display_timezone)
 
 
-def _settings(root: Path) -> tuple[str, Any | None]:
+def _settings_text(root: Path) -> tuple[str, str | None]:
+    """設定ファイルを 1 度だけ読む。(state, 本文)。読めなければ本文は None。"""
     try:
-        raw = (Path(root) / "config" / "settings.yaml").read_text(encoding="utf-8")
+        return "ok", (Path(root) / "config" / "settings.yaml").read_text(encoding="utf-8")
     except FileNotFoundError:
         return "missing", None
     except (OSError, UnicodeDecodeError):
         return "invalid", None
+
+
+def _parse_settings(state: str, raw: str | None) -> tuple[str, Any | None]:
+    if raw is None:
+        return state, None
     try:
         return "ok", load_settings_text(raw)
     except Exception:  # noqa: BLE001 - validation is display-only
         return "invalid", None
+
+
+def _settings(root: Path) -> tuple[str, Any | None]:
+    return _parse_settings(*_settings_text(root))
 
 
 def _unit(run: Callable[..., Any], unit_path: Path) -> tuple[tuple[str, str, str], bool]:
@@ -348,8 +399,9 @@ def collect_status(root: Path, *, run: Callable[..., Any] = subprocess.run,
         setup_state, setup_bad = read_setup_record(root).state, False
     except Exception:  # noqa: BLE001 - each source is independent
         setup_state, setup_bad = "unavailable", True
-    settings_state, settings_value = _settings(root)
-    tz = read_display_timezone(Path(root) / "config" / "settings.yaml")
+    settings_text_state, settings_raw = _settings_text(root)
+    settings_state, settings_value = _parse_settings(settings_text_state, settings_raw)
+    tz = display_timezone_from_text(settings_raw)
     warnings: list[str] = []
     if settings_value is not None:
         note = region_name_warning(getattr(settings_value, "display_timezone", None))
@@ -427,11 +479,17 @@ def render_status(data: StatusData, *, root: Path | None = None) -> str:
     return "\n".join(lines) + "\n"
 
 
-def main(root: Path, *, run: Callable[..., Any] = subprocess.run) -> int:
+def main(root: Path, *, run: Callable[..., Any] = subprocess.run,
+         now: datetime | None = None) -> int:
     """Print offline state and return a diagnostic exit status."""
     instance = probe_instance_lock(root)
     if instance == "locked":
-        print(render_locked(_locked_by(root), root=root), end="")
+        holder = _locked_by(root)
+        if holder == UNKNOWN_HOLDER:
+            tz, history = _locked_history(root, now)
+            print(render_locked(holder, root=root, history=history, tz=tz), end="")
+        else:
+            print(render_locked(holder, root=root), end="")
         return 0
     data = collect_status(root, run=run, instance=instance)
     print(render_status(data, root=root), end="")

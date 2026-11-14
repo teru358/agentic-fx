@@ -3,17 +3,22 @@ from __future__ import annotations
 
 import builtins
 import fcntl
+import hashlib
 import os
+import sqlite3
 import threading
+import time
+from pathlib import Path
 
 import pytest
 
 from agentic_fx import status
 from agentic_fx.ops.contracts import Principal
 from agentic_fx.ops.keys import key_dir
+from agentic_fx.store.db import connect, connect_observer_readonly
 from agentic_fx.store.instance_lock import acquire_instance_lock
 from tests.status_support import (
-    NOTE, UNKNOWN_HOLDER, held_by_other_process, make_db, make_run, manifest, state_json, touch_lock,
+    NOTE, NOW, UNKNOWN_HOLDER, add_sidecars, held_by_other_process, make_db, make_run, manifest, state_json, touch_lock,
     write_activity, write_enroll_marker, write_key, write_settings, write_setup, write_setup_marker,
     write_state,
 )
@@ -21,6 +26,7 @@ from tests.status_support import (
 JOURNAL = "journalctl --user -u afx.service (operator の鍵が無いため afx ctl status は使えません)"
 READERS = ("read_state", "connect_observer_readonly", "tail_lines", "collect_status", "read_setup_record",
            "count_open_readonly", "collect_pending_facts", "pending_steps", "load_settings_text")
+HISTORY_READERS = ("connect_observer_readonly", "load_settings_text")
 
 
 @pytest.fixture(autouse=True)
@@ -28,7 +34,7 @@ def unit_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(status, "default_unit_dir", lambda: tmp_path / "unit")
 
 
-def _forbid_readers(monkeypatch):
+def _forbid_readers(monkeypatch, *, allow=()):
     calls = []
 
     def forbid(name):
@@ -38,7 +44,8 @@ def _forbid_readers(monkeypatch):
         return spy
 
     for name in READERS:
-        monkeypatch.setattr(status, name, forbid(name))
+        if name not in allow:
+            monkeypatch.setattr(status, name, forbid(name))
     return calls
 
 
@@ -102,6 +109,17 @@ def test_locked_output_is_six_exact_lines_for_every_holder(tmp_path, monkeypatch
     assert (manifest(key_dir(root)) if key_dir(root).exists() else {}) == before_keys
 
 
+UNKNOWN_NO_SETTINGS = ("agentic-fx offline status", "root: {root}", "表示 tz: UTC (+00:00)",
+                       "instance: locked", f"locked-by: {UNKNOWN_HOLDER}",
+                       "evaluation history: unavailable", "  reason: settings_unavailable",
+                       "  next: 上の reason に沿って設定・DB・no-bars 一覧を確認し、`afx status` を再実行",
+                       NOTE, "next: {next}")
+
+
+def _expected_unknown_without_settings(root, next_step):
+    return "\n".join(line.format(root=root, next=next_step) for line in UNKNOWN_NO_SETTINGS) + "\n"
+
+
 @pytest.mark.parametrize("keys,expected", [("operator", "afx ctl status"), ("approver", "afx ctl status"),
                                            ("none", JOURNAL)])
 def test_locked_with_no_marker_depends_on_the_key_files(tmp_path, monkeypatch, capsys, keys, expected):
@@ -109,12 +127,14 @@ def test_locked_with_no_marker_depends_on_the_key_files(tmp_path, monkeypatch, c
     lock = touch_lock(root)
     if keys != "none":
         write_key(root, Principal.OPERATOR if keys == "operator" else Principal.APPROVER)
-    _forbid_readers(monkeypatch)
+    calls = _forbid_readers(monkeypatch, allow=HISTORY_READERS)
 
     with held_by_other_process(lock):
         assert status.main(root) == 0
 
-    assert capsys.readouterr().out == _expected_locked(root, UNKNOWN_HOLDER, expected)
+    out = capsys.readouterr()
+    assert out.out == _expected_unknown_without_settings(root, expected)
+    assert out.err == "" and calls == []
 
 
 def test_locked_next_is_chosen_without_reading_key_contents(tmp_path, monkeypatch, capsys):
@@ -138,10 +158,259 @@ def test_locked_next_is_chosen_without_reading_key_contents(tmp_path, monkeypatc
         with held_by_other_process(lock):
             assert status.main(root) == 0
     try:
-        assert capsys.readouterr().out == _expected_locked(root, UNKNOWN_HOLDER, "afx ctl status")
+        assert capsys.readouterr().out == _expected_unknown_without_settings(root, "afx ctl status")
         assert not [name for name in opened if name.endswith(".token")]
     finally:
         os.chmod(path, 0o600)
+
+
+# locked: which holders may read the evaluation history
+
+def _history_root(tmp_path, *, sidecar=False):
+    """settings (eval_source mt5) と空の履歴 DB を持つ root。"""
+    root = _root(tmp_path)
+    write_settings(root, "ok")
+    path = root / "config" / "settings.yaml"
+    path.write_text(path.read_text(encoding="utf-8").replace('eval_source: "none"', 'eval_source: "mt5"', 1),
+                    encoding="utf-8")
+    db = make_db(root)
+    if sidecar:
+        add_sidecars(db)
+    return root, touch_lock(root), db
+
+
+@pytest.mark.parametrize("holder", sorted(HOLDERS))
+def test_only_unknown_reads_history_so_every_other_holder_keeps_the_six_lines(
+        tmp_path, monkeypatch, capsys, holder):
+    spec = HOLDERS[holder]
+    root, lock, _db = _history_root(tmp_path)
+    if spec["setup"]:
+        write_setup_marker(root)
+    if spec["enroll"] is not None:
+        write_enroll_marker(root, spec["enroll"])
+    calls = _forbid_readers(monkeypatch)
+
+    with held_by_other_process(lock):
+        assert status.main(root, now=NOW) == 0
+
+    out = capsys.readouterr()
+    assert out.out == _expected_locked(root, spec["locked_by"], spec["next"])
+    assert out.err == "" and calls == []
+
+
+def test_an_unlisted_future_holder_is_denied_by_default(tmp_path, monkeypatch, capsys):
+    root, lock, _db = _history_root(tmp_path)
+    write_key(root, Principal.OPERATOR)
+    monkeypatch.setattr(status, "_locked_by", lambda _root: "future-holder")
+    calls = _forbid_readers(monkeypatch)
+    with held_by_other_process(lock):
+        assert status.main(root, now=NOW) == 0
+    out = capsys.readouterr()
+    assert out.out == _expected_locked(root, "future-holder", "afx ctl status")
+    assert calls == [] and out.err == ""
+
+
+def test_unknown_shows_the_history_block_in_the_display_zone_and_keeps_the_locked_lines(
+        tmp_path, monkeypatch, capsys):
+    root, lock, _db = _history_root(tmp_path)
+    key = write_key(root, Principal.OPERATOR)
+    calls = _forbid_readers(monkeypatch, allow=HISTORY_READERS)
+    ran = []
+
+    with held_by_other_process(lock):
+        assert status.main(root, now=NOW, run=lambda *a, **k: ran.append(a)) == 0
+
+    out = capsys.readouterr()
+    lines = out.out.splitlines()
+    assert out.err == "" and calls == [] and ran == [] and key.exists()
+    assert lines[:3] == ["agentic-fx offline status", f"root: {root}", lines[2]]
+    assert lines[2].startswith("表示 tz: ")
+    assert lines[3:5] == ["instance: locked", f"locked-by: {UNKNOWN_HOLDER}"]
+    assert lines[5].startswith("evaluation history: history_stale")
+    assert "checked at 2026-10-25 09:00:00 +09:00" in out.out
+    assert lines[-2:] == [NOTE, "next: afx ctl status"]
+    assert [l for l in lines if l.startswith("next: ")] == ["next: afx ctl status"]
+
+
+def test_unknown_history_matches_the_free_path_block_for_the_same_now(tmp_path, monkeypatch, capsys):
+    root, lock, _db = _history_root(tmp_path)
+    free = status.collect_status(root, run=make_run(), instance="free", now=NOW).evaluation_history
+    with held_by_other_process(lock):
+        assert status.main(root, now=NOW) == 0
+    locked = capsys.readouterr().out.splitlines()
+    start = locked.index(free[0])
+    assert tuple(locked[start:start + len(free)]) == free
+
+
+def test_unknown_with_unreadable_settings_does_not_open_the_database(tmp_path, monkeypatch, capsys):
+    root, lock, _db = _history_root(tmp_path)
+    (root / "config" / "settings.yaml").write_text("pairs: [[[not valid\n", encoding="utf-8")
+    calls = _forbid_readers(monkeypatch, allow=("load_settings_text",))
+    with held_by_other_process(lock):
+        assert status.main(root, now=NOW) == 0
+    out = capsys.readouterr()
+    assert "reason: settings_unavailable" in out.out and "evaluation history: ready" not in out.out
+    assert calls == [] and out.err == ""
+
+
+def test_unknown_with_a_missing_database_reports_database_unavailable(tmp_path, capsys):
+    root, lock, db = _history_root(tmp_path)
+    os.unlink(db)
+    with held_by_other_process(lock):
+        assert status.main(root, now=NOW) == 0
+    out = capsys.readouterr()
+    assert "evaluation history: unavailable" in out.out and "reason: database_unavailable" in out.out
+    assert "instance: locked" in out.out and out.err == ""
+    assert not db.exists()                                             # 作って補わない
+
+
+def test_unknown_with_a_failing_open_or_check_gives_fixed_reasons_without_leaking(
+        tmp_path, monkeypatch, capsys):
+    root, lock, _db = _history_root(tmp_path)
+
+    def broken_open(*_a, **_k):
+        raise sqlite3.OperationalError("secret-canary-open")
+
+    monkeypatch.setattr(status, "connect_observer_readonly", broken_open)
+    with held_by_other_process(lock):
+        assert status.main(root, now=NOW) == 0
+    first = capsys.readouterr()
+    assert "reason: database_unavailable" in first.out
+
+    monkeypatch.setattr(status, "connect_observer_readonly", lambda *a, **k: sqlite3.connect(":memory:"))
+
+    def broken_collect(*_a, **_k):
+        raise RuntimeError("secret-canary-check")
+
+    monkeypatch.setattr(status.status_history, "collect", broken_collect)
+    with held_by_other_process(lock):
+        assert status.main(root, now=NOW) == 0
+    second = capsys.readouterr()
+    assert "reason: history_check_unavailable" in second.out
+    for out in (first, second):
+        assert out.err == ""
+        assert "secret-canary" not in out.out and "OperationalError" not in out.out
+        assert "RuntimeError" not in out.out and "Traceback" not in out.out
+
+
+def test_unknown_with_a_corrupt_database_file_reports_the_check_as_unavailable(tmp_path, capsys):
+    root, lock, db = _history_root(tmp_path)
+    db.write_bytes(b"not a database" * 100)
+    with held_by_other_process(lock):
+        assert status.main(root, now=NOW) == 0
+    out = capsys.readouterr()
+    assert "reason: history_check_unavailable" in out.out and out.err == ""
+
+
+@pytest.mark.parametrize("sidecar", [False, True])
+def test_unknown_connection_is_mode_ro_without_immutable_and_waits_one_second(
+        tmp_path, monkeypatch, capsys, sidecar):
+    root, lock, _db = _history_root(tmp_path, sidecar=sidecar)
+    seen = []
+    real = sqlite3.connect
+
+    def spy(database, *args, **kwargs):
+        seen.append((str(database), kwargs.get("timeout")))
+        return real(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    with held_by_other_process(lock):
+        assert status.main(root, now=NOW) == 0
+    monkeypatch.setattr(sqlite3, "connect", real)
+    out = capsys.readouterr()
+    uris = [(uri, timeout) for uri, timeout in seen if "agentic.db" in uri]
+    assert uris, "the history connection must be opened"
+    for uri, timeout in uris:
+        assert "mode=ro" in uri and "immutable" not in uri and "mode=rw" not in uri
+        assert timeout == 1.0
+    assert out.err == ""
+
+
+def test_the_observer_helper_forces_ro_but_keeps_its_default_for_other_callers(tmp_path, monkeypatch):
+    root, _lock, _db = _history_root(tmp_path)
+    uris = []
+    real = sqlite3.connect
+
+    def spy(database, *args, **kwargs):
+        uris.append(str(database))
+        return real(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    path = root / "data" / "agentic.db"
+    connect_observer_readonly(path).close()
+    connect_observer_readonly(path, force_ro=True).close()
+    monkeypatch.setattr(sqlite3, "connect", real)
+    assert uris[0].endswith("mode=ro&immutable=1")
+    assert uris[1].endswith("mode=ro") and "immutable" not in uris[1]
+
+
+def test_unknown_reads_only_committed_rows_and_never_changes_the_main_database(tmp_path, capsys):
+    root, lock, db = _history_root(tmp_path)
+    digest = hashlib.sha256(db.read_bytes()).hexdigest()
+    writer = connect(db)
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute(
+        "INSERT INTO ohlcv_history (symbol, interval, bar_time, open, high, low, close, volume, "
+        "source, spread) VALUES ('USDJPY','5m','2026-10-24T23:50:00+00:00',1,1,1,1,1,'mt5',NULL)")
+    try:
+        with held_by_other_process(lock):
+            assert status.main(root, now=NOW) == 0
+    finally:
+        writer.rollback()
+        writer.close()
+    out = capsys.readouterr()
+    assert "evaluation history:" in out.out and "reason: history_check_unavailable" not in out.out
+    assert "latest stored unavailable" in out.out                       # 未 commit の行は見えない
+    assert out.err == ""
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == digest
+
+
+def test_unknown_leaves_only_wal_sidecars_changed_and_closes_its_connection(tmp_path, monkeypatch, capsys):
+    root, lock, db = _history_root(tmp_path)
+    before = manifest(root)
+    closed = []
+    real = status.connect_observer_readonly
+
+    class Tracked:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def close(self):
+            closed.append(True)
+            self._conn.close()
+
+    monkeypatch.setattr(status, "connect_observer_readonly", lambda *a, **k: Tracked(real(*a, **k)))
+    with held_by_other_process(lock):
+        assert status.main(root, now=NOW) == 0
+    after = manifest(root)
+    changed = {k for k in set(before) | set(after) if before.get(k) != after.get(k)}
+    assert changed <= {"data/agentic.db-wal", "data/agentic.db-shm"}
+    assert after["data/agentic.db"] == before["data/agentic.db"]
+    assert closed == [True]
+    assert capsys.readouterr().err == ""
+
+
+def test_unknown_waits_at_most_one_second_for_a_busy_database(tmp_path, capsys):
+    root, lock, db = _history_root(tmp_path)
+    conn = sqlite3.connect(db)
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.close()
+    blocker = sqlite3.connect(db, isolation_level=None)
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        started = time.monotonic()
+        with held_by_other_process(lock):
+            assert status.main(root, now=NOW) == 0
+        elapsed = time.monotonic() - started
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+    out = capsys.readouterr()
+    assert "reason: history_check_unavailable" in out.out and out.err == ""
+    assert 0.9 <= elapsed < 4.0
 
 
 # state reader
@@ -506,3 +775,36 @@ def test_the_instance_lock_is_taken_shared_at_most_once_per_run(tmp_path, monkey
     shared = [operation for operation in log if operation & fcntl.LOCK_SH]
     assert len(shared) == (1 if instance == "free" else 0)
     assert not [operation for operation in log if operation & fcntl.LOCK_EX]
+
+
+def test_unknown_reads_the_settings_file_once_for_both_the_zone_and_the_history(
+        tmp_path, monkeypatch, capsys):
+    root, lock, _db = _history_root(tmp_path)
+    write_key(root, Principal.OPERATOR)
+    target = root / "config" / "settings.yaml"
+    real_read_text = Path.read_text
+    reads = []
+
+    def counting(self, *args, **kwargs):
+        if self == target:
+            reads.append(str(self))
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counting)
+    with held_by_other_process(lock):
+        assert status.main(root, now=NOW) == 0
+    assert len(reads) == 1
+    assert capsys.readouterr().out.count("evaluation history:") == 1
+
+
+def test_unknown_with_an_unconfigured_source_and_no_database_says_not_configured(
+        tmp_path, monkeypatch, capsys):
+    root = _root(tmp_path)
+    write_settings(root, "ok")
+    touch = touch_lock(root)
+    write_key(root, Principal.OPERATOR)
+    with held_by_other_process(touch):
+        assert status.main(root, now=NOW) == 0
+    out = capsys.readouterr().out
+    assert "evaluation history: not configured" in out
+    assert "database_unavailable" not in out

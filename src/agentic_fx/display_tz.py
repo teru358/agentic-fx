@@ -8,6 +8,21 @@ import yaml
 from agentic_fx.core.display_time import effective_tz_name
 
 
+def display_timezone_from_text(text: str | None) -> str:
+    """読み済みの `settings.yaml` の本文から `display_timezone` だけを解釈する。
+
+    送出しない。本文が無い・壊れている・tz として読めないときは `UTC`。
+    """
+    if text is None:
+        return "UTC"
+    try:
+        data = yaml.safe_load(text)
+        name = data.get("display_timezone") if isinstance(data, dict) else None
+    except Exception:  # noqa: BLE001 — 読めなければ UTC
+        return "UTC"
+    return effective_tz_name(name)
+
+
 def read_display_timezone(settings_path: Path) -> str:
     """`settings.yaml` の `display_timezone` だけを読む。
 
@@ -15,11 +30,10 @@ def read_display_timezone(settings_path: Path) -> str:
     `.env` も他の設定も読まない (鍵が無い環境でも表示 tz だけは決まる)。
     """
     try:
-        data = yaml.safe_load(Path(settings_path).read_text(encoding="utf-8"))
-        name = data.get("display_timezone") if isinstance(data, dict) else None
+        text = Path(settings_path).read_text(encoding="utf-8")
     except Exception:  # noqa: BLE001 — 読めなければ UTC
         return "UTC"
-    return effective_tz_name(name)
+    return display_timezone_from_text(text)
 
 
 def is_region_name(name: object) -> bool:

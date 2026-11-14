@@ -71,9 +71,9 @@ web の承認ページと Discord の承認カードにも同じ内容が出ま�
 
 time repair だけでなく、評価用履歴が古い・欠けているときも、この手順で再評価します。新しい holdout 評価と採用は、評価用履歴の鮮度と充足を満たさないと止まります (改善の in-sample は続きます)。既存の配備と資金保護は、この検査で自動停止しません。
 
-1. `afx status` の `evaluation history` で、主 pair の最新確定足・充足率・60 分を超える日別欠損を確かめます。取得も修復もしないので、足りなければ開場中に `afx history import --source mt5` で補います。閉場中に bridge が 503 を返したら、開場後に再試行するか、期間を分けて取り、取得後にもう一度 `afx status` で日別の充足を確かめます。最新足が更新されただけで完了にしません。
+1. `afx status` の `evaluation history` で、主 pair の最新確定足・充足率・60 分を超える日別欠損を確かめます。取得も修復もしないので、stale / gap と出たときだけ、daemon を止めて開場中に `afx history import --source mt5` で補います (ready のときは案内は出ません)。閉場中に bridge が 503 を返したら、開場後に再試行するか、期間を分けて取り、取得後にもう一度 `afx status` で日別の充足を確かめます。最新足が更新されただけで完了にしません。
 2. broker の休場で足が無い日だと確認できたときだけ、`config/history-no-bars.yaml` に 1 系列・1 日の項目を足します (例は `config/history-no-bars.yaml.example`。実ファイルは gitignore 対象で、`reason` `approved_by` `approved_at` は確認した人が書く)。履歴の行は消さず補間もしません。足したら `afx status` の `no-bars applied` で、検査の対象範囲に当たる項目と digest を確かめます。壊れた一覧は空として続けず、検査が判定不能になります。
-3. `afx plugin reevaluate --all-deployed --yes` を実行します。通常の import でも `history_epoch` は変わらないので、穴埋め後は新しい依頼が作られます。
+3. 再評価は status の充足から推測しません。履歴を補ったあと、承認や gate が出した具体的な結果 (`history_not_ready` や下の表の `pending` / `invalidated` など) が再評価を求めているときに `afx plugin reevaluate --all-deployed --yes` を実行します。通常の import でも `history_epoch` は変わらないので、穴埋め後は新しい依頼が作られます。
 
 ### guard の規則版と `existing`
 

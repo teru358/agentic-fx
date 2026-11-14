@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import itertools
 import logging
 import math
 import sqlite3
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from agentic_fx.core.contracts import Bar
-from agentic_fx.store import db
+from agentic_fx.core.history_epoch import history_epoch
+from agentic_fx.store import db, history_conflicts
 from agentic_fx.store.db import FLOAT_TOL
 
 _log = logging.getLogger("agentic_fx.store.ohlcv")
@@ -242,14 +246,7 @@ class ImportResult:
 
 
 def _close_enough(a: float | None, b: float | None) -> bool:
-    # /code-review 2 周目 CR6 是正 (2026-09-12): `db._values_match`
-    # (公開名 `db.values_match`) へ委譲する — このモジュールの独自複製を
-    # 廃止する。`db._values_match` は frozen `_FLOAT_TOL` (import 時点の
-    # 値) を閉じているため、`ohlcv._FLOAT_TOL` (同じく frozen、モジュール
-    # 冒頭で束縛済み) と挙動は完全に一致する
-    # (`test_store_float_tolerance_is_shared_and_has_the_same_boundaries`
-    # が `db.FLOAT_TOL` を monkeypatch しても両者の判定境界が変わらない
-    # ことを pin している — この委譲後も成立する)。
+    # 許容差の判定は `db.values_match` が唯一の定義。ここに独自の複製を持たない。
     return db.values_match(a, b)
 
 
@@ -307,8 +304,12 @@ def _validate_and_normalize_row(idx: int, row: tuple) -> tuple:
 
 def import_history_bars(conn: sqlite3.Connection, rows: list[tuple], *,
                         source: str, commit: bool = True) -> ImportResult:
-    """一括インポータ用。既存行は不変 — 同一キー同一値は無変更 (unchanged)、
-    値が異なる既存行は入力をスキップして件数だけ計上する (conflicted)。
+    """衝突を記録しない低水準の投入。履歴取込の経路ではない。
+
+    取込 (MT5 / Dukascopy の import) は `history_import.run_series` を通り、衝突の記録・
+    事前遮断・batch 確定は `classify_history_rows` / `apply_classified_history` が担う。
+    この関数は既存行を変えず (同値は unchanged、異値は入力を捨てて conflicted と数える)、
+    異値の記録も遮断もしない。fixture の下地など、記録が要らない投入だけに使う。
 
     rows: (symbol, interval, bar_time_iso, o, h, l, c, volume, spread|None)
 
@@ -316,13 +317,12 @@ def import_history_bars(conn: sqlite3.Connection, rows: list[tuple], *,
     source 名 (例: "yfinance") をここから書くと `ohlcv_history` の
     「削除しない」保証をライブキャッシュの上書きセマンティクスで穢すため。
 
-    バッチ原子性: (1) 書き込み前に全行を検証・正規化し、(2) 実際の書き込みは
-    `SAVEPOINT` で明示的に囲み、例外時は `ROLLBACK TO SAVEPOINT` してから
-    再送出する。
+    原子性: 書き込み前に全行を検証・正規化し、書き込みは `SAVEPOINT` で囲んで、
+    例外時は `ROLLBACK TO SAVEPOINT` してから再送出する。
 
-    `commit=False` は呼び出し側の transaction の中で複数回に分けて書くとき
-    の指定で、commit も rollback もしない (呼び出し側が決める)。transaction
-    の外で指定すると最外の SAVEPOINT の RELEASE が commit になるので拒否する。
+    `commit=False` は呼び出し側の transaction の中で書くときの指定で、commit も
+    rollback もしない。transaction の外で指定すると最外の SAVEPOINT の RELEASE が
+    commit になるので拒否する。
     """
     if source not in IMPORT_SOURCES:
         raise ValueError(
@@ -342,10 +342,7 @@ def import_history_bars(conn: sqlite3.Connection, rows: list[tuple], *,
     conn.execute("SAVEPOINT import_history_bars")
     try:
         # 行単位ループは意図的 — inserted/unchanged/conflicted の三分計上は
-        # 集合演算 (executemany + 一括 diff) では再現できない。migration 側を
-        # 集合演算にしたのはロック保持時間の制約によるもので、ここはプロファイル
-        # が別 (前景・窓分割済み・SAVEPOINT 直後に commit)。1 コールで 10 万行
-        # 超を流す呼び出し元が生まれたら再評価する (実測 10 万行 0.33s)。
+        # 集合演算 (executemany + 一括 diff) では再現できない。fixture 用の小さな投入が前提。
         for (symbol, interval, bar_time_iso, o, h, l, c, volume,  # noqa: E741
              spread) in normalized_rows:
             cur = conn.execute(
@@ -393,6 +390,401 @@ def import_history_bars(conn: sqlite3.Connection, rows: list[tuple], *,
             "for source=%s (existing rows left unchanged)",
             conflicted, source)
     return ImportResult(inserted, unchanged, conflicted, tuple(conflicts))
+
+
+# ---- 履歴の取込 core: 分類 → 事前遮断 → batch 確定 --------------------------
+
+CIRCUIT_MAX_NEW_CONFLICTS = 20
+CIRCUIT_MIN_NEW_FOR_RATIO = 2
+BATCH_MAX_ROWS = 5000
+BATCH_BUDGET_SECONDS = 0.05
+ORIGINS = ("import", "sync", "live_compare")
+
+_VALUE_COLUMNS = ("open", "high", "low", "close", "volume", "spread")
+
+
+class InconsistentInputError(ValueError):
+    """The same bar key arrived with different values inside one input."""
+
+
+def conflict_circuit_open(new_conflicts: int, n_test: int) -> bool:
+    """新規の異値だけで数える事前遮断。1% ちょうどは通し、新規 1 件の孤立は割合に掛けない。"""
+    return (new_conflicts > CIRCUIT_MAX_NEW_CONFLICTS
+            or (new_conflicts >= CIRCUIT_MIN_NEW_FOR_RATIO
+                and 100 * new_conflicts > n_test))
+
+
+def inspection_tail_bars(bar_seconds: int) -> int:
+    """直前 2 時間相当の確定格子数 K = ceil(2h / 足幅)。"""
+    if bar_seconds < 1:
+        raise ValueError("bar_seconds must be >= 1")
+    return -(-7200 // bar_seconds)
+
+
+def inspection_sufficient(n_overlap: int, n_test: int, tail_bars: int) -> bool:
+    return n_overlap >= tail_bars and n_test >= 2
+
+
+@dataclass(frozen=True)
+class ClassifiedRow:
+    kind: str                       # "new" | "unchanged" | "conflict"
+    symbol: str
+    interval: str
+    bar_time: str
+    incoming: tuple
+    existing: tuple | None = None
+    known: bool = False
+
+
+@dataclass(frozen=True)
+class HistoryClassification:
+    source: str
+    epoch: str
+    entries: tuple[ClassifiedRow, ...]
+
+    def _count(self, kind: str, known: bool | None = None) -> int:
+        return sum(1 for e in self.entries if e.kind == kind
+                   and (known is None or e.known is known))
+
+    @property
+    def new_rows(self) -> int:
+        return self._count("new")
+
+    @property
+    def unchanged(self) -> int:
+        return self._count("unchanged")
+
+    @property
+    def conflicts_new(self) -> int:
+        return self._count("conflict", False)
+
+    @property
+    def conflicts_known(self) -> int:
+        return self._count("conflict", True)
+
+    @property
+    def n_test(self) -> int:
+        return self.unchanged + self.conflicts_new
+
+    @property
+    def n_overlap(self) -> int:
+        return self.unchanged + self.conflicts_new + self.conflicts_known
+
+    @property
+    def circuit_open(self) -> bool:
+        return conflict_circuit_open(self.conflicts_new, self.n_test)
+
+    def top_new_conflicts(self, limit: int = 5) -> tuple[ClassifiedRow, ...]:
+        return tuple([e for e in self.entries
+                      if e.kind == "conflict" and not e.known][:limit])
+
+
+@dataclass(frozen=True)
+class BatchProgress:
+    batch_bar_time_end: str
+    resume_from: str | None
+    rows_in_batch: int
+    committed_entries: int
+
+
+@dataclass(frozen=True)
+class ApplyResult:
+    status: str                     # "ok" | "partial" | "failed"
+    inserted: int
+    unchanged: int
+    conflicted_new: int
+    conflicted_known: int
+    last_committed_bar_time: str | None
+    resume_from: str | None
+    failure: str | None = None
+    error_type: str | None = None
+
+    @property
+    def conflicted(self) -> int:
+        return self.conflicted_new + self.conflicted_known
+
+
+# 1 回の問い合わせに渡す key の数 (SQLite の変数上限に十分収まる)。
+_QUERY_CHUNK = 400
+
+
+def _existing_values(conn: sqlite3.Connection, keys: list[tuple], source: str,
+                     ) -> dict[tuple, tuple]:
+    """(symbol, interval, bar_time) の列について、既存行の値を (key → 値) で返す。"""
+    found: dict[tuple, tuple] = {}
+    groups: dict[tuple, list[str]] = {}
+    for symbol, interval, bar_time in keys:
+        groups.setdefault((symbol, interval), []).append(bar_time)
+    for (symbol, interval), times in groups.items():
+        marks = ",".join("?" * len(times))
+        for row in conn.execute(
+                "SELECT bar_time, open, high, low, close, volume, spread FROM ohlcv_history "
+                f"WHERE symbol=? AND interval=? AND source=? AND bar_time IN ({marks})",
+                (symbol, interval, source, *times)):
+            found[(symbol, interval, row["bar_time"])] = tuple(
+                row[name] for name in _VALUE_COLUMNS)
+    return found
+
+
+def _upcoming_keys(entries, start: int) -> list[tuple]:
+    """start 以降の、適用時に再照合が要る (new 以外の) 行の key を最大 1 chunk 分。"""
+    keys = []
+    for entry in itertools.islice(entries, start, None):
+        if entry.kind != "new":
+            keys.append((entry.symbol, entry.interval, entry.bar_time))
+            if len(keys) >= _QUERY_CHUNK:
+                break
+    return keys
+
+
+def _known_conflict_keys(conn: sqlite3.Connection, source: str, epoch: str,
+                         pending: list[tuple]) -> set[tuple]:
+    """現在の epoch で open / kept の衝突記録の (symbol, interval, bar_time, 両 digest)。"""
+    known: set[tuple] = set()
+    groups: dict[tuple, list[str]] = {}
+    for _index, symbol, interval, bar_time, _incoming, _existing in pending:
+        groups.setdefault((symbol, interval), []).append(bar_time)
+    for (symbol, interval), times in groups.items():
+        marks = ",".join("?" * len(times))
+        for row in conn.execute(
+                "SELECT bar_time, existing_digest, incoming_digest FROM history_conflicts "
+                "WHERE source=? AND interval=? AND symbol=? AND history_epoch=? "
+                f"AND state IN ('open','kept') AND bar_time IN ({marks})",
+                (source, interval, symbol, epoch, *times)):
+            known.add((symbol, interval, row["bar_time"],
+                       row["existing_digest"], row["incoming_digest"]))
+    return known
+
+
+
+class ClassificationExpired(Exception):
+    """分類の途中で、呼出し側が渡した期限を過ぎた。"""
+
+
+def classify_history_rows(conn: sqlite3.Connection, rows: list[tuple], *,
+                          source: str,
+                          expired: "Callable[[], bool] | None" = None) -> HistoryClassification:
+    """書込みなしで入力を new / unchanged / conflict に分ける。
+
+    入力内の同一 key は 1 つに正規化し、値が異なれば InconsistentInputError。
+    衝突は現在の epoch と digest 完全一致で open / kept の既知記録があれば known。
+    """
+    if source not in IMPORT_SOURCES:
+        raise ValueError(
+            f"classify_history_rows: source={source!r} は IMPORT_SOURCES "
+            f"{sorted(IMPORT_SOURCES)} に含まれません")
+    normalized = [_validate_and_normalize_row(i, row) for i, row in enumerate(rows)]
+    if len({(row[0], row[1]) for row in normalized}) > 1:
+        raise InconsistentInputError(
+            "classify_history_rows: input mixes more than one (symbol, interval) series")
+    seen: dict[tuple, tuple] = {}
+    for symbol, interval, bar_time, o, h, l, c, volume, spread in normalized:  # noqa: E741
+        key = (symbol, interval, bar_time)
+        values = (o, h, l, c, volume, spread)
+        prior = seen.get(key)
+        if prior is None:
+            seen[key] = values
+        elif not history_conflicts.values_equal(prior, values):
+            raise InconsistentInputError(
+                f"classify_history_rows: input has differing values for one bar key "
+                f"({symbol} {interval} {bar_time})")
+    epoch = history_epoch(conn)
+    ordered = sorted(seen.items(), key=lambda kv: (kv[0][2], kv[0][0], kv[0][1]))
+    entries = []
+    for start in range(0, len(ordered), _QUERY_CHUNK):
+        if expired is not None and expired():
+            raise ClassificationExpired()
+        chunk = ordered[start:start + _QUERY_CHUNK]
+        existing_by_key = _existing_values(conn, [key for key, _ in chunk], source)
+        pending = []
+        for (symbol, interval, bar_time), incoming in chunk:
+            existing = existing_by_key.get((symbol, interval, bar_time))
+            if existing is None:
+                entries.append(ClassifiedRow("new", symbol, interval, bar_time, incoming))
+            elif history_conflicts.values_equal(existing, incoming):
+                entries.append(ClassifiedRow("unchanged", symbol, interval, bar_time,
+                                             incoming, existing))
+            else:
+                pending.append((len(entries), symbol, interval, bar_time, incoming, existing))
+                entries.append(None)
+        if pending:
+            known = _known_conflict_keys(conn, source, epoch, pending)
+            for index, symbol, interval, bar_time, incoming, existing in pending:
+                _ej, existing_digest = history_conflicts.canonical_values(existing)
+                _ij, incoming_digest = history_conflicts.canonical_values(incoming)
+                entries[index] = ClassifiedRow(
+                    "conflict", symbol, interval, bar_time, incoming, existing,
+                    (symbol, interval, bar_time, existing_digest, incoming_digest) in known)
+    return HistoryClassification(source, epoch, tuple(entries))
+
+
+def _failure_code(exc: BaseException) -> str:
+    if isinstance(exc, _EpochChanged):
+        return "epoch_changed"
+    if isinstance(exc, _ConcurrentChange):
+        return "concurrent_change"
+    if isinstance(exc, sqlite3.OperationalError):
+        text = str(exc).lower()
+        if "locked" in text or "busy" in text:
+            return "database_busy"
+    return "write_failed"
+
+
+class _EpochChanged(RuntimeError):
+    pass
+
+
+class _ConcurrentChange(RuntimeError):
+    pass
+
+
+class _StopBeforeCommit(RuntimeError):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+def apply_classified_history(conn: sqlite3.Connection,
+                             classification: HistoryClassification, *,
+                             origin: str, seen_at: datetime | str,
+                             run_id: str | None = None,
+                             max_rows: int = BATCH_MAX_ROWS,
+                             budget_seconds: float = BATCH_BUDGET_SECONDS,
+                             clock=time.monotonic,
+                             on_batch=None, admission=None,
+                             before_batch=None, before_commit=None) -> ApplyResult:
+    """分類済みの系列を短い BEGIN IMMEDIATE batch に分けて確定する。
+
+    各 batch で履歴 INSERT と衝突 upsert を同じ transaction で確定する。
+    `on_batch(conn, BatchProgress)` は commit 直前の同じ transaction で呼ばれ、
+    進捗の永続化に使う。失敗した batch は全て rollback し、確定済みの batch は残す。
+    遮断条件に当たる分類は書込み 0 件のまま拒否する。
+
+    `admission` (WriterAdmission) があれば batch ごとに BEGIN の前から commit / rollback の
+    後まで lease を取る。通らなければ database_busy で止める。`before_batch()` は各 batch の
+    前に呼ばれ、失敗コードの文字列を返すとそこで新しい batch を始めずに止める。
+    `before_commit()` は各 batch の commit 直前に呼ばれ、失敗コードを返すとその batch を
+    rollback して止める。
+    unchanged 行も適用時に既存値を再照合し、変わっていれば concurrent_change で batch を戻す。
+    """
+    if origin not in ORIGINS:
+        raise ValueError(f"apply_classified_history: origin={origin!r} is not in {ORIGINS}")
+    if classification.circuit_open:
+        raise ValueError("apply_classified_history: circuit is open; nothing may be written")
+    if max_rows < 1:
+        raise ValueError("max_rows must be >= 1")
+    if conn.in_transaction:
+        raise ValueError("apply_classified_history: batches need their own transaction")
+    stamp = _iso_utc(seen_at) if isinstance(seen_at, datetime) else seen_at
+    entries = classification.entries
+    total = len(entries)
+    inserted = unchanged = new_c = known_c = 0
+    done = 0
+    failure = error_type = None
+    while done < total:
+        if before_batch is not None:
+            stop = before_batch()
+            if stop is not None:
+                failure = stop
+                break
+        started = clock()
+        batch_end = done
+        b_ins = b_unc = b_new = b_known = 0
+        admitted = False
+        try:
+            if admission is not None:
+                admitted = admission.admit(lambda: conn.execute("BEGIN IMMEDIATE"))
+                if not admitted:
+                    failure = "database_busy"
+                    break
+            else:
+                conn.execute("BEGIN IMMEDIATE")
+            if history_epoch(conn) != classification.epoch:
+                raise _EpochChanged()
+            current_values: dict = {}
+            loaded: set = set()
+            while batch_end < total:
+                entry = entries[batch_end]
+                if entry.kind == "new":
+                    values = entry.incoming
+                    cur = conn.execute(
+                        "INSERT OR IGNORE INTO ohlcv_history (symbol, interval, bar_time, "
+                        "open, high, low, close, volume, source, spread) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (entry.symbol, entry.interval, entry.bar_time, *values[:5],
+                         classification.source, values[5]))
+                    if cur.rowcount != 1:
+                        raise _ConcurrentChange()
+                    b_ins += 1
+                else:
+                    key = (entry.symbol, entry.interval, entry.bar_time)
+                    if key not in loaded:
+                        upcoming = _upcoming_keys(entries, batch_end)
+                        current_values.update(_existing_values(
+                            conn, upcoming, classification.source))
+                        loaded.update(upcoming)
+                    if current_values.get(key) != entry.existing:
+                        raise _ConcurrentChange()
+                if entry.kind == "unchanged":
+                    b_unc += 1
+                elif entry.kind == "conflict":
+                    history_conflicts.upsert(
+                        conn, source=classification.source, interval=entry.interval,
+                        symbol=entry.symbol, bar_time=entry.bar_time,
+                        history_epoch=classification.epoch, existing=entry.existing,
+                        incoming=entry.incoming, origin=origin, seen_at=stamp,
+                        run_id=run_id)
+                    if entry.known:
+                        b_known += 1
+                    else:
+                        b_new += 1
+                batch_end += 1
+                if batch_end - done >= max_rows or clock() - started >= budget_seconds:
+                    break
+            if on_batch is not None:
+                on_batch(conn, BatchProgress(
+                    batch_bar_time_end=entries[batch_end - 1].bar_time,
+                    resume_from=(entries[batch_end].bar_time if batch_end < total else None),
+                    rows_in_batch=batch_end - done, committed_entries=batch_end))
+            if before_commit is not None:
+                stop = before_commit()
+                if stop is not None:
+                    raise _StopBeforeCommit(stop)
+            conn.commit()
+        except _StopBeforeCommit as exc:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            failure = exc.code
+            break
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            failure, error_type = _failure_code(exc), type(exc).__name__
+            break
+        except BaseException:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            if admitted:
+                admission.end()
+        inserted += b_ins
+        unchanged += b_unc
+        new_c += b_new
+        known_c += b_known
+        done = batch_end
+    status = "ok" if failure is None else ("partial" if done > 0 else "failed")
+    return ApplyResult(
+        status, inserted, unchanged, new_c, known_c,
+        entries[done - 1].bar_time if done else None,
+        entries[done].bar_time if done < total else None,
+        failure, error_type)
 
 
 def load_history_bars(conn: sqlite3.Connection, symbol: str, interval: str,

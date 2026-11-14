@@ -31,8 +31,9 @@ from agentic_fx.backtest.holdout import (
 from agentic_fx.backtest.importer import import_dukascopy
 from agentic_fx.backtest.metrics import compute_metrics
 from agentic_fx.backtest.mt5_import import (
-    ImportConflictError, ImportTooLargeError, _is_grid_aligned, compare_sources,
-    effective_import_end, import_mt5)
+    _is_grid_aligned, compare_sources, effective_import_end, import_mt5)
+from agentic_fx.store.history_import import (
+    ImportOutcome, ImportTooLargeError, SeriesOutcome, summarize)
 from agentic_fx.backtest import plugin_deploy_cli
 from agentic_fx.backtest import time_repair
 from agentic_fx.backtest.runner import run_replay
@@ -290,58 +291,124 @@ def _history_import(conn, settings, args: argparse.Namespace) -> int:
         print(f"エラー: --from/--to は {args.interval} 格子に整列が必要です",
               file=sys.stderr)
         return 2
-    if source == "dukascopy":
-        kw = {} if args.max_requests is None else {
-            "max_requests": args.max_requests}
-        result = import_dukascopy(conn, args.symbol, args.from_, args.to,
-                                  progress=_make_dukascopy_progress(), **kw)
-    else:  # mt5
-        bridge_url = settings.datafeed.mt5.bridge_url
-        if bridge_url is None:
-            print("datafeed.mt5.bridge_url が未設定です", file=sys.stderr)
-            return 1
-        grace = timedelta(seconds=settings.datafeed.closed_bar_grace_sec)
-        now = _utc_now()
-        effective_end = effective_import_end(
-            args.to, now, grace=grace, interval=args.interval)
-        print(f"要求終端={args.to.isoformat()} 実効終端={effective_end.isoformat()} "
-              f"(確定済みの直近 1 本分は時計差の余裕として取り込みません)")
-        if args.from_ >= effective_end:
-            print("確定済みの取り込み対象なし (何も取得・書込みしていません)")
-            print("inserted=0 unchanged=0 conflicted=0")
-            return 0
-        try:
-            result = import_mt5(conn, args.symbol, args.from_, args.to,
+    try:
+        if source == "dukascopy":
+            kw = {} if args.max_requests is None else {
+                "max_requests": args.max_requests}
+            series = import_dukascopy(conn, args.symbol, args.from_, args.to,
+                                      progress=_make_dukascopy_progress(), **kw)
+        else:  # mt5
+            bridge_url = settings.datafeed.mt5.bridge_url
+            if bridge_url is None:
+                print("datafeed.mt5.bridge_url が未設定です", file=sys.stderr)
+                return 1
+            grace = timedelta(seconds=settings.datafeed.closed_bar_grace_sec)
+            now = _utc_now()
+            effective_end = effective_import_end(
+                args.to, now, grace=grace, interval=args.interval)
+            print(f"要求終端={args.to.isoformat()} 実効終端={effective_end.isoformat()} "
+                  f"(確定済みの直近 1 本分は時計差の余裕として取り込みません)")
+            if args.from_ >= effective_end:
+                print("確定済みの取り込み対象なし (何も取得・書込みしていません)")
+                print("inserted=0 unchanged=0 conflicted=0")
+                return 0
+            series = import_mt5(conn, args.symbol, args.from_, args.to,
                                 base_url=bridge_url, interval=args.interval,
                                 clock=lambda: now, grace=grace)
-        except ImportConflictError as exc:
-            # codex 2 周目 Minor: stderr だけを保存した運用記録でも conflict 行を
-            # 一意に特定できるよう、主キー全フィールドを出す (CP3b の復旧資料)。
-            for symbol, interval, bar_time, existing, incoming in exc.conflicts:
-                print(f"conflict symbol={symbol} interval={interval} "
-                      f"bar_time={bar_time} existing={existing} "
-                      f"incoming={incoming}", file=sys.stderr)
-            print(f"partial inserted={exc.partial.inserted} "
-                  f"unchanged={exc.partial.unchanged} "
-                  f"conflicted={exc.partial.conflicted}", file=sys.stderr)
-            return 3
-        except ImportTooLargeError as exc:
-            print(f"エラー: {exc}", file=sys.stderr)
-            return 2
-        except BridgeTimeRuleMismatch:
-            print("bridge の時刻規則が broker の時計と一致しません (time_rule_mismatch)。"
-                  "取り込みを中止しました。何も書き込んでいません (0 行)。"
-                  "元の --from から取り直してください", file=sys.stderr)
-            return 1
-        except BridgeTimeUnverified:
-            print("bridge の時刻規則を検査できていません (time_rule_unverified)。"
-                  "開場中にもう一度実行してください。取り込みを中止しました。"
-                  "何も書き込んでいません (0 行)。元の --from から取り直してください",
-                  file=sys.stderr)
-            return 1
-    print(f"inserted={result.inserted} unchanged={result.unchanged} "
-         f"conflicted={result.conflicted}")
-    return 0
+    except ImportTooLargeError as exc:
+        print(f"エラー: {exc}", file=sys.stderr)
+        return 2
+    outcome = summarize([series])
+    _print_import_outcome(outcome)
+    return outcome.rc
+
+
+#: 通常の衝突を表示する上限 / 遮断時に表示する上限 (表示の省略は記録の省略ではない)
+CONFLICT_DISPLAY_LIMIT = 20
+CIRCUIT_DISPLAY_LIMIT = 5
+
+_FAILURE_MESSAGES = {
+    "time_rule_mismatch": "bridge の時刻規則が broker の時計と一致しません (time_rule_mismatch)。"
+                          "取り込みを中止しました。この系列は何も書き込んでいません (0 行)。"
+                          "元の --from から取り直してください",
+    "time_rule_unverified": "bridge の時刻規則を検査できていません (time_rule_unverified)。"
+                            "開場中にもう一度実行してください。取り込みを中止しました。"
+                            "この系列は何も書き込んでいません (0 行)。元の --from から取り直してください",
+}
+
+
+def _fmt_values(values) -> str:
+    return "(" + ", ".join("None" if v is None else repr(v) for v in values) + ")"
+
+
+def _series_label(s: SeriesOutcome) -> str:
+    return f"source={s.source} symbol={s.symbol} interval={s.interval}"
+
+
+def _conflict_line(s: SeriesOutcome, line) -> str:
+    return (f"conflict id={line.id} state={line.state} "
+            f"{'known' if line.known else 'new'} {_series_label(s)} "
+            f"bar_time={line.bar_time} epoch={line.epoch} "
+            f"existing={_fmt_values(line.existing)} incoming={_fmt_values(line.incoming)}")
+
+
+def _print_series(s: SeriesOutcome) -> None:
+    err = sys.stderr
+    if s.status == "conflict_circuit_open":
+        total = s.conflicted_new + s.conflicted_known
+        shown = s.conflict_lines[:CIRCUIT_DISPLAY_LIMIT]
+        ratio = (f"{100 * s.conflicted_new / s.n_test:.2f}%" if s.n_test else "算出不能")
+        print(f"conflict_circuit_open {_series_label(s)} N_overlap={s.n_overlap} "
+              f"N_test={s.n_test} C_new={s.conflicted_new} C_known={s.conflicted_known} "
+              f"new_ratio={ratio} threshold=1% (C_new>20 または C_new>=2 かつ 1% 超) "
+              f"omitted={total - len(shown)} persisted=false", file=err)
+        for line in shown:
+            print(f"conflict {'known' if line.known else 'new'} {_series_label(s)} "
+                  f"bar_time={line.bar_time} epoch={line.epoch} "
+                  f"existing={_fmt_values(line.existing)} "
+                  f"incoming={_fmt_values(line.incoming)}", file=err)
+        print("この系列は履歴・衝突記録とも 0 件です。遮断を迂回して再実行しないでください。"
+              "同じ範囲を取り直して値を比較し、ずれの原因 (時刻規則・broker 側の改訂・"
+              "取得元の差) を確かめてください", file=err)
+        return
+    if s.status in ("partial", "failed"):
+        msg = _FAILURE_MESSAGES.get(s.failure or "", "")
+        print(f"{s.status} {_series_label(s)} reason={s.failure} "
+              f"error_type={s.error_type} last_committed_bar_time={s.last_committed_bar_time} "
+              f"remaining=[{s.resume_from},{s.effective_end})", file=err)
+        if msg:
+            print(msg, file=err)
+        elif s.detail:
+            print(s.detail, file=err)
+        if s.status == "partial":
+            print(f"確定済みは残っています (inserted={s.inserted} unchanged={s.unchanged} "
+                  f"conflicted={s.conflicted})。元の同じ範囲を最初から再実行してください "
+                  "(確定済みの行は unchanged、既知の衝突は再観測として数えます)", file=err)
+        else:
+            print("この系列は何も書き込んでいません (0 行)。元の --from から取り直してください",
+                  file=err)
+        return
+    print(f"processed=[{s.requested_start},{s.effective_end}) "
+          f"requested_end={s.requested_end} effective_end={s.effective_end} "
+          f"{_series_label(s)}")
+    lines = s.conflict_lines
+    for line in lines[:CONFLICT_DISPLAY_LIMIT]:
+        print(_conflict_line(s, line), file=err)
+    if len(lines) > CONFLICT_DISPLAY_LIMIT:
+        print(f"omitted={len(lines) - CONFLICT_DISPLAY_LIMIT} (C_new={s.conflicted_new} "
+              f"C_known={s.conflicted_known})", file=err)
+    if s.conflicted:
+        print(f"conflicts {_series_label(s)} C_new={s.conflicted_new} "
+              f"C_known={s.conflicted_known}", file=err)
+
+
+def _print_import_outcome(outcome: ImportOutcome) -> None:
+    for s in outcome.series:
+        _print_series(s)
+    print(f"result={outcome.result} rc={outcome.rc}")
+    if outcome.result != "failed":
+        print(f"inserted={outcome.inserted} unchanged={outcome.unchanged} "
+              f"conflicted={outcome.conflicted}")
 
 
 def _history_compare(conn, settings, args: argparse.Namespace) -> int:

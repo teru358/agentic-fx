@@ -169,7 +169,7 @@ uv run afx init
 
    backend の実往復は、使う backend を明示して `afx check backend --backend <local|claude|codex|opencode> [--provider chatgpt]` で確認します。接続できれば backend の確認結果が出て rc=0、未導入・未認証・隔離不適合なら固定 reason と次の手順が出ます。
 
-   停止中の root を調べるときは `afx status` を使います。期待する先頭は `agentic-fx offline status` で、2 行目の `root:` は解決した root です。`instance:` は `locked`、`free`、`unknown` のいずれかです。`locked` のときは詳細を読まず、稼働 daemon の状態が必要なら `afx ctl status` を使います。
+   停止中の root を調べるときは `afx status` を使います。期待する先頭は `agentic-fx offline status` で、2 行目の `root:` は解決した root です。`instance:` は `locked`、`free`、`unknown` のいずれかです。`locked` のときは、保持者が `setup` や `enroll:*` なら詳細を読まず固定の 6 行です。`locked-by: unknown (daemon 稼働中とみられる)` のときだけ、設定と評価用履歴を読取専用で読み、表示 tz 付きの `evaluation history` ブロックが加わります (読めなければ固定の reason が出ます)。稼働 daemon の状態が必要なら `afx ctl status` を使います。
 
    `instance: free` のときの出力は次の行の並びで、各 `<...>` はそのときの観測値です。`instance: unknown` でも同じ形で、`state:` だけが `mode=unavailable kill_switch=unavailable` になります。`unavailable` の節が 1 つでもあれば rc 1、それ以外は rc 0 です。
 
