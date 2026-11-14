@@ -2146,3 +2146,92 @@ def test_a_bot_enable_resumes_and_repairs_a_missing_bot_dropin(tmp_path, monkeyp
     setup.enable("bot")
 
     assert setup.paths.bot_dropin_path.exists()
+
+
+def test_disabling_web_on_an_old_manager_never_writes_the_bot_dropin(tmp_path, monkeypatch):
+    setup, systemd, home = _versioned(tmp_path, 259)
+    _with_home(home, monkeypatch)
+    setup.enable("bot")
+    setup.enable("web")
+    systemd.reported = 252
+    setup.paths.bot_dropin_path.unlink()
+
+    setup.disable("web")
+
+    assert not setup.paths.bot_dropin_path.exists()
+    saved = read_stage(setup.root, "web")
+    assert saved["stage"] == "disabled" and saved["warn"] == "bot_dropin_not_exact"
+    assert any("bot の recovery drop-in" in line for line in setup.notices)
+    assert read_stage(setup.root, "bot")["stage"] == "enabled"
+
+
+def test_disabling_web_leaves_a_changed_bot_dropin_as_it_was(tmp_path, monkeypatch):
+    setup, systemd, home = _versioned(tmp_path, 259)
+    _with_home(home, monkeypatch)
+    setup.enable("bot")
+    setup.enable("web")
+    systemd.reported = 252
+    setup.paths.bot_dropin_path.write_text("[Service]\nRestart=always\n")
+
+    setup.disable("web")
+
+    assert setup.paths.bot_dropin_path.read_text() == "[Service]\nRestart=always\n"
+    assert read_stage(setup.root, "web")["warn"] == "bot_dropin_not_exact"
+
+
+def test_disabling_web_with_an_exact_bot_dropin_stays_quiet(tmp_path, monkeypatch):
+    setup, systemd, home = _versioned(tmp_path, 259)
+    _with_home(home, monkeypatch)
+    setup.enable("bot")
+    setup.enable("web")
+    systemd.reported = 252
+    before = setup.paths.bot_dropin_path.read_text()
+
+    setup.disable("web")
+
+    assert setup.paths.bot_dropin_path.read_text() == before
+    assert "warn" not in read_stage(setup.root, "web") and not setup.notices
+
+
+def test_the_rollback_of_a_failed_install_does_not_write_the_bot_dropin(tmp_path, monkeypatch):
+    setup, _systemd, home = _versioned(tmp_path, 259)
+    _with_home(home, monkeypatch)
+    setup.enable("bot")
+    setup.paths.bot_dropin_path.unlink()
+    state = read_stage(setup.root, "web", missing_ok=True) or setup._new_state("web", "enable", "enrolled")
+
+    setup._rollback_install(state, SystemdError("daemon-reload"))
+
+    assert not setup.paths.bot_dropin_path.exists()
+    assert "bot の recovery drop-in" in state["failure_detail"]
+
+
+def test_only_enable_paths_write_the_bot_dropin():
+    import ast
+    import inspect
+
+    from agentic_fx.ops_setup import stages, units
+
+    def calls(module, name):
+        found = []
+        for node in ast.walk(ast.parse(inspect.getsource(module))):
+            if isinstance(node, ast.Call):
+                func = node.func
+                called = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+                if called == name:
+                    found.append((node.lineno, node))
+        return found
+
+    # drop-in を書く関数 (_write_if_changed の bot 行) は install_units の中だけ。
+    source = inspect.getsource(units)
+    assert source.count("_write_if_changed(paths.bot_dropin_path") == 1
+    # install_units の呼出しは stages の enable (1 か所、既定で書く) と uninstall_feature (書かない) だけ。
+    stage_calls = calls(stages, "install_units")
+    assert len(stage_calls) == 1
+    assert not stage_calls[0][1].keywords
+    unit_calls = calls(units, "install_units")
+    assert len(unit_calls) == 1
+    assert [(k.arg, getattr(k.value, "value", None)) for k in unit_calls[0][1].keywords] == [
+        ("write_bot_dropin", False)]
+    # uninstall_feature の呼出し元の全数。
+    assert len(calls(stages, "uninstall_feature")) == 2

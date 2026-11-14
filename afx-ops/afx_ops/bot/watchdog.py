@@ -87,7 +87,7 @@ class Watchdog:
         self._acknowledged = self._clock()
 
     def begin_shutdown(self, *, permanent: bool = False) -> None:
-        """終了の開始。最初の 1 回の時刻と分類だけを保持し、以後は動かさない。
+        """終了の開始。最初の 1 回の時刻を保持し、以後は動かさない。分類は一時から恒久へだけ上げる。
 
         `permanent` は終了を始めた理由が恒久 (再起動しても同じ) のとき真。終了が期限内に終わらず
         強制終了するときの終了コードを、恒久なら 78、それ以外は 79 にする。
@@ -97,6 +97,9 @@ class Watchdog:
             self._shutdown_permanent = permanent
             # 周期の待ちの途中でも起こし、残り時間を期限として待ち直させる
             self._wake.set()
+        elif permanent:
+            # 後から恒久と分かったときは上げる。恒久から一時へは下げない。時刻は動かさない
+            self._shutdown_permanent = True
 
     def next_wait(self) -> float:
         """次の確認までの秒数。終了開始後は、60 秒の期限までの残りを超えない。"""

@@ -228,17 +228,29 @@ def _rendered(paths: UnitPaths, features: set[str]) -> tuple[str, str]:
     return template, f"[Unit]\nWants={wants}\n"
 
 
-def install_units(paths: UnitPaths, features: set[str]) -> None:
-    """template と有効 feature 全体の Wants を exact にそろえる。"""
+def install_units(paths: UnitPaths, features: set[str], *, write_bot_dropin: bool = True) -> None:
+    """template と有効 feature 全体の Wants を exact にそろえる。
+
+    bot の drop-in を書いてよいのは、systemd の版の検査を通った enable だけである。それ以外
+    (disable・rollback) は `write_bot_dropin=False` で呼び、bot が残る集合でも drop-in を
+    新しく作らず修復もしない。bot が集合に無ければ、残っている drop-in は取り除く。"""
     if not features or not features <= _FEATURES:
         raise ValueError("unknown_feature")
     template, dropin = _rendered(paths, features)
     _write_if_changed(paths.template_path, template)
     _write_if_changed(paths.dropin_path, dropin)
-    if "bot" in features:
-        _write_if_changed(paths.bot_dropin_path, BOT_DROPIN)
-    else:
+    if "bot" not in features:
         _remove_bot_dropin(paths)
+    elif write_bot_dropin:
+        _write_if_changed(paths.bot_dropin_path, BOT_DROPIN)
+
+
+def bot_dropin_exact(paths: UnitPaths) -> bool:
+    """bot の drop-in が書くはずの内容と exact に一致するか。読めなければ False。"""
+    try:
+        return paths.bot_dropin_path.read_text() == BOT_DROPIN
+    except (OSError, UnicodeDecodeError):
+        return False
 
 
 def _remove_bot_dropin(paths: UnitPaths) -> None:
@@ -251,12 +263,16 @@ def _remove_bot_dropin(paths: UnitPaths) -> None:
     fsync_dir(paths.unit_dir)
 
 
-def units_match(paths: UnitPaths, features: set[str]) -> bool:
-    """設置済みの template と drop-in が、features に対して書くはずの内容と一致するか。"""
+def units_match(paths: UnitPaths, features: set[str], *, check_bot_dropin: bool = True) -> bool:
+    """設置済みの template と drop-in が、features に対して書くはずの内容と一致するか。
+
+    `check_bot_dropin=False` は、bot が残る集合で bot の drop-in の中身を見ない
+    (disable は bot の drop-in を直さないので、その食い違いで止まらない)。bot が無い集合では
+    drop-in が残っていないことを常に見る。"""
     template, dropin = _rendered(paths, features)
     try:
         if "bot" in features:
-            if paths.bot_dropin_path.read_text() != BOT_DROPIN:
+            if check_bot_dropin and paths.bot_dropin_path.read_text() != BOT_DROPIN:
                 return False
         elif os.path.lexists(paths.bot_dropin_path):
             return False
@@ -274,4 +290,4 @@ def uninstall_feature(paths: UnitPaths, remaining_features: set[str]) -> None:
         remove_durably(paths.dropin_path)
         remove_durably(paths.template_path)
         return
-    install_units(paths, remaining_features)
+    install_units(paths, remaining_features, write_bot_dropin=False)

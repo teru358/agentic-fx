@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 
+import discord
 import pytest
 
 from afx_ops.bot import runtime
@@ -255,17 +256,29 @@ def test_shutdown_limit_is_measured_from_the_first_begin(pipe):
     assert pipe.drain() == SHUTDOWN_LINE
 
 
-@pytest.mark.parametrize("kwargs, rc", [({}, RC_BOT_TRANSIENT), ({"permanent": False}, RC_BOT_TRANSIENT),
-                                         ({"permanent": True}, RC_BOT_PERMANENT)])
-def test_a_shutdown_timeout_exits_with_the_class_of_the_reason_that_started_it(pipe, kwargs, rc):
+@pytest.mark.parametrize("first, later, rc", [
+    (False, False, RC_BOT_TRANSIENT), (True, False, RC_BOT_PERMANENT),
+    (True, True, RC_BOT_PERMANENT), (False, True, RC_BOT_PERMANENT)])
+def test_a_shutdown_timeout_exits_with_the_class_of_the_reasons_known_by_then(pipe, first, later, rc):
     clock, exits = Clock(), []
     dog = _dog(clock, exits, pipe)
-    dog.begin_shutdown(**kwargs)
-    dog.begin_shutdown(permanent=not kwargs.get("permanent", False))  # 2 回目は分類も動かさない
+    dog.begin_shutdown(permanent=first)
+    dog.begin_shutdown(permanent=later)  # 恒久は後から知らされても上がり、恒久から一時へは下がらない
     clock.t += SHUTDOWN_LIMIT
     assert dog.tick() is True
     assert exits == [rc]
     assert pipe.drain() == SHUTDOWN_LINE
+
+
+def test_a_late_permanent_classification_does_not_move_the_deadline(pipe):
+    clock, exits = Clock(), []
+    dog = _dog(clock, exits, pipe)
+    dog.begin_shutdown()
+    clock.t += SHUTDOWN_LIMIT - 1
+    dog.begin_shutdown(permanent=True)
+    assert dog.tick() is False
+    clock.t += 1
+    assert dog.tick() is True and exits == [RC_BOT_PERMANENT]
 
 
 @pytest.mark.parametrize("exc, permanent", [(BotFailure("token_invalid"), True),
@@ -570,6 +583,52 @@ def test_a_bot_close_that_never_returns_cannot_hold_the_shutdown_forever(tmp_pat
     backstop.start()
     try:
         harness.run(watchdog=dog)
+        assert rcs == [RC_BOT_TRANSIENT]
+    finally:
+        backstop.cancel()
+        release.set()
+        dog.stop()
+
+
+def test_a_permanent_failure_from_the_real_body_exits_78_when_the_cleanup_hangs(tmp_path, monkeypatch):
+    async def rejected(self):
+        raise discord.LoginFailure("rejected")
+    harness = Harness(tmp_path, monkeypatch, connect=rejected)
+    release = threading.Event()
+    harness.close_gate = release
+    harness.sleeper.limit = 1000.0 + 100
+    rcs: list[int] = []
+    dog = _shutdown_dog(harness, rcs, release.set)
+    dog.start()
+    backstop = threading.Timer(DEADLINE / 2, release.set)
+    backstop.start()
+    try:
+        with pytest.raises(BotFailure) as raised:
+            harness.run(watchdog=dog)
+        assert raised.value.reason == "discord_rejected"
+        assert rcs == [RC_BOT_PERMANENT]
+    finally:
+        backstop.cancel()
+        release.set()
+        dog.stop()
+
+
+def test_a_transient_failure_from_the_real_body_still_exits_79_when_the_cleanup_hangs(tmp_path, monkeypatch):
+    async def broken(adapter, interval):
+        raise RuntimeError("poll failed")
+    monkeypatch.setattr(runtime, "_poll", broken)
+    harness = Harness(tmp_path, monkeypatch)
+    release = threading.Event()
+    harness.close_gate = release
+    harness.sleeper.limit = 1000.0 + 100
+    rcs: list[int] = []
+    dog = _shutdown_dog(harness, rcs, release.set)
+    dog.start()
+    backstop = threading.Timer(DEADLINE / 2, release.set)
+    backstop.start()
+    try:
+        with pytest.raises(RuntimeError):
+            harness.run(watchdog=dog)
         assert rcs == [RC_BOT_TRANSIENT]
     finally:
         backstop.cancel()
