@@ -191,7 +191,6 @@ def test_bot_exit_line_carries_detail(monkeypatch, tmp_path):
     monkeypatch.setattr(runtime, "open_state_dir", lambda _p: __import__("os").open(
         tmp_path, __import__("os").O_RDONLY))
     monkeypatch.setattr(runtime, "_main", main)
-    monkeypatch.setattr(runtime, "_quiet_discord_logging", lambda: None)
     out = io.StringIO()
     rc = runtime.run(Iso(), client=object(), stderr=out)
     assert rc == runtime.RC_UNREACHABLE

@@ -436,13 +436,14 @@ class Harness:
         timeout = kwargs.pop("timeout", HARNESS_TIMEOUT)
         monitor_interval = kwargs.pop("monitor_interval", 10.0)
         watchdog = kwargs.pop("watchdog", None)
+        loop_errors = kwargs.pop("loop_errors", None)
 
         async def go() -> bool:
             task = asyncio.ensure_future(runtime._main(
                 SimpleNamespace(config=CONFIG), "token", self.client, self.fd,
                 connector_factory=None, stop=self.stop, poll_interval=0.01, now=lambda: 0.0,
                 progress=self.progress, sleep=self.sleeper, monitor_interval=monitor_interval,
-                watchdog=watchdog))
+                watchdog=watchdog, loop_errors=loop_errors))
             done, _ = await asyncio.wait({task}, timeout=timeout)
             if done:
                 task.result()

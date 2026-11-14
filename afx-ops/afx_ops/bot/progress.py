@@ -11,6 +11,9 @@ from collections.abc import Callable
 # この秒数だけ連続して進捗が無ければ一時の終了にする
 WINDOW_SECONDS = 600.0
 
+# 畳んだ件数の上限 (出す数値を有界にする)
+REPEAT_CAP = 9999
+
 GATEWAY_STARTING = "starting"
 GATEWAY_HEALTHY = "healthy"
 GATEWAY_UNHEALTHY = "unhealthy"
@@ -20,9 +23,14 @@ class ProgressTracker:
     """gateway / 配送 / poller の進捗。単一の event loop thread だけが更新する。"""
 
     def __init__(self, clock: Callable[[], float] = time.monotonic,
-                 window: float = WINDOW_SECONDS) -> None:
+                 window: float = WINDOW_SECONDS,
+                 emit: Callable[[str], None] | None = None) -> None:
         self._clock = clock
         self.window = window
+        # gateway の遷移を固定語で出す先。discord の logger は閉じてあるので、journal に残る
+        # gateway の診断はこれだけ。不健全の間の disconnect の反復は件数に畳む
+        self._emit = emit
+        self.gateway_repeats = 0
         started = clock()
         self.started_at = started
         # gateway: process 開始から starting。login 中は窓に含め、起動 reconcile の間は止め、
@@ -43,14 +51,31 @@ class ProgressTracker:
 
     # ------------------------------------------------------------------ gateway
 
+    def _say(self, text: str) -> None:
+        if self._emit is not None:
+            try:
+                self._emit(text)
+            except Exception:  # noqa: BLE001 — 出力の失敗で進捗の判定を止めない
+                pass
+
+    def _gateway_healthy(self) -> None:
+        before, repeats = self.gateway_state, self.gateway_repeats
+        self.gateway_repeats = 0
+        if before == GATEWAY_UNHEALTHY:
+            self._say(f"gateway_recovered repeats={repeats}")
+        elif before == GATEWAY_STARTING and repeats > 0:
+            self._say(f"gateway_started repeats={repeats}")
+
     def gateway_connected(self) -> None:
         """READY (`on_connect`)。健全にして連続の不健全の起点を消す。"""
+        self._gateway_healthy()
         self.gateway_state = GATEWAY_HEALTHY
         self.gateway_unhealthy_since = None
         self.last_ready_at = self._clock()
 
     def gateway_resumed(self) -> None:
         """RESUMED (`on_resumed`)。READY と同じく健全に戻す。"""
+        self._gateway_healthy()
         self.gateway_state = GATEWAY_HEALTHY
         self.gateway_unhealthy_since = None
         self.last_resumed_at = self._clock()
@@ -72,6 +97,9 @@ class ProgressTracker:
         if self.gateway_state == GATEWAY_HEALTHY:
             self.gateway_state = GATEWAY_UNHEALTHY
             self.gateway_unhealthy_since = now
+            self._say("gateway_unhealthy")
+        else:
+            self.gateway_repeats = min(self.gateway_repeats + 1, REPEAT_CAP)
 
     # ------------------------------------------------------------------ 配送
 

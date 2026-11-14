@@ -30,7 +30,6 @@ event・high watermark の後退・Discord の配送拒否) は systemd が再�
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import re
 import sys
@@ -46,6 +45,7 @@ from afx_ops.api_client import RC_UNREACHABLE, ApiError, BotClient, with_detail
 from afx_ops.bot.adapter import BotAdapter, BotFailure, BotSettings, open_state_dir
 from afx_ops.bot.exits import (REASONS, RC_BOT_LOOP_STALLED, RC_BOT_PERMANENT,  # noqa: F401
                                RC_BOT_TRANSIENT, RC_OK, rc_for_reason)
+from afx_ops.bot.logsafe import LoopErrors, SafeLogging
 from afx_ops.bot.progress import GATEWAY_HEALTHY, ProgressTracker
 from afx_ops.bot.rest import PERMANENT, REST_ERRORS, classify
 from afx_ops.bot.watchdog import Watchdog
@@ -81,13 +81,6 @@ def parse_token(raw: object) -> str:
     return text
 
 
-def _quiet_discord_logging() -> None:
-    # discord.py の log (再接続時の traceback 等) は例外文や URL を含み得るので出さない
-    logger = logging.getLogger("discord")
-    logger.addHandler(logging.NullHandler())
-    logger.propagate = False
-
-
 def run(isolated, *, client=None, connector_factory: Callable[[], object] | None = None,
         api_base: str | None = None, gateway_url: str | None = None,
         stop: threading.Event | None = None, poll_interval: float = POLL_INTERVAL,
@@ -106,6 +99,9 @@ def run(isolated, *, client=None, connector_factory: Callable[[], object] | None
     out = sys.stderr if stderr is None else stderr
     watchdog = new_watchdog() if watchdog is None else watchdog
     watchdog.start()
+    # discord.py / aiohttp / asyncio の log は例外文・URL・ID を含み得るので、record の中身は出さず
+    # 系統と件数の固定語だけにする
+    safe = SafeLogging(lambda text: _say(out, text))
     try:
         token = parse_token(isolated.secrets.get(SECRET_NAME))
         if client is None:
@@ -115,12 +111,12 @@ def run(isolated, *, client=None, connector_factory: Callable[[], object] | None
         if gateway_url is not None:
             import yarl
             discord.gateway.DiscordWebSocket.DEFAULT_GATEWAY = yarl.URL(gateway_url)
-        _quiet_discord_logging()
         dir_fd = open_state_dir(isolated.state_dir)
         try:
             asyncio.run(_main(isolated, token, client, dir_fd, connector_factory=connector_factory,
                               stop=stop, poll_interval=poll_interval, now=now,
-                              progress=ProgressTracker(monotonic), sleep=sleep,
+                              progress=ProgressTracker(monotonic, emit=lambda t: _say(out, t)),
+                              sleep=sleep, loop_errors=LoopErrors(lambda t: _say(out, t)),
                               monitor_interval=monitor_interval, watchdog=watchdog))
         finally:
             os.close(dir_fd)
@@ -140,6 +136,9 @@ def run(isolated, *, client=None, connector_factory: Callable[[], object] | None
         # KeyboardInterrupt / SystemExit / 取消し。後始末が詰まっても 60 秒で止まるよう、再送出の前に印を付ける
         watchdog.begin_shutdown()
         raise
+    finally:
+        safe.flush_counts()
+        safe.restore()
     watchdog.begin_shutdown()
     return RC_OK
 
@@ -183,12 +182,13 @@ class _Client(discord.Client):
 async def _main(isolated, token: str, client, dir_fd: int, *, connector_factory, stop,
                 poll_interval: float, now, progress: ProgressTracker | None = None,
                 sleep=asyncio.sleep, monitor_interval: float = MONITOR_INTERVAL,
-                watchdog: Watchdog | None = None) -> None:
+                watchdog: Watchdog | None = None, loop_errors=None) -> None:
     # 初期化の途中の中断でも shutdown を記録する (本体の finally に入る前の経路)
     try:
         await _main_body(isolated, token, client, dir_fd, connector_factory=connector_factory,
                          stop=stop, poll_interval=poll_interval, now=now, progress=progress,
-                         sleep=sleep, monitor_interval=monitor_interval, watchdog=watchdog)
+                         sleep=sleep, monitor_interval=monitor_interval, watchdog=watchdog,
+                         loop_errors=loop_errors)
     except BaseException:
         if watchdog is not None:
             watchdog.begin_shutdown()
@@ -198,7 +198,10 @@ async def _main(isolated, token: str, client, dir_fd: int, *, connector_factory,
 async def _main_body(isolated, token: str, client, dir_fd: int, *, connector_factory, stop,
                      poll_interval: float, now, progress: ProgressTracker | None = None,
                      sleep=asyncio.sleep, monitor_interval: float = MONITOR_INTERVAL,
-                     watchdog: Watchdog | None = None) -> None:
+                     watchdog: Watchdog | None = None, loop_errors=None) -> None:
+    if loop_errors is not None:
+        # 既定の handler は例外文と traceback を出す。型名と固定語だけにする
+        asyncio.get_running_loop().set_exception_handler(loop_errors)
     progress = progress if progress is not None else ProgressTracker()
     if watchdog is not None:
         watchdog.attach(asyncio.get_running_loop())
@@ -221,22 +224,27 @@ async def _main_body(isolated, token: str, client, dir_fd: int, *, connector_fac
     tasks: list[asyncio.Task] = []
     try:
         # monitor は login の前から動かす (login 前も gateway の 10 分の窓に含める)
-        monitor = asyncio.create_task(_monitor(progress, monitor_interval, sleep))
-        startup = asyncio.create_task(_startup(adapter, bot, token, sleep,
-                                             connector_factory))
-        tasks = [monitor, startup]
+        monitor = _spawn(_monitor(progress, monitor_interval, sleep))
+        tasks.append(monitor)
+        startup = _spawn(_startup(adapter, bot, token, sleep, connector_factory))
+        tasks.append(startup)
         await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         if startup.done():
             startup.result()
         else:
             monitor.result()
-        gateway = asyncio.create_task(_gateway(bot, progress, sleep))
-        poller = asyncio.create_task(_poll(adapter, poll_interval))
-        failed = asyncio.create_task(adapter.failed.wait())
-        running = [monitor, gateway, poller, failed]
+        running = [monitor]
+        for make in (lambda: _gateway(bot, progress, sleep),
+                     lambda: _poll(adapter, poll_interval),
+                     adapter.failed.wait):
+            task = _spawn(make())
+            tasks.append(task)
+            running.append(task)
+        gateway, poller, failed = running[1:]
         if stop is not None:
-            running.append(asyncio.create_task(asyncio.to_thread(stop.wait)))
-        tasks += running[1:]
+            task = _spawn(asyncio.to_thread(stop.wait))
+            tasks.append(task)
+            running.append(task)
         done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             if task is not failed and task.exception() is not None:
@@ -258,6 +266,21 @@ async def _main_body(isolated, token: str, client, dir_fd: int, *, connector_fac
         except Exception:  # 終了処理の失敗で、止まった本来の理由を上書きしない
             pass
         adapter.close()
+
+
+def _spawn(coro) -> asyncio.Task:
+    """task を作り、終わったら例外を必ず回収する (unretrieved task exception を作らない)。
+
+    結果を待つ側は別に `.exception()` / `.result()` で読む。
+    """
+    task = asyncio.create_task(coro)
+    task.add_done_callback(_retrieve)
+    return task
+
+
+def _retrieve(task: asyncio.Task) -> None:
+    if not task.cancelled():
+        task.exception()
 
 
 async def _startup(adapter: BotAdapter, bot: discord.Client, token: str, sleep,
