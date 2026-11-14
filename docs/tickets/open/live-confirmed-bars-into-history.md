@@ -5,7 +5,7 @@ status: 実装中
 priority: 高
 opened: 2026-09-21
 closed: null
-related: [history-import-stops-at-first-conflict, status-history-hidden-while-daemon-runs, improve-eval-window-reference-availability]
+related: [history-import-stops-at-first-conflict, status-history-hidden-while-daemon-runs, improve-eval-window-reference-availability, cross-cutting-invariant-review]
 backfilled: true
 source_section: 完了ログ
 kind: 不具合
@@ -28,4 +28,4 @@ kind: 不具合
 - 2026-11-13: 関連: [killswitch-reset-hwm-rebase] — 2026-11-13 22:20: 利用者判断で asym_shock_breakout (#122、holdout PF 0.81) と ichimoku_rsi_cloud_reentry (#124、PF 0.92) を afx plugin disable --revoke で配備から外し、版を rejected にした (追記 #126・#127)。配備中は close_pressure_followthrough と volume_close_pressure の 2 版。manifest の human_decision は再評価依頼 #122・#124 自体の決定 (approved) のままで、後の失効は DB の #126・#127 が記録する。
 - 2026-11-14: 関連: [history-import-stops-at-first-conflict, status-history-hidden-while-daemon-runs, improve-eval-window-reference-availability] — 段 1b の設計 C2 を 2026-11-14 に利用者承認 (docs/superpowers/specs/2026-11-14-stage1b-non-deployed-audit-design.md)。非配備 7 版のうち 4 版 (#21・#25・#23・#24) は既に失効済みで rollback の恩恵は無いが、既存裁定どおり 7 版すべてを監査する (J0)。方式 D: 7 版を配備せず現在の条件で各 1 回 warn / compare off で評価し、人間専用 report と manifest (最小 v2、従来の v1 は受理を維持) に 4 軸 (実行完了 / 床合否 / 履歴検証 / 未実行 scope) で記録する。rollback が要るときは既存の人間専用強行を使い、段 1a 設計 §8.4 の「後続実装で通常 rollback」は需要まで延期 (J1)。7 版の実行は実行前に利用者が確認する。関連を段 1 の後続チケットに付け直した。
 - 2026-11-14: 関連: [history-import-stops-at-first-conflict, status-history-hidden-while-daemon-runs, improve-eval-window-reference-availability] — 段 1b の task 1.1〜1.3 を実装 (非配備版を配備せず現在の条件で評価する入口 `plugin/history_audit.py`、共有 gate の失敗の記録先の切替、manifest 版 2 と版別の validate / verify)。段 1a 設計 §8.1・§8.3・§8.4・§8.5 と運用手順に今回の裁定を追記した (過去の裁定は残している)。通常 rollback を可能にする接続は需要まで延期。残り: task 1.4 (7 版の実行、実行前に利用者が確認)、段 2 (afx history sync)、段 3 (daemon の定期同期)、status-history-hidden-while-daemon-runs。
-
+- 2026-11-14: 関連: [history-import-stops-at-first-conflict, status-history-hidden-while-daemon-runs, improve-eval-window-reference-availability, cross-cutting-invariant-review] — 2026-11-14: 段 1b の task 1.1〜1.3 を main に merge。非配備版を配備せず現在の条件で評価する入口 (plugin/history_audit.py、warn / compare off、保存版はコピー元を symlink を追わず検査してから fd でコピー、記録先は明示の非 DB sink、4 軸の人間専用 report)、manifest 版 2 (従来受理された v1 はそのまま受理)。gate の pytest worker に後方互換の状態の pipe を足した (本番 gate の判定は不変)。task 1.4 (7 版の実行) は利用者の確認の後。
