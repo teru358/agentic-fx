@@ -139,6 +139,46 @@ def test_old_database_gets_empty_rebase_ledger_and_second_init_is_noop(tmp_path)
         "SELECT * FROM account_snapshots").fetchall() == before
 
 
+def test_real_schema_v5_fixture_migrates_without_inventing_rebases(tmp_path):
+    import sqlite3
+    from pathlib import Path
+
+    from agentic_fx.store.db import connect, init_db
+
+    path = tmp_path / "schema-v5.db"
+    legacy = sqlite3.connect(path)
+    legacy.executescript((Path(__file__).parents[1] / "fixtures" /
+                          "db_schema_v5.sql").read_text())
+    legacy.commit()
+    legacy.close()
+    migrated = connect(path)
+    init_db(migrated)
+    assert migrated.execute(
+        "SELECT COUNT(*) FROM kill_switch_hwm_rebases").fetchone()[0] == 0
+    migrated.close()
+
+
+def test_rebase_ledger_rejects_each_missing_foreign_key(tmp_path):
+    import sqlite3
+    from agentic_fx.store.db import connect, init_db
+
+    conn = connect(tmp_path / "fk.db")
+    init_db(conn)
+    values = ("2026-11-14T00:00:00+00:00", 1, 9991, 9992, 9993, 1,
+              "x", 100, 100, 100, 100, 0, 1, 0, 0, 0)
+    sql = ("INSERT INTO kill_switch_hwm_rebases "
+           "(applied_at,generation,source_snapshot_id,rebase_snapshot_id,"
+           "accepted_audit_id,digest_version,preview_token,hwm_before,hwm_after,"
+           "equity,balance,drawdown_pct,threshold_pct,cut,cut_pct,additional_headroom) "
+           "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    for missing_index in (2, 3, 4):
+        row = list(values)
+        row[missing_index] += 1
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+            conn.execute(sql, row)
+        conn.rollback()
+
+
 def test_rebase_ledger_is_append_only_and_references_are_unique(tmp_path):
     import sqlite3
     from agentic_fx.store.db import connect, init_db

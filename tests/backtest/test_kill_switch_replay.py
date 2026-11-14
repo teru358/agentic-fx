@@ -18,6 +18,13 @@ from agentic_fx.backtest.runner import (
 )
 from agentic_fx.store import ohlcv, snapshots
 from agentic_fx.store.db import connect, init_db
+
+
+def test_replay_database_initialization_includes_empty_manual_rebase_ledger(tmp_path):
+    conn = connect(tmp_path / "replay-init.db")
+    init_db(conn)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM kill_switch_hwm_rebases").fetchone()[0] == 0
 from tests.backtest.factories import SETTINGS, _conn, _row_at
 
 UTC = timezone.utc

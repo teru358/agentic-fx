@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 from agentic_fx.core.accounting import daily_start_equity
 from agentic_fx.core.paper_broker import PaperBroker
@@ -16,15 +16,15 @@ from agentic_fx.config import Settings
 from agentic_fx.core.contracts import Clock
 
 
-def read_rebase_totals(conn: sqlite3.Connection) -> dict[str, float | int | None]:
-    """Read ledger SUM/COUNT and last id in one read transaction.
+class RebaseOutcomeUnknown(RuntimeError):
+    """COMMIT raised; callers must inspect the ledger to resolve the outcome."""
 
-    The connection must not already have an open transaction. Cumulative
-    values are derived solely from ledger rows and are never persisted.
-    """
-    if conn.in_transaction:
-        raise RuntimeError("read_rebase_totals requires an idle connection")
-    conn.execute("BEGIN")
+
+def read_rebase_totals(conn: sqlite3.Connection) -> dict[str, float | int | None]:
+    """Read ledger SUM/COUNT and last id, joining an existing read transaction."""
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN")
     try:
         row = conn.execute(
             "SELECT COALESCE(SUM(cut),0) AS cut_sum, "
@@ -32,11 +32,18 @@ def read_rebase_totals(conn: sqlite3.Connection) -> dict[str, float | int | None
             "MAX(id) AS last_id FROM kill_switch_hwm_rebases").fetchone()
         result = {"cut": row["cut_sum"], "cut_pct": row["cut_pct_sum"],
                   "count": row["count"], "last_id": row["last_id"]}
-        conn.commit()
+        if owns_transaction:
+            conn.commit()
         return result
     except BaseException:
-        conn.rollback()
+        if owns_transaction:
+            conn.rollback()
         raise
+
+
+def _commit_rebase(conn: sqlite3.Connection) -> None:
+    """Isolated commit boundary, intentionally replaceable for fault injection."""
+    conn.commit()
 
 
 def paper_equity(conn: sqlite3.Connection, settings: Settings,
@@ -52,16 +59,18 @@ def apply_rebase(
         hwm_before: float, equity: float, balance: float,
         drawdown_pct: float, threshold_pct: float, cut: float,
         cut_pct: float, additional_headroom: float,
-        now: datetime) -> dict[str, Any]:
+        now: datetime,
+        validate: Callable[[sqlite3.Connection], None]) -> dict[str, Any]:
     """Atomically insert a rebase snapshot and its ledger row.
 
-    Preconditions: caller has checked broker/source/flat/freshness, generation,
-    DD threshold and token against the current state. This function verifies
-    that the selected source snapshot is still latest and that the daily
-    reference is unchanged by the zero-cashflow, same-ts insertion.
+    ``validate`` rechecks caller-owned broker/source/flat/freshness, generation,
+    DD threshold and token conditions while BEGIN IMMEDIATE is held. Exceptions
+    roll back without writing. This function also checks source/latest and daily
+    invariants before committing.
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
+        validate(conn)
         source = conn.execute(
             "SELECT * FROM account_snapshots WHERE id=?",
             (source_snapshot_id,)).fetchone()
@@ -106,8 +115,18 @@ def apply_rebase(
         result = {"rebase_id": ledger_cur.lastrowid,
             "snapshot_id": rebase_snapshot_id,
             "generation": generation, "latched": latched_at is not None}
-        conn.commit()
+        try:
+            _commit_rebase(conn)
+        except BaseException as exc:
+            try:
+                conn.rollback()
+            except BaseException:
+                pass
+            raise RebaseOutcomeUnknown("rebase COMMIT outcome is unknown") from exc
         return result
     except BaseException:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except BaseException:
+            pass
         raise
