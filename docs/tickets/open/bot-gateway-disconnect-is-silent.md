@@ -26,3 +26,4 @@ afx-ops@bot の process は active のまま Discord gateway への接続が無�
 
 - 2026-11-13: 起票。
 - 2026-11-14: 状態: 実装中 — 設計 C4 を 2026-11-14 に利用者承認 (同上の spec)。直し方は discord の WARNING を出す案ではなく、gateway・送信・poll・event loop・停止処理の進捗監視と exit 分類 (一時 79 / loop 停止 80 / 恒久 78) + bot 専用 systemd drop-in の backoff 再起動、health を /v1/status と web に出す形に変えた。discord.py の log template 棚卸しは別チケット。
+- 2026-11-14: 状態: 実装中 — 直し方の案の処置: discord の WARNING を journal へ出す案は採らず、gateway・配送・poll・event loop・停止処理を進捗監視し、10 分止まれば固定語で終了する (一時 79 / loop 停止 80 / 恒久 78)。bot 専用 systemd drop-in (30 秒から最大 10 分の backoff、start-limit 無し、恒久コードは再起動しない) で再起動し、systemd 254 未満では bot の enable を拒否する。health は gateway.snapshot から /v1/status・afx status・afx ops bot status・web に出し、notify 未設定は alternate_push=none の固定警告で示す。

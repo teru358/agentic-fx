@@ -53,7 +53,7 @@ def test_success_calls_the_wrapper_once_with_the_returned_state(tmp_path):
     state.update(kill_switch_latched=True)
     gen = state.load().kill_switch_generation
     out = cmds.dispatch(f"killswitch reset {gen}")
-    assert out == base_out == "kill switch ラッチを解除しました"
+    assert out == base_out == "kill switch ラッチを解除しました\nDD が閾値以上のままなら、次の新規判断で kill switch が再びラッチします。"
     assert [a[a.index("kill_switch_reset"):][:17] for a in activity.tail(20, Category.SYSTEM)
             if "kill_switch_reset" in a] == ["kill_switch_reset"]
     assert len(wrapper.calls) == 2
@@ -138,7 +138,7 @@ def test_wrapper_failure_is_swallowed_with_a_fixed_line(tmp_path, caplog, error)
     gen = state.load().kill_switch_generation
     with caplog.at_level(logging.WARNING):
         out = cmds.dispatch(f"killswitch reset {gen}")
-    assert out == "kill switch ラッチを解除しました"
+    assert out == "kill switch ラッチを解除しました\nDD が閾値以上のままなら、次の新規判断で kill switch が再びラッチします。"
     assert [r.getMessage() for r in caplog.records] == ["guard_notice_deferred"]
     assert all(r.exc_info is None for r in caplog.records)
 
@@ -148,7 +148,7 @@ def test_no_ops_service_means_no_notice_call_and_normal_behaviour(tmp_path):
     assert cmds.ops_service is None
     state.update(kill_switch_latched=True)
     out = cmds.dispatch(f"killswitch reset {state.load().kill_switch_generation}")
-    assert out == "kill switch ラッチを解除しました"
+    assert out == "kill switch ラッチを解除しました\nDD が閾値以上のままなら、次の新規判断で kill switch が再びラッチします。"
 
 
 @pytest.mark.parametrize("failures", [{0}, {1}, {0, 1}])

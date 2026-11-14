@@ -25,7 +25,9 @@ connect の開始から数え直す)、配送は
 失敗は固定 reason を stderr に 1 行出して非零終了する。恒久 (rc 78: token・state の内容・payload・
 event・high watermark の後退・Discord の配送拒否) は systemd が再起動せず、一時 (rc 79: 進捗の
 停止・Discord / state の I/O の一時障害・内部の想定外) は backoff で再起動する。daemon に届かない
-ときは rc 3。値と対応は `exits`。token・例外文・Discord の応答本文は出さない。
+ときは rc 3 (一時、再起動対象)。event loop が 10 分止まったときと、停止処理が 60 秒を超えたときは、
+loop の外の watchdog が process を直接終える (loop の停止は rc 80、停止処理の超過は rc 79、どちらも
+再起動対象)。値と対応は `exits`。token・例外文・Discord の応答本文は出さない。
 """
 from __future__ import annotations
 

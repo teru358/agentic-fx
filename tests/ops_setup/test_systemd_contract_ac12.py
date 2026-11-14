@@ -763,3 +763,18 @@ def test_bot_long_outage_recovers_within_monitor_plus_max_wait_scaled(ac):
     assert _wait(lambda: _show(ac.ops("bot"), "ActiveState")["ActiveState"] == "active",
                  seconds=monitor + maximum + 3)
 
+
+def test_bot_runs_without_notify_and_the_status_shows_the_fixed_warning_only(ac):
+    """notify を一度も enable していなくても、afx と bot は動き、警告は固定の 2 値の表示だけになる。"""
+    from agentic_fx.ops import bot_health
+
+    ac.setup().enable("bot")
+
+    assert _wait(lambda: _show(ac.ops("bot"), "ActiveState")["ActiveState"] == "active", seconds=15)
+    assert _show(ac.afx, "ActiveState")["ActiveState"] == "active"
+    assert _show(ac.ops("notify"), "ActiveState")["ActiveState"] != "active"
+    assert read_stage(ac.root, "notify", missing_ok=True) is None
+    health = bot_health.collect(ac.root, time.time())
+    assert health["alternate_push"] == "none"
+    assert "warning: alternate_push=none" in bot_health.lines(health)
+    assert health["state"] != "unhealthy"

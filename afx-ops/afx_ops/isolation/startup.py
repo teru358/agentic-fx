@@ -1091,7 +1091,9 @@ def run(plan: StartupPlan, config: OpsConfig, body: Callable[[Isolated], int], *
     body の想定外の例外が `RC_BODY_FAILED`。body が返す値はそのまま返す。bot の body は、進捗の
     監視 (gateway / 配送 / poll 周回が 10 分止まる)・Discord の一時障害・想定外を一時 (`RC_BOT_TRANSIENT`、
     再起動対象)、token・state の内容・payload・event・Discord の配送拒否を恒久 (`RC_BOT_PERMANENT`、
-    再起動しない) として返す (`afx_ops.bot.exits`)。起動の失敗は bot の unit では恒久として扱う。
+    再起動しない) として返す (`afx_ops.bot.exits`)。起動の失敗のうち `RC_RUNTIME_IMPORT_FAILED` と
+    `RC_ISOLATION_FAILED` は bot の unit では恒久 (再起動しない)、`RC_UNREACHABLE` と `RC_BODY_FAILED` は
+    再起動の対象。
     """
     owner = _ConfigDirOwner(config.config_dir_fd)
     try:

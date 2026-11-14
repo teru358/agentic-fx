@@ -767,7 +767,7 @@ def test_shell_reset_before_the_first_tick_emits_latched_then_released(rig):
     _latch(rig)
     rec = _Recorder(rig)
     out = _shell(rig, rec).dispatch("killswitch reset 1")
-    assert out == "kill switch ラッチを解除しました"
+    assert out == "kill switch ラッチを解除しました\nDD が閾値以上のままなら、次の新規判断で kill switch が再びラッチします。"
     assert _events(rig.conn) == [("latched", 1), ("released", 1)]
     (before_after, before_latched, before_events), (post_after, _, _) = rec.calls
     assert before_after is None and before_latched is True and before_events == []
@@ -798,7 +798,7 @@ def test_shell_reset_survives_a_failing_before_call(rig, caplog):
     rec = _Recorder(rig, OpsError(ErrorCode.REQUEST_TIMEOUT))
     with caplog.at_level(logging.WARNING):
         out = _shell(rig, rec).dispatch("killswitch reset 2")
-    assert out == base_out == "kill switch ラッチを解除しました"
+    assert out == base_out == "kill switch ラッチを解除しました\nDD が閾値以上のままなら、次の新規判断で kill switch が再びラッチします。"
     assert rig.state.load().kill_switch_latched is False
     new_acts = rig.env.activity_path.read_text()
     def _reset_lines(text):
@@ -858,5 +858,5 @@ def test_shell_aggregates_failures_swallowed_by_real_wrapper(rig, caplog, monkey
     monkeypatch.setattr(service_mod, "plan_kill_switch_notice", busy)
     with caplog.at_level(logging.WARNING):
         result = _shell(rig, _Recorder(rig)).dispatch("killswitch reset 1")
-    assert result == "kill switch ラッチを解除しました"
+    assert result == "kill switch ラッチを解除しました\nDD が閾値以上のままなら、次の新規判断で kill switch が再びラッチします。"
     assert _warnings(caplog, "guard_notice_deferred") == ["guard_notice_deferred"]

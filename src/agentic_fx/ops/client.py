@@ -33,6 +33,7 @@ import httpcore
 import httpx
 
 from agentic_fx.core import improve_repeat as ir
+from agentic_fx.core.kill_switch_words import KILL_SWITCH_RESET_WARNING
 from agentic_fx.core.display_time import (
     PRECISION_MINUTE, PRECISION_SECOND, TIME_FIELDS, convert_activity_line,
     convert_log_line, convert_or_raw, display_header, effective_tz_name)
@@ -1764,6 +1765,7 @@ class Runner:
                                   "reconcile` で確認してください")
             raise _fail(reply)
         self.say(f"kill switch ラッチを解除しました (gen={_ident(reply.data.get('generation'))})")
+        self.say(KILL_SWITCH_RESET_WARNING)
         return RC_OK
 
     def _op_killswitch_reconcile(self, *, terminal: Terminal) -> int:
