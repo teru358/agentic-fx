@@ -166,6 +166,8 @@ fresh DDL、既存DBの `init_db` による冪等導入、旧DB fixture、`TABLE
 
 stage の作成後、反映中に期限 (10 分) に達したら、未確定の batch を rollback して stage を破棄し、確定済み prefix と確定 cursor はそのまま保ち、mutation lease を解放する。operation の結果は `stage_expired` (技術失敗、rc は §3 の技術失敗と同じ) とし、残りの範囲は次の cycle で新しい generation として再取得・再判定する (prefix は新しい N/C に含めない)。受入: 期限到達を fake clock で注入し、prefix が残る・lease が解放される・次 cycle が suffix だけを取る・旧 stage を再利用しない、を確かめる。
 
+stage の寿命は取得の完了 (stage の作成) から数え、分類の再試行の前と分類の chunk ごとにも確かめる。長い取得の途中で提供元が先に取った足の値を訂正した場合、その古い値は寿命の内なら書かれ得る。これは受け入れる。確定した足の値が後で変われば、次の取込みで衝突として記録され、人が判断する (§2.4)。stage の寿命は取得値の鮮度の保証ではなく、取得の後に分類と反映を長く遅らせないための上限である。
+
 同じgenerationの通常cycle間はstage・N/C・分類を維持する。mutation lease下でreadonly分類を一度済ませ、unchanged行は書込みSQLを省く。新規行と衝突だけをbatchへ渡す。INSERT競合時はrowcount=0の行だけ再比較し、契約外変更ならbatchをrollbackして技術失敗とする。全unchangedでも進捗を確定する。分類済みsuffixを先頭から再処理しない。
 
 確定進捗は `operation_id/generation, committed_prefix_end, next_cursor, last_committed_bar_time` を系列別に持つ。prefixは行番号ではなく要求区間集合の時刻順prefixで、空応答窓も含む。cursorは最初の未確定範囲の先頭、残りは複数区間なら区間一覧とする。同期では履歴+監査+この進捗を同じbatchで確定し、失敗batchのcursorは進めない。readonlyで判明したunchangedだけのprefixも短い進捗transactionを必要とする。run/series終端の失敗はbatch進捗から復元する。

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import itertools
 import logging
 import math
 import sqlite3
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -527,7 +529,7 @@ def _existing_values(conn: sqlite3.Connection, keys: list[tuple], source: str,
 def _upcoming_keys(entries, start: int) -> list[tuple]:
     """start 以降の、適用時に再照合が要る (new 以外の) 行の key を最大 1 chunk 分。"""
     keys = []
-    for entry in entries[start:]:
+    for entry in itertools.islice(entries, start, None):
         if entry.kind != "new":
             keys.append((entry.symbol, entry.interval, entry.bar_time))
             if len(keys) >= _QUERY_CHUNK:
@@ -555,8 +557,13 @@ def _known_conflict_keys(conn: sqlite3.Connection, source: str, epoch: str,
 
 
 
+class ClassificationExpired(Exception):
+    """分類の途中で、呼出し側が渡した期限を過ぎた。"""
+
+
 def classify_history_rows(conn: sqlite3.Connection, rows: list[tuple], *,
-                          source: str) -> HistoryClassification:
+                          source: str,
+                          expired: "Callable[[], bool] | None" = None) -> HistoryClassification:
     """書込みなしで入力を new / unchanged / conflict に分ける。
 
     入力内の同一 key は 1 つに正規化し、値が異なれば InconsistentInputError。
@@ -585,6 +592,8 @@ def classify_history_rows(conn: sqlite3.Connection, rows: list[tuple], *,
     ordered = sorted(seen.items(), key=lambda kv: (kv[0][2], kv[0][0], kv[0][1]))
     entries = []
     for start in range(0, len(ordered), _QUERY_CHUNK):
+        if expired is not None and expired():
+            raise ClassificationExpired()
         chunk = ordered[start:start + _QUERY_CHUNK]
         existing_by_key = _existing_values(conn, [key for key, _ in chunk], source)
         pending = []

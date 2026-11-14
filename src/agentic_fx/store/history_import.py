@@ -233,10 +233,19 @@ def _classify_and_apply(conn, spec, op, rows, *, origin, run_id, seen_at, monoto
                         sleep, stage_started, stage_ttl, busy_budget, admission,
                         max_rows, budget_seconds) -> SeriesOutcome:
     busy_spent = 0.0
+
+    def stage_over() -> bool:
+        return monotonic() - stage_started >= stage_ttl
+
     while True:
+        if stage_over():
+            return _failed(spec, op, "stage_expired")
         try:
-            classification = ohlcv.classify_history_rows(conn, rows, source=spec.source)
+            classification = ohlcv.classify_history_rows(
+                conn, rows, source=spec.source, expired=stage_over)
             break
+        except ohlcv.ClassificationExpired:
+            return _failed(spec, op, "stage_expired")
         except ohlcv.InconsistentInputError as exc:
             return _failed(spec, op, "invalid_response", detail=str(exc),
                            error_type=type(exc).__name__)

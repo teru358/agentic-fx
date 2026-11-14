@@ -374,8 +374,8 @@ def test_stage_just_under_the_ttl_after_fetch_is_written(tmp_path):
 def test_stage_expiring_between_batches_keeps_the_prefix_and_releases_the_lease(tmp_path):
     conn = _conn(tmp_path)
     rows = [_row(i) for i in range(6)]
-    # stage 作成 0 → batch 1 の前 1・commit 直前 2 → batch 2 の前 700
-    ticks = iter([0.0, 1.0, 2.0, 700.0] + [700.0] * 20)
+    # stage 作成 0 → 分類の前と chunk の確認 0.5 → batch 1 の前 1・commit 直前 2 → batch 2 の前 700
+    ticks = iter([0.0, 0.5, 0.5, 1.0, 2.0, 700.0] + [700.0] * 20)
     out = _run(conn, _spec(rows, n=6), max_rows=2, monotonic=lambda: next(ticks))
     assert (out.status, out.failure) == ("partial", "stage_expired")
     assert out.inserted == 2 and out.resume_from == _t(2)
@@ -403,8 +403,9 @@ def test_stage_expiring_inside_a_batch_rolls_that_batch_back(tmp_path):
 def test_stage_expiring_before_the_last_batch_commit_keeps_only_earlier_batches(tmp_path):
     conn = _conn(tmp_path)
     rows = [_row(i) for i in range(4)]
-    # batch 1 は前後とも期限内、batch 2 の前は期限内で commit 直前に越える
-    seq = iter([0.0, 2.0, 3.0, 4.0, 700.0])
+    # 分類の前と chunk の確認は期限内、batch 1 は前後とも期限内、batch 2 の前は期限内で
+    # commit 直前に越える
+    seq = iter([0.0, 1.0, 1.0, 2.0, 3.0, 4.0, 700.0])
     out = _run(conn, _spec(rows, n=4), max_rows=2,
                monotonic=lambda: next(seq, 700.0))
     assert (out.status, out.failure) == ("partial", "stage_expired")
@@ -540,11 +541,11 @@ def test_classification_busy_retries_within_the_same_budget(tmp_path, monkeypatc
     real = ohlcv.classify_history_rows
     calls = []
 
-    def flaky(c, rows, *, source):
+    def flaky(c, rows, *, source, **_kw):
         calls.append(1)
         if len(calls) <= 2:
             raise sqlite3.OperationalError("database is locked")
-        return real(c, rows, source=source)
+        return real(c, rows, source=source, **_kw)
 
     monkeypatch.setattr(ohlcv, "classify_history_rows", flaky)
     slept = []
@@ -553,10 +554,40 @@ def test_classification_busy_retries_within_the_same_budget(tmp_path, monkeypatc
     assert len(calls) == 3 and len(slept) == 2
 
 
+def test_classification_retries_stop_once_the_stage_expires(tmp_path, monkeypatch):
+    import sqlite3
+    conn = _conn(tmp_path)
+    calls = []
+
+    def locked(c, rows, *, source, **_kw):
+        calls.append(1)
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(ohlcv, "classify_history_rows", locked)
+    # 1 回目の分類が busy で戻った後は、時計が stage の期限を越えている
+    out = _run(conn, _spec([_row(0)]), sleep=lambda s: None,
+               monotonic=lambda: 700.0 if calls else 0.0)
+    assert (out.status, out.failure) == ("failed", "stage_expired")
+    assert len(calls) == 1 and _count(conn, "ohlcv_history") == 0
+
+
+def test_a_long_classification_checks_the_stage_between_chunks(tmp_path):
+    conn = _conn(tmp_path)
+    rows = [_row(i) for i in range(1200)]
+    seen = []
+
+    def expired():
+        seen.append(1)
+        return len(seen) >= 2
+    with pytest.raises(ohlcv.ClassificationExpired):
+        ohlcv.classify_history_rows(conn, rows, source="mt5", expired=expired)
+    assert len(seen) == 2
+
+
 def test_classification_busy_gives_up_after_the_budget(tmp_path, monkeypatch):
     import sqlite3
 
-    def always(c, rows, *, source):
+    def always(c, rows, *, source, **_kw):
         raise sqlite3.OperationalError("database is locked")
 
     monkeypatch.setattr(ohlcv, "classify_history_rows", always)
