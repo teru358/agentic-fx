@@ -133,6 +133,43 @@ class GateResult:
     returncode: int
     stdout_tail: str
     duration_sec: float
+    # 監査だけが読む構造化情報。既定は「識別できない」。`passed` の判定には使わない。
+    worker_ready: bool = False
+    pytest_exit: int | None = None
+    hash_changed: bool = False
+
+
+_STATUS_READY = "worker_ready"
+_STATUS_EXIT = "pytest_exit="
+_STATUS_MAX_BYTES = 4096
+
+
+def _read_worker_status(read_fd: int) -> tuple[bool, int | None]:
+    """worker が専用の fd へ書いた状態 (初期化の成功と pytest の終了コード) を読む。
+    読み取れない・形が違うものは「識別できない」として扱う。"""
+    try:
+        os.set_blocking(read_fd, False)
+        raw = b""
+        while len(raw) < _STATUS_MAX_BYTES:
+            try:
+                chunk = os.read(read_fd, _STATUS_MAX_BYTES - len(raw))
+            except (BlockingIOError, InterruptedError):
+                break
+            if not chunk:
+                break
+            raw += chunk
+    except OSError:
+        return False, None
+    ready, exit_code = False, None
+    for line in raw.decode("ascii", errors="replace").splitlines():
+        if line == _STATUS_READY:
+            ready = True
+        elif line.startswith(_STATUS_EXIT):
+            try:
+                exit_code = int(line[len(_STATUS_EXIT):])
+            except ValueError:
+                continue
+    return ready, exit_code
 
 
 def run_gate_pytest(plugin_dir: Path, *, settings: "Settings") -> GateResult:
@@ -188,10 +225,19 @@ def run_gate_pytest(plugin_dir: Path, *, settings: "Settings") -> GateResult:
               "PYTHONPYCACHEPREFIX": str(pyc_dir),
               "TMPDIR": str(workdir),
               **_SINGLE_THREAD_ENV}
-        proc = subprocess.Popen(argv, cwd=str(workdir), env=env,
-                                stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, start_new_session=True)
+        status_r, status_w = os.pipe()
+        argv = [*argv, str(status_w)]
+        try:
+            proc = subprocess.Popen(argv, cwd=str(workdir), env=env,
+                                    stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, start_new_session=True,
+                                    pass_fds=(status_w,))
+        except BaseException:
+            os.close(status_r)
+            raise
+        finally:
+            os.close(status_w)
         try:
             stdout, _ = proc.communicate(timeout=settings.plugin.pytest_timeout_sec)
             returncode = proc.returncode
@@ -218,6 +264,10 @@ def run_gate_pytest(plugin_dir: Path, *, settings: "Settings") -> GateResult:
                     proc.wait(timeout=5)
             returncode = -1
         duration = time.monotonic() - started
+        try:
+            worker_ready, pytest_exit = _read_worker_status(status_r)
+        finally:
+            os.close(status_r)
 
     after_content, after_artifact = hashes_of(plugin_dir)
     if after_content != before_content or after_artifact != before_artifact:
@@ -225,8 +275,10 @@ def run_gate_pytest(plugin_dir: Path, *, settings: "Settings") -> GateResult:
                           stdout_tail=(stdout[-_STDOUT_TAIL_MAX_BYTES:] if stdout else "") + "\n[gate_pytest] candidate "
                                       "content changed during test run "
                                       "(hash mismatch) — rejecting",
-                          duration_sec=duration)
+                          duration_sec=duration, worker_ready=worker_ready,
+                          pytest_exit=pytest_exit, hash_changed=True)
 
     tail = stdout[-_STDOUT_TAIL_MAX_BYTES:] if stdout else ""
     return GateResult(passed=(returncode == 0), returncode=returncode,
-                      stdout_tail=tail, duration_sec=duration)
+                      stdout_tail=tail, duration_sec=duration,
+                      worker_ready=worker_ready, pytest_exit=pytest_exit)

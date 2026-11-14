@@ -212,10 +212,13 @@ class FailureCollector:
         self.failures.append(failure)
 
 
-def _classify_pytest_exit(returncode: int | None) -> tuple[str, str]:
-    """pytest 段の終了の分類。版の自前 test が通常に失敗した (pytest の終了コード 1) ときだけ
-    不合格にし、信号終了・資源の上限・起動や収集の異常・終了コード 0 の不合格 (実行中の
-    hash 変化) は、版の評価ではなく評価不能にする。"""
+def _classify_pytest_exit(failure: "switch.GateFailure") -> tuple[str, str]:
+    """pytest 段の終了の分類。worker が初期化の成功と pytest 自身の終了コード 1 (test の失敗)
+    を構造化して知らせたときだけ不合格にする。実行中の hash 変化・信号終了・資源の上限・
+    初期化や収集の異常・識別できない終了は、版の評価ではなく評価不能にする。"""
+    returncode = failure.returncode
+    if failure.hash_changed:
+        return UNEVALUABLE, "changed_during_evaluation"
     if returncode == -1:
         return UNEVALUABLE, "timeout"
     if returncode is None:
@@ -224,7 +227,7 @@ def _classify_pytest_exit(returncode: int | None) -> tuple[str, str]:
         return UNEVALUABLE, "resource_unavailable"
     if returncode == 0:
         return UNEVALUABLE, "changed_during_evaluation"
-    if returncode == 1:
+    if returncode == 1 and failure.worker_ready is True and failure.pytest_exit == 1:
         return FAIL, "pytest"
     return UNEVALUABLE, "sandbox_unavailable"
 
@@ -234,7 +237,7 @@ def classify_failure(failure: "switch.GateFailure") -> tuple[str, str]:
     stage, detail, kind = failure.stage, failure.detail, failure.verdict_kind
     if stage == "pytest":
         if detail == "pytest":
-            return _classify_pytest_exit(failure.returncode)
+            return _classify_pytest_exit(failure)
         if failure.error_type == "CandidateSnapshotError":
             return UNEVALUABLE, "invalid_snapshot"
         if failure.error_type == "RuntimeError":
@@ -404,12 +407,25 @@ def _lock_names(target: AuditTarget) -> list[str]:
     return sorted(names)
 
 
+def _report_bytes(report: dict) -> bytes:
+    return (json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
+
+
+def _is_published(report_dir: Path, trial_id: str, data: bytes) -> bool:
+    """公開先に、書こうとした内容がそのまま公開済みか (割込みや例外の後の照合用)。"""
+    try:
+        with open(Path(report_dir) / f"{trial_id}.json", "rb") as handle:
+            return handle.read(len(data) + 1) == data
+    except OSError:
+        return False
+
+
 def _write_report(report_dir: Path, trial_id: str, report: dict) -> Path:
     """一時ファイルへ書いて fsync し、既存を上書きしない形で公開する。"""
     report_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     final = report_dir / f"{trial_id}.json"
     tmp = report_dir / f".{trial_id}.{uuid.uuid4().hex}.tmp"
-    data = (json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
+    data = _report_bytes(report)
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         try:
@@ -514,15 +530,18 @@ def audit_non_deployed_version(
                 written = _write_report(Path(report_dir), trial_id, report)
                 error = None
                 break
-            except (KeyboardInterrupt, SystemExit) as exc:
-                pending = pending or exc
-                trial.interrupted = True
-                trial.stop(UNEVALUABLE, "interrupted")
+            except (KeyboardInterrupt, SystemExit, Exception) as exc:  # noqa: BLE001
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    pending = pending or exc
+                    trial.interrupted = True
+                    trial.stop(UNEVALUABLE, "interrupted")
+                elif not trial.interrupted:
+                    trial.stop(UNEVALUABLE, "failed")
+                if _is_published(Path(report_dir), trial_id, _report_bytes(report)):
+                    written, error = Path(report_dir) / f"{trial_id}.json", None
+                    break
+                error = type(exc).__name__
                 report = _fallback_report(target, trial_id, started, clock(), trial)
-                error = type(exc).__name__
-            except Exception as exc:  # noqa: BLE001 - reported on its own, never a pass
-                error = type(exc).__name__
-                break
     finally:
         shutil.rmtree(copy_dir, ignore_errors=True)
     if pending is not None:

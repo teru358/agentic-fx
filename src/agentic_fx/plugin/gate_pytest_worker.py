@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 
 assert sys.pycache_prefix is not None, (
@@ -17,9 +18,21 @@ from pathlib import Path
 from agentic_fx.core import landlock
 
 
+def _report_status(fd: int | None, line: str) -> None:
+    """親が渡した専用の fd へ、初期化の成功と pytest の終了コードを知らせる。
+    fd が無い (従来の起動) ・書けないときは何もしない。"""
+    if fd is None:
+        return
+    try:
+        os.write(fd, (line + "\n").encode("ascii"))
+    except OSError:
+        pass
+
+
 def main() -> None:
     plugin_dir = Path(sys.argv[1]).resolve()
     workdir = Path(sys.argv[2]).resolve()
+    status_fd = int(sys.argv[3]) if len(sys.argv) > 3 else None
 
     code_root = Path(__file__).resolve().parents[1]
     venv_root = Path(sys.prefix).resolve()
@@ -47,6 +60,7 @@ def main() -> None:
     landlock.restrict_to(read_only_paths=read_only,
                          read_write_paths=[workdir, Path("/dev")],
                          execute_file_paths=execute_file_paths)
+    _report_status(status_fd, "worker_ready")
 
     import pytest
     # `-c <workdir>/pytest.ini`: implicit inifile 探索 (親ディレクトリを
@@ -69,6 +83,7 @@ def main() -> None:
                       "--confcutdir", str(plugin_dir),
                       "--basetemp", str(workdir / "basetemp"),
                       str(plugin_dir)])
+    _report_status(status_fd, f"pytest_exit={int(rc)}")
     raise SystemExit(int(rc))
 
 

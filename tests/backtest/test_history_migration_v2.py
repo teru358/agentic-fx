@@ -373,18 +373,23 @@ def test_a_passing_report_whose_evidence_fails_the_current_rules_is_refused(tmp_
     assert any("current history rules" in p for p in _verify(tmp_path, manifest, root))
 
 
-@pytest.mark.parametrize("mutate", [
-    lambda ev: ev.update(threshold_snapshot={"forged": 1}),
-    lambda ev: ev.update(version=ev["version"] + 1),
-    lambda ev: ev.update(no_bars_digest="0" * 64),
-    lambda ev: ev.pop("checked_at"),
+@pytest.mark.parametrize("mutate,detail", [
+    (lambda ev: ev.update(threshold_snapshot={"forged": 1}), "thresholds differ"),
+    (lambda ev: ev.update(version=ev["version"] + 1), "guard version differs"),
+    (lambda ev: ev.update(no_bars_digest="0" * 64), None),
+    (lambda ev: ev.pop("checked_at"), "unexpected set of fields"),
 ])
-def test_a_tampered_evidence_in_a_passing_report_is_refused(tmp_path, root, mutate):
+def test_a_tampered_evidence_in_a_passing_report_is_refused(tmp_path, root, mutate, detail):
     manifest, e, name = _one(root)
     report = json.loads((root / name).read_text())
     mutate(report["axes"]["history"]["evidence"])
     (root / name).write_text(json.dumps(report))
-    assert _verify(tmp_path, manifest, root)
+    check = hm.evidence_currently_valid(report, no_bars_path=tmp_path / "none.yaml")
+    assert not check.ok
+    if detail is not None:
+        assert detail in check.detail, check.detail
+    problems = _verify(tmp_path, manifest, root)
+    assert any("current history rules" in p for p in problems), problems
 
 
 # ---- 読み切りと型の防御 ----------------------------------------------------------------

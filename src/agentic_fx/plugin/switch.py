@@ -85,10 +85,15 @@ class GateCheckError(ValueError):
     """Gate failure whose failed check is carried as a structured ``kind``
     (``pytest`` or ``hash``); callers must not classify by message text."""
 
-    def __init__(self, message: str, *, kind: str, returncode: int | None = None) -> None:
+    def __init__(self, message: str, *, kind: str, returncode: int | None = None,
+                 worker_ready: bool = False, pytest_exit: int | None = None,
+                 hash_changed: bool = False) -> None:
         super().__init__(message)
         self.kind = kind
         self.returncode = returncode
+        self.worker_ready = worker_ready
+        self.pytest_exit = pytest_exit
+        self.hash_changed = hash_changed
 
 
 class IndicatorFixtureReject(ValueError):
@@ -1272,6 +1277,9 @@ class GateFailure:
     mission_outcome: str | None = None
     rows: tuple = ()
     message: str = ""
+    worker_ready: bool = False
+    pytest_exit: int | None = None
+    hash_changed: bool = False
 
 
 FailureSink = Callable[[GateFailure], None]
@@ -1425,7 +1433,10 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
             raise GateCheckError(
                 f"plugin {name!r}: test_plugin.py failed pytest gate "
                 f"(returncode={gate_result.returncode})", kind="pytest",
-                returncode=gate_result.returncode)
+                returncode=gate_result.returncode,
+                worker_ready=gate_result.worker_ready,
+                pytest_exit=gate_result.pytest_exit,
+                hash_changed=gate_result.hash_changed)
 
         stage = "hash"
         after_content, after_artifact = hashes_of(candidate_dir)  # 手順 6
@@ -1461,6 +1472,9 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
         sink(GateFailure(
             stage=stage, error_type=type(exc).__name__, detail=_failure_detail(exc),
             returncode=getattr(exc, "returncode", None),
+            worker_ready=getattr(exc, "worker_ready", False),
+            pytest_exit=getattr(exc, "pytest_exit", None),
+            hash_changed=getattr(exc, "hash_changed", False),
             mission_outcome="gate_failed", rows=tuple(rows), message=safe_error_text(exc)))
         raise
 

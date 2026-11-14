@@ -146,6 +146,29 @@ def test_a_pytest_stage_failure_that_is_not_an_ordinary_test_failure_is_unevalua
     assert report["axes"]["execution"]["status"] == status
 
 
+@pytest.mark.parametrize("gate", [
+    Gate(passed=False, returncode=1, ready=False, pytest_exit=None),   # died before pytest ran
+    Gate(passed=False, returncode=1, ready=True, pytest_exit=None),    # no pytest result reported
+    Gate(passed=False, returncode=1, ready=True, pytest_exit=2),       # pytest said something else
+    Gate(passed=False, returncode=1, ready=False, pytest_exit=1),      # no initialization seen
+], ids=["init_failed", "no_pytest_result", "other_pytest_exit", "not_ready"])
+def test_an_exit_code_one_that_the_worker_did_not_describe_as_a_test_failure_is_unevaluable(
+        make, gate):
+    world = make(gate=gate)
+    _v, target = world.stored()
+    report = _result(world, target).report
+    assert (report["result"]["overall"], report["result"]["reason"]) == (
+        "unevaluable", "sandbox_unavailable")
+
+
+def test_a_hash_change_reported_by_the_gate_outranks_a_test_failure_even_if_it_was_restored(make):
+    world = make(gate=Gate(passed=False, returncode=1, hash_changed=True))
+    _v, target = world.stored()
+    report = _result(world, target).report
+    assert (report["result"]["overall"], report["result"]["reason"]) == (
+        "unevaluable", "changed_during_evaluation")
+
+
 def test_a_stored_version_changed_by_its_own_test_run_is_unevaluable_not_a_fail(make):
     class Mutating(Gate):
         def __call__(self, plugin_dir, *, settings):
@@ -269,10 +292,13 @@ def test_every_reason_the_audit_can_report_is_in_the_fixed_set():
                 for error_type, rc in (("ValueError", None), ("SandboxError", None),
                                        ("RuntimeError", 1), ("OSError", -1),
                                        ("CandidateSnapshotError", None)):
-                    overall, reason = audit.classify_failure(GateFailure(
-                        stage=stage, error_type=error_type, detail=detail, verdict_kind=kind,
-                        returncode=rc))
-                    seen.add((overall, reason))
+                    for ready, exit_code, changed in ((False, None, False), (True, 1, False),
+                                                      (True, None, False), (True, 1, True)):
+                        overall, reason = audit.classify_failure(GateFailure(
+                            stage=stage, error_type=error_type, detail=detail,
+                            verdict_kind=kind, returncode=rc, worker_ready=ready,
+                            pytest_exit=exit_code, hash_changed=changed))
+                        seen.add((overall, reason))
     for overall, reason in seen:
         assert overall in ("fail", "unevaluable")
         if overall == "unevaluable":
@@ -808,3 +834,53 @@ def test_an_interrupt_while_writing_the_report_is_retried_as_an_interrupted_repo
     assert calls == ["pass", "unevaluable"]
     (path,) = list(world.report_dir.iterdir())
     assert json.loads(path.read_text())["result"]["reason"] == "interrupted"
+
+
+@pytest.mark.parametrize("exc", [KeyboardInterrupt, OSError])
+def test_a_failure_right_after_the_report_was_published_keeps_the_published_result(
+        make, monkeypatch, exc):
+    world = make()
+    _v, target = world.stored()
+    real_link = os.link
+
+    def link_then_fail(src, dst, **kw):
+        real_link(src, dst, **kw)
+        raise exc("after publish")
+
+    monkeypatch.setattr(audit.os, "link", link_then_fail)
+    if exc is KeyboardInterrupt:
+        with pytest.raises(KeyboardInterrupt):
+            world.run(target)
+        result = None
+    else:
+        result = world.run(target)
+    (path,) = [p for p in world.report_dir.iterdir() if not p.name.startswith(".")]
+    on_disk = json.loads(path.read_text())
+    assert on_disk["result"]["overall"] == "pass"
+    if result is not None:
+        assert result.report == on_disk and result.report_path == path
+        assert result.write_error is None
+    assert [p.name for p in world.report_dir.iterdir()] == [path.name]
+    assert list(world.work_root.iterdir()) == []
+
+
+def test_an_ordinary_write_failure_leaves_an_unevaluable_report_instead_of_none(
+        make, monkeypatch):
+    world = make()
+    _v, target = world.stored()
+    real = audit._write_report
+    calls = []
+
+    def once(report_dir, trial_id, report):
+        calls.append(report["result"]["overall"])
+        if len(calls) == 1:
+            raise OSError("disk full")
+        return real(report_dir, trial_id, report)
+
+    monkeypatch.setattr(audit, "_write_report", once)
+    result = world.run(target)
+    assert calls == ["pass", "unevaluable"]
+    (path,) = list(world.report_dir.iterdir())
+    on_disk = json.loads(path.read_text())
+    assert (on_disk["result"]["overall"], on_disk["result"]["reason"]) == ("unevaluable", "failed")
+    assert result.report == on_disk and result.report_path == path

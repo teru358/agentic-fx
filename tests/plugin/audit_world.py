@@ -69,14 +69,26 @@ class Replay:
 
 
 class Gate:
-    """Stands in for the sandboxed pytest of the shared gate; counts its calls."""
+    """Stands in for the sandboxed pytest of the shared gate; counts its calls.
 
-    def __init__(self, passed: bool = True, returncode: int = 0):
+    By default it reports what the real worker does: a ready worker and pytest's own exit code
+    equal to the process exit code. Pass `ready` / `pytest_exit` / `hash_changed` to model an
+    exit that the worker did not describe."""
+
+    _SAME = object()
+
+    def __init__(self, passed: bool = True, returncode: int = 0, *, ready: bool | None = None,
+                 pytest_exit=_SAME, hash_changed: bool = False):
         self.passed, self.returncode, self.calls = passed, returncode, 0
+        self.ready = (returncode >= 0) if ready is None else ready
+        self.pytest_exit = (returncode if returncode >= 0 else None) \
+            if pytest_exit is Gate._SAME else pytest_exit
+        self.hash_changed = hash_changed
 
     def __call__(self, plugin_dir, *, settings):
         self.calls += 1
-        return GateResult(self.passed, self.returncode, "", 0.01)
+        return GateResult(self.passed, self.returncode, "", 0.01, worker_ready=self.ready,
+                          pytest_exit=self.pytest_exit, hash_changed=self.hash_changed)
 
 
 class AuditWorld(RealWorld):
