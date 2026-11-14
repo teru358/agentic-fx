@@ -485,11 +485,21 @@ class ApiSettings(_Strict):
     shutdown_join_sec: float = Field(default=5.0, gt=0)
 
 
+class HistorySyncSettings(_Strict):
+    """評価用履歴の同期。省略時はこの既定で動く (旧 settings にキー行を足さない)。
+
+    `lookback_days` は手動同期の後ろ窓 (UTC 暦日数、当日を含む)。
+    """
+    auto_enabled: bool = True
+    lookback_days: int = Field(default=7, ge=2, le=31)
+
+
 class BacktestSettings(_Strict):
     holdout_months: int = Field(ge=1)
     initial_balance: float = Field(gt=0)
     eval_source: str = "none"
     base_interval: str = "1m"
+    history_sync: HistorySyncSettings = Field(default_factory=HistorySyncSettings)
 
     @model_validator(mode="after")
     def _history_dataset_is_valid(self):

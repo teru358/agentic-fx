@@ -9,8 +9,8 @@ from agentic_fx.config import Settings
 from agentic_fx.setup.settings_edit import EditResult, find_duplicate_keys
 
 
-CURRENT_SCHEMA_VERSION = 5
-_SCHEMA_LINE = "schema_version: 5  # [init] settings の版。`afx init` が移行する\n"
+CURRENT_SCHEMA_VERSION = 6
+_SCHEMA_LINE = "schema_version: 6  # [init] settings の版。`afx init` が移行する\n"
 _V1_SCHEMA_LINE = "schema_version: 1  # settings の版。`afx init` が移行する\n"
 
 
@@ -188,6 +188,31 @@ def _migrate_four_to_five(text: str) -> EditResult:
     return EditResult(ok=True, text=updated)
 
 
+_VERSION_FIVE_LINE = re.compile(r"(schema_version:[ \t]*)5(([ \t]+#.*)?\r?\n?)")
+
+
+def _migrate_five_to_six(text: str) -> EditResult:
+    """Bump the marker to v6 only.
+
+    ``backtest.history_sync`` is optional and its model defaults apply when it is
+    absent, so an older file keeps its meaning without a new line; only the marker
+    line changes.
+    """
+    lines = text.splitlines(keepends=True)
+    marker = next((i for i, line in enumerate(lines) if _VERSION_FIVE_LINE.fullmatch(line)), None)
+    if marker is None:
+        return _failure("schema_version: 5 の行を見つけられません。手で編集してください。")
+    lines[marker], replaced = _VERSION_FIVE_LINE.subn(r"\g<1>6\g<2>", lines[marker], count=1)
+    if replaced != 1:
+        return _failure("schema_version: 5 の行を書き換えられませんでした。手で編集してください。")
+    updated = "".join(lines)
+    try:
+        Settings.model_validate(yaml.safe_load(updated) or {})
+    except Exception as error:
+        return _failure(f"移行後の型検証に失敗しました: {error}。手で編集してください。")
+    return EditResult(ok=True, text=updated)
+
+
 def migrate(text: str) -> EditResult:
     """Migrate a settings document only through the explicitly listed versions."""
     duplicates = find_duplicate_keys(text)
@@ -211,6 +236,8 @@ def migrate(text: str) -> EditResult:
             result = _migrate_three_to_four(text)
         elif version == 4:
             result = _migrate_four_to_five(text)
+        elif version == 5:
+            result = _migrate_five_to_six(text)
         else:
             return _failure("この settings の移行経路がありません。手で編集してください。")
         if not result.ok or result.text is None:

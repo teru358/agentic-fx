@@ -1240,10 +1240,10 @@ def test_econ_section_is_optional_and_defaults_to_the_window_rule():
     assert s.econ.signal_capacity_daily_max == 5
 
 
-def test_example_states_the_econ_window_defaults_and_the_schema_stays_v5():
+def test_example_states_the_econ_window_defaults_and_the_schema_is_v6():
     import yaml
     raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
-    assert raw["schema_version"] == CURRENT_SCHEMA_VERSION == 5
+    assert raw["schema_version"] == CURRENT_SCHEMA_VERSION == 6
     assert raw["econ"] == {"window": {"importance_min": 3, "before_min": 30,
                                       "after_min": 15}}
     s = load_settings(EXAMPLE)
