@@ -103,6 +103,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"afx-ops: {REASON_UNKNOWN_FEATURE} (usage: afx-ops {{{'|'.join(FEATURES)}}} | afx-ops probe {{{'|'.join(FEATURES)}}} | afx-ops interfaces)",
               file=sys.stderr)
         return RC_UNKNOWN_FEATURE
+    early = None
+    if args[0] == "bot":
+        # 設定・secret・依存の import より前に、log の record を固定語だけにする
+        from afx_ops.bot import logsafe
+
+        def _write(text: str) -> None:
+            try:
+                print(f"afx-ops: {text}", file=sys.stderr, flush=True)
+            except (OSError, ValueError):
+                pass
+        early = logsafe.install_early(_write)
+    try:
+        return _start(args[0])
+    finally:
+        if early is not None:
+            from afx_ops.bot import logsafe
+            if logsafe.take_early() is early:
+                early.flush_counts()
+                early.restore()
+
+
+def _start(feature: str) -> int:
+    args = [feature]
     config = None
     try:
         config = read_config(args[0])

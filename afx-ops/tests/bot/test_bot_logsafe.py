@@ -360,3 +360,130 @@ def test_the_client_callbacks_drive_the_transition_lines():
         await bot.on_resumed()
     asyncio.run(go())
     assert lines == ["gateway_unhealthy", "gateway_recovered repeats=1"]
+
+
+# ------------------------------------------------------------------ 是正の確認
+
+def test_a_type_name_shaped_like_an_identifier_but_not_a_known_type_is_not_printed():
+    hostile = type("secret_token_123", (Exception,), {})
+    handler = LoopErrors(lambda text: lines.append(text))
+    lines: list[str] = []
+    handler(None, {"exception": hostile(TOKEN), "message": "Task exception was never retrieved"})
+    handler(None, {"exception": ValueError(TOKEN)})
+    handler(None, {"exception": asyncio.TimeoutError()})
+    assert lines[0] == "bot_loop_error other message=task_exception_was_never_retrieved"
+    assert lines[1] == "bot_loop_error ValueError"
+    assert "secret_token_123" not in "".join(lines)
+    # 本物の module の名前を名乗る偽の型も、その module が公開する型でなければ出さない
+    fake = type("secret_token_123", (Exception,), {"__module__": "builtins"})
+    assert logsafe._type_name(fake()) == "other"
+
+
+def test_existing_handlers_on_discord_and_its_children_are_removed_and_restored():
+    import io
+    stream = io.StringIO()
+    stream_child = io.StringIO()
+    parent = logging.getLogger("discord")
+    child = logging.getLogger("discord.gateway")
+    parent_handler, child_handler = logging.StreamHandler(stream), logging.StreamHandler(stream_child)
+    parent.addHandler(parent_handler)
+    child.addHandler(child_handler)
+    before = (list(parent.handlers), list(child.handlers), parent.propagate, child.propagate)
+    installed = SafeLogging(lambda text: None)
+    try:
+        _poison("discord", logging.CRITICAL)
+        _poison("discord.gateway", logging.CRITICAL)
+        _poison("discord.http", logging.CRITICAL)
+        assert stream.getvalue() == "" and stream_child.getvalue() == ""
+    finally:
+        installed.restore()
+        try:
+            assert (list(parent.handlers), list(child.handlers), parent.propagate,
+                    child.propagate) == before
+        finally:
+            parent.removeHandler(parent_handler)
+            child.removeHandler(child_handler)
+
+
+def test_a_partly_built_safe_logging_restores_what_it_changed(monkeypatch):
+    root = logging.getLogger()
+    before = (list(root.handlers), root.level, logging.lastResort, logging.raiseExceptions)
+
+    def boom(name):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(logsafe, "_family_loggers", boom)
+    with pytest.raises(KeyboardInterrupt):
+        SafeLogging(lambda text: None)
+    assert (list(root.handlers), root.level, logging.lastResort, logging.raiseExceptions) == before
+
+
+class _FakeWatchdog:
+    def __init__(self) -> None:
+        self.started = False
+        self.shutdown = 0
+
+    def start(self) -> None:
+        self.started = True
+
+    def attach(self, loop) -> None:
+        pass
+
+    def begin_shutdown(self) -> None:
+        self.shutdown += 1
+
+
+def test_an_interrupt_while_building_the_safe_logging_still_records_the_shutdown(tmp_path, monkeypatch):
+    def boom(write):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(runtime, "SafeLogging", boom)
+    dog = _FakeWatchdog()
+    with pytest.raises(KeyboardInterrupt):
+        runtime.run(_isolated(tmp_path), client=object(), stderr=_Out(), watchdog=dog)
+    assert dog.started and dog.shutdown >= 1
+
+
+def test_loop_errors_beyond_the_limit_are_summarised_by_run(tmp_path, monkeypatch):
+    out = _Out()
+
+    async def main(*args, loop_errors=None, **kwargs):
+        for _ in range(logsafe.LOOP_ERROR_LINES + 5):
+            loop_errors(None, {"exception": RuntimeError(TOKEN)})
+    monkeypatch.setattr(runtime, "_main", main)
+    assert runtime.run(_isolated(tmp_path), client=object(), stderr=out) == 0
+    assert "bot_loop_error_repeated count=5" in out.text
+    _assert_clean(out.text)
+
+
+def test_records_emitted_before_run_are_closed_by_the_early_install(tmp_path, monkeypatch, capfd):
+    from afx_ops import cli
+    root = logging.getLogger()
+    before = (list(root.handlers), logging.lastResort)
+
+    def start(feature):
+        # 設定の読込み・import の段で出る record。run の前
+        _poison("discord.client")
+        _poison("asyncio", logging.CRITICAL)
+        return 0
+    monkeypatch.setattr(cli, "_start", start)
+    assert cli.main(["bot"]) == 0
+    seen = capfd.readouterr()
+    _assert_clean(seen.out + seen.err)
+    assert "log_record family=asyncio" in seen.err
+    assert "family=discord" not in seen.err
+    assert (list(root.handlers), logging.lastResort) == before
+    assert logsafe.take_early() is None
+
+
+def test_run_takes_over_the_early_install_and_restores_it(tmp_path, monkeypatch):
+    installed = logsafe.install_early(lambda text: None)
+    out = _Out()
+
+    async def main(*args, **kwargs):
+        _poison("asyncio", logging.CRITICAL)
+    monkeypatch.setattr(runtime, "_main", main)
+    root = logging.getLogger()
+    assert installed.handler in root.handlers
+    runtime.run(_isolated(tmp_path), client=object(), stderr=out)
+    assert installed.handler not in root.handlers
+    assert "log_record family=asyncio" in out.text
+    assert logsafe.take_early() is None

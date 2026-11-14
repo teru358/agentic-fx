@@ -45,7 +45,7 @@ from afx_ops.api_client import RC_UNREACHABLE, ApiError, BotClient, with_detail
 from afx_ops.bot.adapter import BotAdapter, BotFailure, BotSettings, open_state_dir
 from afx_ops.bot.exits import (REASONS, RC_BOT_LOOP_STALLED, RC_BOT_PERMANENT,  # noqa: F401
                                RC_BOT_TRANSIENT, RC_OK, rc_for_reason)
-from afx_ops.bot.logsafe import LoopErrors, SafeLogging
+from afx_ops.bot.logsafe import LoopErrors, SafeLogging, take_early
 from afx_ops.bot.progress import GATEWAY_HEALTHY, ProgressTracker
 from afx_ops.bot.rest import PERMANENT, REST_ERRORS, classify
 from afx_ops.bot.watchdog import Watchdog
@@ -98,11 +98,18 @@ def run(isolated, *, client=None, connector_factory: Callable[[], object] | None
     """
     out = sys.stderr if stderr is None else stderr
     watchdog = new_watchdog() if watchdog is None else watchdog
-    watchdog.start()
-    # discord.py / aiohttp / asyncio の log は例外文・URL・ID を含み得るので、record の中身は出さず
-    # 系統と件数の固定語だけにする
-    safe = SafeLogging(lambda text: _say(out, text))
+    safe: SafeLogging | None = None
+    loop_errors = LoopErrors(lambda t: _say(out, t))
     try:
+        watchdog.start()
+        # discord.py / aiohttp / asyncio の log は例外文・URL・ID を含み得るので、record の中身は出さず
+        # 系統と件数の固定語だけにする。起動の最初に入れてあればそれを引き継ぐ
+        write = lambda text: _say(out, text)  # noqa: E731
+        safe = take_early()
+        if safe is None:
+            safe = SafeLogging(write)
+        else:
+            safe.set_write(write)
         token = parse_token(isolated.secrets.get(SECRET_NAME))
         if client is None:
             client = client_for(isolated, BotClient)
@@ -116,7 +123,7 @@ def run(isolated, *, client=None, connector_factory: Callable[[], object] | None
             asyncio.run(_main(isolated, token, client, dir_fd, connector_factory=connector_factory,
                               stop=stop, poll_interval=poll_interval, now=now,
                               progress=ProgressTracker(monotonic, emit=lambda t: _say(out, t)),
-                              sleep=sleep, loop_errors=LoopErrors(lambda t: _say(out, t)),
+                              sleep=sleep, loop_errors=loop_errors,
                               monitor_interval=monitor_interval, watchdog=watchdog))
         finally:
             os.close(dir_fd)
@@ -137,8 +144,10 @@ def run(isolated, *, client=None, connector_factory: Callable[[], object] | None
         watchdog.begin_shutdown()
         raise
     finally:
-        safe.flush_counts()
-        safe.restore()
+        loop_errors.flush_counts()
+        if safe is not None:
+            safe.flush_counts()
+            safe.restore()
     watchdog.begin_shutdown()
     return RC_OK
 

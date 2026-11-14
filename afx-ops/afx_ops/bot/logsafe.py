@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import sys
 from collections.abc import Callable
 
 # 1 系統あたり、最初の 1 件だけ出す。以後は件数に畳み、`flush` で件数だけ出す
@@ -40,9 +41,24 @@ def _family(name: object) -> str:
     return head if head in ("asyncio", "aiohttp", "discord") else "other"
 
 
+# 型名を出してよい出所。その module が同じ名前でその型を公開しているものだけ (動的に作った型・
+# 利用側の型は、名前が識別子の形でも出さない)
+_TYPE_ROOTS = frozenset({"builtins", "asyncio", "aiohttp", "discord", "ssl", "socket",
+                         "json", "concurrent"})
+
+
 def _type_name(exc: object) -> str:
-    name = type(exc).__name__
-    return name if _TYPE_NAME.fullmatch(name) else "other"
+    kind = type(exc)
+    name = getattr(kind, "__name__", "")
+    module = getattr(kind, "__module__", "")
+    if (not isinstance(name, str) or not isinstance(module, str)
+            or _TYPE_NAME.fullmatch(name) is None
+            or module.split(".", 1)[0] not in _TYPE_ROOTS):
+        return "other"
+    owner = sys.modules.get(module)
+    if owner is None or getattr(owner, name, None) is not kind:
+        return "other"
+    return name
 
 
 def _loop_message(message: str) -> str:
@@ -119,14 +135,34 @@ class LoopErrors:
             pass
 
 
+def _family_loggers(root_name: str) -> list[logging.Logger]:
+    """系統の logger 本体と、既に作られている子孫 (直接 handler を持ち得る)。"""
+    found = [logging.getLogger(root_name)]
+    prefix = root_name + "."
+    for name, logger in list(logging.Logger.manager.loggerDict.items()):
+        if name.startswith(prefix) and isinstance(logger, logging.Logger):
+            found.append(logger)
+    return found
+
+
 class SafeLogging:
-    """process の logging を安全 handler だけにし、`restore` で元に戻す。"""
+    """process の logging を安全 handler だけにし、`restore` で元に戻す。
+
+    構築の途中で失敗・中断しても、それまでに変えた分を戻してから例外を出す。
+    """
 
     def __init__(self, write: Callable[[str], None]) -> None:
         self.handler = FixedCodeHandler(write)
         root = logging.getLogger()
         self._saved = (list(root.handlers), root.level, logging.lastResort,
                        logging.raiseExceptions, [])
+        try:
+            self._install(root)
+        except BaseException:
+            self.restore()
+            raise
+
+    def _install(self, root: logging.Logger) -> None:
         # 既存の handler (生の record を整形して出し得る) を外し、安全 handler だけにする
         for old in list(root.handlers):
             root.removeHandler(old)
@@ -134,17 +170,23 @@ class SafeLogging:
         root.setLevel(logging.WARNING)
         logging.lastResort = None
         logging.raiseExceptions = False
-        # 伝播先を root の安全 handler に揃える。discord は何も出さない
+        # 伝播先を root の安全 handler に揃える。子孫が直接持つ handler も外す。discord は何も出さない
         for name in ("asyncio", "aiohttp"):
-            logger = logging.getLogger(name)
+            for logger in _family_loggers(name):
+                self._saved[4].append((logger, list(logger.handlers), logger.propagate))
+                for old in list(logger.handlers):
+                    logger.removeHandler(old)
+                logger.propagate = True
+        for logger in _family_loggers("discord"):
             self._saved[4].append((logger, list(logger.handlers), logger.propagate))
             for old in list(logger.handlers):
                 logger.removeHandler(old)
-            logger.propagate = True
         quiet = logging.getLogger("discord")
-        self._saved[4].append((quiet, list(quiet.handlers), quiet.propagate))
         quiet.addHandler(logging.NullHandler())
         quiet.propagate = False
+
+    def set_write(self, write: Callable[[str], None]) -> None:
+        self.handler._write = write
 
     def flush_counts(self) -> None:
         self.handler.flush_counts()
@@ -165,3 +207,22 @@ class SafeLogging:
             for old in saved:
                 logger.addHandler(old)
             logger.propagate = propagate
+        loggers.clear()
+
+
+# 起動の最初 (import・設定の読込みより前) に入れた安全 logging。`run` が引き取る
+_EARLY: SafeLogging | None = None
+
+
+def install_early(write: Callable[[str], None]) -> SafeLogging:
+    global _EARLY
+    if _EARLY is not None:
+        _EARLY.restore()
+    _EARLY = SafeLogging(write)
+    return _EARLY
+
+
+def take_early() -> SafeLogging | None:
+    global _EARLY
+    early, _EARLY = _EARLY, None
+    return early
