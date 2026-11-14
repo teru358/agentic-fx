@@ -8,6 +8,7 @@ import os
 import sqlite3
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -774,3 +775,36 @@ def test_the_instance_lock_is_taken_shared_at_most_once_per_run(tmp_path, monkey
     shared = [operation for operation in log if operation & fcntl.LOCK_SH]
     assert len(shared) == (1 if instance == "free" else 0)
     assert not [operation for operation in log if operation & fcntl.LOCK_EX]
+
+
+def test_unknown_reads_the_settings_file_once_for_both_the_zone_and_the_history(
+        tmp_path, monkeypatch, capsys):
+    root, lock, _db = _history_root(tmp_path)
+    write_key(root, Principal.OPERATOR)
+    target = root / "config" / "settings.yaml"
+    real_read_text = Path.read_text
+    reads = []
+
+    def counting(self, *args, **kwargs):
+        if self == target:
+            reads.append(str(self))
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counting)
+    with held_by_other_process(lock):
+        assert status.main(root, now=NOW) == 0
+    assert len(reads) == 1
+    assert capsys.readouterr().out.count("evaluation history:") == 1
+
+
+def test_unknown_with_an_unconfigured_source_and_no_database_says_not_configured(
+        tmp_path, monkeypatch, capsys):
+    root = _root(tmp_path)
+    write_settings(root, "ok")
+    touch = touch_lock(root)
+    write_key(root, Principal.OPERATOR)
+    with held_by_other_process(touch):
+        assert status.main(root, now=NOW) == 0
+    out = capsys.readouterr().out
+    assert "evaluation history: not configured" in out
+    assert "database_unavailable" not in out

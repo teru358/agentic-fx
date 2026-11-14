@@ -408,7 +408,7 @@ rejectは使わず、人間の自由記述による履歴情報を改善prompt�
 
 ## 7. `afx status`
 
-段1aではローカルの `afx status` に `evaluation_history` を1ブロック追加する。読取専用接続で計算し、既存ライブdata・referencesとは区別する。読むのは instance lock が free のとき、および locked のうち marker なしの `locked-by: unknown` のときだけで、`mode=ro` 固定 (`immutable` なし) の履歴専用接続を使う。`setup`・`enroll:*`・将来の保持者では読まず従来の6行を維持する (正本は `2026-11-14-history-status-and-import-conflicts-design.md` §1.2)。
+段1aではローカルの `afx status` に `evaluation_history` を1ブロック追加する。読取専用接続で計算し、既存ライブdata・referencesとは区別する。読むのは instance lock が free のとき、`instance: unknown` (lock file の不在など) の通常集計、および locked のうち marker なしの `locked-by: unknown` のときだけである。接続は経路で分ける。locked の `unknown` は `mode=ro` 固定 (`immutable` なし) の履歴専用接続を使う。free と `instance: unknown` の通常集計は既定の読取専用 helper を使い、sidecar (WAL/SHM) が無いときは `immutable=1` で開く。`setup`・`enroll:*`・将来の保持者では読まず従来の6行を維持する (正本は `2026-11-14-history-status-and-import-conflicts-design.md` §1.2)。
 
 表示は次に絞る。
 

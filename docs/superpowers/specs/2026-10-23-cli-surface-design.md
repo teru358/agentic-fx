@@ -724,7 +724,7 @@ probe の結果は次の 3 語で出す。
 
 lock file や親 directory は作らない。判定前後の状態変化を含む TOCTOU はゼロと主張せず、「観測時点」固定文を locked / free / unknown のすべてで出す。
 
-`instance: locked` のときは次の 6 行を出し、DB、state file、activity log の詳細を読まない。終了コードは 0 とする。ただし `locked-by` が marker なしの `unknown (daemon 稼働中とみられる)` のときだけ例外で、設定と `mode=ro` 固定 (`immutable` なし) の履歴専用接続を 1 度ずつ使って、表示 tz 行と評価履歴ブロック (固定理由つき) を `locked-by` と note の間に足す (置換の正本は `2026-11-14-history-status-and-import-conflicts-design.md` §1.2)。`setup`、`enroll:*`、将来の保持者は従来の 6 行を完全に維持し、履歴のために何も読まない。
+`instance: locked` のときは次の 6 行を出し、DB、state file、activity log の詳細を読まない。終了コードは 0 とする。ただし `locked-by` が marker なしの `unknown (daemon 稼働中とみられる)` のときだけ例外で、設定の読取と `mode=ro` 固定 (`immutable` なし) の履歴専用接続をそれぞれ 1 度だけ使って、表示 tz 行 (`root:` の次、`instance:` の前) を足し、評価履歴ブロック (固定理由つき) を `locked-by` と note の間に足す (置換の正本は `2026-11-14-history-status-and-import-conflicts-design.md` §1.2)。`setup`、`enroll:*`、将来の保持者は従来の 6 行を完全に維持し、履歴のために何も読まない。
 
 ```text
 agentic-fx offline status

@@ -290,8 +290,18 @@ def test_status_without_a_daemon_renders_the_block_and_keeps_the_rest(tmp_path):
 
 def test_status_survives_a_missing_database(tmp_path):
     write_settings(tmp_path, "ok")
+    path = tmp_path / "config" / "settings.yaml"
+    path.write_text(path.read_text(encoding="utf-8").replace(
+        'eval_source: "none"', 'eval_source: "mt5"', 1), encoding="utf-8")
     data = status.collect_status(tmp_path, run=make_run(), instance="free", now=NOW)
     assert data.evaluation_history[0].startswith("evaluation history: unavailable")
+    assert "instance: free" in status.render_status(data, root=tmp_path)
+
+
+def test_status_without_a_database_and_an_unconfigured_source_says_not_configured(tmp_path):
+    write_settings(tmp_path, "ok")
+    data = status.collect_status(tmp_path, run=make_run(), instance="free", now=NOW)
+    assert data.evaluation_history[0].startswith("evaluation history: not configured")
     assert "instance: free" in status.render_status(data, root=tmp_path)
 
 
@@ -326,3 +336,27 @@ def test_the_dto_keeps_utc_values_and_the_renderer_converts(world):
     assert result.evaluation_history.pairs[0].latest_confirmed.utcoffset() == timedelta(0)
     assert "+09:00" in "\n".join(status_history.render(result, "Asia/Tokyo"))
     assert "+09:00" not in "\n".join(status_history.render(result, "UTC"))
+
+
+def test_an_unconfigured_source_is_not_configured_even_without_a_database(world):
+    root, _conn = world
+    settings = _settings(eval_source="none")
+    block = status_history.collect(root, settings, None, "Asia/Tokyo", NOW,
+                                   unavailable_reason=status_history.ReasonCode.DATABASE_UNAVAILABLE)
+    assert block.evaluation_history.state is status_history.State.NOT_CONFIGURED
+    text = "\n".join(status_history.render(block, "Asia/Tokyo"))
+    assert text.startswith("evaluation history: not configured")
+    configured = status_history.collect(root, _settings(), None, "Asia/Tokyo", NOW)
+    assert configured.evaluation_history.state is status_history.State.UNAVAILABLE
+    assert configured.evaluation_history.reason_code is status_history.ReasonCode.DATABASE_UNAVAILABLE
+
+
+def test_the_dto_states_use_the_design_words_and_the_renderer_keeps_the_display_words(world):
+    assert {s.value for s in status_history.State} == {
+        "ready", "stale", "gap", "unavailable", "not_configured"}
+    _fill(world[1], "USDJPY", until=datetime(2026, 11, 4, tzinfo=UTC))
+    result = _collect(world)
+    assert result.evaluation_history.state is status_history.State.STALE
+    assert result.evaluation_history.state.value == "stale"
+    assert "evaluation history: history_stale" in "\n".join(status_history.render(result, "UTC"))
+    assert status_history.State("gap") is status_history.State.GAP

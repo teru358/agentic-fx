@@ -32,10 +32,16 @@ _MAX_DAYS_SHOWN = 10
 
 class State(str, Enum):
     READY = hh.HISTORY_READY
-    STALE = hh.HISTORY_STALE
-    GAP = hh.HISTORY_GAP
+    STALE = "stale"
+    GAP = "gap"
     UNAVAILABLE = "unavailable"
     NOT_CONFIGURED = "not_configured"
+
+
+_VERDICT_STATE = {hh.HISTORY_READY: State.READY, hh.HISTORY_STALE: State.STALE,
+                  hh.HISTORY_GAP: State.GAP, hh.HISTORY_UNAVAILABLE: State.UNAVAILABLE}
+# 表示の語は従来どおり guard の判定語 (history_stale / history_gap)。DTO の値とは分ける。
+_STATE_SHOWN = {State.STALE: hh.HISTORY_STALE, State.GAP: hh.HISTORY_GAP}
 
 
 class ReasonCode(str, Enum):
@@ -242,20 +248,20 @@ def collect(root: Path, settings: Any, conn: sqlite3.Connection | None, tz: str,
     try:
         if settings is None:
             return _unavailable(now, ReasonCode.SETTINGS_UNAVAILABLE)
-        if conn is None:
-            return _unavailable(now, unavailable_reason or ReasonCode.DATABASE_UNAVAILABLE)
         dataset = settings.backtest.dataset()
         if dataset.unconfigured:
             return HistoryStatus(now, EvaluationHistory(
                 State.NOT_CONFIGURED, None, source=dataset.source,
                 base_interval=dataset.base_interval))
+        if conn is None:
+            return _unavailable(now, unavailable_reason or ReasonCode.DATABASE_UNAVAILABLE)
         grace = timedelta(seconds=settings.datafeed.closed_bar_grace_sec)
         path = history_evidence.no_bars_path(root)
         health = hh.evaluate_history(
             conn, dataset=dataset, pairs=list(settings.pairs), now=now,
             holdout_months=settings.backtest.holdout_months, grace=grace, no_bars_path=path)
         load_error = bool(health.detail and health.detail.startswith("NoBarsConfigError"))
-        state = State.UNAVAILABLE if health.verdict == hh.HISTORY_UNAVAILABLE else State(health.verdict)
+        state = _VERDICT_STATE[health.verdict]
         reasons = tuple("unavailable" if r == hh.HISTORY_UNAVAILABLE else r for r in health.reasons)
         pairs = tuple(PairDiagnosis(
             p.symbol, tuple("unavailable" if r == hh.HISTORY_UNAVAILABLE else r
@@ -315,7 +321,7 @@ def render(status: HistoryStatus, tz: str) -> tuple[str, ...]:
     if h.state is State.UNAVAILABLE and h.source is None:
         return (UNAVAILABLE_LINE, f"  reason: {h.reason_code.value}",
                 *(f"  next: {_NEXT_TEXT[a]}" for a in h.next_actions or _next_actions(h.state)))
-    lines = [f"evaluation history: {h.state.value}" + (f" ({','.join(h.reasons)})" if len(h.reasons) > 1 else ""),
+    lines = [f"evaluation history: {_STATE_SHOWN.get(h.state, h.state.value)}" + (f" ({','.join(h.reasons)})" if len(h.reasons) > 1 else ""),
              f"  dataset: {h.source} {h.base_interval}  checked at {_shown(h.checked_at, tz)}",
              f"  rules: guard v{h.guard_version} calendar {h.calendar_version} thresholds "
              f"{h.thresholds}"]
