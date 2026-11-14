@@ -28,6 +28,8 @@ VERSION = 1
 MAX_BYTES = 4096
 # observed_at がこの秒数より古ければ stale
 STALE_SECONDS = 120.0
+# observed_at が now よりこの秒数を超えて未来なら、時計のずれ・改竄として stale にする
+FUTURE_SKEW_SECONDS = 30.0
 # 書込みの周期 (遷移が無くても最新を置く) と、遷移を見つける周期
 WRITE_INTERVAL = 60.0
 TICK_INTERVAL = 1.0
@@ -138,7 +140,8 @@ def evaluate(record: Mapping[str, Any] | None, now: float) -> dict[str, Any]:
     terminal_code = record["terminal_code"]
     if record["terminal"] == "permanent":
         state = PERMANENT_FAILURE
-    elif observed is None or now - observed > STALE_SECONDS:
+    elif observed is None or now - observed > STALE_SECONDS \
+            or observed - now > FUTURE_SKEW_SECONDS:
         state = STALE
     elif gateway != "healthy" or record["terminal"] == "transient":
         state = UNHEALTHY

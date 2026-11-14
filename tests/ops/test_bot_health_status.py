@@ -149,6 +149,11 @@ def test_lines_warn_when_alternate_push_is_none():
         "bot health: healthy alternate_push=none", "warning: alternate_push=none"]
 
 
+def test_lines_have_no_warning_when_the_bot_is_not_configured():
+    assert bot_health.lines({"state": "not_configured", "alternate_push": "none"}) == [
+        "bot health: not_configured alternate_push=none"]
+
+
 def test_lines_have_no_warning_when_alternate_push_is_configured():
     assert bot_health.lines({"state": "healthy", "alternate_push": "configured"}) == [
         "bot health: healthy alternate_push=configured"]

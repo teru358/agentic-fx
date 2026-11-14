@@ -47,7 +47,7 @@ def test_ops_status_reports_saved_operation_stage_and_failure(tmp_path, monkeypa
 
     assert capsys.readouterr().out.strip().splitlines() == [
         "bot: enable installed (ops_not_ready) unit=activating result=exit-code",
-        "bot health: not_configured alternate_push=none", "warning: alternate_push=none"]
+        "bot health: not_configured alternate_push=none"]
     assert asked == [("afx-ops@bot.service", ("ActiveState", "Result"))]
 
 
@@ -110,7 +110,7 @@ def test_ops_status_without_systemctl_reports_unknown_unit(tmp_path, monkeypatch
 
     assert capsys.readouterr().out == (
         "bot: disable disabled unit=unknown result=unknown\n"
-        "bot health: not_configured alternate_push=none\nwarning: alternate_push=none\n")
+        "bot health: not_configured alternate_push=none\n")
 
 
 def test_ops_marker_rejection_prints_owner_and_recovery(tmp_path, monkeypatch, capsys):

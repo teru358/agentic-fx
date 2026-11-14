@@ -338,18 +338,28 @@ class OpsSetup:
             self._failure(state, "ops_exec_not_found", detail)
             raise SystemdError("ops_exec_not_found", detail) from error
 
-    def _check_bot_systemd(self, feature: str, state: dict[str, Any]) -> None:
-        """bot の recovery drop-in を使えない systemd では、afx に触れる前に固定理由で拒否する。
+    def _check_bot_systemd(self, feature: str, state: dict[str, Any], *, lenient: bool = False) -> None:
+        """bot の recovery drop-in を書く操作の前に、manager が使えるかを固定理由で確かめる。
 
-        version を答えられない port (試験の代役) は検査しない。実 manager は常に答える。"""
+        drop-in は bot が有効な集合 (bot の enable、bot が有効な間の web / notify の enable) を
+        設置するたびに書き直されるので、対象は「bot を含む集合」で、操作する feature には依らない。
+        version を答えられない port (試験の代役) は検査しない。実 manager は常に答える。
+
+        `lenient` は、すでに enabled の stage の再実行 (冪等な確認) で使う。version を取得できないだけなら
+        失敗を stage に書かず、drop-in が exact に設置済みである限り警告に留める。古いと分かった manager は
+        常に拒否する。
+        """
         read_version = getattr(self.systemd, "version", None)
-        if feature != "bot" or read_version is None:
+        if read_version is None or "bot" not in self._active_features() | {feature}:
             return
         try:
             problem = bot_systemd_problem(read_version())
         except SystemdError as error:
             problem = bot_systemd_problem(None)
             detail = f"{problem}; {_describe(error)}"
+            if lenient and units_match(self.paths, self._active_features() | {feature}):
+                self.notices.append(f"warning: {detail}。設置済みの資材は一致しているので続けた")
+                return
         else:
             detail = problem
         if problem:
@@ -568,7 +578,8 @@ class OpsSetup:
         if fresh:
             _write_stage(self.root, state)
         self._resolve_exec(state)
-        self._check_bot_systemd(feature, state)
+        confirming = not fresh and state["stage"] == _ENABLE_TERMINAL
+        self._check_bot_systemd(feature, state, lenient=confirming)
         # afx を止める前に鍵の不一致を見つける。不一致は enroll では直らない。
         self._principal_active(feature, state)
         if not fresh:
@@ -576,6 +587,9 @@ class OpsSetup:
             self._verify_resumed(feature, state)
             if state["stage"] == _ENABLE_TERMINAL:
                 return StageResult(feature, "enable", _ENABLE_TERMINAL)
+            if confirming:
+                # 確認のつもりが設置のやり直しになった。drop-in を書く前に version を厳密に確かめる
+                self._check_bot_systemd(feature, state)
         lock = None
         try:
             if state["stage"] == "staged":
@@ -761,6 +775,7 @@ class OpsSetup:
             done = units_match(self.paths, remaining)
         else:
             done = (not self.paths.template_path.exists() and not self.paths.dropin_path.exists()
+                    and not os.path.lexists(self.paths.bot_dropin_path)
                     and seen["LoadState"] == "not-found")
         return None if done else "stopping-ops"
 

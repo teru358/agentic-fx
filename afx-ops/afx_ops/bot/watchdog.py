@@ -16,7 +16,7 @@ import threading
 import time
 from collections.abc import Callable
 
-from afx_ops.bot.exits import RC_BOT_LOOP_STALLED, RC_BOT_TRANSIENT
+from afx_ops.bot.exits import RC_BOT_LOOP_STALLED, RC_BOT_PERMANENT, RC_BOT_TRANSIENT
 
 # acknowledgement の callback を積む周期と、loop の応答の窓、終了開始からの上限 (秒)
 CHECK_INTERVAL = 5.0
@@ -74,6 +74,7 @@ class Watchdog:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._acknowledged = clock()
         self._shutdown_at: float | None = None
+        self._shutdown_permanent = False
         self._halt = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -85,10 +86,15 @@ class Watchdog:
         self._loop = loop
         self._acknowledged = self._clock()
 
-    def begin_shutdown(self) -> None:
-        """終了の開始。最初の 1 回の時刻だけを保持し、以後は動かさない。"""
+    def begin_shutdown(self, *, permanent: bool = False) -> None:
+        """終了の開始。最初の 1 回の時刻と分類だけを保持し、以後は動かさない。
+
+        `permanent` は終了を始めた理由が恒久 (再起動しても同じ) のとき真。終了が期限内に終わらず
+        強制終了するときの終了コードを、恒久なら 78、それ以外は 79 にする。
+        """
         if self._shutdown_at is None:
             self._shutdown_at = self._clock()
+            self._shutdown_permanent = permanent
             # 周期の待ちの途中でも起こし、残り時間を期限として待ち直させる
             self._wake.set()
 
@@ -114,7 +120,8 @@ class Watchdog:
         now = self._clock()
         if self._shutdown_at is not None:
             if now - self._shutdown_at >= self._shutdown_limit:
-                self._terminate(SHUTDOWN_LINE, RC_BOT_TRANSIENT)
+                self._terminate(SHUTDOWN_LINE,
+                                RC_BOT_PERMANENT if self._shutdown_permanent else RC_BOT_TRANSIENT)
                 return True
         elif now - self._acknowledged >= self._window:
             self._terminate(STALL_LINE, RC_BOT_LOOP_STALLED)

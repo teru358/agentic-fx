@@ -21,6 +21,8 @@ VERSION = 1
 MAX_BYTES = 4096
 # observed_at がこの秒数より古ければ stale
 STALE_SECONDS = 120.0
+# observed_at が now よりこの秒数を超えて未来なら、時計のずれ・改竄として stale にする
+FUTURE_SKEW_SECONDS = 30.0
 MAX_LATENCY_MS = 3_600_000.0
 
 # terminal_code に入れてよい固定語。恒久 / 一時で分ける (別の側の語は拒否)。bot 側の定義の写し
@@ -127,7 +129,8 @@ def evaluate(record: Mapping[str, Any] | None, now: float) -> dict[str, Any]:
     terminal_code = record["terminal_code"]
     if record["terminal"] == "permanent":
         state = PERMANENT_FAILURE
-    elif observed is None or now - observed > STALE_SECONDS:
+    elif observed is None or now - observed > STALE_SECONDS \
+            or observed - now > FUTURE_SKEW_SECONDS:
         state = STALE
     elif gateway != "healthy" or record["terminal"] == "transient":
         state = UNHEALTHY
@@ -229,6 +232,7 @@ def lines(health: Mapping[str, Any] | None) -> list[str]:
     push = health.get("alternate_push")
     push = push if push in (ALTERNATE_NONE, ALTERNATE_CONFIGURED) else ALTERNATE_NONE
     out = [f"bot health: {state} alternate_push={push}"]
-    if push == ALTERNATE_NONE:
+    # bot が無い (未設定) なら、別経路が無いことは警告にならない
+    if push == ALTERNATE_NONE and state != NOT_CONFIGURED:
         out.append(f"warning: {WARNING_ALTERNATE_NONE}")
     return out

@@ -439,7 +439,7 @@ class _FakeWatchdog:
     def attach(self, loop) -> None:
         pass
 
-    def begin_shutdown(self) -> None:
+    def begin_shutdown(self, **kw) -> None:
         self.shutdown += 1
 
 

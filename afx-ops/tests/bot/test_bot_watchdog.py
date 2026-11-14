@@ -17,7 +17,7 @@ import pytest
 
 from afx_ops.bot import runtime
 from afx_ops.bot.adapter import BotFailure
-from afx_ops.bot.exits import RC_BOT_LOOP_STALLED, RC_BOT_TRANSIENT
+from afx_ops.bot.exits import RC_BOT_LOOP_STALLED, RC_BOT_PERMANENT, RC_BOT_TRANSIENT
 from afx_ops.bot.watchdog import (CHECK_INTERVAL, SHUTDOWN_LIMIT, SHUTDOWN_LINE, STALL_LINE,
                                   STALL_WINDOW, Watchdog, emit_line)
 from test_bot_progress import DaemonClient, Harness
@@ -255,6 +255,42 @@ def test_shutdown_limit_is_measured_from_the_first_begin(pipe):
     assert pipe.drain() == SHUTDOWN_LINE
 
 
+@pytest.mark.parametrize("kwargs, rc", [({}, RC_BOT_TRANSIENT), ({"permanent": False}, RC_BOT_TRANSIENT),
+                                         ({"permanent": True}, RC_BOT_PERMANENT)])
+def test_a_shutdown_timeout_exits_with_the_class_of_the_reason_that_started_it(pipe, kwargs, rc):
+    clock, exits = Clock(), []
+    dog = _dog(clock, exits, pipe)
+    dog.begin_shutdown(**kwargs)
+    dog.begin_shutdown(permanent=not kwargs.get("permanent", False))  # 2 回目は分類も動かさない
+    clock.t += SHUTDOWN_LIMIT
+    assert dog.tick() is True
+    assert exits == [rc]
+    assert pipe.drain() == SHUTDOWN_LINE
+
+
+@pytest.mark.parametrize("exc, permanent", [(BotFailure("token_invalid"), True),
+                                            (BotFailure("discord_rejected"), True),
+                                            (BotFailure("gateway_failed"), False),
+                                            (ValueError("x"), False)])
+def test_run_tells_the_watchdog_whether_the_failure_that_began_shutdown_is_permanent(
+        tmp_path, monkeypatch, exc, permanent):
+    async def main(*args, **kwargs):
+        raise exc
+    monkeypatch.setattr(runtime, "_main", main)
+    spy = _Spy()
+    runtime.run(_isolated(tmp_path), client=object(), stderr=_Out(), watchdog=spy)
+    assert spy._shutdown_permanent is permanent
+
+
+def test_run_leaves_a_permanent_terminal_when_the_token_is_malformed(tmp_path):
+    import json
+    iso = _isolated(tmp_path)
+    iso.secrets["discord.token"] = b"bad"
+    assert runtime.run(iso, client=object(), stderr=_Out(), watchdog=_Spy()) == 78
+    record = json.loads((iso.state_dir / "gateway.snapshot").read_text())
+    assert record["terminal"] == "permanent" and record["terminal_code"] == "token_invalid"
+
+
 def test_the_watchdog_keeps_watching_after_shutdown_starts_and_ignores_the_stale_acknowledgement(pipe):
     clock, exits = Clock(), []
     loop = asyncio.new_event_loop()
@@ -404,9 +440,9 @@ class _Spy(Watchdog):
         self.events.append("attach")
         super().attach(loop)
 
-    def begin_shutdown(self) -> None:
+    def begin_shutdown(self, **kw) -> None:
         self.events.append("shutdown")
-        super().begin_shutdown()
+        super().begin_shutdown(**kw)
 
 
 def _isolated(tmp_path):
@@ -471,9 +507,11 @@ def test_other_tests_get_the_unstarted_stand_in():
     assert type(runtime.new_watchdog()) is not Watchdog
 
 
-def test_a_blocked_stderr_write_after_asyncio_run_is_still_bounded(tmp_path, monkeypatch):
+@pytest.mark.parametrize("reason, rc", [("discord_rejected", RC_BOT_PERMANENT),
+                                        ("gateway_failed", RC_BOT_TRANSIENT)])
+def test_a_blocked_stderr_write_after_asyncio_run_is_still_bounded(tmp_path, monkeypatch, reason, rc):
     async def main(*args, **kwargs):
-        raise BotFailure("discord_rejected")
+        raise BotFailure(reason)
     monkeypatch.setattr(runtime, "_main", main)
     release = threading.Event()
     fired, rcs = threading.Event(), []
@@ -485,8 +523,8 @@ def test_a_blocked_stderr_write_after_asyncio_run_is_still_bounded(tmp_path, mon
     dog = Watchdog(interval=0.01, shutdown_limit=0.3, exit_fn=record, fd=os.dup(2))
     out = _Out(gate=release)
     try:
-        assert runtime.run(_isolated(tmp_path), client=object(), stderr=out, watchdog=dog) == 78
-        assert fired.is_set() and rcs == [RC_BOT_TRANSIENT]
+        assert runtime.run(_isolated(tmp_path), client=object(), stderr=out, watchdog=dog) == rc
+        assert fired.is_set() and rcs == [rc]
     finally:
         dog.stop()
 

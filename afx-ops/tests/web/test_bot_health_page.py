@@ -54,6 +54,10 @@ def test_a_healthy_gateway_does_not_say_interaction_is_unavailable():
         {"state": "healthy", "alternate_push": "configured"})
 
 
+def test_alternate_push_none_has_no_warning_when_the_bot_is_not_configured():
+    assert "alternate_push=none (" not in _page({"state": "not_configured", "alternate_push": "none"})
+
+
 def test_alternate_push_none_shows_the_warning_and_configured_does_not():
     assert "alternate_push=none" in _page({"state": "healthy", "alternate_push": "none"})
     page = _page({"state": "healthy", "alternate_push": "configured"})

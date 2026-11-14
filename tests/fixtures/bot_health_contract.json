@@ -278,6 +278,90 @@
    }
   },
   {
+   "name": "future_within_clock_skew_is_fresh",
+   "record": {
+    "version": 1,
+    "observed_at": "2026-11-14T12:00:30Z",
+    "gateway_state": "healthy",
+    "gateway_unhealthy_since": null,
+    "last_ready_at": "2026-11-14T11:00:00Z",
+    "last_resumed_at": null,
+    "last_disconnect_at": null,
+    "last_ack_latency_ms": 42.5,
+    "delivery_state": "healthy",
+    "delivery_stalled_since": null,
+    "last_delivery_success_at": "2026-11-14T11:59:00Z",
+    "poll_started_at": "2026-11-14T11:59:29Z",
+    "last_poll_completed_at": "2026-11-14T11:59:27Z",
+    "loop_acknowledged_at": "2026-11-14T11:59:30Z",
+    "terminal": null,
+    "terminal_code": null
+   },
+   "expect": {
+    "state": "healthy",
+    "observed_at": "2026-11-14T12:00:30Z",
+    "gateway_state": "healthy",
+    "delivery_state": "healthy",
+    "terminal_code": null
+   }
+  },
+  {
+   "name": "future_beyond_clock_skew_is_stale",
+   "record": {
+    "version": 1,
+    "observed_at": "2026-11-14T12:00:31Z",
+    "gateway_state": "healthy",
+    "gateway_unhealthy_since": null,
+    "last_ready_at": "2026-11-14T11:00:00Z",
+    "last_resumed_at": null,
+    "last_disconnect_at": null,
+    "last_ack_latency_ms": 42.5,
+    "delivery_state": "healthy",
+    "delivery_stalled_since": null,
+    "last_delivery_success_at": "2026-11-14T11:59:00Z",
+    "poll_started_at": "2026-11-14T11:59:29Z",
+    "last_poll_completed_at": "2026-11-14T11:59:27Z",
+    "loop_acknowledged_at": "2026-11-14T11:59:30Z",
+    "terminal": null,
+    "terminal_code": null
+   },
+   "expect": {
+    "state": "stale",
+    "observed_at": "2026-11-14T12:00:31Z",
+    "gateway_state": "healthy",
+    "delivery_state": "healthy",
+    "terminal_code": null
+   }
+  },
+  {
+   "name": "far_future_is_stale",
+   "record": {
+    "version": 1,
+    "observed_at": "2099-01-01T00:00:00Z",
+    "gateway_state": "healthy",
+    "gateway_unhealthy_since": null,
+    "last_ready_at": "2026-11-14T11:00:00Z",
+    "last_resumed_at": null,
+    "last_disconnect_at": null,
+    "last_ack_latency_ms": 42.5,
+    "delivery_state": "healthy",
+    "delivery_stalled_since": null,
+    "last_delivery_success_at": "2026-11-14T11:59:00Z",
+    "poll_started_at": "2026-11-14T11:59:29Z",
+    "last_poll_completed_at": "2026-11-14T11:59:27Z",
+    "loop_acknowledged_at": "2026-11-14T11:59:30Z",
+    "terminal": null,
+    "terminal_code": null
+   },
+   "expect": {
+    "state": "stale",
+    "observed_at": "2099-01-01T00:00:00Z",
+    "gateway_state": "healthy",
+    "delivery_state": "healthy",
+    "terminal_code": null
+   }
+  },
+  {
    "name": "permanent_fresh",
    "record": {
     "version": 1,

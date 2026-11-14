@@ -115,18 +115,19 @@ def run(isolated, *, client=None, connector_factory: Callable[[], object] | None
             safe = SafeLogging(write)
         else:
             safe.set_write(write)
-        token = parse_token(isolated.secrets.get(SECRET_NAME))
-        if client is None:
-            client = client_for(isolated, BotClient)
-        if api_base is not None:
-            discord.http.Route.BASE = api_base
-        if gateway_url is not None:
-            import yarl
-            discord.gateway.DiscordWebSocket.DEFAULT_GATEWAY = yarl.URL(gateway_url)
+        # state dir が開けなければ health も残せない (保証外)。開けたら、token・client の失敗も terminal に残す
         dir_fd = open_state_dir(isolated.state_dir)
         try:
             # 表示専用の health snapshot。起動時は terminal を null にして先に置く
             health = _start_health(dir_fd, tracker, out, now, monotonic, watchdog)
+            token = parse_token(isolated.secrets.get(SECRET_NAME))
+            if client is None:
+                client = client_for(isolated, BotClient)
+            if api_base is not None:
+                discord.http.Route.BASE = api_base
+            if gateway_url is not None:
+                import yarl
+                discord.gateway.DiscordWebSocket.DEFAULT_GATEWAY = yarl.URL(gateway_url)
             asyncio.run(_main(isolated, token, client, dir_fd, connector_factory=connector_factory,
                               stop=stop, poll_interval=poll_interval, now=now,
                               progress=tracker, health=health,
@@ -135,7 +136,7 @@ def run(isolated, *, client=None, connector_factory: Callable[[], object] | None
         finally:
             os.close(dir_fd)
     except BotFailure as failure:
-        watchdog.begin_shutdown()
+        watchdog.begin_shutdown(permanent=rc_for_reason(failure.reason) == RC_BOT_PERMANENT)
         _say(out, failure.reason)
         if health is not None:
             health.finalize(failure.reason)

@@ -199,7 +199,7 @@ def _bot_section(data: Mapping[str, object], tz: str = "UTC") -> str:
     notes = ""
     if state != "healthy":
         notes += f"<p>{INTERACTION_UNAVAILABLE_TEXT}</p>"
-    if push != "configured":
+    if push != "configured" and state != "not_configured":
         notes += f'<p class="warn">{html.escape(ALTERNATE_NONE_TEXT, quote=True)}</p>'
     return "<section><h2>Bot</h2>" + _rows(pairs) + notes + "</section>"
 
