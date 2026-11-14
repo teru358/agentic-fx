@@ -58,6 +58,7 @@ from agentic_fx.datafeed.health import DataUnhealthy
 from agentic_fx.datafeed.news_collector import NewsCollector
 from agentic_fx.datafeed.price_provider import PriceProvider
 from agentic_fx.logging_setup import setup_technical_logging
+from agentic_fx.ops import bot_health
 from agentic_fx.ops import keys as ops_keys
 from agentic_fx.ops.api_server import ApiLimits, ApiServer, ApiStartError
 from agentic_fx.ops.service import OpsLimits, OpsService, plan_kill_switch_notice
@@ -2231,6 +2232,8 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
         if trade_event_sink is not None:
             # 理由別の件数だけ。理由の文言や event の中身は載せない
             status["trade_events"] = trade_event_sink.counters()
+        # bot の health は検査済みの非機密値だけ。読めなくても status を落とさず unknown
+        status["bot_health"] = bot_health.collect(root, clock.now().timestamp())
         return status
 
     def ask_submitter(question: str):

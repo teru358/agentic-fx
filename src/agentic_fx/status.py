@@ -19,6 +19,7 @@ from agentic_fx.config import load_settings_text
 from agentic_fx.core.contracts import SystemClock
 from agentic_fx.core.display_time import convert_or_raw, display_header
 from agentic_fx.display_tz import read_display_timezone, region_name_warning
+from agentic_fx.ops import bot_health
 from agentic_fx.ops.contracts import Principal
 from agentic_fx.ops.keys import key_dir, key_file_name
 from agentic_fx.loops import econ_signal_report
@@ -182,6 +183,7 @@ class StatusData:
     warnings: tuple[str, ...] = ()
     econ: tuple[str, ...] = ()
     evaluation_history: tuple[str, ...] = ()
+    bot_health: tuple[str, ...] = ()
 
 
 def _settings(root: Path) -> tuple[str, Any | None]:
@@ -363,6 +365,10 @@ def collect_status(root: Path, *, run: Callable[..., Any] = subprocess.run,
         ops, ops_bad = _ops(root)
     except Exception:  # noqa: BLE001
         ops, ops_bad = ("unavailable",) * 4, True
+    try:
+        health = tuple(bot_health.lines(bot_health.collect(Path(root), time.time())))
+    except Exception:  # noqa: BLE001 - display-only
+        health = ()
     if instance == "unknown":
         state = ("unavailable", "unavailable")
     else:
@@ -394,7 +400,7 @@ def collect_status(root: Path, *, run: Callable[..., Any] = subprocess.run,
     return StatusData(instance, setup_state, settings_state, unit, ops, state, *db,
                       activity, steps, any((setup_bad, unit_bad, ops_bad, state_bad, db_bad,
                                             activity_bad, pending_bad)),
-                      tz, tuple(warnings), econ, history)
+                      tz, tuple(warnings), econ, history, health)
 
 
 def render_status(data: StatusData, *, root: Path | None = None) -> str:
@@ -404,6 +410,7 @@ def render_status(data: StatusData, *, root: Path | None = None) -> str:
              f"settings: {data.settings}",
              f"unit: afx.service={data.unit[0]} active={data.unit[1]} linger={data.unit[2]}"]
     lines.append("ops: bot=%s web=%s notify=%s marker=%s" % data.ops)
+    lines.extend(line for line in data.bot_health if not line.startswith("warning: "))
     lines.append("state: mode=%s kill_switch=%s" % data.state)
     lines.extend((f"database: {data.database}", f"recent mission: {data.mission}",
                   f"pending approvals: {data.approvals}", f"plugin deploy ops: {data.deploy_ops}",
@@ -411,6 +418,7 @@ def render_status(data: StatusData, *, root: Path | None = None) -> str:
                   f"pending steps: {'unavailable' if data.steps is None else len(data.steps)}"))
     lines.extend(f"  - {step}" for step in data.steps or ())
     lines.extend(f"warning: {note}" for note in data.warnings)
+    lines.extend(line for line in data.bot_health if line.startswith("warning: "))
     lines.extend(data.econ)
     lines.extend(data.evaluation_history)
     lines.append(_NOTE)

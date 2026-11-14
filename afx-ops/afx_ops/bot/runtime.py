@@ -49,6 +49,7 @@ from afx_ops.bot.logsafe import LoopErrors, SafeLogging, take_early
 from afx_ops.bot.progress import GATEWAY_HEALTHY, ProgressTracker
 from afx_ops.bot.rest import PERMANENT, REST_ERRORS, classify
 from afx_ops.bot.watchdog import Watchdog
+from afx_ops.health import HealthWriter, Publisher
 from afx_ops.gate.service import GateService
 from afx_ops.gate.state import BotState
 from afx_ops.isolation.startup import client_for
@@ -100,6 +101,8 @@ def run(isolated, *, client=None, connector_factory: Callable[[], object] | None
     watchdog = new_watchdog() if watchdog is None else watchdog
     safe: SafeLogging | None = None
     loop_errors = LoopErrors(lambda t: _say(out, t))
+    tracker = ProgressTracker(monotonic, emit=lambda t: _say(out, t))
+    health: Publisher | None = None
     try:
         watchdog.start()
         # discord.py / aiohttp / asyncio の log は例外文・URL・ID を含み得るので、record の中身は出さず
@@ -120,9 +123,11 @@ def run(isolated, *, client=None, connector_factory: Callable[[], object] | None
             discord.gateway.DiscordWebSocket.DEFAULT_GATEWAY = yarl.URL(gateway_url)
         dir_fd = open_state_dir(isolated.state_dir)
         try:
+            # 表示専用の health snapshot。起動時は terminal を null にして先に置く
+            health = _start_health(dir_fd, tracker, out, now, monotonic, watchdog)
             asyncio.run(_main(isolated, token, client, dir_fd, connector_factory=connector_factory,
                               stop=stop, poll_interval=poll_interval, now=now,
-                              progress=ProgressTracker(monotonic, emit=lambda t: _say(out, t)),
+                              progress=tracker, health=health,
                               sleep=sleep, loop_errors=loop_errors,
                               monitor_interval=monitor_interval, watchdog=watchdog))
         finally:
@@ -130,26 +135,46 @@ def run(isolated, *, client=None, connector_factory: Callable[[], object] | None
     except BotFailure as failure:
         watchdog.begin_shutdown()
         _say(out, failure.reason)
+        if health is not None:
+            health.finalize(failure.reason)
         return rc_for_reason(failure.reason)
     except ApiError as exc:
         watchdog.begin_shutdown()
         _say(out, with_detail(exc.reason, exc.detail))
+        if health is not None:
+            health.finalize("daemon_unreachable")
         return RC_UNREACHABLE
     except Exception:  # 例外文には token や URL が入り得るので、固定語だけにする
         watchdog.begin_shutdown()
         _say(out, "bot_internal_error")
+        if health is not None:
+            health.finalize("bot_internal_error")
         return rc_for_reason("bot_internal_error")
     except BaseException:
         # KeyboardInterrupt / SystemExit / 取消し。後始末が詰まっても 60 秒で止まるよう、再送出の前に印を付ける
         watchdog.begin_shutdown()
         raise
     finally:
+        if health is not None:
+            health.close()
         loop_errors.flush_counts()
         if safe is not None:
             safe.flush_counts()
             safe.restore()
     watchdog.begin_shutdown()
     return RC_OK
+
+
+def _start_health(dir_fd, tracker, out, wall, mono, watchdog) -> Publisher | None:
+    """表示専用の snapshot の writer を起こし、terminal 無しの最初の snapshot を先に置く。失敗しても bot は止めない。"""
+    try:
+        writer = HealthWriter(os.dup(dir_fd), say=lambda t: _say(out, t))
+    except Exception:  # noqa: BLE001
+        return None
+    publisher = Publisher(writer, tracker, wall=wall, mono=mono,
+                          loop_acknowledged=lambda: watchdog.acknowledged_at)
+    publisher.publish(force=True)
+    return publisher
 
 
 def new_watchdog() -> Watchdog:
@@ -191,13 +216,14 @@ class _Client(discord.Client):
 async def _main(isolated, token: str, client, dir_fd: int, *, connector_factory, stop,
                 poll_interval: float, now, progress: ProgressTracker | None = None,
                 sleep=asyncio.sleep, monitor_interval: float = MONITOR_INTERVAL,
-                watchdog: Watchdog | None = None, loop_errors=None) -> None:
+                watchdog: Watchdog | None = None, loop_errors=None,
+                health: Publisher | None = None) -> None:
     # 初期化の途中の中断でも shutdown を記録する (本体の finally に入る前の経路)
     try:
         await _main_body(isolated, token, client, dir_fd, connector_factory=connector_factory,
                          stop=stop, poll_interval=poll_interval, now=now, progress=progress,
                          sleep=sleep, monitor_interval=monitor_interval, watchdog=watchdog,
-                         loop_errors=loop_errors)
+                         loop_errors=loop_errors, health=health)
     except BaseException:
         if watchdog is not None:
             watchdog.begin_shutdown()
@@ -207,7 +233,8 @@ async def _main(isolated, token: str, client, dir_fd: int, *, connector_factory,
 async def _main_body(isolated, token: str, client, dir_fd: int, *, connector_factory, stop,
                      poll_interval: float, now, progress: ProgressTracker | None = None,
                      sleep=asyncio.sleep, monitor_interval: float = MONITOR_INTERVAL,
-                     watchdog: Watchdog | None = None, loop_errors=None) -> None:
+                     watchdog: Watchdog | None = None, loop_errors=None,
+                     health: Publisher | None = None) -> None:
     if loop_errors is not None:
         # 既定の handler は例外文と traceback を出す。型名と固定語だけにする
         asyncio.get_running_loop().set_exception_handler(loop_errors)
@@ -227,6 +254,8 @@ async def _main_body(isolated, token: str, client, dir_fd: int, *, connector_fac
     connector = connector_factory() if connector_factory is not None else None
     bot = _Client(intents=discord.Intents.none(), connector=connector)
     bot.progress = progress
+    if health is not None:
+        health.bind_latency(lambda: bot.latency)
     adapter = BotAdapter(gate=gate, client=client, dir_fd=dir_fd, settings=settings,
                          discord_client=bot, now=now, progress=progress, sleep=sleep)
     bot.adapter = adapter
@@ -235,6 +264,9 @@ async def _main_body(isolated, token: str, client, dir_fd: int, *, connector_fac
         # monitor は login の前から動かす (login 前も gateway の 10 分の窓に含める)
         monitor = _spawn(_monitor(progress, monitor_interval, sleep))
         tasks.append(monitor)
+        if health is not None:
+            # 周期の task は終わらない。終了の判断には加えず、後始末で取り消す
+            tasks.append(_spawn(health.run()))
         startup = _spawn(_startup(adapter, bot, token, sleep, connector_factory))
         tasks.append(startup)
         await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -789,6 +790,14 @@ class OpsSetup:
         return StageResult(feature, str(saved["operation"]), str(saved["stage"]))
 
 
+def _bot_health_lines(root: Path) -> tuple[str, ...]:
+    from agentic_fx.ops import bot_health
+    try:
+        return tuple(bot_health.lines(bot_health.collect(root, time.time())))
+    except Exception:  # noqa: BLE001 - 表示専用
+        return ()
+
+
 def run_ops_command(root: Path, action: str, feature: str) -> int:
     """CLI 用の小さな表示層。状態の正本は stage file のままにする。"""
     setup = OpsSetup(root)
@@ -796,6 +805,7 @@ def run_ops_command(root: Path, action: str, feature: str) -> int:
         result = getattr(setup, action)(feature)
         line = setup.status_line(feature) if action == "status" else None
         access = setup.web_access_line() if action == "status" and feature == "web" else None
+        health = _bot_health_lines(root) if action == "status" and feature == "bot" else ()
     except (InvalidState, SystemdError, KeySetError, OSError, ValueError) as error:
         reason = getattr(error, "reason", None) or getattr(error, "code", None) or str(error)
         detail = getattr(error, "detail", "")
@@ -805,6 +815,8 @@ def run_ops_command(root: Path, action: str, feature: str) -> int:
         print(line)
         if access is not None:
             print(access)
+        for health_line in health:
+            print(health_line)
         open_ops = deploy_store.count_open_readonly(root / "data" / "agentic.db")
         if open_ops:
             print(f"配備操作が未完了: {open_ops} 件 (afx plugin versions <name>)")

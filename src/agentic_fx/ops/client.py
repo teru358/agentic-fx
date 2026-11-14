@@ -48,7 +48,7 @@ from agentic_fx.cli_surface import render_ctl_help
 from agentic_fx.setup.pending_text import (STEP_PARAMS, PendingStep, is_ident,
                                            parse_observed_at, render_pending_step)
 
-from . import base_view, change_limits, keys, redactor
+from . import base_view, bot_health, change_limits, keys, redactor
 from .contracts import IMPROVE_RUNS_DEFAULT_LIMIT, IMPROVE_RUNS_MAX_LIMIT, Principal
 from .events import EventCursor, EventPage
 from .tail import ACTIVITY_CATEGORIES
@@ -765,6 +765,7 @@ def format_status(data: dict) -> str:
     admission = _admission_line(data)
     if admission is not None:
         lines.append(admission)
+    lines.extend(bot_health.lines(data.get("bot_health")))
     lines.extend(_econ_lines(data.get("econ_signal"), tz))
     lines.extend(_deploy_ops_lines(data.get("plugin_deploy_ops")))
     repeat = data.get("improve_repeat")

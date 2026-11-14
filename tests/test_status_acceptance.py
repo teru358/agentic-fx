@@ -997,7 +997,7 @@ def test_the_heading_names_the_zone_of_the_settings_and_the_times_follow_it(tmp_
     assert out.splitlines()[2].startswith("表示 tz: America/New_York (-0")
     assert fields(out)["recent activity"] == "2026-10-24 20:00:00 -04:00 mission started"
     assert fields(out)["recent mission"] == "#1 running at 2026-10-24 20:00:00 -04:00"
-    assert "warning" not in out
+    assert "warning: display_timezone" not in out
 
 
 def test_a_non_region_zone_name_adds_a_warning_but_still_converts(tmp_path, capsys):

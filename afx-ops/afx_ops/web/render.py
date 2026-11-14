@@ -161,8 +161,47 @@ def _page(title: str, body: str, tz: str | None = None) -> bytes:
 def render_status(data: Mapping[str, object]) -> bytes:
     tz = zone_of(data)
     body = _pairs(data, STATUS_FIELDS, nested_allowed=NESTED_FIELDS, emphasis=_EMPHASIS, tz=tz)
-    return _page("Status", body + _calendar_section(data) + _econ_section(data, tz)
-                 + _reaction_section(data), tz)
+    return _page("Status", body + _bot_section(data, tz) + _calendar_section(data)
+                 + _econ_section(data, tz) + _reaction_section(data), tz)
+
+
+# daemon の `bot_health` の語 (agentic_fx.ops.bot_health の写し。test が突き合わせる)。web は daemon API
+# だけを読み、bot の state dir には触れない
+BOT_HEALTH_STATES = ("healthy", "unhealthy", "stalled", "stale", "unknown", "not_configured",
+                     "permanent-failure")
+BOT_ALTERNATE_PUSH = ("none", "configured")
+_BOT_CODE = re.compile(r"[a-z_]{1,48}\Z")
+INTERACTION_UNAVAILABLE_TEXT = "gateway が健全でない間、Discord の承認操作は使えません"
+ALTERNATE_NONE_TEXT = "alternate_push=none (別経路の通知が設定されていません)"
+
+
+def _bot_section(data: Mapping[str, object], tz: str = "UTC") -> str:
+    health = data.get("bot_health")
+    if type(health) is not dict:
+        return ""
+    state = _word(health.get("state"), BOT_HEALTH_STATES)
+    if state == "-":
+        state = "unknown"
+    pairs = [("gateway health", state)]
+    gateway, delivery = health.get("gateway_state"), health.get("delivery_state")
+    if gateway in ("starting", "healthy", "unhealthy"):
+        pairs.append(("gateway", gateway))
+    if delivery in ("idle", "healthy", "stalled"):
+        pairs.append(("delivery", delivery))
+    code = health.get("terminal_code")
+    if type(code) is str and _BOT_CODE.fullmatch(code):
+        pairs.append(("terminal", html.escape(code, quote=True)))
+    observed = health.get("observed_at")
+    if type(observed) is str:
+        pairs.append(("observed_at", _time_text(observed, tz)))
+    push = _word(health.get("alternate_push"), BOT_ALTERNATE_PUSH)
+    pairs.append(("alternate_push", push if push != "-" else "none"))
+    notes = ""
+    if state != "healthy":
+        notes += f"<p>{INTERACTION_UNAVAILABLE_TEXT}</p>"
+    if push != "configured":
+        notes += f'<p class="warn">{html.escape(ALTERNATE_NONE_TEXT, quote=True)}</p>'
+    return "<section><h2>Bot</h2>" + _rows(pairs) + notes + "</section>"
 
 
 # daemon 側 (agentic_fx.loops.econ_signal_report) の定義の写し。test が突き合わせる。

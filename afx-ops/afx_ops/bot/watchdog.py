@@ -99,6 +99,11 @@ class Watchdog:
         remaining = self._shutdown_limit - (self._clock() - self._shutdown_at)
         return max(0.0, min(self._interval, remaining))
 
+    @property
+    def acknowledged_at(self) -> float:
+        """loop が最後に応答した時刻 (この watchdog の clock、既定は monotonic)。"""
+        return self._acknowledged
+
     def _acknowledge(self) -> None:
         self._acknowledged = self._clock()
 
