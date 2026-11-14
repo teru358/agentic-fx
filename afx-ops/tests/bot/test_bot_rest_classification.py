@@ -47,6 +47,10 @@ PERMANENT = {
     "404/10003": http(404, 10003),
     "404/no code": http(404),
     "404/other code": http(404, 10004),
+    # status が message 局所の 400 でも、共有の配送先・権限の code は恒久
+    "400/10003": http(400, 10003),
+    "400/50001": http(400, 50001),
+    "400/50013": http(400, 50013),
 }
 # 429 / 5xx / network / timeout (一時)
 TRANSIENT = {
@@ -75,6 +79,18 @@ def test_the_classifier_separates_gone_permanent_and_transient():
     assert all(rest.classify(e) == rest.PERMANENT for e in PERMANENT.values())
     assert all(rest.classify(e) == rest.TRANSIENT for e in TRANSIENT.values())
     assert rest.classify(discord.LoginFailure("x")) == rest.PERMANENT
+
+
+def test_a_shared_target_code_wins_over_the_status():
+    for code in (10003, 50001, 50013):
+        for status in (400, 401, 403, 404, 500):
+            assert rest.classify(http(status, code)) == rest.PERMANENT
+            assert rest.is_shared_rejection(http(status, code))
+    # message 局所の 400 は共有の拒否ではない。一時 (429 / 5xx / network) もそうではない
+    assert not rest.is_shared_rejection(http(400))
+    assert not rest.is_shared_rejection(http(400, 50035))
+    for exc in TRANSIENT.values():
+        assert not rest.is_shared_rejection(exc)
 
 
 class Channel:
@@ -234,8 +250,8 @@ def test_an_event_send_transient_failure_retries_from_the_same_event(rig, failur
 
 # ------------------------------------------------------------------ 承認の send (新規 / 出し直し)
 
-def _pending_rig(rig):
-    return rig(client=Client(approvals=(7,)))
+def _pending_rig(rig, **kwargs):
+    return rig(client=Client(approvals=(7,)), **kwargs)
 
 
 @pytest.mark.parametrize("failure", permanent())
@@ -288,13 +304,46 @@ def test_a_history_permission_failure_is_permanent_and_is_not_read_as_an_empty_h
     assert built.channel.calls["send"] == 0
 
 
+class Sleeps:
+    """adapter の待ちを記録するだけの sleep (実時間は進めない)。"""
+
+    def __init__(self) -> None:
+        self.delays: list[float] = []
+
+    async def __call__(self, delay: float) -> None:
+        self.delays.append(delay)
+
+
 @pytest.mark.parametrize("failure", transient())
-def test_a_history_transient_failure_is_not_read_as_empty_either(rig, failure):
-    built = _pending_rig(rig)
-    built.channel.script["history"] = [failure]
+def test_a_history_transient_failure_is_held_and_retried_never_read_as_empty(rig, failure):
+    sleeps = Sleeps()
+    built = _pending_rig(rig, sleep=sleeps)
+    built.channel.script["history"] = [failure, failure]
+    built.channel.script["send"] = []
+    sent_at_failure = []
+    original = built.channel._play
+
+    async def play(name):
+        if name == "history":
+            sent_at_failure.append(built.channel.calls["send"])
+        await original(name)
+    built.channel._play = play
+    asyncio.run(built.adapter.sync_pending())
+    # 履歴が読めるまで投稿せず、読めた後に (履歴に無いので) 一度だけ投稿する
+    assert sent_at_failure == [0, 0, 0]
+    assert built.channel.calls["history"] == 3 and built.channel.calls["send"] == 1
+    assert sleeps.delays == [2.0, 4.0]
+    assert built.gate.state.record(7) is not None
+
+
+def test_a_history_retry_backs_off_up_to_the_cap_and_a_permanent_failure_ends_it(rig):
+    sleeps = Sleeps()
+    built = _pending_rig(rig, sleep=sleeps)
+    built.channel.script["history"] = [http(503)] * 8 + [http(403, 50013)]
     with pytest.raises(BotFailure) as info:
         asyncio.run(built.adapter.sync_pending())
-    assert info.value.reason == "discord_unavailable"
+    assert info.value.reason == "discord_rejected"
+    assert sleeps.delays == [2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0, 60.0]
     assert built.channel.calls["send"] == 0
 
 
@@ -323,13 +372,51 @@ def test_a_fetch_rejection_is_permanent_never_none(rig, failure):
     assert info.value.reason == "discord_rejected"
 
 
+def _stored_message(message_id):
+    return SimpleNamespace(id=message_id, author=Discord.user, channel=SimpleNamespace(id=CHANNEL),
+                           embeds=[])
+
+
 @pytest.mark.parametrize("failure", transient())
-def test_a_fetch_transient_failure_is_not_a_vanished_message(rig, failure):
-    built = rig(record=_record())
+def test_a_fetch_transient_failure_is_held_and_retried_never_a_vanished_message(rig, failure):
+    sleeps = Sleeps()
+    built = rig(record=_record(), sleep=sleeps)
+    built.channel.fetched[101] = _stored_message(101)
+    built.channel.script["fetch"] = [failure, failure, failure]
+    found = asyncio.run(built.adapter._fetch(101))
+    assert found is not None and found.message_id == 101
+    assert built.channel.calls["fetch"] == 4 and sleeps.delays == [2.0, 4.0, 8.0]
+    assert built.channel.sent == []
+
+
+@pytest.mark.parametrize("failure", transient())
+def test_startup_holds_on_a_transient_fetch_failure_without_reposting(rig, failure):
+    sleeps = Sleeps()
+    built = rig(record=_record(), sleep=sleeps)
+    built.channel.fetched[101] = _stored_message(101)
     built.channel.script["fetch"] = [failure]
+    sent_at_fetch = []
+    original = built.channel._play
+
+    async def play(name):
+        if name == "fetch":
+            sent_at_fetch.append(len(built.channel.sent))
+        await original(name)
+    built.channel._play = play
+    asyncio.run(built.adapter.reconcile_startup())
+    # 失敗のあいだは投稿せず、読めた後の判断 (この投稿は footer が無いので出し直し) に進む
+    assert sent_at_fetch == [0, 0] and sleeps.delays == [2.0]
+
+
+def test_a_fetch_retry_ends_at_once_on_a_permanent_rejection_and_on_a_vanished_message(rig):
+    sleeps = Sleeps()
+    built = rig(record=_record(), sleep=sleeps)
+    built.channel.script["fetch"] = [http(503), GONE]
+    assert asyncio.run(built.adapter._fetch(101)) is None
+    built.channel.script["fetch"] = [OSError(), http(401)]
     with pytest.raises(BotFailure) as info:
         asyncio.run(built.adapter._fetch(101))
-    assert info.value.reason == "discord_unavailable"
+    assert info.value.reason == "discord_rejected"
 
 
 @pytest.mark.parametrize("failure", permanent())
@@ -467,10 +554,11 @@ def test_an_unadopted_repost_cleanup_with_a_400_ends_once_without_stopping_the_b
     assert built.channel.calls["edit"] == 1 and built.adapter.failure is None
 
 
-def test_an_unadopted_repost_cleanup_does_not_swallow_a_permission_rejection(rig):
+@pytest.mark.parametrize("key", ["403/50013", "400/50013", "400/50001", "400/10003", "401"])
+def test_an_unadopted_repost_cleanup_does_not_swallow_a_permission_rejection(rig, key):
     built = rig(record=_record())
     with pytest.raises(BotFailure) as info:
-        _unadopted_repost(built, http(403, 50013))
+        _unadopted_repost(built, PERMANENT[key])
     assert info.value.reason == "discord_rejected"
 
 

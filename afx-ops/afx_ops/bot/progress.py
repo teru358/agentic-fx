@@ -35,7 +35,8 @@ class ProgressTracker:
         self.delivery_stalled_since: float | None = None
         self.delivery_event_id: int | None = None
         self.last_delivery_success_at: float | None = None
-        # poller: 周回の開始と完了
+        # poller: login 後の起動 reconcile の開始 (最初の窓) から周回の開始・完了。起動 reconcile も
+        # 周回も、始めてから 10 分戻らなければ止まっている。login 前は gateway の窓が数える
         self.poll_started_at: float | None = None
         self.last_poll_completed_at: float | None = None
 
@@ -81,6 +82,10 @@ class ProgressTracker:
 
     # ------------------------------------------------------------------ poller
 
+    def startup_begin(self) -> None:
+        """login が済み、起動 reconcile を始める直前。最初の poll の窓の起点。"""
+        self.poll_started_at = self._clock()
+
     def poll_begin(self) -> None:
         self.poll_started_at = self._clock()
 
@@ -100,11 +105,8 @@ class ProgressTracker:
         stalled = self.delivery_stalled_since
         if stalled is not None and now - stalled >= self.window:
             return "delivery_stalled"
-        # poll は process 開始から最初の完了まで、その後は一周の開始から
-        if self.last_poll_completed_at is None:
-            begin = self.started_at
-        else:
-            begin = self.poll_started_at
+        # 起動 reconcile の開始、又は一周の開始から、完了しないまま窓を過ぎた
+        begin = self.poll_started_at
         if begin is not None and now - begin >= self.window:
             return "poller_stalled"
         return None

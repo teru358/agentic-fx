@@ -46,7 +46,8 @@ from afx_ops.gate.state import ApprovalRecord, StateError
 from afx_ops.notify.payload import PayloadError
 from afx_ops.gate.types import CustomIdError, GateResult, Interaction, SideEffect, decode_custom_id
 from afx_ops.bot.progress import ProgressTracker
-from afx_ops.bot.rest import PERMANENT, REST_ERRORS, classify, is_message_gone
+from afx_ops.bot.rest import (PERMANENT, REST_ERRORS, classify, is_message_gone,
+                              is_shared_rejection)
 from afx_ops.bot.views import GateView
 
 EVENTS_LIMIT = 100
@@ -56,6 +57,10 @@ APPROVALS_LIMIT = 20
 EDIT_RETRY_LIMIT = 8
 EDIT_BACKOFF_SECONDS = 2.0
 EDIT_BACKOFF_MAX_SECONDS = 60.0
+# fetch / history の一時失敗は、操作を保留して倍々の待ちで再試行する。上限は起動 reconcile と poll
+# 周回の監視窓 (runtime の monitor) が持つ
+REST_RETRY_SECONDS = 2.0
+REST_RETRY_MAX_SECONDS = 60.0
 # 正本が 429 / 503 を返した承認の次の問合せまでの待ち。Retry-After があればそれ (上限つき)、
 # 無ければ既定
 THROTTLE_DEFAULT_SECONDS = 10.0
@@ -176,8 +181,10 @@ class BotAdapter:
     def __init__(self, *, gate: GateService, client, dir_fd: int, settings: BotSettings,
                  discord_client: discord.Client, now: Callable[[], float] = time.time,
                  progress: ProgressTracker | None = None,
-                 response_deadline: float = RESPONSE_DEADLINE_SECONDS) -> None:
+                 response_deadline: float = RESPONSE_DEADLINE_SECONDS,
+                 sleep: Callable[[float], object] = asyncio.sleep) -> None:
         self.gate = gate
+        self._sleep = sleep
         self.client = client
         self.settings = settings
         self.discord = discord_client
@@ -412,15 +419,20 @@ class BotAdapter:
     # ------------------------------------------------------------------ Discord REST
 
     async def _fetch(self, message_id: int) -> MessageMetadata | None:
-        try:
-            message = await self._channel.fetch_message(message_id)
-        except REST_ERRORS as exc:
-            if is_message_gone(exc):
-                return None
-            # 一時の障害を投稿の消失とみなして出し直さない
-            raise BotFailure("discord_rejected" if classify(exc) == PERMANENT
-                             else "discord_unavailable") from None
-        return self._metadata(message)
+        delay = REST_RETRY_SECONDS
+        while True:
+            try:
+                message = await self._channel.fetch_message(message_id)
+            except REST_ERRORS as exc:
+                if is_message_gone(exc):
+                    return None
+                if classify(exc) == PERMANENT:
+                    raise BotFailure("discord_rejected") from None
+                # 一時の障害は投稿の消失とみなして出し直さず、保留して再試行する
+                await self._sleep(delay)
+                delay = min(delay * 2, REST_RETRY_MAX_SECONDS)
+                continue
+            return self._metadata(message)
 
     def _metadata(self, message: discord.Message) -> MessageMetadata:
         text = None
@@ -440,8 +452,8 @@ class BotAdapter:
         """bot token の edit。結果は ok、gone (投稿が無い)、failed (一時的な失敗)。
 
         gone は edit の成功ではない。呼び出し側が、終端なら表示の削除済み、pending なら再投稿として扱う。
-        gone は 404 かつ code 10008 だけ。channel・認証・権限の拒否 (10003 / 50001 / 50013 / 401 / 403、
-        その他の 404) は恒久で ``BotFailure("discord_rejected")``。cleanup (View の取り外しや不採用の
+        gone は 404 かつ code 10008 だけ。channel・認証・権限の拒否 (10003 / 50001 / 50013 は status によらず、
+        401 / 403、その他の 404) は恒久で ``BotFailure("discord_rejected")``。cleanup (View の取り外しや不採用の
         投稿の後始末) は、投稿一つに閉じた 400 等だけ failed にする。deadline があれば await を打ち切る。
         """
         if "content" in kwargs:
@@ -455,8 +467,7 @@ class BotAdapter:
         except REST_ERRORS as exc:
             if is_message_gone(exc):
                 return "gone"
-            if classify(exc) == PERMANENT and (
-                    not cleanup or getattr(exc, "status", None) in {401, 403, 404}):
+            if classify(exc) == PERMANENT and (not cleanup or is_shared_rejection(exc)):
                 raise BotFailure("discord_rejected") from None
             return "failed"
         return "ok"
@@ -1044,18 +1055,24 @@ class BotAdapter:
         exclude は record が今指している (消えた) 投稿。
         """
         expected = gate_footer(draft.approval_id, draft.payload_sha256, generation)
-        try:
-            async for message in self._channel.history(limit=100):
-                meta = self._metadata(message)
-                if (meta.message_id != exclude and meta.author_is_bot
-                        and meta.guild_id == draft.guild_id
-                        and meta.channel_id == draft.channel_id and meta.footer == expected):
-                    return meta.message_id
-        except REST_ERRORS as exc:
-            # 権限の拒否も一時の失敗も、履歴が空だったとは読み替えない (重複して投稿しない)
-            raise BotFailure("discord_rejected" if classify(exc) == PERMANENT
-                             else "discord_unavailable") from None
-        return None
+        delay = REST_RETRY_SECONDS
+        while True:
+            try:
+                async for message in self._channel.history(limit=100):
+                    meta = self._metadata(message)
+                    if (meta.message_id != exclude and meta.author_is_bot
+                            and meta.guild_id == draft.guild_id
+                            and meta.channel_id == draft.channel_id and meta.footer == expected):
+                        return meta.message_id
+            except REST_ERRORS as exc:
+                # 権限の拒否も一時の失敗も、履歴が空だったとは読み替えない (重複して投稿しない)。
+                # 一時の失敗は履歴の読み直しを保留して再試行する
+                if classify(exc) == PERMANENT:
+                    raise BotFailure("discord_rejected") from None
+                await self._sleep(delay)
+                delay = min(delay * 2, REST_RETRY_MAX_SECONDS)
+                continue
+            return None
 
 
 def _page(reply) -> tuple[list[dict], int, int]:

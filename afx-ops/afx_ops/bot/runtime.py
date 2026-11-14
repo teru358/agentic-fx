@@ -44,7 +44,7 @@ from afx_ops.api_client import RC_UNREACHABLE, ApiError, BotClient, with_detail
 from afx_ops.bot.adapter import BotAdapter, BotFailure, BotSettings, open_state_dir
 from afx_ops.bot.exits import (REASONS, RC_BOT_LOOP_STALLED, RC_BOT_PERMANENT,  # noqa: F401
                                RC_BOT_TRANSIENT, RC_OK, rc_for_reason)
-from afx_ops.bot.progress import ProgressTracker
+from afx_ops.bot.progress import GATEWAY_HEALTHY, ProgressTracker
 from afx_ops.bot.rest import PERMANENT, REST_ERRORS, classify
 from afx_ops.gate.service import GateService
 from afx_ops.gate.state import BotState
@@ -177,7 +177,7 @@ async def _main(isolated, token: str, client, dir_fd: int, *, connector_factory,
     bot = _Client(intents=discord.Intents.none(), connector=connector)
     bot.progress = progress
     adapter = BotAdapter(gate=gate, client=client, dir_fd=dir_fd, settings=settings,
-                         discord_client=bot, now=now, progress=progress)
+                         discord_client=bot, now=now, progress=progress, sleep=sleep)
     bot.adapter = adapter
     tasks: list[asyncio.Task] = []
     try:
@@ -190,7 +190,7 @@ async def _main(isolated, token: str, client, dir_fd: int, *, connector_factory,
             startup.result()
         else:
             monitor.result()
-        gateway = asyncio.create_task(_gateway(bot))
+        gateway = asyncio.create_task(_gateway(bot, progress, sleep))
         poller = asyncio.create_task(_poll(adapter, poll_interval))
         failed = asyncio.create_task(adapter.failed.wait())
         running = [monitor, gateway, poller, failed]
@@ -221,6 +221,8 @@ async def _main(isolated, token: str, client, dir_fd: int, *, connector_factory,
 async def _startup(adapter: BotAdapter, bot: discord.Client, token: str, sleep) -> None:
     await adapter.prepare()
     await _login(bot, token, sleep)
+    # 起動 reconcile の窓は login の後から数える (login 前は gateway の窓が数える)
+    adapter.progress.startup_begin()
     await adapter.reconcile_startup()
 
 
@@ -253,15 +255,34 @@ async def _monitor(progress: ProgressTracker, interval: float, sleep) -> None:
             raise BotFailure(reason)
 
 
-async def _gateway(bot: discord.Client) -> None:
-    try:
-        await bot.connect(reconnect=True)
-    except BotFailure:
-        raise
-    except Exception as exc:
-        if isinstance(exc, discord.HTTPException) and classify(exc) == PERMANENT:
-            raise BotFailure("discord_rejected") from None
-        raise BotFailure("gateway_failed") from None
+async def _gateway(bot: discord.Client, progress: ProgressTracker, sleep, *,
+                   delay: float = LOGIN_BACKOFF_SECONDS,
+                   limit: float = LOGIN_BACKOFF_MAX_SECONDS) -> None:
+    """gateway に接続し続ける。恒久の拒否は止まり、一時の REST / 接続の失敗は backoff で再接続する。
+
+    再接続の間は不健全の起点を動かさない (gateway の 10 分の窓を monitor が持つ)。
+    """
+    initial = delay
+    while True:
+        try:
+            await bot.connect(reconnect=True)
+        except BotFailure:
+            raise
+        except Exception as exc:
+            if isinstance(exc, discord.LoginFailure) or (
+                    isinstance(exc, discord.HTTPException) and classify(exc) == PERMANENT):
+                raise BotFailure("discord_rejected") from None
+            if not isinstance(exc, REST_ERRORS):
+                raise BotFailure("gateway_failed") from None
+        else:
+            # connect が正常に戻るのは close 後だけ。再接続せず止める
+            raise BotFailure("gateway_failed")
+        # 一時の失敗。健全だった場合だけ今を不健全の起点にし (待ちも最初から)、既に不健全なら動かさない
+        if progress.gateway_state == GATEWAY_HEALTHY:
+            delay = initial
+        progress.gateway_disconnected()
+        await sleep(delay)
+        delay = min(delay * 2, limit)
 
 
 async def _poll(adapter: BotAdapter, interval: float) -> None:

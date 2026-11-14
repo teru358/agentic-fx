@@ -21,6 +21,8 @@ from afx_ops.gate.service import GateService
 from afx_ops.gate.state import BotState, initialize_event_cursor, load, save
 
 WINDOW = 600.0
+# `_main` を回す test 自身の実時間の期限 (fake の時計とは別)。超えたら明示的な失敗にする
+HARNESS_TIMEOUT = 30.0
 GUILD = 12345678901234567
 CHANNEL = 12345678901234568
 
@@ -200,10 +202,34 @@ def test_the_next_event_after_a_commit_opens_a_new_window():
 
 # ------------------------------------------------------------------ poller
 
-def test_the_first_poll_has_ten_minutes_from_process_start():
+def test_before_login_the_poller_has_no_window_of_its_own():
     clock = Clock()
     progress = tracker(clock)
     progress.gateway_connected()
+    clock.t += 100000
+    assert progress.expired() is None
+
+
+def test_the_first_poll_window_starts_when_the_startup_reconcile_starts():
+    clock = Clock()
+    progress = tracker(clock)
+    progress.gateway_connected()
+    clock.t += 590
+    progress.startup_begin()
+    began = clock.t
+    clock.t = began + 599
+    assert progress.expired() is None
+    clock.t = began + 600
+    assert progress.expired() == "poller_stalled"
+
+
+def test_the_first_poll_cycle_gets_its_own_window_after_the_reconcile():
+    clock = Clock()
+    progress = tracker(clock)
+    progress.gateway_connected()
+    progress.startup_begin()
+    clock.t += 500
+    progress.poll_begin()
     clock.t += 599
     assert progress.expired() is None
     clock.t += 1
@@ -331,8 +357,10 @@ CONFIG = SimpleNamespace(guild_id=GUILD, channel_id=CHANNEL, mention_role_id=Non
 class DaemonClient:
     """events / approvals を静かに返す。events を block する指定もできる。"""
 
-    def __init__(self, events_gate: threading.Event | None = None, pages=()) -> None:
+    def __init__(self, events_gate: threading.Event | None = None, pages=(),
+                 approvals_gate: threading.Event | None = None) -> None:
         self.events_gate = events_gate
+        self.approvals_gate = approvals_gate
         self.pages = list(pages)
         self.event_calls = 0
 
@@ -344,6 +372,8 @@ class DaemonClient:
         return Reply(200, page, None)
 
     def approvals(self, *, limit: int) -> Reply:
+        if self.approvals_gate is not None:
+            self.approvals_gate.wait()
         return Reply(200, {"approvals": []}, None)
 
     def approval(self, approval_id: int, *, timeout=None) -> Reply:
@@ -399,14 +429,33 @@ class Harness:
         monkeypatch.setattr(runtime, "_Client", FakeBot)
 
     def run(self, **kwargs) -> None:
-        try:
-            asyncio.run(runtime._main(
+        """`_main` を回す。実時間の期限を超えたら、止めて明示的な失敗として報告する。"""
+        timeout = kwargs.pop("timeout", HARNESS_TIMEOUT)
+        monitor_interval = kwargs.pop("monitor_interval", 10.0)
+
+        async def go() -> bool:
+            task = asyncio.ensure_future(runtime._main(
                 SimpleNamespace(config=CONFIG), "token", self.client, self.fd,
                 connector_factory=None, stop=self.stop, poll_interval=0.01, now=lambda: 0.0,
-                progress=self.progress, sleep=self.sleeper,
-                monitor_interval=kwargs.pop("monitor_interval", 10.0)))
+                progress=self.progress, sleep=self.sleeper, monitor_interval=monitor_interval))
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+            if done:
+                task.result()
+                return False
+            self.stop.set()
+            for gate in (getattr(self.client, "events_gate", None),
+                         getattr(self.client, "approvals_gate", None)):
+                if gate is not None:
+                    gate.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            return True
+        try:
+            timed_out = asyncio.run(go())
         finally:
             os.close(self.fd)
+        if timed_out:
+            pytest.fail(f"_main did not finish within {timeout} s (fake clock {self.clock.t})")
 
 
 async def _wait_until(predicate) -> None:
@@ -523,7 +572,8 @@ def test_main_a_blocked_gate_executor_stalls_the_poll_even_with_a_healthy_gatewa
     timers[0].join()
     assert failure.value.reason == "poller_stalled"
     assert harness.progress.gateway_state == "healthy"
-    assert harness.clock.t == 1000.0 + WINDOW
+    # 周回の窓はその周回の開始から (process 開始からではない)
+    assert harness.clock.t == harness.progress.poll_started_at + WINDOW
 
 
 def test_main_completed_polls_keep_the_bot_alive_past_ten_minutes(tmp_path, monkeypatch):
@@ -554,6 +604,179 @@ def test_main_a_send_that_never_returns_ends_the_process_with_a_transient_reason
     assert rc_for_reason(failure.value.reason) == 79
     assert failure.value.reason in {"delivery_stalled", "poller_stalled"}
     assert harness.progress.delivery_stalled_since is not None
+
+
+def test_main_the_harness_reports_a_run_that_never_ends_as_an_explicit_failure(tmp_path, monkeypatch):
+    harness = Harness(tmp_path, monkeypatch)
+
+    async def connect(bot):
+        await bot.on_connect()
+    harness.connect = connect
+    # 時計を進めない・止める合図も無い run は、期限で明示的に失敗する
+    harness.sleeper.limit = harness.clock.t
+    with pytest.raises(pytest.fail.Exception, match="did not finish"):
+        harness.run(timeout=0.3)
+
+
+def test_main_the_first_poll_gets_its_own_window_after_a_slow_login(tmp_path, monkeypatch):
+    release = threading.Event()
+    harness = Harness(tmp_path, monkeypatch, client=DaemonClient(events_gate=release))
+    # login に 580 秒かかる (gateway の窓の内側)。monitor はそのあいだ時計を進めない
+    harness.sleeper.limit = 1000.0 + 580
+
+    async def login(bot):
+        harness.clock.t = 1000.0 + 580
+    harness.login = login
+
+    async def connect(bot):
+        await bot.on_connect()
+        harness.sleeper.limit = None
+    harness.connect = connect
+    began = 1000.0 + 580
+    timers = []
+
+    def tick(now: float) -> None:
+        if now >= began + WINDOW and not timers:
+            timers.append(threading.Timer(0.5, release.set))
+            timers[0].start()
+    harness.sleeper.on_tick = tick
+    with pytest.raises(BotFailure) as failure:
+        harness.run()
+    timers[0].join()
+    # 最初の poll は process 開始からではなく、login 後の reconcile 開始から 10 分
+    assert failure.value.reason == "poller_stalled"
+    assert harness.clock.t == began + WINDOW
+
+
+def test_main_a_hung_startup_reconcile_is_stopped_with_a_transient_reason(tmp_path, monkeypatch):
+    release = threading.Event()
+    harness = Harness(tmp_path, monkeypatch, client=DaemonClient(approvals_gate=release))
+    timers = []
+
+    def tick(now: float) -> None:
+        if now >= 1000.0 + WINDOW and not timers:
+            timers.append(threading.Timer(0.5, release.set))
+            timers[0].start()
+    harness.sleeper.on_tick = tick
+    with pytest.raises(BotFailure) as failure:
+        harness.run()
+    timers[0].join()
+    from afx_ops.bot.exits import rc_for_reason
+    assert rc_for_reason(failure.value.reason) == 79
+    assert failure.value.reason in {"gateway_unhealthy", "poller_stalled"}
+    assert harness.progress.poll_started_at is not None
+
+
+class _FetchHangChannel(Channel):
+    """fetch_message が一時の失敗を返し続ける。"""
+
+    def __init__(self, failure) -> None:
+        super().__init__()
+        self.failure = failure
+        self.fetches = 0
+
+    async def fetch_message(self, message_id):
+        self.fetches += 1
+        raise self.failure
+
+
+@pytest.mark.parametrize("failure", [http(429), http(503), OSError("down")])
+def test_main_a_transient_fetch_failure_holds_the_startup_until_the_window_ends(
+        tmp_path, monkeypatch, failure):
+    from afx_ops.gate.state import ApprovalRecord
+    channel = _FetchHangChannel(failure)
+    harness = Harness(tmp_path, monkeypatch, channel=channel)
+    save(harness.fd, BotState.empty().with_record(ApprovalRecord(
+        approval_id=7, message_id=101, guild_id=GUILD, channel_id=CHANNEL,
+        payload_sha256="a" * 64, display_generation=1, state="fresh")))
+    with pytest.raises(BotFailure) as failure_info:
+        harness.run()
+    from afx_ops.bot.exits import rc_for_reason
+    assert rc_for_reason(failure_info.value.reason) == 79
+    assert failure_info.value.reason in {"gateway_unhealthy", "poller_stalled"}
+    # 即 rc 79 にせず、窓の間は再試行を続け、投稿の消失とも読み替えない
+    assert channel.fetches > 5 and channel.sent == []
+
+
+# ------------------------------------------------------------------ connect の失敗
+
+def _flaky_connect(harness, failures):
+    attempts = []
+
+    async def connect(bot):
+        attempts.append(harness.clock.t)
+        if len(attempts) <= len(failures):
+            raise failures[len(attempts) - 1]
+        await bot.on_connect()
+    harness.connect = connect
+    return attempts
+
+
+@pytest.mark.parametrize("failure", [http(429), http(500), http(503), OSError("down"),
+                                      asyncio.TimeoutError()])
+def test_main_a_transient_connect_failure_reconnects_with_backoff_and_stays_alive(
+        tmp_path, monkeypatch, failure):
+    harness = Harness(tmp_path, monkeypatch)
+    attempts = _flaky_connect(harness, [failure, failure, failure])
+    harness.sleeper.limit = 1000.0 + 1500
+    harness.sleeper.on_tick = lambda now: harness.stop.set() if now >= 1000.0 + 1500 else None
+    harness.run()
+    assert len(attempts) == 4
+    assert harness.progress.gateway_state == "healthy"
+    assert harness.clock.t == 1000.0 + 1500
+
+
+def test_main_a_connect_that_keeps_failing_dies_ten_minutes_after_the_unhealthy_origin(
+        tmp_path, monkeypatch):
+    harness = Harness(tmp_path, monkeypatch)
+    attempts = _flaky_connect(harness, [http(503)] * 10000)
+    with pytest.raises(BotFailure) as failure:
+        harness.run()
+    assert failure.value.reason == "gateway_unhealthy"
+    # 起点は process 開始。再接続の待ちと monitor の間隔の分だけ遅れて検知される
+    assert 1000.0 + WINDOW <= harness.clock.t < 1000.0 + WINDOW + 120 and len(attempts) > 3
+
+
+def test_main_connect_failures_after_a_disconnect_keep_the_first_unhealthy_origin(
+        tmp_path, monkeypatch):
+    harness = Harness(tmp_path, monkeypatch)
+    calls = []
+
+    async def connect(bot):
+        calls.append(harness.clock.t)
+        if len(calls) == 1:
+            await bot.on_connect()
+            await asyncio.sleep(0.01)
+            await bot.on_disconnect()
+            raise OSError("dropped")
+        raise http(503)
+    harness.connect = connect
+    with pytest.raises(BotFailure) as failure:
+        harness.run()
+    assert failure.value.reason == "gateway_unhealthy"
+    origin = harness.progress.gateway_unhealthy_since
+    assert origin + WINDOW <= harness.clock.t < origin + WINDOW + 120
+    assert len(calls) > 3
+
+
+@pytest.mark.parametrize("failure", [discord.LoginFailure("no"), http(401), http(403),
+                                      http(400), http(404, 10003), http(403, 50013)])
+def test_main_a_permanent_connect_rejection_stops_at_once_as_rejected(
+        tmp_path, monkeypatch, failure):
+    harness = Harness(tmp_path, monkeypatch)
+    attempts = _flaky_connect(harness, [failure])
+    with pytest.raises(BotFailure) as info:
+        harness.run()
+    assert info.value.reason == "discord_rejected"
+    assert len(attempts) == 1 and harness.clock.t < 1000.0 + WINDOW
+
+
+def test_main_an_unclassified_connect_failure_stops_as_gateway_failed(tmp_path, monkeypatch):
+    harness = Harness(tmp_path, monkeypatch)
+    _flaky_connect(harness, [RuntimeError("boom")])
+    with pytest.raises(BotFailure) as info:
+        harness.run()
+    assert info.value.reason == "gateway_failed"
 
 
 def test_the_real_client_routes_discord_dispatch_names_to_the_tracker():
