@@ -1,7 +1,7 @@
 ---
 id: code-impact-map
 title: コードから読み取る現状の影響地図 (機械索引・契約表・領域頁) を docs/ に置く
-status: 設計待ち
+status: 実装中
 priority: 高
 kind: 保守
 opened: 2026-11-14
@@ -10,7 +10,7 @@ related: [auto-killswitch-latch-emits-no-event, bot-gateway-disconnect-is-silent
 ---
 # [code-impact-map] コードから読み取る現状の影響地図 (機械索引・契約表・領域頁) を docs/ に置く
 
-**状態**: 設計待ち / **優先**: 高 / **種別**: 保守
+**状態**: 実装中 / **優先**: 高 / **種別**: 保守
 
 ## 現象
 
@@ -25,3 +25,4 @@ related: [auto-killswitch-latch-emits-no-event, bot-gateway-disconnect-is-silent
 ## 経緯
 
 - 2026-11-14: 起票。
+- 2026-11-14: 状態: 実装中 — 設計 C2.1 を 2026-11-14 に利用者承認 (docs/superpowers/specs/2026-11-14-code-impact-map-design.md)。範囲はチケット本文より狭めて始める: 初回 (T1) は試行頁 1 枚 + 独立の正解表 A/B + literal 逆引きの extract/evaluate + test 約 6 本。合否は抽出規則の種類 × 領域で出し、未測定の種類は unsupported。鮮度判定・affected・check (本文 (4)) は T2、工程への組み込み (本文 (5)) は T3 の実運用確認の後。正式試行の基準 revision は opsalert の merge 後。T0 (頁の雛形と手順) から着手。

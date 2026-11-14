@@ -3,7 +3,7 @@
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 未完了: 171 件。完了分は closed/。
 
-## 実装中 (2)
+## 実装中 (3)
 
 ### 不具合 (1)
 
@@ -16,6 +16,12 @@
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [web-plugin-improve-hub](open/web-plugin-improve-hub.md) | 高 | 2026-11-08 | 同梱 web に plugin と改善の画面群を作る (一覧・依存・承認・改善の実行) |
+
+### 保守 (1)
+
+| id | 優先 | 起票 | 概要 |
+|---|---|---|---|
+| [code-impact-map](open/code-impact-map.md) | 高 | 2026-11-14 | コードから読み取る現状の影響地図 (機械索引・契約表・領域頁) を docs/ に置く |
 
 ## 実装待ち (13)
 
@@ -70,7 +76,7 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (150)
+## 設計待ち (149)
 
 ### 不具合 (83)
 
@@ -207,11 +213,10 @@
 | [legacy-e2e-model](open/legacy-e2e-model.md) | 低 |  | backend を切り替えるたびにモデル名の手編集が要る |
 | [legacy-oc-qwen3-8-toolcall](open/legacy-oc-qwen3-8-toolcall.md) | 低 |  | モデルが壊れた引数でツールを連打し予算を焼く |
 
-### 保守 (25)
+### 保守 (24)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
-| [code-impact-map](open/code-impact-map.md) | 高 | 2026-11-14 | コードから読み取る現状の影響地図 (機械索引・契約表・領域頁) を docs/ に置く |
 | [gate-admission-helper](open/gate-admission-helper.md) | 低 | 2026-09-06 | gate 検査が 3 経路で重複し drift する |
 | [fake-run-context-consolidation](open/fake-run-context-consolidation.md) | 低 | 2026-09-17 | テストのフェイク RunContext が散在し追随漏れで壊れやすい |
 | [iw-r3-unverified-residuals](open/iw-r3-unverified-residuals.md) | 低 | 2026-09-19 | iw 3 周目で未検証のまま残った 3 点 |
