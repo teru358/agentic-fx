@@ -362,6 +362,26 @@ CREATE TABLE IF NOT EXISTS ohlcv_history (
 );
 """
 
+_HISTORY_CONFLICTS_DDL = """
+CREATE TABLE IF NOT EXISTS history_conflicts (
+  id INTEGER PRIMARY KEY,
+  source TEXT NOT NULL, interval TEXT NOT NULL, symbol TEXT NOT NULL,
+  bar_time TEXT NOT NULL, history_epoch TEXT NOT NULL,
+  existing_json TEXT NOT NULL, incoming_json TEXT NOT NULL,
+  existing_digest TEXT NOT NULL, incoming_digest TEXT NOT NULL,
+  origin TEXT NOT NULL CHECK(origin IN ('import','sync','live_compare')),
+  last_origin TEXT NOT NULL CHECK(last_origin IN ('import','sync','live_compare')),
+  state TEXT NOT NULL DEFAULT 'open' CHECK(state IN ('open','kept','replaced','superseded')),
+  first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+  seen_count INTEGER NOT NULL DEFAULT 1 CHECK(seen_count >= 1),
+  first_run_id TEXT, last_run_id TEXT,
+  resolved_at TEXT, resolved_by TEXT,
+  resolution_action TEXT CHECK(resolution_action IN ('keep_existing','replace_with_incoming','supersede')),
+  reason_ref TEXT, revision_id TEXT,
+  UNIQUE(source, interval, symbol, bar_time, history_epoch, existing_digest, incoming_digest)
+);
+"""
+
 _IMPROVE_WAVES_DDL = """
 -- expected=0 は初期設定が書く消費印 (slot を 1 件も持たない)。通常の wave は
 -- expected>=1 で slot を expected 件持つ。
@@ -534,7 +554,7 @@ CREATE TABLE IF NOT EXISTS candidate_archives (
 );
 """
 
-_SCHEMA = _OHLCV_CACHE_DDL + _OHLCV_HISTORY_DDL + """
+_SCHEMA = _OHLCV_CACHE_DDL + _OHLCV_HISTORY_DDL + _HISTORY_CONFLICTS_DDL + """
 CREATE TABLE IF NOT EXISTS data_migrations (
   name TEXT PRIMARY KEY, applied_at TEXT NOT NULL
 );
@@ -778,7 +798,7 @@ BEFORE DELETE ON improve_run_summaries BEGIN SELECT RAISE(ABORT, 'improve_run_su
 """
 
 TABLE_NAMES = frozenset({
-    "ohlcv_cache", "ohlcv_history", "data_migrations", "missions", "trade_intents", "orders",
+    "ohlcv_cache", "ohlcv_history", "history_conflicts", "data_migrations", "missions", "trade_intents", "orders",
     "reflections", "account_snapshots", "improvement_backlog",
     "improvement_runs", "econ_events", "approval_requests", "news_sources",
     "backtest_runs", "analysis_runs", "signals", "reflection_attempts",

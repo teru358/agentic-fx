@@ -8,7 +8,7 @@ from agentic_fx.store.db import TABLE_NAMES, connect, connect_readonly, init_db
 NOW = datetime(2026, 8, 11, tzinfo=timezone.utc)
 
 EXPECTED = {
-    "ohlcv_cache", "ohlcv_history", "data_migrations", "missions", "trade_intents", "orders",
+    "ohlcv_cache", "ohlcv_history", "history_conflicts", "data_migrations", "missions", "trade_intents", "orders",
     "reflections", "account_snapshots", "improvement_backlog",
     "improvement_runs", "econ_events", "approval_requests", "news_sources",
     "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
