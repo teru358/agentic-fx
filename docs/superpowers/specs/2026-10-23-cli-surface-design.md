@@ -724,7 +724,7 @@ probe の結果は次の 3 語で出す。
 
 lock file や親 directory は作らない。判定前後の状態変化を含む TOCTOU はゼロと主張せず、「観測時点」固定文を locked / free / unknown のすべてで出す。
 
-`instance: locked` のときは次の 6 行だけを出し、DB、state file、activity log の詳細を読まない。終了コードは 0 とする。
+`instance: locked` のときは次の 6 行を出し、DB、state file、activity log の詳細を読まない。終了コードは 0 とする。ただし `locked-by` が marker なしの `unknown (daemon 稼働中とみられる)` のときだけ例外で、設定と `mode=ro` 固定 (`immutable` なし) の履歴専用接続を 1 度ずつ使って、表示 tz 行と評価履歴ブロック (固定理由つき) を `locked-by` と note の間に足す (置換の正本は `2026-11-14-history-status-and-import-conflicts-design.md` §1.2)。`setup`、`enroll:*`、将来の保持者は従来の 6 行を完全に維持し、履歴のために何も読まない。
 
 ```text
 agentic-fx offline status
@@ -906,7 +906,7 @@ survey §2 の集計は 6 パターンで 248 行 / 46 ファイルであるが�
 | AC-15 | `policy remove <id>` は該当 DB row だけを消し、DB の全 row から ID marker 付き block を file 末尾に再生成し、marker 外の手書き / legacy / 不正 marker を byte 保存し、成功時だけ固定 activity を 1 件残す。`ops_requests` の phase は `accepted` と `succeeded` の 2 行だけで、CHECK 制約の 4 値以外を書かない | DB / file / audit / activity の before-after |
 | AC-16 | (a) remove の同一 idempotency key 再送は保存済みの応答を返す。(b) DELETE commit 後の file replace 例外は、`ops_requests` に phase=`outcome_unknown` の終端行を書き、`outcome_unknown` を応答する。(c) DELETE commit 後・replace 前の hard crash を fault injection し、再起動で `recover_after_journal()` がその要求を `outcome_unknown` にし、file が DB 正本へ収束する。(d) managed が 1 件だけの状態でその 1 件を remove し、同じ位置で crash しても、再起動後の file に block が残らない (DB 0 行でも reconcile が走る)。(e) (b) の後に別 key で同じ ID を remove すると、`not_found` を返す前に file が収束し、先頭 reconcile が直した場合の `policy_reconciled` activity は残る。daemon は再起動しない。(f) 別 key で削除済みの正の整数 ID を送ると、API は `not_found` を返し、先頭 reconcile が unchanged なら DB / file / activity は変わらない。`0`、負数、非数値 (`abc`、`1.5`、空文字) は client の parse で API 接続前に rc=2 となり、鍵の読込と接続は 0 回である。(g) (b) の後の file に AC-13 の (i)〜(iii) の変異を重ねても、別 key の remove の先頭 reconcile で canonical 列へ収束する。(h) 起動時 reconcile が例外でも `SYSTEM policy_reconcile_failed` と技術ログを残して listener は開き、`recover_after_journal()` の失敗だけが listener を妨げる | replace fault、crash child、再起動 recovery、listener、API と client parse |
 | AC-17 | principal × scope / 新 endpoint が §5.5 と一致する。`guidance.read` は operator / approver だけが持ち、ops-web / ops-bot / ops-notify は backlog / policy 自由文を取得できない。remove と reconcile も operator / approver だけが通る | principal × scope × endpoint の直積 test |
-| AC-18 | `afx status` は instance lock が排他保持されているとき §6.1 の `instance: locked` の 6 行だけを出し、DB / state / log reader を呼ばない。`locked-by` は setup marker / enroll marker / 両方 (enroll が先) / 読めない enroll marker / どちらも無い、の各場合に §6.1 の語になり、`next` は §6.1 の表どおりになる。どちらの marker も無く鍵 file も無いときは `next` が `journalctl --user -u afx.service …` になる。marker と鍵は作成・変更しない | exclusive lock holder fixture、marker 直積、鍵有無、spy |
+| AC-18 | `afx status` は instance lock が排他保持されているとき §6.1 の `instance: locked` の 6 行を出し (`locked-by` が marker なしの unknown のときだけ評価履歴ブロックが加わり、そのとき読むのは設定と `mode=ro` 強制・`immutable` なしの履歴専用接続だけ)、state / log / pending reader と systemctl を呼ばない。setup / enroll / 将来の保持者は DB・設定も読まず 6 行のまま。`locked-by` は setup marker / enroll marker / 両方 (enroll が先) / 読めない enroll marker / どちらも無い、の各場合に §6.1 の語になり、`next` は §6.1 の表どおりになる。どちらの marker も無く鍵 file も無いときは `next` が `journalctl --user -u afx.service …` になる。marker と鍵は作成・変更しない | exclusive lock holder fixture、marker 直積、鍵有無、spy |
 | AC-19 | `instance: free` で setup=`ok / missing / corrupt`、settings=`ok / missing / invalid`、主要 file 不在を固定語で出す。どの source が不良でも残りの collector と pending steps を表示する | source 直積 fixture |
 | AC-20 | DB が ok / missing / corrupt、各 table が present / absent の場合に `ok / missing / unavailable`、mission、approval 件数、deploy op 件数を固定形で出す。DB を作成・migration せず、DB collector の失敗で settings / unit / ops / activity の表示を抑止しない | FS / sqlite fixture の直積 |
 | AC-21 | instance lock の shared lock は probe の 1 回だけ取り、state を読む前に解放されている。state は `data/state/app_state.json.lock` を `O_RDONLY` で開いて shared で読み、clear / latched / markerあり / missing / corrupt を出す。lock file 不在は lock なしで読み、lock file を作らない。`app_state.json.lock` が 1 秒排他保持されたままなら `unavailable` になる。`StateStore.load()` / `_shared()` は呼ばず、`instance: unknown` では state を読まない | flock fixture、state-reader spy、open flag の記録 |
@@ -1068,7 +1068,7 @@ console script `afx` (`pyproject.toml` の `[project.scripts]`) は `uv sync` �
 - instance lock が不在 / unreadable の環境では `instance: unknown` になる。unknown 時は state 詳細を読まず、他 source も「観測時点」の診断としてのみ出す。
 - instance lock の probe は shared lock を 1 回取って直ちに解放するが、その瞬間に重なった `LOCK_EX|LOCK_NB` の取得 (daemon 起動、`afx keys`、`afx init` 等) は失敗し得る。窓は flock の system call 2 回の間に限られる。daemon は `Restart=on-failure` で再試行され (`setup/unit.py:47`)、他の操作は利用者が再実行する。
 - `locked-by` は marker からの推定である。marker を書かない保持者 (`afx keys`、marker を書く前の `afx init`、post_start) も `unknown (daemon 稼働中とみられる)` と出る。`next` の `afx ctl status` が失敗したら、利用者はその保持者の完了を待って `afx status` を再実行する。
-- `immutable=1` の観測用接続は並行 writer を無視する。sidecar の無い DB を読んでいる間に daemon が起動して書き始めると、古い内容を読むか読取が失敗する。表示は「観測時点」の診断に限る。
+- `immutable=1` の観測用接続は並行 writer を無視する。sidecar の無い DB を読んでいる間に daemon が起動して書き始めると、古い内容を読むか読取が失敗する。表示は「観測時点」の診断に限る。locked (unknown) の履歴専用接続は `immutable` を付けず `mode=ro` だけで開くのでこの制約を受けないが、開けなければ固定理由 `database_unavailable` になる。
 - `news` は local CLI の metadata と parser が同じ 5 操作を公開する。API endpoint は持たない。
 
 ## 13. 変更履歴

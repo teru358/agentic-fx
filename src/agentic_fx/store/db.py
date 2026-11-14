@@ -832,14 +832,18 @@ def connect(db_path: Path, *, check_same_thread: bool = False) -> sqlite3.Connec
     return conn
 
 
-def connect_observer_readonly(db_path: Path) -> sqlite3.Connection:
+def connect_observer_readonly(db_path: Path, *, force_ro: bool = False) -> sqlite3.Connection:
     """観測専用 (`afx status` / `afx plugin list`) の読み取り接続。
 
-    `-wal` と `-shm` のどちらも無い (lstat で確認) DB は `immutable=1` で開く。
+    既定では `-wal` と `-shm` のどちらも無い (lstat で確認) DB を `immutable=1` で開く。
     sidecar を作らず、主 DB file も書かない。どちらか一方でもあれば daemon の
     WAL が残っているので `mode=ro` で開く (sidecar だけが変わりうる)。
+    `force_ro=True` は、他の process が書込み中かもしれない DB (`afx status` の
+    locked 経路) 向けで、sidecar の有無にかかわらず `mode=ro` だけで開き `immutable` を
+    付けない (immutable は変更されない前提の宣言で、書込み中の DB では誤読になる)。
+    開けなければ例外で、rw への fallback はしない。
     `db_path` が無ければ `FileNotFoundError`。DB の作成・journal_mode の変更・
-    migration は行わない。
+    migration は行わない。busy は接続 1 回あたり最大 1 秒待つ。
     """
     if sqlite3.sqlite_version_info < (3, 35, 0):
         raise RuntimeError(
@@ -855,7 +859,7 @@ def connect_observer_readonly(db_path: Path) -> sqlite3.Connection:
         except FileNotFoundError:
             continue
         has_sidecar = True
-    mode = "mode=ro" if has_sidecar else "mode=ro&immutable=1"
+    mode = "mode=ro" if (force_ro or has_sidecar) else "mode=ro&immutable=1"
     uri = f"file:{quote(str(resolved), safe='/')}?{mode}"
     conn = sqlite3.connect(uri, uri=True, check_same_thread=False,
                            isolation_level=None, timeout=1.0)

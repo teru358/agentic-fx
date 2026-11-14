@@ -408,7 +408,7 @@ rejectは使わず、人間の自由記述による履歴情報を改善prompt�
 
 ## 7. `afx status`
 
-段1aではローカルの `afx status` に `evaluation_history` を1ブロック追加する。daemon停止中も読取専用接続で計算し、既存ライブdata・referencesとは区別する。
+段1aではローカルの `afx status` に `evaluation_history` を1ブロック追加する。読取専用接続で計算し、既存ライブdata・referencesとは区別する。読むのは instance lock が free のとき、および locked のうち marker なしの `locked-by: unknown` のときだけで、`mode=ro` 固定 (`immutable` なし) の履歴専用接続を使う。`setup`・`enroll:*`・将来の保持者では読まず従来の6行を維持する (正本は `2026-11-14-history-status-and-import-conflicts-design.md` §1.2)。
 
 表示は次に絞る。
 
@@ -416,8 +416,8 @@ rejectは使わず、人間の自由記述による履歴情報を改善prompt�
 - 主pairごとの最新保存足・最新確定足、壁時計差・開場時間差。
 - holdoutのpresent・expected・充足率、最悪の日の欠損本数と時間、欠損が60分ぶんを超える日。
 - `ready / history_stale / history_gap / unavailable`。複数理由があれば併記。
-- 参照銘柄について、主pairに足があるUTC日なのに0本だった日の一覧。
-- 手動import、開場後の再試行、配備中版の再評価への案内。
+- 参照銘柄 (`datafeed.watch_symbols` から主pairを除いたもの。空なら `no reference watch symbols`) について、主pairに足があるUTC日なのに0本だった日の一覧。見出しは「holdout 区間の 0 本日 (評価に使えるかは eval_window の表示を見る)」。
+- 主判定に応じた案内。stale / gap のときだけ「daemon を止めて `afx history import`」、unavailable のときは固定理由に沿う確認、ready と not configured では `next:` を出さない。配備中版の再評価は status の充足から推測せず、gate・再評価の具体的な結果から案内する。
 
 無足一覧のファイルパスはrepository rootを基準とする `config/history-no-bars.yaml` に固定し、実際に解決したパスを人間面に表示する。実行時のカレントディレクトリによって別の一覧を読まない。
 
@@ -427,7 +427,7 @@ statusの無足一覧表示には、§5.2の対象範囲で抽出した項目と
 
 参照の0本日は疑いの表示であり、休場と取得不足を断定しない。採用停止にも使わない。20有足日の中央値との比較は導入しない。
 
-DB・設定・暦の読取失敗では、このブロックを `unavailable` とし、status全体の表示は維持する。statusは履歴取得や修復を実行しない。
+DB・設定・暦の読取失敗では、このブロックを固定理由 (`settings_unavailable` / `database_unavailable` / `history_check_unavailable`、参照だけなら `reference_query_failed`) 付きの `unavailable` とし、status全体の表示は維持する。statusは履歴取得や修復を実行しない。
 
 ## 8. 移行と15件の扱い
 
