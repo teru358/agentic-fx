@@ -85,9 +85,10 @@ class GateCheckError(ValueError):
     """Gate failure whose failed check is carried as a structured ``kind``
     (``pytest`` or ``hash``); callers must not classify by message text."""
 
-    def __init__(self, message: str, *, kind: str) -> None:
+    def __init__(self, message: str, *, kind: str, returncode: int | None = None) -> None:
         super().__init__(message)
         self.kind = kind
+        self.returncode = returncode
 
 
 class PluginBusyError(RuntimeError):
@@ -1246,11 +1247,91 @@ def _persist_human_gate_rows(conn: sqlite3.Connection, rows: list[dict], *,
         raise
 
 
+@dataclass(frozen=True)
+class GateFailure:
+    """`_run_full_gate` が失敗の直前に記録先へ渡す、構造化された失敗の情報。
+
+    `stage` は失敗した段階 (snapshot / source / discovery / contract / indicator_static /
+    pytest / hash / kind_gate / verdict)、`detail` は構造化された判別子
+    (`GateCheckError.kind`・`SandboxError.code`・gate の `verdict_kind` 等)。
+    `rows` はそこまでに集めた gate の行、`mission_outcome` はその行を保存するときの分類
+    (保存しない失敗は None)。`message` は診断用で、分類には使わない。"""
+    stage: str
+    error_type: str
+    detail: str = ""
+    verdict_kind: str | None = None
+    returncode: int | None = None
+    mission_outcome: str | None = None
+    rows: tuple = ()
+    message: str = ""
+
+
+FailureSink = Callable[[GateFailure], None]
+
+
+class _DefaultFailureSink:
+    """`failure_sink` を省略したことを表す目印 (None とは区別する)。"""
+
+
+_DEFAULT_FAILURE_SINK = _DefaultFailureSink()
+
+
+def _db_failure_sink(conn: sqlite3.Connection, now: datetime) -> FailureSink:
+    """既定の記録先。分類つきで集めた gate の行を DB の成績表へ保存する。"""
+    def sink(failure: GateFailure) -> None:
+        if failure.mission_outcome is None or not failure.rows:
+            return
+        _persist_human_gate_rows(
+            conn, list(failure.rows), mission_outcome=failure.mission_outcome, now=now)
+    return sink
+
+
+def _resolve_failure_sink(failure_sink, conn: sqlite3.Connection,
+                          now: datetime) -> FailureSink:
+    """記録先を内部へ進む前に 1 つに決める。省略は既定の DB 記録先、明示した None や
+    呼び出せない値は拒否する (DB へ黙って倒さない)。"""
+    if isinstance(failure_sink, _DefaultFailureSink):
+        return _db_failure_sink(conn, now)
+    if not callable(failure_sink):
+        raise TypeError("failure_sink must be callable; omit it to use the database sink")
+    return failure_sink
+
+
+def _failure_detail(exc: BaseException) -> str:
+    """例外の型と構造化された属性だけから固定語の判別子を作る (文言は見ない)。"""
+    from agentic_fx.backtest import holdout
+
+    if isinstance(exc, GateCheckError):
+        return exc.kind
+    if isinstance(exc, SandboxError):
+        return exc.code
+    if isinstance(exc, sqlite3.OperationalError):
+        code = getattr(exc, "sqlite_errorcode", None)
+        if isinstance(code, int) and code & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+            return "db_busy"
+        return ""
+    if isinstance(exc, holdout.NoHistoryError):
+        return "no_history"
+    if isinstance(exc, MemoryError):
+        return "resource"
+    return ""
+
+
+def _fail_verdict(sink: FailureSink, outcome, rows: list, mission_outcome: str, *,
+                  detail: str = "") -> None:
+    """gate の判別子による失敗を記録先へ渡す。分類は `verdict_kind` だけで行う。"""
+    sink(GateFailure(
+        stage="verdict", error_type="ValueError", detail=detail,
+        verdict_kind=outcome.verdict_kind, mission_outcome=mission_outcome,
+        rows=tuple(rows)))
+
+
 def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
                    settings, now: datetime,
                    floor_mode: Literal["enforce", "warn"] = "enforce",
                    plugins_root: Path,
-                   activity: "ActivityLog | None" = None):
+                   activity: "ActivityLog | None" = None,
+                   failure_sink=_DEFAULT_FAILURE_SINK):
     """P1 手順 2〜7 / P3 手順 1〜2 の共有ゲート本体 (§8.1-41 pin: P1 と P3
     は同じゲートを通る — 二重実装しない)。合格すれば
     `(meta, content_hash, artifact_hash, outcome: approval.GateOutcome)`
@@ -1265,60 +1346,78 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
     `gate_rows` は raise の直前に `_persist_human_gate_rows` で保存する
     (F6-12: `run_kind_gate` を抜けてくる想定外例外の経路でも同様に
     `gate_failed` で保存してから元例外を伝播する — 行を捨てない/
-    `unprofitable` で保存しない)。"""
-    check_candidate_snapshot(candidate_dir)  # 手順 2 (B-5: 名指し再利用)
-    before_content, before_artifact = hashes_of(candidate_dir)  # 手順 3
+    `unprofitable` で保存しない)。
 
-    # 順序は改善ループの plugin gate と同じ: snapshot → ソース検査 → loader →
-    # 契約 (outputs・max_bars) → 名前・param の静的検査 → 以降の実行段。
-    # 未検査の候補は loader にも静的検査にも渡さない。
-    try:
-        check_source(candidate_dir / "plugin.py")  # 手順 4
-        check_source(candidate_dir / "test_plugin.py",
-                    extra_allowed=frozenset({"pytest", "plugin"}))
-    except SandboxError as exc:
-        raise ValueError(f"plugin {name!r}: {exc}") from exc
-
-    meta = loader._discover_one(candidate_dir, name)
-    if meta is None:
-        raise ValueError(
-            f"plugin {name!r}: candidate at {candidate_dir} failed discovery "
-            "validation (config/AST ゲート不合格 — ログ参照)")
-
-    # [indicator-consumption-wiring] U4 (2026-09-14): 新規承認では
-    # kind=indicator の `outputs` 宣言を必須にする。固定文言のみ
-    # (候補名も理由も足さない — Global Constraints の語彙一覧)。
-    # 位置は `assert_max_bars_within_limit` と同じ「ゲート本体の手前」。
-    # /code-review 2 周目 CR7 (2026-09-18): 条件式は
-    # `approval.outputs_required_violation` に一本化 (improve_loop の
-    # commit gate と共有 — 挙動不変)。
-    if approval.outputs_required_violation(meta):
-        raise ValueError("outputs_required")
-    # max_bars 上限は実行段 (pytest・run_kind_gate) の前で fail closed する。
-    approval.assert_max_bars_within_limit(meta, settings=settings)
-
-    # submit は改善ループと同じ reject、bless は政策検査を warning にする
-    # (収益床の floor_mode と同じ 2 値)。
-    lane = "submit" if floor_mode == "enforce" else "bless"
-    static_report = None
+    失敗の記録先は `failure_sink` で決まる。省略すると従来どおり gate の行を DB の
+    成績表へ保存する。明示した記録先は、全ての失敗と想定外例外の分岐でその 1 つだけが
+    呼ばれ、DB へは倒れない。記録先は内部へ進む前に決める。"""
+    sink = _resolve_failure_sink(failure_sink, conn, now)
+    stage = "snapshot"
     inventory = None
-    if meta.kind == "indicator":
-        inventory = tools_plugin_loader.approved_plugins(
-            conn, plugins_root, settings=settings)
-        static_report = indicator_pipeline.check_static(
-            meta, candidate_dir, settings=settings,
-            deployed=inventory.inventory.by_name(name), lane=lane)
-        if not static_report.ok:
-            raise ValueError(f"plugin {name!r}: {static_report.code}")
+    static_report = None
+    try:
+        check_candidate_snapshot(candidate_dir)  # 手順 2 (B-5: 名指し再利用)
+        before_content, before_artifact = hashes_of(candidate_dir)  # 手順 3
+
+        # 順序は改善ループの plugin gate と同じ: snapshot → ソース検査 → loader →
+        # 契約 (outputs・max_bars) → 名前・param の静的検査 → 以降の実行段。
+        # 未検査の候補は loader にも静的検査にも渡さない。
+        stage = "source"
+        try:
+            check_source(candidate_dir / "plugin.py")  # 手順 4
+            check_source(candidate_dir / "test_plugin.py",
+                        extra_allowed=frozenset({"pytest", "plugin"}))
+        except SandboxError as exc:
+            raise ValueError(f"plugin {name!r}: {exc}") from exc
+
+        stage = "discovery"
+        meta = loader._discover_one(candidate_dir, name)
+        if meta is None:
+            raise ValueError(
+                f"plugin {name!r}: candidate at {candidate_dir} failed discovery "
+                "validation (config/AST ゲート不合格 — ログ参照)")
+
+        # [indicator-consumption-wiring] U4 (2026-09-14): 新規承認では
+        # kind=indicator の `outputs` 宣言を必須にする。固定文言のみ
+        # (候補名も理由も足さない — Global Constraints の語彙一覧)。
+        # 位置は `assert_max_bars_within_limit` と同じ「ゲート本体の手前」。
+        # /code-review 2 周目 CR7 (2026-09-18): 条件式は
+        # `approval.outputs_required_violation` に一本化 (improve_loop の
+        # commit gate と共有 — 挙動不変)。
+        stage = "contract"
+        if approval.outputs_required_violation(meta):
+            raise ValueError("outputs_required")
+        # max_bars 上限は実行段 (pytest・run_kind_gate) の前で fail closed する。
+        approval.assert_max_bars_within_limit(meta, settings=settings)
+
+        # submit は改善ループと同じ reject、bless は政策検査を warning にする
+        # (収益床の floor_mode と同じ 2 値)。
+        lane = "submit" if floor_mode == "enforce" else "bless"
+        if meta.kind == "indicator":
+            stage = "indicator_static"
+            inventory = tools_plugin_loader.approved_plugins(
+                conn, plugins_root, settings=settings)
+            static_report = indicator_pipeline.check_static(
+                meta, candidate_dir, settings=settings,
+                deployed=inventory.inventory.by_name(name), lane=lane)
+            if not static_report.ok:
+                raise ValueError(f"plugin {name!r}: {static_report.code}")
+    except BaseException as exc:
+        sink(GateFailure(stage=stage, error_type=type(exc).__name__,
+                         detail=_failure_detail(exc), message=safe_error_text(exc)))
+        raise
 
     rows: list[dict] = []
+    stage = "pytest"
     try:
         gate_result = run_gate_pytest(candidate_dir, settings=settings)  # 手順 5
         if not gate_result.passed:
             raise GateCheckError(
                 f"plugin {name!r}: test_plugin.py failed pytest gate "
-                f"(returncode={gate_result.returncode})", kind="pytest")
+                f"(returncode={gate_result.returncode})", kind="pytest",
+                returncode=gate_result.returncode)
 
+        stage = "hash"
         after_content, after_artifact = hashes_of(candidate_dir)  # 手順 6
         if after_content != before_content or after_artifact != before_artifact:
             raise GateCheckError(
@@ -1329,6 +1428,7 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
         # **ここで 1 回だけ**構築する (submit / bless の両方が通る唯一の
         # 場所)。`run_kind_gate` は `pin_mode="require"` で解決し、
         # 失敗は判別子で返る (raise しない)。
+        stage = "kind_gate"
         if inventory is None:
             inventory = tools_plugin_loader.approved_plugins(
                 conn, plugins_root, settings=settings)
@@ -1340,43 +1440,48 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
         # は `rows` と同一オブジェクト — 二重の list を作らない。
         assert outcome.gate_rows is rows
     except SandboxError as exc:
-        _persist_human_gate_rows(conn, rows, mission_outcome="gate_failed", now=now)
+        sink(GateFailure(
+            stage=stage, error_type=type(exc).__name__, detail=_failure_detail(exc),
+            mission_outcome="gate_failed", rows=tuple(rows), message=safe_error_text(exc)))
         raise ValueError(f"plugin {name!r}: {exc}") from exc
-    except BaseException:
+    except BaseException as exc:
         # F6-12 (codex R3-M1): run_kind_gate を抜けてくる想定外例外
         # (holdout.NoHistoryError・履歴空の ValueError 等) も含め、
         # 捕捉済みの行を gate_failed で保存してから元例外を伝播する。
-        _persist_human_gate_rows(conn, rows, mission_outcome="gate_failed", now=now)
+        sink(GateFailure(
+            stage=stage, error_type=type(exc).__name__, detail=_failure_detail(exc),
+            returncode=getattr(exc, "returncode", None),
+            mission_outcome="gate_failed", rows=tuple(rows), message=safe_error_text(exc)))
         raise
 
     # [indicator-consumption-wiring] §2.8: 判別子から固定 ValueError。
     # 例外メッセージの部分一致による分類は禁止 — ここも判別子だけを見る。
     if outcome.verdict_kind == "indicator_unresolved":
-        _persist_human_gate_rows(conn, rows, mission_outcome="gate_failed", now=now)
+        _fail_verdict(sink, outcome, rows, "gate_failed", detail=outcome.indicator_reason)
         raise ValueError(
             f"indicator_unresolved:{outcome.indicator_alias or '-'}:"
             f"{outcome.indicator_reason}")
     if outcome.verdict_kind == "insufficient_trades":
-        _persist_human_gate_rows(conn, rows, mission_outcome="gate_failed", now=now)
+        _fail_verdict(sink, outcome, rows, "gate_failed")
         raise ValueError(
             f"plugin {name!r}: strategy not evaluable "
             f"({outcome.insufficient_trades_reason})")
     if outcome.verdict_kind == "reference_history_missing":
-        _persist_human_gate_rows(conn, rows, mission_outcome="gate_failed", now=now)
+        _fail_verdict(sink, outcome, rows, "gate_failed")
         raise ValueError(
             f"plugin {name!r}: strategy not evaluable ({outcome.unevaluable_reason})")
     if outcome.verdict_kind == "history_source_unconfigured":
-        _persist_human_gate_rows(conn, rows, mission_outcome="gate_failed", now=now)
+        _fail_verdict(sink, outcome, rows, "gate_failed")
         raise ValueError(
             f"plugin {name!r}: 履歴源が設定されていません "
             "(backtest.eval_source を mt5 か対応履歴源にしてください)")
     if outcome.verdict_kind in strategy_gate.HISTORY_UNEVALUABLE_KINDS:
-        _persist_human_gate_rows(conn, rows, mission_outcome="gate_failed", now=now)
+        _fail_verdict(sink, outcome, rows, "gate_failed")
         raise ValueError(
             f"plugin {name!r}: strategy not evaluable ({outcome.verdict_kind}) — "
             "履歴条件を満たしていません。`afx status` で確認し、履歴補充後に提出してください")
     if outcome.verdict_kind == "floor" and floor_mode == "enforce":
-        _persist_human_gate_rows(conn, rows, mission_outcome="unprofitable", now=now)
+        _fail_verdict(sink, outcome, rows, "unprofitable")
         g = settings.improve.gate
         # [profitability-floor] codex 2 周目レビュー CR1/CR3 (2026-09-13):
         # `strategy_gate.floor_rule_text(audience="human")` を使う —
@@ -1406,7 +1511,7 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
     # 続行できるのは ok と、warn のときの floor (いずれも evaluable) だけ。ここまでに
     # 個別に扱っていない評価不能・未知の判別子は、既定で拒否する。
     if not _gate_outcome_may_continue(outcome, floor_mode=floor_mode):
-        _persist_human_gate_rows(conn, rows, mission_outcome="gate_failed", now=now)
+        _fail_verdict(sink, outcome, rows, "gate_failed")
         raise ValueError(f"plugin {name!r}: strategy not evaluable")
 
     if meta.kind == "indicator":

@@ -370,7 +370,7 @@ def run_kind_gate(conn: sqlite3.Connection, meta: PluginMeta, *,
         verdict = strategy_gate.evaluate_strategy_adoption_gate(
             conn, meta=meta, settings=settings, now=now,
             floor_mode=floor_mode, record_fn=_sink, resolved=resolved,
-            inventory=inventory, no_bars_path=no_bars_path)
+            inventory=inventory, compare_mode="off", no_bars_path=no_bars_path)
         cpu_samples = verdict.cpu_samples if verdict is not None else ()
         if verdict is None or not verdict.evaluable:
             # strategy_gate.evaluate_strategy_adoption_gate は既に
