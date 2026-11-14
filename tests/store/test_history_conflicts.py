@@ -726,9 +726,28 @@ def test_conflict_canaries_do_not_reach_agent_tool_responses(tmp_path):
     provider = PriceProvider(conn, settings, FixedClock(now), readonly=True)
     tools = {t.name: t for t in market_tools.build(
         provider, MagicMock(), settings, sandbox_run=lambda *a, **k: {})}
-    with patch("agentic_fx.datafeed.price_provider.sources.mt5_bars", return_value=bars):
-        responses = [tools["get_ohlcv"].func("USDJPY", "1h"),
-                     tools["get_indicators"].func("USDJPY", "1h")]
+    # tool が DB を読む経路で、衝突の表へ触れたら拒否して記録する。応答に値が出ないことに加えて、
+    # 衝突の表そのものが agent の tool の経路から読まれないことを直接確かめる。
+    touched: list[str] = []
+
+    def _deny_conflicts(action, arg1, arg2, dbname, source):
+        if "history_conflicts" in (arg1, arg2):
+            touched.append(f"{action}:{arg1}:{arg2}")
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    conn.set_authorizer(_deny_conflicts)
+    try:
+        with pytest.raises(sqlite3.DatabaseError):
+            conn.execute("SELECT bar_time FROM history_conflicts").fetchall()
+        assert touched
+        touched.clear()
+        with patch("agentic_fx.datafeed.price_provider.sources.mt5_bars", return_value=bars):
+            responses = [tools["get_ohlcv"].func("USDJPY", "1h"),
+                         tools["get_indicators"].func("USDJPY", "1h")]
+    finally:
+        conn.set_authorizer(None)
+    assert touched == []
     assert responses[0] and "sma_20" in responses[1]
     assert last.isoformat()[:16] in json.dumps(responses[0], default=str)
 

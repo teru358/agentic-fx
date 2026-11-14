@@ -6,10 +6,10 @@
 
 新しい衝突の記録 (`history_conflicts`) と共通の import 経路は、コードを更新して **daemon を再起動した後**に使います。
 
-1. コードを更新し、`afx ctl` で daemon を再起動する。起動時に `history_conflicts` 表が作られる (既存 DB への追加は冪等で、再起動を重ねても変わらない)。
+1. コードを更新し、`systemctl --user restart afx` で daemon を再起動する。起動時に `history_conflicts` 表が作られる (既存 DB への追加は冪等で、再起動を重ねても変わらない)。
 2. `afx status` の `evaluation history` で状態を確かめる。
-3. daemon を止め、開場中に `afx history import ...` を実行する。
-4. 終わったら daemon を戻す。
+3. `systemctl --user stop afx` で daemon を止め、開場中に `afx history import ...` を実行する (daemon を止めている間は kill switch の監視も止まる)。
+4. 終わったら `systemctl --user start afx` で daemon を戻す。
 
 旧い daemon が動いたまま、新しい import だけを先に走らせてはいけません。取込と time repair は、DB と同じ directory の `history-mutation.lock` で互いに待たずに排他され、取れなければ `database_busy` で何も書かずに終わります。この lock は履歴を書く処理どうしだけを排他し、daemon の通常の取引 DB 書込みは止めません。
 
