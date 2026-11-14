@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, replace
 
-from afx_ops.snapshot import SnapshotError, read_snapshot, write_snapshot
+from afx_ops.snapshot import SnapshotError, SnapshotIOError, read_snapshot, write_snapshot
 
 SNAPSHOT_NAME = "bot.snapshot"
 SNAPSHOT_VERSION = 5
@@ -19,10 +19,18 @@ _ACTIONS = frozenset({"approve", "reject", "retry"})
 
 
 class StateError(Exception):
+    """snapshot の内容・形が契約に反する (再試行しても同じ)。"""
+
     reason = "bot_state_invalid"
 
     def __init__(self) -> None:
         super().__init__(self.reason)
+
+
+class StateIOError(StateError):
+    """snapshot の読み書きの OS 失敗 (内容は不明で、再試行で直り得る)。"""
+
+    reason = "bot_state_unavailable"
 
 
 def _id(value: object) -> int:
@@ -216,6 +224,8 @@ def _from_object(obj: object) -> BotState:
 def load(dir_fd: int) -> BotState:
     try:
         obj = read_snapshot(dir_fd, SNAPSHOT_NAME, SNAPSHOT_VERSION, older=(PREVIOUS_VERSION,))
+    except SnapshotIOError:
+        raise StateIOError() from None
     except SnapshotError:
         raise StateError() from None
     return BotState.empty() if obj is None else _from_object(obj)
@@ -230,5 +240,7 @@ def save(dir_fd: int, state: BotState) -> None:
            "approvals": [_record_object(record) for record in state.approvals]}
     try:
         write_snapshot(dir_fd, SNAPSHOT_NAME, obj)
+    except SnapshotIOError:
+        raise StateIOError() from None
     except SnapshotError:
         raise StateError() from None

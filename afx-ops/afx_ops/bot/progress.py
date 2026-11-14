@@ -1,0 +1,110 @@
+"""bot の進捗の監視: gateway・配送・poll 周回のそれぞれが 10 分止まっていないか。
+
+時刻は全部 monotonic clock (wall clock の後退・調整に影響されない)。状態はここに集め、判定は
+`expired` が理由 (固定語) を返すだけで、終了は呼ぶ側が行う。
+"""
+from __future__ import annotations
+
+import time
+from collections.abc import Callable
+
+# この秒数だけ連続して進捗が無ければ一時の終了にする
+WINDOW_SECONDS = 600.0
+
+GATEWAY_STARTING = "starting"
+GATEWAY_HEALTHY = "healthy"
+GATEWAY_UNHEALTHY = "unhealthy"
+
+
+class ProgressTracker:
+    """gateway / 配送 / poller の進捗。単一の event loop thread だけが更新する。"""
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic,
+                 window: float = WINDOW_SECONDS) -> None:
+        self._clock = clock
+        self.window = window
+        started = clock()
+        self.started_at = started
+        # gateway: process 開始から starting。login 前も窓に含める
+        self.gateway_state = GATEWAY_STARTING
+        self.gateway_unhealthy_since: float | None = started
+        self.last_ready_at: float | None = None
+        self.last_resumed_at: float | None = None
+        self.last_disconnect_at: float | None = None
+        # 配送: 先頭 event の最初の send の直前に立て、send と cursor 保存の両方が済んだときだけ消す
+        self.delivery_stalled_since: float | None = None
+        self.delivery_event_id: int | None = None
+        self.last_delivery_success_at: float | None = None
+        # poller: 周回の開始と完了
+        self.poll_started_at: float | None = None
+        self.last_poll_completed_at: float | None = None
+
+    # ------------------------------------------------------------------ gateway
+
+    def gateway_connected(self) -> None:
+        """READY (`on_connect`)。健全にして連続の不健全の起点を消す。"""
+        self.gateway_state = GATEWAY_HEALTHY
+        self.gateway_unhealthy_since = None
+        self.last_ready_at = self._clock()
+
+    def gateway_resumed(self) -> None:
+        """RESUMED (`on_resumed`)。READY と同じく健全に戻す。"""
+        self.gateway_state = GATEWAY_HEALTHY
+        self.gateway_unhealthy_since = None
+        self.last_resumed_at = self._clock()
+
+    def gateway_disconnected(self) -> None:
+        """`on_disconnect`。既に不健全 (starting を含む) なら起点を動かさない。"""
+        now = self._clock()
+        self.last_disconnect_at = now
+        if self.gateway_state == GATEWAY_HEALTHY:
+            self.gateway_state = GATEWAY_UNHEALTHY
+            self.gateway_unhealthy_since = now
+
+    # ------------------------------------------------------------------ 配送
+
+    def delivery_begin(self, event_id: int) -> None:
+        """先頭 event の最初の send を始める直前。既に立っていれば起点を動かさない。"""
+        if self.delivery_stalled_since is None:
+            self.delivery_stalled_since = self._clock()
+            self.delivery_event_id = event_id
+
+    def delivery_committed(self, event_id: int, *, delivered: bool = True) -> None:
+        """cursor の保存まで済んだ。追っている event 以後まで進んだときだけ消す。"""
+        if self.delivery_stalled_since is None:
+            return
+        if self.delivery_event_id is None or event_id >= self.delivery_event_id:
+            self.delivery_stalled_since = None
+            self.delivery_event_id = None
+            if delivered:
+                self.last_delivery_success_at = self._clock()
+
+    # ------------------------------------------------------------------ poller
+
+    def poll_begin(self) -> None:
+        self.poll_started_at = self._clock()
+
+    def poll_end(self) -> None:
+        self.last_poll_completed_at = self._clock()
+        self.poll_started_at = None
+
+    # ------------------------------------------------------------------ 判定
+
+    def expired(self) -> str | None:
+        """期限を過ぎた経路の理由 (固定語)。無ければ None。ちょうど窓の長さで期限切れ。"""
+        now = self._clock()
+        since = self.gateway_unhealthy_since
+        if self.gateway_state != GATEWAY_HEALTHY and since is not None \
+                and now - since >= self.window:
+            return "gateway_unhealthy"
+        stalled = self.delivery_stalled_since
+        if stalled is not None and now - stalled >= self.window:
+            return "delivery_stalled"
+        # poll は process 開始から最初の完了まで、その後は一周の開始から
+        if self.last_poll_completed_at is None:
+            begin = self.started_at
+        else:
+            begin = self.poll_started_at
+        if begin is not None and now - begin >= self.window:
+            return "poller_stalled"
+        return None

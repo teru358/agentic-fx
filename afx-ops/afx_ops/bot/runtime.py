@@ -7,15 +7,24 @@ bot は listener を持たない (gateway も REST も外向きの接続だけ)�
 この中の順序:
 
 1. snapshot を読み、未終端の確認 (claimed / in_flight) を 1 回の置換で無効化して保存する
-2. Discord に login する (REST: 自分の identity と application)
+2. Discord に login する (REST: 自分の identity と application)。一時の失敗 (429 / 5xx / network /
+   timeout) は process 内で上限つきの backoff で再試行し、認証の拒否 (LoginFailure / 401 /
+   他の 4xx) は恒久として止まる
 3. snapshot の未終端の投稿に persistent View を登録する
 4. 終端の投稿から View を外す edit、既存投稿の adopt / repost、snapshot に無い pending 承認の
    adopt / 投稿 (全部 bot token の REST)
 5. gateway に接続する (切断は discord.py の再接続 (RESUME) に任せる)
 6. event と pending 承認を短い間隔で読み、投稿する
 
-失敗は固定 reason を stderr に 1 行出して非零終了し、systemd の restart に委ねる。token・
-例外文・Discord の応答本文は出さない。
+進捗の監視 (`progress.ProgressTracker`、monotonic clock、窓は 10 分): gateway は process 開始から
+READY / RESUMED まで・切断から RESUMED までを連続の不健全として数え (login 前も含む)、配送は
+先頭 event の最初の send の直前から send と cursor の保存が済むまで、poll 周回は一周の開始から
+完了までを数える。loop 上の独立した monitor が期限を見て、超えたら一時の失敗で止まる。
+
+失敗は固定 reason を stderr に 1 行出して非零終了する。恒久 (rc 78: token・state の内容・payload・
+event・high watermark の後退・Discord の配送拒否) は systemd が再起動せず、一時 (rc 79: 進捗の
+停止・Discord / state の I/O の一時障害・内部の想定外) は backoff で再起動する。daemon に届かない
+ときは rc 3。値と対応は `exits`。token・例外文・Discord の応答本文は出さない。
 """
 from __future__ import annotations
 
@@ -33,6 +42,10 @@ import discord
 
 from afx_ops.api_client import RC_UNREACHABLE, ApiError, BotClient, with_detail
 from afx_ops.bot.adapter import BotAdapter, BotFailure, BotSettings, open_state_dir
+from afx_ops.bot.exits import (REASONS, RC_BOT_LOOP_STALLED, RC_BOT_PERMANENT,  # noqa: F401
+                               RC_BOT_TRANSIENT, RC_OK, rc_for_reason)
+from afx_ops.bot.progress import ProgressTracker
+from afx_ops.bot.rest import PERMANENT, REST_ERRORS, classify
 from afx_ops.gate.service import GateService
 from afx_ops.gate.state import BotState
 from afx_ops.isolation.startup import client_for
@@ -40,12 +53,10 @@ from afx_ops.isolation.startup import client_for
 SECRET_NAME = "discord.token"
 POLL_INTERVAL = 2.0
 
-RC_OK = 0
-RC_BOT_FAILED = 1
-
-REASONS = ("token_invalid", "bot_state_invalid", "discord_login_failed", "discord_unavailable",
-           "gateway_failed", "events_invalid", "high_watermark_regressed", "payload_invalid",
-           "bot_internal_error")
+# 進捗 monitor の確認の間隔と、login の再試行の待ち (倍々で上限まで)
+MONITOR_INTERVAL = 5.0
+LOGIN_BACKOFF_SECONDS = 2.0
+LOGIN_BACKOFF_MAX_SECONDS = 60.0
 
 # bot token の形 (base64url の 3 区切り)。中身の真偽は login で確かめる
 _TOKEN = re.compile(r"[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{16,}\Z")
@@ -74,12 +85,16 @@ def _quiet_discord_logging() -> None:
 def run(isolated, *, client=None, connector_factory: Callable[[], object] | None = None,
         api_base: str | None = None, gateway_url: str | None = None,
         stop: threading.Event | None = None, poll_interval: float = POLL_INTERVAL,
-        now: Callable[[], float] = time.time, stderr: TextIO | None = None) -> int:
+        now: Callable[[], float] = time.time, stderr: TextIO | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], object] = asyncio.sleep,
+        monitor_interval: float = MONITOR_INTERVAL) -> int:
     """production は `isolated` だけで呼ばれ、失敗するまで戻らない。
 
-    client / connector_factory / api_base / gateway_url / stop / poll_interval / now / stderr は
-    試験だけが渡す (loopback の偽 Discord・試験 CA・試験用の名前解決・停止の合図)。stop が
-    立つと rc 0 で戻る。
+    client / connector_factory / api_base / gateway_url / stop / poll_interval / now / stderr /
+    monotonic / sleep / monitor_interval は試験だけが渡す (loopback の偽 Discord・試験 CA・試験用の
+    名前解決・停止の合図・進捗の時計)。stop が立つと rc 0 で戻る。失敗は理由ごとに `exits` の
+    終了コード (恒久 78 / 一時 79) を返す。
     """
     out = sys.stderr if stderr is None else stderr
     try:
@@ -95,18 +110,20 @@ def run(isolated, *, client=None, connector_factory: Callable[[], object] | None
         dir_fd = open_state_dir(isolated.state_dir)
         try:
             asyncio.run(_main(isolated, token, client, dir_fd, connector_factory=connector_factory,
-                              stop=stop, poll_interval=poll_interval, now=now))
+                              stop=stop, poll_interval=poll_interval, now=now,
+                              progress=ProgressTracker(monotonic), sleep=sleep,
+                              monitor_interval=monitor_interval))
         finally:
             os.close(dir_fd)
     except BotFailure as failure:
         _say(out, failure.reason)
-        return RC_BOT_FAILED
+        return rc_for_reason(failure.reason)
     except ApiError as exc:
         _say(out, with_detail(exc.reason, exc.detail))
         return RC_UNREACHABLE
     except Exception:  # 例外文には token や URL が入り得るので、固定語だけにする
         _say(out, "bot_internal_error")
-        return RC_BOT_FAILED
+        return rc_for_reason("bot_internal_error")
     return RC_OK
 
 
@@ -121,6 +138,21 @@ class _Client(discord.Client):
     """interaction を adapter へ渡すだけの Client (message_content intent は要求しない)。"""
 
     adapter: BotAdapter | None = None
+    progress: ProgressTracker | None = None
+
+    # gateway の健全性は READY (on_connect) と RESUMED だけが戻し、disconnect は不健全にする。
+    # Client.latency は最後の ACK の往復時間であって健全性の根拠にならない
+    async def on_connect(self) -> None:
+        if self.progress is not None:
+            self.progress.gateway_connected()
+
+    async def on_resumed(self) -> None:
+        if self.progress is not None:
+            self.progress.gateway_resumed()
+
+    async def on_disconnect(self) -> None:
+        if self.progress is not None:
+            self.progress.gateway_disconnected()
 
     async def on_interaction(self, interaction: discord.Interaction) -> None:
         if self.adapter is not None:
@@ -128,7 +160,9 @@ class _Client(discord.Client):
 
 
 async def _main(isolated, token: str, client, dir_fd: int, *, connector_factory, stop,
-                poll_interval: float, now) -> None:
+                poll_interval: float, now, progress: ProgressTracker | None = None,
+                sleep=asyncio.sleep, monitor_interval: float = MONITOR_INTERVAL) -> None:
+    progress = progress if progress is not None else ProgressTracker()
     config = isolated.config
     settings = BotSettings(guild_id=config.guild_id, channel_id=config.channel_id,
                            mention_role_id=config.mention_role_id,
@@ -141,26 +175,29 @@ async def _main(isolated, token: str, client, dir_fd: int, *, connector_factory,
                        allowlist_user_ids=tuple(config.allowlist_user_ids), client=client)
     connector = connector_factory() if connector_factory is not None else None
     bot = _Client(intents=discord.Intents.none(), connector=connector)
+    bot.progress = progress
     adapter = BotAdapter(gate=gate, client=client, dir_fd=dir_fd, settings=settings,
-                         discord_client=bot, now=now)
+                         discord_client=bot, now=now, progress=progress)
     bot.adapter = adapter
     tasks: list[asyncio.Task] = []
     try:
-        await adapter.prepare()
-        try:
-            await bot.login(token)
-        except discord.LoginFailure:
-            raise BotFailure("discord_login_failed") from None
-        except (discord.HTTPException, OSError, asyncio.TimeoutError):
-            raise BotFailure("discord_unavailable") from None
-        await adapter.reconcile_startup()
+        # monitor は login の前から動かす (login 前も gateway の 10 分の窓に含める)
+        monitor = asyncio.create_task(_monitor(progress, monitor_interval, sleep))
+        startup = asyncio.create_task(_startup(adapter, bot, token, sleep))
+        tasks = [monitor, startup]
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        if startup.done():
+            startup.result()
+        else:
+            monitor.result()
         gateway = asyncio.create_task(_gateway(bot))
         poller = asyncio.create_task(_poll(adapter, poll_interval))
         failed = asyncio.create_task(adapter.failed.wait())
-        tasks = [gateway, poller, failed]
+        running = [monitor, gateway, poller, failed]
         if stop is not None:
-            tasks.append(asyncio.create_task(asyncio.to_thread(stop.wait)))
-        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            running.append(asyncio.create_task(asyncio.to_thread(stop.wait)))
+        tasks += running[1:]
+        done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             if task is not failed and task.exception() is not None:
                 raise task.exception()
@@ -174,8 +211,46 @@ async def _main(isolated, token: str, client, dir_fd: int, *, connector_factory,
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        await bot.close()
+        try:
+            await bot.close()
+        except Exception:  # 終了処理の失敗で、止まった本来の理由を上書きしない
+            pass
         adapter.close()
+
+
+async def _startup(adapter: BotAdapter, bot: discord.Client, token: str, sleep) -> None:
+    await adapter.prepare()
+    await _login(bot, token, sleep)
+    await adapter.reconcile_startup()
+
+
+async def _login(bot: discord.Client, token: str, sleep, *,
+                 delay: float = LOGIN_BACKOFF_SECONDS,
+                 limit: float = LOGIN_BACKOFF_MAX_SECONDS) -> None:
+    """login する。認証の拒否は恒久、429 / 5xx / network / timeout は backoff で再試行する。
+
+    再試行の期間の上限は gateway の 10 分の窓 (monitor) が持つ。
+    """
+    while True:
+        try:
+            await bot.login(token)
+            return
+        except discord.LoginFailure:
+            raise BotFailure("discord_login_failed") from None
+        except REST_ERRORS as exc:
+            if classify(exc) == PERMANENT:
+                raise BotFailure("discord_login_failed") from None
+        await sleep(delay)
+        delay = min(delay * 2, limit)
+
+
+async def _monitor(progress: ProgressTracker, interval: float, sleep) -> None:
+    """loop 上で周期に進捗の期限を見る。await の完了を待たずに判定するので、send などが戻らなくても動く。"""
+    while True:
+        await sleep(interval)
+        reason = progress.expired()
+        if reason is not None:
+            raise BotFailure(reason)
 
 
 async def _gateway(bot: discord.Client) -> None:
@@ -183,11 +258,15 @@ async def _gateway(bot: discord.Client) -> None:
         await bot.connect(reconnect=True)
     except BotFailure:
         raise
-    except Exception:
+    except Exception as exc:
+        if isinstance(exc, discord.HTTPException) and classify(exc) == PERMANENT:
+            raise BotFailure("discord_rejected") from None
         raise BotFailure("gateway_failed") from None
 
 
 async def _poll(adapter: BotAdapter, interval: float) -> None:
     while True:
+        adapter.progress.poll_begin()
         await adapter.poll_once()
+        adapter.progress.poll_end()
         await asyncio.sleep(interval)
