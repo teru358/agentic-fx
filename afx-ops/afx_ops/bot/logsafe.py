@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import sys
 from collections.abc import Callable
 
 # 1 系統あたり、最初の 1 件だけ出す。以後は件数に畳み、`flush` で件数だけ出す
@@ -41,22 +40,52 @@ def _family(name: object) -> str:
     return head if head in ("asyncio", "aiohttp", "discord") else "other"
 
 
-# 型名を出してよい出所。その module が同じ名前でその型を公開しているものだけ (動的に作った型・
-# 利用側の型は、名前が識別子の形でも出さない)
-_TYPE_ROOTS = frozenset({"builtins", "asyncio", "aiohttp", "discord", "ssl", "socket",
-                         "json", "concurrent"})
+# 型名を出してよい例外型。module の import 時に固定した型の集合 (同じ名前を後から公開した動的な型や
+# 利用側の型は、名前が識別子の形でも出さない)。比較は型そのものの同一性で行う
+def _allowed_types() -> frozenset[type]:
+    import builtins
+    import concurrent.futures
+    import json
+    import socket
+    import ssl
+
+    import aiohttp
+    import discord
+
+    found: set[type] = {value for value in vars(builtins).values()
+                        if isinstance(value, type) and issubclass(value, BaseException)}
+    named = {
+        asyncio: ("CancelledError", "TimeoutError", "InvalidStateError", "IncompleteReadError",
+                  "LimitOverrunError", "QueueEmpty", "QueueFull"),
+        concurrent.futures: ("CancelledError", "TimeoutError", "BrokenExecutor"),
+        json: ("JSONDecodeError",),
+        socket: ("gaierror", "herror", "timeout"),
+        ssl: ("SSLError", "SSLCertVerificationError", "SSLEOFError", "SSLZeroReturnError",
+              "SSLWantReadError", "SSLWantWriteError", "SSLSyscallError"),
+        aiohttp: ("ClientError", "ClientConnectionError", "ClientConnectorError",
+                  "ClientOSError", "ClientPayloadError", "ClientResponseError",
+                  "ServerDisconnectedError", "ServerTimeoutError", "ClientConnectorSSLError",
+                  "ClientConnectorCertificateError", "WSServerHandshakeError"),
+        discord: ("DiscordException", "ClientException", "HTTPException", "Forbidden",
+                  "NotFound", "DiscordServerError", "LoginFailure", "ConnectionClosed",
+                  "GatewayNotFound", "RateLimited", "InvalidData"),
+    }
+    for module, names in named.items():
+        for name in names:
+            value = getattr(module, name, None)
+            if isinstance(value, type) and issubclass(value, BaseException):
+                found.add(value)
+    return frozenset(found)
+
+
+_ALLOWED_TYPES = _allowed_types()
 
 
 def _type_name(exc: object) -> str:
     kind = type(exc)
     name = getattr(kind, "__name__", "")
-    module = getattr(kind, "__module__", "")
-    if (not isinstance(name, str) or not isinstance(module, str)
-            or _TYPE_NAME.fullmatch(name) is None
-            or module.split(".", 1)[0] not in _TYPE_ROOTS):
-        return "other"
-    owner = sys.modules.get(module)
-    if owner is None or getattr(owner, name, None) is not kind:
+    if (kind not in _ALLOWED_TYPES or not isinstance(name, str)
+            or _TYPE_NAME.fullmatch(name) is None):
         return "other"
     return name
 

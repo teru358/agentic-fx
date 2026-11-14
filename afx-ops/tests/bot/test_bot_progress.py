@@ -437,13 +437,14 @@ class Harness:
         monitor_interval = kwargs.pop("monitor_interval", 10.0)
         watchdog = kwargs.pop("watchdog", None)
         loop_errors = kwargs.pop("loop_errors", None)
+        health = kwargs.pop("health", None)
 
         async def go() -> bool:
             task = asyncio.ensure_future(runtime._main(
                 SimpleNamespace(config=CONFIG), "token", self.client, self.fd,
                 connector_factory=None, stop=self.stop, poll_interval=0.01, now=lambda: 0.0,
                 progress=self.progress, sleep=self.sleeper, monitor_interval=monitor_interval,
-                watchdog=watchdog, loop_errors=loop_errors))
+                watchdog=watchdog, loop_errors=loop_errors, health=health))
             done, _ = await asyncio.wait({task}, timeout=timeout)
             if done:
                 task.result()
@@ -1100,3 +1101,24 @@ def test_a_commit_before_the_tracked_event_keeps_the_stall_and_the_success_time(
     progress.delivery_committed(8)
     assert progress.delivery_stalled_since is not None
     assert progress.last_delivery_success_at is None
+
+
+class _FailingHealth:
+    """表示用の health が、起動の途中ですぐに例外で終わる。"""
+
+    def bind_latency(self, latency) -> None:
+        pass
+
+    async def run(self, sleep=None) -> None:
+        raise RuntimeError("health failed")
+
+
+def test_main_a_health_task_that_fails_at_once_does_not_stop_the_startup(tmp_path, monkeypatch):
+    harness = Harness(tmp_path, monkeypatch)
+
+    async def connect(bot):
+        await bot.on_connect()
+        harness.stop.set()
+    harness.connect = connect
+    harness.run(health=_FailingHealth())
+    assert harness.progress.gateway_state == "healthy"

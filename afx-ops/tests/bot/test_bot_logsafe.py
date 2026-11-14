@@ -379,6 +379,17 @@ def test_a_type_name_shaped_like_an_identifier_but_not_a_known_type_is_not_print
     assert logsafe._type_name(fake()) == "other"
 
 
+def test_a_type_published_later_under_a_known_module_is_not_printed():
+    import aiohttp
+    hostile = type("secret_token_456", (aiohttp.ClientError,), {"__module__": "aiohttp"})
+    aiohttp.secret_token_456 = hostile
+    try:
+        assert logsafe._type_name(hostile()) == "other"
+    finally:
+        del aiohttp.secret_token_456
+    assert logsafe._type_name(aiohttp.ClientConnectionError()) == "ClientConnectionError"
+
+
 def test_existing_handlers_on_discord_and_its_children_are_removed_and_restored():
     import io
     stream = io.StringIO()

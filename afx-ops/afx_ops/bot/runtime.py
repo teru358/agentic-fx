@@ -269,7 +269,8 @@ async def _main_body(isolated, token: str, client, dir_fd: int, *, connector_fac
             tasks.append(_spawn(health.run()))
         startup = _spawn(_startup(adapter, bot, token, sleep, connector_factory))
         tasks.append(startup)
-        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        # 起動の判断は startup と monitor だけで決める。表示用の health task の失敗で bot を止めない
+        await asyncio.wait((startup, monitor), return_when=asyncio.FIRST_COMPLETED)
         if startup.done():
             startup.result()
         else:
