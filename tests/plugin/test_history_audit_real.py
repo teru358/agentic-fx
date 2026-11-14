@@ -15,8 +15,9 @@ from agentic_fx.plugin import history_audit as audit
 from agentic_fx.plugin import loader, sandbox
 from tests.plugin.reevaluation_world import STARTED, RealWorld, strategy_py
 
-pytestmark = pytest.mark.skipif(sandbox.host_preflight()[0] is not None,
-                                reason="this host cannot isolate plugin workers")
+_reason = sandbox.host_preflight()[0] or sandbox.inherited_filter_preflight()
+pytestmark = pytest.mark.skipif(_reason is not None,
+                                reason=f"this host cannot isolate plugin workers: {_reason}")
 
 NAME = "sma"
 
@@ -73,6 +74,7 @@ def test_a_stored_copy_whose_own_test_fails_is_a_fail_through_the_real_sandbox(t
     old_id = world.approve(NAME, final)
     target = audit.AuditTarget(old_id, NAME, final.name, loader.content_hash(final), {})
     work_root = tmp_path / "work"
+    before_children = _children()
 
     result = audit.audit_non_deployed_version(
         world.conn, target, plugins_root=world.root, settings=world.settings,
@@ -81,3 +83,4 @@ def test_a_stored_copy_whose_own_test_fails_is_a_fail_through_the_real_sandbox(t
     assert result.report["result"]["overall"] == "fail"
     assert result.report["axes"]["floor"]["in_sample"]["result"] == "not_run"
     assert [p.name for p in work_root.iterdir()] == []
+    assert _children() <= before_children
