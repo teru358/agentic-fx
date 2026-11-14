@@ -227,9 +227,9 @@ async def _main(isolated, token: str, client, dir_fd: int, *, connector_factory,
                          stop=stop, poll_interval=poll_interval, now=now, progress=progress,
                          sleep=sleep, monitor_interval=monitor_interval, watchdog=watchdog,
                          loop_errors=loop_errors, health=health)
-    except BaseException:
+    except BaseException as error:
         if watchdog is not None:
-            watchdog.begin_shutdown()
+            watchdog.begin_shutdown(permanent=_is_permanent(error))
         raise
 
 
@@ -300,7 +300,8 @@ async def _main_body(isolated, token: str, client, dir_fd: int, *, connector_fac
             raise BotFailure("gateway_failed")
     finally:
         if watchdog is not None:
-            watchdog.begin_shutdown()
+            # 伝わっている例外が恒久の BotFailure なら、後始末が詰まって強制終了するときも 78 にする
+            watchdog.begin_shutdown(permanent=_is_permanent(sys.exc_info()[1]))
         if stop is not None:
             stop.set()
         for task in tasks:
@@ -311,6 +312,10 @@ async def _main_body(isolated, token: str, client, dir_fd: int, *, connector_fac
         except Exception:  # 終了処理の失敗で、止まった本来の理由を上書きしない
             pass
         adapter.close()
+
+
+def _is_permanent(error: BaseException | None) -> bool:
+    return isinstance(error, BotFailure) and rc_for_reason(error.reason) == RC_BOT_PERMANENT
 
 
 def _spawn(coro) -> asyncio.Task:

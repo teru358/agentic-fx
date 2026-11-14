@@ -23,7 +23,7 @@ from .feature_config import InterfaceLookupFailed, collect, web_access_reason
 from .probe import run_probe
 from .systemd import Systemd, SystemdError
 from .write_key import KEY_MISMATCH_CODES, Inconsistent, check_write_key_consistency, stage_mode
-from .units import (OpsExecNotFound, UnitPaths, atomic_write, bot_systemd_problem, install_units,
+from .units import (OpsExecNotFound, UnitPaths, atomic_write, bot_dropin_exact, bot_systemd_problem, install_units,
                     remove_durably, resolve_ops_exec, uninstall_feature, units_match)
 from .web_setup import access_line
 
@@ -93,6 +93,10 @@ def read_stage(root: Path, feature: str, *, missing_ok: bool = False) -> dict[st
         raise InvalidState("invalid_stage", f"path={path} {problem}")
     return data
 
+
+_BOT_DROPIN_WARN = "bot_dropin_not_exact"
+_BOT_DROPIN_WARN_TEXT = ("bot の recovery drop-in が期待の内容と一致しない。disable と rollback は"
+                         "書き直さないので、bot を enable し直して直す")
 
 # 型を確かめる任意の key。手編集や破損で型が変わると、再開の判断が TypeError や誤判定になる。
 _STAGE_FIELD_TYPES: dict[str, type] = {
@@ -314,6 +318,9 @@ class OpsSetup:
             uninstall_feature(self.paths, self._active_features())
         except OSError as rollback_error:
             notes.append(f"資材の戻しに失敗 ({_describe(rollback_error)})")
+        else:
+            if "bot" in self._active_features() and not bot_dropin_exact(self.paths):
+                notes.append(_BOT_DROPIN_WARN_TEXT)
         try:
             self.systemd.daemon_reload()
         except SystemdError as reload_error:
@@ -738,7 +745,13 @@ class OpsSetup:
                 self._failure(state, "uninstall_failed", _describe(error))
                 self._recorded = error
                 raise
-            self._set_stage(state, "uninstalled", artifacts=[], wants=sorted(remaining))
+            extra: dict[str, Any] = {}
+            state.pop("warn", None)
+            if "bot" in remaining and not bot_dropin_exact(self.paths):
+                # disable は bot の drop-in を作らず直さない。食い違いは書かずに知らせる。
+                extra["warn"] = _BOT_DROPIN_WARN
+                self.notices.append(f"warning: {_BOT_DROPIN_WARN_TEXT}")
+            self._set_stage(state, "uninstalled", artifacts=[], wants=sorted(remaining), **extra)
         if state["stage"] == "uninstalled":
             back = self._checked_gap(feature, state)
             if back is not None:
@@ -772,7 +785,7 @@ class OpsSetup:
             return "stopping-ops"
         if remaining:
             # 他の機能が残る間は template が残るので、instance は loaded に見えてよい。
-            done = units_match(self.paths, remaining)
+            done = units_match(self.paths, remaining, check_bot_dropin=False)
         else:
             done = (not self.paths.template_path.exists() and not self.paths.dropin_path.exists()
                     and not os.path.lexists(self.paths.bot_dropin_path)
