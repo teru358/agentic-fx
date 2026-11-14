@@ -34,6 +34,7 @@ from agentic_fx.backtest.mt5_import import (
     _is_grid_aligned, compare_sources, effective_import_end, import_mt5)
 from agentic_fx.store.history_import import (
     ImportOutcome, ImportTooLargeError, SeriesOutcome, summarize)
+from agentic_fx.backtest import history_sync_cli
 from agentic_fx.backtest import plugin_deploy_cli
 from agentic_fx.backtest import time_repair
 from agentic_fx.backtest.runner import run_replay
@@ -130,6 +131,8 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     repair.add_argument("--apply", action="store_true")
     repair.add_argument("--plan", type=Path)
     repair.add_argument("--confirm")
+
+    history_sync_cli.register(history_sub, _surface_parser_kw)
 
     news = sub.add_parser("news", **_surface_parser_kw("news"))
     news_sub = news.add_subparsers(dest="news_command", required=True)
@@ -321,6 +324,22 @@ def _history_import(conn, settings, args: argparse.Namespace) -> int:
     outcome = summarize([series])
     _print_import_outcome(outcome)
     return outcome.rc
+
+
+def _history_import_locked(settings, args: argparse.Namespace, root: Path) -> int:
+    """取得の前、DB を開く前に instance lock を取る。稼働中は bridge にも DB にも触れない。"""
+    lock = history_sync_cli.acquire_or_report(root)
+    if lock is None:
+        return 1
+    conn = None
+    try:
+        conn = connect(root / "data" / "agentic.db")
+        init_db(conn)
+        return _history_import(conn, settings, args)
+    finally:
+        if conn is not None:
+            conn.close()
+        lock.close()
 
 
 #: 通常の衝突を表示する上限 / 遮断時に表示する上限 (表示の省略は記録の省略ではない)
@@ -1040,6 +1059,8 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
     if args.command == "news":
         from agentic_fx.news_cli import dispatch_news
         return dispatch_news(args, root)
+    if args.command == "history" and history_sync_cli.is_readonly(args):
+        return history_sync_cli.dispatch_readonly(args, root)
     # `plugin versions` は何も書かない読み取り専用の表示なので、state ファイルの
     # lock を作りうる初期化確認を通さない (DB が無ければ自身で案内して終わる)。
     read_only_view = args.command == "plugin" and args.plugin_command in {"versions", "list"}
@@ -1067,6 +1088,12 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
     try:
         if args.command == "plugin" and args.plugin_command == "versions":
             return plugin_deploy_cli.plugin_versions(settings, args, root)
+        if args.command == "history" and history_sync_cli.needs_instance_lock(args):
+            if args.history_command == "sync":
+                return history_sync_cli.run_sync_command(args, root, settings)
+            if args.history_command == "conflicts":
+                return history_sync_cli.run_resolve_command(args, root)
+            return _history_import_locked(settings, args, root)
         repair_apply = (args.command == "history" and args.history_command == "repair-time"
                         and args.apply)
         if repair_apply:
