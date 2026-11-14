@@ -44,6 +44,12 @@ def _day_bounds(day):
             datetime(day.year, day.month, day.day, tzinfo=UTC) + timedelta(days=1))
 
 
+def _sunday_no_bars(*symbols):
+    """日曜は 22:00 以降の 2 時間だけの日で、参照の本数が中央値の半分未満に見える。"""
+    return NoBarsList(tuple(NoBarsEntry("mt5", "15m", s, date(2026, 11, 8), "sunday", "human", T)
+                            for s in symbols), "d")
+
+
 def _weekdays(start, stop):
     d = start
     while d < stop:
@@ -550,3 +556,128 @@ def test_the_sync_origin_conflict_is_the_shared_history_conflicts_record(tmp_pat
     rows = conn.execute("SELECT * FROM history_conflicts").fetchall()
     assert len(rows) == 1 and rows[0]["seen_count"] == 2           # 同じ id を再観測 (冪等)
     assert rows[0]["first_run_id"] == first.run_id and rows[0]["last_run_id"] == second.run_id
+
+
+# ---- 系列の独立・round-robin・B の clip・遮断の検出 --------------------------
+
+def test_one_failed_series_does_not_roll_back_the_others_and_is_the_technical_failure(tmp_path):
+    conn = conn_at(tmp_path)
+    settings = make_settings(watch=[REF, "US500"])
+    for symbol in (SYMBOL, REF, "US500"):
+        seed(conn, symbol, B1, E)
+
+    class Corrupt(FakeBridge):
+        def __call__(self, url):
+            payload = super().__call__(url)
+            if self.calls[-1][0] == REF:
+                payload["bars"][-1]["close"] = "not-a-number"        # 最終窓の応答が不正
+            return payload
+    result = _run(conn, settings, Corrupt(), no_bars=_sunday_no_bars(REF, "US500"))
+    by_symbol = {o.symbol: o for o in result.ops if o.operation == "recent"}
+    assert by_symbol[REF].status == "failed" and by_symbol[REF].reason == "invalid_response"
+    assert by_symbol[SYMBOL].status == by_symbol["US500"].status == "ok"
+    assert (result.result, result.rc) == ("partial", 1)           # 確定した系列があるので partial
+    assert result.cursors[SYMBOL] == result.cursors["US500"] == E.isoformat()
+    assert result.cursors[REF] is None
+    state = store.get_state(conn, "mt5", "15m", REF)
+    assert state["attempts"] == 1 and state["last_error"] == "invalid_response"
+
+
+def test_a_failed_old_gap_does_not_undo_the_recent_operation_of_the_same_run(tmp_path):
+    conn, settings = _seeded(tmp_path)
+    day = date(2026, 10, 20)
+    _holes(conn, [day])
+
+    class FailGap(FakeBridge):
+        def __call__(self, url):
+            payload = super().__call__(url)
+            if self.calls[-1][1].date() == day:
+                raise RuntimeError("down")
+            return payload
+    result = _run(conn, settings, FailGap())
+    recent = next(o for o in result.ops if o.operation == "recent")
+    assert recent.status == "ok" and result.cursors[SYMBOL] == E.isoformat()
+    assert (result.result, result.rc) in (("failed", 1), ("partial", 1))
+    assert store.get_state(conn, "mt5", "15m", SYMBOL)["last_processed_e"] == E.isoformat()
+
+
+def test_old_gap_budget_is_shared_round_robin_across_symbols_and_the_cursor_is_persisted(tmp_path):
+    conn = conn_at(tmp_path)
+    settings = make_settings(holdout_months=2, watch=[REF])
+    for symbol in (SYMBOL, REF):
+        seed(conn, symbol, B2, E)
+    weekdays = list(_weekdays(date(2026, 9, 14), date(2026, 11, 6)))
+    # 主 pair は奇数日、参照は偶数日が欠ける (参照は主 pair に足がある日の 0 本が疑いになる)
+    for symbol, parity in ((SYMBOL, 1), (REF, 0)):
+        for i, day in enumerate(weekdays):
+            if i % 2 == parity:
+                lo, hi = _day_bounds(day)
+                conn.execute("DELETE FROM ohlcv_history WHERE symbol=? AND bar_time >= ? "
+                             "AND bar_time < ?", (symbol, lo.isoformat(), hi.isoformat()))
+    conn.commit()
+    result = _run(conn, settings, no_bars=_sunday_no_bars(REF))
+    gap_ops = [o for o in result.ops if o.operation == "gap" and o.status != "deferred"]
+    symbols = [o.symbol for o in gap_ops]
+    # 一方の銘柄が予算を独占しない: 古い日から順に、銘柄を交互に選ぶ
+    assert set(symbols[:2]) == {SYMBOL, REF}
+    assert abs(symbols.count(SYMBOL) - symbols.count(REF)) <= 1
+    assert store.get_rr_cursor(conn, "mt5", "15m") == symbols[-1]
+
+
+def test_a_gap_day_that_crosses_b_is_clipped_to_b_for_requests_and_rows(tmp_path):
+    conn, settings = _seeded(tmp_path)
+    day = B1.date()                                              # B の当日 (12:00 以降だけが holdout)
+    lo, hi = _day_bounds(day)
+    conn.execute("DELETE FROM ohlcv_history WHERE bar_time >= ? AND bar_time < ?",
+                 (B1.isoformat(), hi.isoformat()))
+    conn.commit()
+    before_b = conn.execute("SELECT COUNT(*) FROM ohlcv_history WHERE bar_time < ?",
+                            (B1.isoformat(),)).fetchone()[0]
+    bridge = FakeBridge()
+    _run(conn, settings, bridge, until_done=True)
+    assert all(start >= B1 for _s, start, _e in bridge.calls) or all(
+        start >= B1 - timedelta(hours=3) for _s, start, _e in bridge.calls)
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv_history WHERE bar_time < ?",
+                        (B1.isoformat(),)).fetchone()[0] == before_b      # B より前の行は増えない
+
+
+def test_an_hour_shifted_response_opens_the_circuit_instead_of_appending_blindly(tmp_path):
+    conn, settings = _seeded(tmp_path)
+    before = count(conn)
+
+    class Shifted(FakeBridge):
+        def __call__(self, url):
+            payload = super().__call__(url)
+            for bar in payload["bars"]:
+                t = datetime.fromisoformat(bar["time"]) - timedelta(hours=1)
+                from tests.backtest.history_sync_support import values
+                o, h, low, c = values(self.calls[-1][0], t)
+                bar.update(open=o, high=h, low=low, close=c)
+            return payload
+    result = _run(conn, settings, Shifted())
+    assert result.result == "conflict_circuit_open" and result.rc == 4
+    assert count(conn) == before and count(conn, table="history_conflicts") == 0
+
+
+def test_unchanged_rows_cost_no_per_row_write_statements(tmp_path):
+    conn, settings = _seeded(tmp_path)
+    statements = []
+    conn.set_trace_callback(statements.append)
+    result = _run(conn, settings)
+    conn.set_trace_callback(None)
+    assert result.unchanged > 100 and result.inserted == 0
+    history_writes = [s for s in statements if s.lstrip().upper().startswith(
+        ("INSERT INTO OHLCV_HISTORY", "UPDATE OHLCV_HISTORY", "INSERT OR IGNORE INTO OHLCV_HISTORY",
+         "INSERT INTO HISTORY_CONFLICTS"))]
+    assert history_writes == []
+
+
+def test_the_sync_writes_no_in_sample_rows_before_b_even_with_a_deep_lookback(tmp_path):
+    conn = conn_at(tmp_path)
+    settings = make_settings(lookback_days=31)
+    seed(conn, SYMBOL, B1, E)
+    bridge = FakeBridge()
+    _run(conn, settings, bridge)
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv_history WHERE bar_time < ?",
+                        (B1.isoformat(),)).fetchone()[0] == 0
+    assert all(start >= B1 - timedelta(hours=3) for _s, start, _e in bridge.calls)

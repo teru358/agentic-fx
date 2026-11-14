@@ -183,3 +183,14 @@ def test_prefix_cursor_is_clipped_up_to_b():
 
 def test_default_calendar_is_the_shared_market_hours_function():
     assert plan.is_market_open is is_market_open
+
+
+def test_a_three_open_hour_lag_catches_up_with_two_open_hour_prefixes_in_consecutive_runs():
+    b, e = dt(2026, 10, 11, 12), dt(2026, 11, 11, 11, 30)
+    cursor, steps = dt(2026, 11, 11, 8, 30), 0
+    while cursor < e:
+        step = plan.plan_prefix(cursor, boundary=b, limit=e)
+        assert step.ok and step.end > cursor
+        assert step.end - step.cursor <= 2 * H
+        cursor, steps = step.end, steps + 1
+    assert steps == 2                                          # 3 時間の遅れは 2 回の 2 時間 prefix で追いつく
