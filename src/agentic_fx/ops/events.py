@@ -258,3 +258,16 @@ class EventCursor:
             self._seen = {i for i in self._seen if i > self.position - MAX_POLL_LIMIT}
         self.high_watermark = page.high_watermark
         return fresh
+
+
+def kill_switch_event_states(conn: sqlite3.Connection, generation: int) -> list[tuple[str, str]]:
+    """kill switch の ``guard_state_changed`` event のうち、指定した世代の (ts, state) を返す。
+
+    ``ops_events`` を読むのはこの module だけにする。照合の規則は呼出し側が持つ。"""
+    rows = conn.execute(
+        "SELECT ts,json_extract(fields_json,'$.state') AS state FROM ops_events "
+        "WHERE code='guard_state_changed' AND ref='instance' "
+        "AND json_extract(fields_json,'$.guard_kind')='kill_switch' "
+        "AND json_extract(fields_json,'$.generation')=?", (generation,)).fetchall()
+    return [(row[0], row[1]) for row in rows]
+

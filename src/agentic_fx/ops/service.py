@@ -143,16 +143,12 @@ def plan_kill_switch_notice(conn, state) -> tuple[str | None, int | None, bool]:
         return None, None, False
     if floor is None:
         raise ValueError("kill_switch_latched_at is not a timestamp")
-    rows = conn.execute(
-        "SELECT ts,json_extract(fields_json,'$.state') AS state FROM ops_events "
-        "WHERE code='guard_state_changed' AND ref='instance' "
-        "AND json_extract(fields_json,'$.guard_kind')='kill_switch' "
-        "AND json_extract(fields_json,'$.generation')=?", (generation,)).fetchall()
+    from agentic_fx.ops.events import kill_switch_event_states
     present = set()
-    for row in rows:
-        stamp = _parse_utc(row["ts"])
-        if stamp is not None and stamp >= floor and row["state"] in _KILL_SWITCH_STATES:
-            present.add(row["state"])
+    for ts, event_state in kill_switch_event_states(conn, generation):
+        stamp = _parse_utc(ts)
+        if stamp is not None and stamp >= floor and event_state in _KILL_SWITCH_STATES:
+            present.add(event_state)
     if "released" in present:
         return None, generation, "latched" not in present
     if state.kill_switch_latched:
