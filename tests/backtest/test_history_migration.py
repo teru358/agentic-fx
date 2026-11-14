@@ -70,7 +70,7 @@ def test_an_evaluated_manifest_validates_and_unevaluable_needs_a_fixed_reason():
     (lambda m: m["entries"].pop(), "exactly the 15"),
     (lambda m: m["entries"].append(copy.deepcopy(m["entries"][0])), "exactly the 15"),
     (lambda m: m["entries"][0].update(old_approval_id=999), "15 old approvals"),
-    (lambda m: m.update(schema_version=2), "schema_version"),
+    (lambda m: m.update(schema_version=3), "schema_version"),
     (lambda m: m.update(created_at="2026-11-11T12:00:00"), "created_at"),
     (lambda m: m.update(extra=1), "top-level"),
     (lambda m: _entry(m, 32).update(artifact_hash="3b35b61fa798"), "full 64"),

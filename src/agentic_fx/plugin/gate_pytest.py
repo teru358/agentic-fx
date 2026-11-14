@@ -133,6 +133,90 @@ class GateResult:
     returncode: int
     stdout_tail: str
     duration_sec: float
+    # 監査だけが読む構造化情報。既定は「識別できない」。`passed` の判定には使わない。
+    worker_ready: bool = False
+    pytest_exit: int | None = None
+    hash_changed: bool = False
+
+
+_STATUS_READY = "worker_ready"
+_STATUS_EXIT = "pytest_exit="
+_STATUS_MAX_BYTES = 4096
+
+
+def _read_worker_status(read_fd: int) -> tuple[bool, int | None]:
+    """worker が専用の fd へ書いた状態 (初期化の成功と pytest の終了コード) を読む。
+    読み取れない・形が違うものは「識別できない」として扱う。"""
+    try:
+        os.set_blocking(read_fd, False)
+        raw = b""
+        while len(raw) < _STATUS_MAX_BYTES:
+            try:
+                chunk = os.read(read_fd, _STATUS_MAX_BYTES - len(raw))
+            except (BlockingIOError, InterruptedError):
+                break
+            if not chunk:
+                break
+            raw += chunk
+    except OSError:
+        return False, None
+    ready, exit_code = False, None
+    for line in raw.decode("ascii", errors="replace").splitlines():
+        if line == _STATUS_READY:
+            ready = True
+        elif line.startswith(_STATUS_EXIT):
+            try:
+                exit_code = int(line[len(_STATUS_EXIT):])
+            except ValueError:
+                continue
+    return ready, exit_code
+
+
+def _wait_gate_worker(proc, timeout: float):
+    """gate worker の終了を待つ。期限を越えたら process group ごと止めて回収する。"""
+    try:
+        stdout, _ = proc.communicate(timeout=timeout)
+        return stdout, proc.returncode
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, __import__("signal").SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            stdout, _ = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            if proc.stdout is not None:
+                proc.stdout.close()
+            stdout = "\n[gate_pytest] gate timeout: stdout holder survived"
+            # codex 2 周目 (2026-09-06): communicate は pipe の EOF 待ちで
+            # timeout するため、SIGKILL 済みの直接子が未 reap のまま残る。
+            # 長寿命の service/improve プロセスで zombie が蓄積するので
+            # stdout を閉じた後に必ず wait する (孫は別 session に逃げる
+            # ので killpg では止まらない — ここでは直接子の回収のみ)。
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        returncode = -1
+    return stdout, returncode
+
+
+def _stop_and_reap(proc) -> None:
+    """process group を止め、直接の子を回収する。失敗しても例外を出さない。"""
+    try:
+        os.killpg(proc.pid, __import__("signal").SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        if proc.stdout is not None:
+            proc.stdout.close()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
 
 
 def run_gate_pytest(plugin_dir: Path, *, settings: "Settings") -> GateResult:
@@ -188,36 +272,31 @@ def run_gate_pytest(plugin_dir: Path, *, settings: "Settings") -> GateResult:
               "PYTHONPYCACHEPREFIX": str(pyc_dir),
               "TMPDIR": str(workdir),
               **_SINGLE_THREAD_ENV}
-        proc = subprocess.Popen(argv, cwd=str(workdir), env=env,
-                                stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, start_new_session=True)
+        status_r, status_w = os.pipe()
+        argv = [*argv, str(status_w)]
         try:
-            stdout, _ = proc.communicate(timeout=settings.plugin.pytest_timeout_sec)
-            returncode = proc.returncode
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, __import__("signal").SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
-            try:
-                stdout, _ = proc.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                if proc.stdout is not None:
-                    proc.stdout.close()
-                stdout = "\n[gate_pytest] gate timeout: stdout holder survived"
-                # codex 2 周目 (2026-09-06): communicate は pipe の EOF 待ちで
-                # timeout するため、SIGKILL 済みの直接子が未 reap のまま残る。
-                # 長寿命の service/improve プロセスで zombie が蓄積するので
-                # stdout を閉じた後に必ず wait する (孫は別 session に逃げる
-                # ので killpg では止まらない — ここでは直接子の回収のみ)。
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=5)
-            returncode = -1
+            proc = subprocess.Popen(argv, cwd=str(workdir), env=env,
+                                    stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, start_new_session=True,
+                                    pass_fds=(status_w,))
+        except BaseException:
+            os.close(status_r)
+            raise
+        finally:
+            os.close(status_w)
+        try:
+            stdout, returncode = _wait_gate_worker(proc, settings.plugin.pytest_timeout_sec)
+        except BaseException:
+            # 割込みや想定外の例外でも、子を止めて回収し、状態の pipe を閉じてから伝える
+            _stop_and_reap(proc)
+            os.close(status_r)
+            raise
         duration = time.monotonic() - started
+        try:
+            worker_ready, pytest_exit = _read_worker_status(status_r)
+        finally:
+            os.close(status_r)
 
     after_content, after_artifact = hashes_of(plugin_dir)
     if after_content != before_content or after_artifact != before_artifact:
@@ -225,8 +304,10 @@ def run_gate_pytest(plugin_dir: Path, *, settings: "Settings") -> GateResult:
                           stdout_tail=(stdout[-_STDOUT_TAIL_MAX_BYTES:] if stdout else "") + "\n[gate_pytest] candidate "
                                       "content changed during test run "
                                       "(hash mismatch) — rejecting",
-                          duration_sec=duration)
+                          duration_sec=duration, worker_ready=worker_ready,
+                          pytest_exit=pytest_exit, hash_changed=True)
 
     tail = stdout[-_STDOUT_TAIL_MAX_BYTES:] if stdout else ""
     return GateResult(passed=(returncode == 0), returncode=returncode,
-                      stdout_tail=tail, duration_sec=duration)
+                      stdout_tail=tail, duration_sec=duration,
+                      worker_ready=worker_ready, pytest_exit=pytest_exit)

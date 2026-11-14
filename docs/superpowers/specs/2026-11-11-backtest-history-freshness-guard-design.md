@@ -455,6 +455,8 @@ DB・設定・暦の読取失敗では、このブロックを固定理由 (`set
 
 配備中4版の再評価承認 #89・#91・#92・#94 は、いずれも `eval_now=2026-11-07T07:05Z`。レビューの停止再現では、この時点の履歴は充足率約0.31である。
 
+**追記 (2026-11-14、段1b設計C2の裁定)**: 非配備7版のうち4版 (#21・#23・#24・#25) は、この時点で既に最新の決定が却下 (取消し・再評価却下) で失効済みであり、通常rollbackは既存の承認検査で拒否され、履歴の強行でも迂回できない。それでも既存裁定「15件すべて再評価」を維持し、7版すべてを評価する (J0)。評価は**当時の承認の再現ではなく、現在のcore・履歴・設定による再評価**であり、依存は現在の承認済みinventoryを使い、保存pinと完全に一致しなければ評価不能とする。詳細は `docs/superpowers/specs/2026-11-14-stage1b-non-deployed-audit-design.md`。
+
 ### 8.2 段1aの運用手順
 
 1. 整合したDBバックアップ、承認id・完全長hash・依存pin・現在配備の対象manifestを保存する。
@@ -480,11 +482,15 @@ DB・設定・暦の読取失敗では、このブロックを固定理由 (`set
 
 段1bでは `.versions` の正確なコード版と依存pinから評価入力を復元する必要がある。現在のinventoryや同名最新版で代用しない。この監査再生は現行 `reevaluate_deployed` では実行できず、別チケットの実装対象である。
 
+**追記 (2026-11-14)**: 上の「現在のinventoryで代用しない」は、過去依存の復元・探索を前提にした記述だった。段1b設計C2は方式Dを採り、strategyは `.versions` の正確な版 (artifact 3ファイル) をそのまま使い、依存だけは**現在の承認済みinventoryを `pin_mode="require"` で解決し、保存pinと完全一致したときだけ**評価する (欠損・変化は `dependency_changed` で評価不能。過去の indicator artifact は探索しない)。実装は `plugin/history_audit.py` の `audit_non_deployed_version`。
+
 新run・証跡または復元不能等の根拠付き理由を、旧承認idと版へ関連付ける。再評価不能は成功に数えず、残作業として明示する。15件の追跡表を閉じるのは、この段1bの結果を記録した後とする。
 
 ### 8.4 裁定済みのrollback制限と人間専用の強行操作
 
 **裁定（2026-11-11）: 適正な新証跡のない版へのrollbackは、段1bの監査結果が出るまで拒否する。段1aでこの拒否を導入する。**
+
+**追記（2026-11-14、段1b設計C2・利用者裁定 J1）**: 監査の結果は人間専用のreportとmanifestに残すだけで、承認・決定・配備・rollbackの可否を変えない。したがって「段1bの監査結果が出るまで」拒否する、の解除条件は「監査結果が出たこと」ではなく、**通常のsubmitと承認で適正な証跡つきの承認を得ること**である。失効済みの4版 (#21・#23・#24・#25) は、評価がpassでも記録のみで、既存の `--force-history-guard` でも戻せない。残る3版 (#39・#71・#72) でrollbackが要るときは、人間がreportの対象版・条件・結果を確認し、上の既存の強行操作を使う (理由にreport参照を書く)。
 
 新しいstrategy rollback操作では、`resolve_rollback_target` の明示 `--to` と既定対象の双方について、対象を解決した後に証跡を確認する。対象の名前と完全長artifact hashに一致する最新の承認済みpayloadを使い、§5.2の有効な `history_guard` と既存のhash・依存pin・epoch等を照合する。別版の証跡や、却下・pendingの新依頼を代用しない。
 
@@ -519,6 +525,8 @@ afx plugin rollback <name> --to <完全長artifact_hash> \
 段1aの通常運用と移行作業では強行を使わない。受入では、非配備7版への通常rollbackがすべて拒否されることと、明示的な人間の強行経路だけが履歴証跡拒否を迂回できることを分けて検証する。
 
 段1bの監査で適正な証跡を得た版は、承認済み根拠へ結び付ける後続実装を経て通常rollbackを可能にする。manifestに監査結果を書いただけでは拒否を解除しない。
+
+**更新（2026-11-14）**: 上の「承認済み根拠へ結び付ける後続実装を経て通常rollbackを可能にする」は、**需要が出るまで延期する**。段1bは新しいテーブル・basis・接続CLI・rollbackの改修を作らない (最大3版のforce省略のためにDB・接続・rollbackを増やさない)。「監査まで拒否」の記述は、本節の追記のとおり、監査では解除されず強行 (3版のみ) か通常の再承認で扱う、と読む。
 
 ### 8.5 移行manifestの置き場・形式・書き手
 
@@ -563,6 +571,13 @@ task 6の記録の受入は、次をすべて満たすこととする。
 - 非配備7行は段1b未完了として残り、段1aの新配備を指していない。
 
 8行に理由が入れば記録要件は満たすが、`unevaluable` は再評価成功ではない。配備中4版の評価・人間の決定が未完了なら、その残作業を最終報告に明示する。段1bも同じmanifestを更新し、15件の追跡を継続する。
+
+**追記 (2026-11-14、段1b設計C2): 版別の境界。** manifestは `schema_version` で判定を分ける。
+
+- **版1**は従来の `validate_manifest` / `verify_against_db` の判定を**そのまま**保つ。従来受理された入力 (非UTCのaware時刻、段1a以外の行の時刻・根拠欄、未着手行の非null欄など) は版1では全て受理し、新しい必須欄・時刻形式・状態制約・report検証を課さない。版変更なしの互換破壊を避けるためである。上の「配備中8行の評価時刻はaware UTC」「evaluated / unevaluable の時刻・根拠参照は必須」は、実装 (版1) では配備中行にだけ課され、時刻はtimezone付きであれば非UTCも受理する。**非配備行の evaluated / unevaluable は版1では受理されない** (非配備は deferred 固定)。aware UTC・phaseによらない必須化は版2の契約である。
+- **版2**は、各行に `audit_ref` (非配備版の評価reportへの相対path、または null) を足した最小の形で、厳格化は版2だけに課す。全15行 (旧id・name・両hash・dependency_pins・初回配備事実・phase) を維持し、未知の欄を拒否する。段1aの8行は `audit_ref=null` で結果・新id・人間決定・時刻・参照をそのまま保持し、同じ版の2行の一致とDB照合を続ける。段1bの7行は新approval idを常にnull、`human_decision=not_applicable / decided_at=null` とする。`deferred` / `pending` は `audit_ref / evidence_ref / evaluated_at / unevaluable_reason` が全てnull。`evaluated` はreportの総合結果がpass / failで、`audit_ref`・aware UTCの試行時刻・`evidence_ref` が必須。`unevaluable` は固定理由・試行時刻・`audit_ref`・`evidence_ref` が必須。時刻と根拠は**phaseによらず**要求する。
+- 版2の `verify_against_db` は、段1aの行を従来と同じに照合し、段1bの行は旧payload・pin・`audit_ref` が指すreport (明示した `report_root` の中の通常ファイルだけ。symlink・root外・別版・欠落・不正JSONを拒否) と照合する。passのreportは全scope・床・ready証跡・epochを確認する。「実行時の記録整合」と「現在の条件で証跡が有効か」を分け、後者は `evidence_currently_valid` で別に問い、再評価済みの事実やrollback許可と混同しない。
+- 版1から版2への変換は明示的に行い (`convert_to_v2`)、元を書き換えず、版2の制約を満たさない行があれば変換を止めて不足を報告する。時刻・根拠は補作しない。
 
 ## 9. 受入・検証
 
@@ -687,6 +702,7 @@ improve・submit・bless・reevaluateの各入口に、`real_history_guard` mark
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-11-14 | C2.4 | §8.1・§8.3・§8.4・§8.5 に段1b設計C2の裁定を追記 (失効済み4版、現在の条件での再評価と現在inventoryのrequire、通常rollback接続の延期、manifestの版別境界)。過去の裁定は消していない | 段1bの利用者承認 (J0 = 7版すべて、J1 = 方式D) と、実装 (task 1.1〜1.3) の反映 | — |
 | 2026-11-14 | C2.3 | import の「停止・部分commit維持」と「衝突の永続記録は段2」を C2.2 が前倒しで置換したと、概要・§2.3・§7・§9・段の表に明記。status の読取条件を保持者別に訂正。schema version の記述を撤回 | C2.2 付録B 4・6・7。同期は C5 | — |
 | 2026-11-12 | C2.1 | §5 の保存時の再照合を実装に合わせて訂正 (現在の一覧を既存依頼自身の区間で照合) | 新評価の区間で照合すると、評価中に時計が進んだだけで適正な pending が無効になるため。入口ごとの実検査の結合 test を追加 | — |
 | 2026-11-12 | C2.2 | 強行rollbackの監査を、activityの読み返しによるop記録から、開始の監査行(force_token入り)とopと同一transactionのDBの印の対へ組み直し。op記録のevent・完了経路での書込みを廃止。activityの追記は部分行を改行で閉じてから書く | 同じ部品でCriticalが3周続いたため。指揮者の指示 | — |

@@ -109,3 +109,15 @@ afx plugin rollback <name> --to <完全長の artifact hash> --force-history-gua
 - 更新: 再評価の結果ごとに、同じ版の旧承認 2 行へ同じ新依頼 id (`evaluated`) か同じ固定の評価不能理由 (`unevaluable`) と、評価試行の時刻・根拠参照を書く。人間が決めたら `human_decision` と `decided_at` を書く。
 - 検証: `validate_manifest(manifest)` が形と受入条件 (15 行の一致、配備中 8 行の結果、同じ版 2 行の一致、非配備 7 行が段 1b 未完了のまま) を、`verify_against_db(manifest, conn, no_bars_path=...)` が DB との一致 (新依頼がその版自身の再評価で、有効な証跡があること、決定の一致) を確かめます。
 - `unevaluable` は再評価の成功ではありません。配備中 4 版の評価・人間の決定が残っていれば、その残作業を最終報告に書きます。
+
+### 非配備 7 版の評価 (段 1b) と manifest 版 2
+
+非配備 7 版は、配備せず現在の条件で各 1 回評価し、人間専用の report と manifest に記録します。承認・決定・配備・rollback の可否は変えません (新しい approval も作りません)。
+
+- 実行: 運用担当者が DB と manifest を backup してから、版ごとに `agentic_fx.plugin.history_audit.audit_non_deployed_version` を直列に呼ぶ (改善 loop・agent・daemon のジョブにはしない)。入力は manifest の旧承認 id・name・完全長 hash・dependency_pins。実行前に、DB の旧承認行・`.versions` の実物・現在 live の依存 pin を照合する。
+- 評価: 保存版を lock の下で symlink を追わずに検査して専用領域へ複製し、共有 gate を `floor_mode=warn` / 比較なしで 1 回通す。依存は現在の承認済み inventory で `pin_mode="require"` 解決し、保存 pin と完全一致しなければ評価不能 (`dependency_changed`)。
+- report: `data/history-guard-migration/reports/<試行 id>.json` に 1 試行 1 ファイル。実行完了 / 床合否 / 履歴検証 / 未実行 scope の 4 軸と総合結果 (`pass` / `fail` / `unevaluable`) を持つ。warn の完走は合格ではない。成績は DB の成績表に書かない。
+- manifest: 運用担当者が backup 後に `convert_to_v2` で版 2 へ変換し、7 行の `result_status` / `audit_ref` / `evaluated_at` / `evidence_ref` / (評価不能なら) `unevaluable_reason` を書く。版 1 は従来どおり受理し、厳格化は版 2 だけ。検証は `validate_manifest` と `verify_against_db(manifest, conn, no_bars_path=..., report_root=...)`。
+- rollback: 失効済みの 4 版 (#21・#23・#24・#25) は、評価が pass でも記録のみで、`--force-history-guard` でも戻せません。残る 3 版 (#39・#71・#72) で必要なときは、report を確認したうえで上の強行操作を使う (理由に report 参照を書く)。通常 rollback を可能にする接続は需要が出るまで延期しています。
+- `unevaluable` と `fail` は再評価成功ではありません。評価不能が残れば「15 件すべて再評価成功」と報告せず、対象 id と対処を残作業に書きます。
+

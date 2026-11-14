@@ -556,3 +556,104 @@ def test_gate_pytest_does_not_use_preexec_fn():
     from agentic_fx.plugin import gate_pytest
     src = inspect.getsource(gate_pytest)
     assert "preexec_fn" not in src
+
+
+# ---- worker が親へ渡す構造化された状態 (監査だけが読む) ------------------------------------
+
+def test_the_worker_reports_its_initialization_and_the_pytest_exit_code(tmp_path, settings):
+    _skip_if_no_landlock()
+    ok = run_gate_pytest(_write_candidate(tmp_path, test_py=_PASSING_TEST), settings=settings)
+    assert (ok.worker_ready, ok.pytest_exit, ok.hash_changed) == (True, 0, False)
+    other = tmp_path / "other"
+    other.mkdir()
+    bad = run_gate_pytest(_write_candidate(other, test_py=_FAILING_TEST), settings=settings)
+    assert (bad.passed, bad.returncode, bad.worker_ready, bad.pytest_exit) == (False, 1, True, 1)
+
+
+def test_a_collection_error_is_reported_as_a_pytest_exit_other_than_one(tmp_path, settings):
+    _skip_if_no_landlock()
+    d = _write_candidate(tmp_path, test_py="import not_a_module_xyz\n")
+    result = run_gate_pytest(d, settings=settings)
+    assert (result.worker_ready, result.pytest_exit) == (True, 2)
+
+
+def test_a_worker_that_failed_to_initialize_is_not_reported_as_ready(tmp_path):
+    import subprocess
+    import sys
+    r, w = os.pipe()
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "agentic_fx.plugin.gate_pytest_worker",
+             str(tmp_path / "missing"), str(tmp_path), str(w)],
+            env={**os.environ, "PYTHONPYCACHEPREFIX": str(tmp_path / "pyc")},
+            pass_fds=(w,), capture_output=True, timeout=120)
+    finally:
+        os.close(w)
+    from agentic_fx.plugin.gate_pytest import _read_worker_status
+    try:
+        status = _read_worker_status(r)
+    finally:
+        os.close(r)
+    assert proc.returncode != 0
+    assert status == (False, None)
+
+
+@pytest.mark.parametrize("payload,expected", [
+    (b"", (False, None)),
+    (b"worker_ready\n", (True, None)),
+    (b"worker_ready\npytest_exit=1\n", (True, 1)),
+    (b"pytest_exit=1\n", (False, 1)),
+    (b"worker_ready\npytest_exit=abc\n", (True, None)),
+    (b"garbage\n\xff\xfe\n", (False, None)),
+])
+def test_the_worker_status_reader_accepts_only_exact_lines(payload, expected):
+    from agentic_fx.plugin.gate_pytest import _read_worker_status
+    r, w = os.pipe()
+    try:
+        os.write(w, payload)
+        os.close(w)
+        assert _read_worker_status(r) == expected
+    finally:
+        os.close(r)
+
+
+def test_a_hash_change_during_the_run_is_flagged_independently_of_the_exit_code(
+        tmp_path, settings, monkeypatch):
+    _skip_if_no_landlock()
+    d = _write_candidate(tmp_path, test_py=_FAILING_TEST)
+    import agentic_fx.plugin.gate_pytest as gate_mod
+    real = gate_mod.hashes_of
+    calls = {"n": 0}
+
+    def tampering(plugin_dir):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            (plugin_dir / "plugin.py").write_text("TAMPERED")
+        return real(plugin_dir)
+
+    monkeypatch.setattr(gate_mod, "hashes_of", tampering)
+    result = run_gate_pytest(d, settings=settings)
+    assert (result.passed, result.returncode, result.hash_changed) == (False, 1, True)
+
+
+def test_an_interrupt_while_waiting_stops_the_worker_and_closes_the_status_pipe(
+        tmp_path, settings, monkeypatch):
+    _skip_if_no_landlock()
+    import subprocess
+    from agentic_fx.plugin import gate_pytest as gp
+
+    candidate = _write_candidate(tmp_path, test_py="def test_x():\n    assert True\n")
+    before = set(os.listdir("/proc/self/fd"))
+    seen = []
+
+    def interrupted(proc, timeout):
+        seen.append(proc)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(gp, "_wait_gate_worker", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        gp.run_gate_pytest(candidate, settings=settings)
+    (proc,) = seen
+    assert proc.returncode is not None          # 子は止められて回収された
+    assert set(os.listdir("/proc/self/fd")) <= before
+
