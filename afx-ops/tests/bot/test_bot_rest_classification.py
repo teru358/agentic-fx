@@ -284,6 +284,19 @@ def test_a_transiently_failed_substitute_retries_from_the_same_event(rig, second
     assert built.progress.delivery_stalled_since is not None
 
 
+@pytest.mark.parametrize("second", transient())
+def test_after_a_transient_substitute_failure_the_next_round_advances_the_cursor_once(rig, second):
+    built = _delivery_rig(rig, [_page(APPROVED, {**APPROVED, "id": 2})])
+    built.channel.script["send"] = [http(400, 50035), second, http(400, 50035)]
+    asyncio.run(built.adapter.deliver_events())
+    assert load(built.fd).cursor == 0
+    asyncio.run(built.adapter.deliver_events())
+    assert load(built.fd).cursor == 2 and built.channel.calls["send"] == 5
+    contents = [sent["content"] for sent in built.channel.sent]
+    assert contents.count(SUBSTITUTE) == 1 and contents[0] == SUBSTITUTE
+    assert built.progress.delivery_stalled_since is None
+
+
 def test_the_substitute_carries_no_event_text_or_exception_text(rig):
     built = _delivery_rig(rig, [_page(APPROVED)])
     built.channel.script["send"] = [http(400, 50035)]
@@ -291,7 +304,7 @@ def test_the_substitute_carries_no_event_text_or_exception_text(rig):
     assert built.channel.sent[0]["content"] == SUBSTITUTE
 
 
-@pytest.mark.parametrize("failure", [http(403), http(408)])
+@pytest.mark.parametrize("failure", [http(403), http(408), http(408, 50035), http(408, 40002)])
 def test_a_codeless_403_and_a_408_on_an_event_send_are_retried_not_stopped(rig, failure):
     built = _delivery_rig(rig, [_page(APPROVED)])
     built.channel.script["send"] = [failure]

@@ -40,8 +40,9 @@ def is_message_local_rejection(exc: BaseException) -> bool:
 
 
 def _is_codeless_gateway_reply(exc: discord.HTTPException) -> bool:
-    """Discord の JSON code を持たない 403 / 408 (前段の proxy や Cloudflare の一時の拒否)。"""
-    return exc.status in (403, 408) and not exc.code
+    """一時の拒否として扱う応答。408 は code の有無によらず、403 は Discord の JSON code を持たないもの
+    (前段の proxy や Cloudflare の一時の拒否) だけ。"""
+    return exc.status == 408 or (exc.status == 403 and not exc.code)
 
 
 def is_shared_rejection(exc: BaseException) -> bool:
@@ -61,8 +62,8 @@ def classify(exc: BaseException) -> str:
     """恒久 (設定・認証・権限の修復が要る拒否) か一時 (429 / 5xx / network / timeout) か。
 
     共有の配送先の code (10003 / 50001 / 50013) は status によらず恒久。401 / 403 / 404 と、
-    429 以外の 4xx も恒久。ただし JSON code を持たない 403 と 408 は前段の一時の拒否として
-    一時にする。投稿の消失 (`is_message_gone`) の判定は呼出し側が先に行う。判別できない失敗は
+    429 以外の 4xx も恒久。ただし 408 (code の有無によらず) と JSON code を持たない 403 は
+    前段の一時の拒否として一時にする。投稿の消失 (`is_message_gone`) の判定は呼出し側が先に行う。判別できない失敗は
     一時にする。message 固有の不正な body (`is_message_local_rejection`) の扱いは送信側が決める。
     """
     if isinstance(exc, discord.LoginFailure):
