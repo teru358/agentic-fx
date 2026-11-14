@@ -127,6 +127,59 @@ def test_a_failing_stored_test_is_a_normal_fail_and_floor_and_history_stay_unexe
     assert world.replay.calls == []
 
 
+@pytest.mark.parametrize("returncode,reason,status", [
+    (-9, "resource_unavailable", "interrupted"),      # SIGKILL
+    (-24, "resource_unavailable", "interrupted"),     # a negative code from a resource limit
+    (2, "sandbox_unavailable", "interrupted"),        # pytest interrupted
+    (3, "sandbox_unavailable", "interrupted"),        # pytest internal error
+    (4, "sandbox_unavailable", "interrupted"),        # usage error / launcher failure
+    (5, "sandbox_unavailable", "interrupted"),        # nothing collected
+    (0, "changed_during_evaluation", "completed"),    # not passed with a clean exit: hash change
+])
+def test_a_pytest_stage_failure_that_is_not_an_ordinary_test_failure_is_unevaluable(
+        make, returncode, reason, status):
+    world = make(gate=Gate(passed=False, returncode=returncode))
+    _v, target = world.stored()
+    report = _result(world, target).report
+    assert report["result"] == {"overall": "unevaluable", "reason": reason,
+                                "result_status": "unevaluable"}
+    assert report["axes"]["execution"]["status"] == status
+
+
+def test_a_stored_version_changed_by_its_own_test_run_is_unevaluable_not_a_fail(make):
+    class Mutating(Gate):
+        def __call__(self, plugin_dir, *, settings):
+            (plugin_dir / "plugin.py").write_bytes(
+                (plugin_dir / "plugin.py").read_bytes() + b"\n# edited\n")
+            return super().__call__(plugin_dir, settings=settings)
+
+    world = make(gate=Mutating(passed=False, returncode=1))
+    _v, target = world.stored()
+    report = _result(world, target).report
+    assert (report["result"]["overall"], report["result"]["reason"]) == (
+        "unevaluable", "changed_during_evaluation")
+
+
+def test_a_snapshot_error_in_the_pytest_stage_is_invalid_snapshot_and_completed(make):
+    from agentic_fx.plugin.gate_pytest import CandidateSnapshotError
+    world = make()
+    _v, target = world.stored()
+
+    def raising(plugin_dir, *, settings):
+        raise CandidateSnapshotError("extra entry")
+
+    import agentic_fx.plugin.switch as sw
+    sw_run = sw.run_gate_pytest
+    try:
+        sw.run_gate_pytest = raising
+        report = _result(world, target).report
+    finally:
+        sw.run_gate_pytest = sw_run
+    assert (report["result"]["overall"], report["result"]["reason"]) == (
+        "unevaluable", "invalid_snapshot")
+    assert report["axes"]["execution"]["status"] == "completed"
+
+
 def test_a_pytest_timeout_is_unevaluable_and_counts_as_an_aborted_run(make):
     world = make(gate=Gate(passed=False, returncode=-1))
     _v, target = world.stored()
@@ -206,8 +259,8 @@ def test_a_short_in_sample_sample_is_unevaluable_too(make):
 def test_every_reason_the_audit_can_report_is_in_the_fixed_set():
     from agentic_fx.plugin.switch import GateFailure
     seen = set()
-    for stage in ("snapshot", "source", "discovery", "contract", "indicator_static", "pytest",
-                  "hash", "kind_gate", "verdict", "unexpected"):
+    for stage in ("snapshot", "source", "discovery", "contract", "indicator_static", "indicator_fixture",
+                  "pytest", "hash", "kind_gate", "verdict", "unexpected"):
         for detail in ("", "pytest", "timeout", "crashed", "sandbox_unavailable", "db_busy",
                        "resource", "no_history"):
             for kind in (None, "indicator_unresolved", "insufficient_trades",
@@ -644,3 +697,114 @@ def test_a_gate_result_that_is_not_evaluable_is_never_a_pass(make):
 
     report = world.run(target, clock=lambda: TUESDAY, gate_fn=not_evaluable).report
     assert report["result"]["overall"] == "unevaluable"
+
+
+# ---- 指標の fixture 段 ----------------------------------------------------------------
+
+def _indicator_target(world):
+    version = world.version(NAME, "ind", kind="indicator")
+    old_id = world.approve(NAME, version)
+    return audit.AuditTarget(old_id, NAME, version.name, loader.content_hash(version), {})
+
+
+@pytest.mark.parametrize("raises,code", [
+    (lambda ip: ip.IndicatorGateUnavailable("busy"), "indicator_gate_unavailable"),
+    (None, "duplicate_of_deployed"),
+])
+def test_an_indicator_fixture_rejection_reaches_the_sink_and_is_a_completed_unevaluable(
+        make, monkeypatch, raises, code):
+    from types import SimpleNamespace
+    from agentic_fx.plugin import indicator_pipeline as ip
+    world = make()
+    target = _indicator_target(world)
+
+    def fixture_stage(*a, **kw):
+        if raises is not None:
+            raise raises(ip)
+        return SimpleNamespace(ok=False, code=code, warnings=(), similar_to=(), unavailable=())
+
+    monkeypatch.setattr(ip, "run_fixture_stage", fixture_stage)
+    report = _result(world, target).report
+    assert (report["result"]["overall"], report["result"]["reason"]) == (
+        "unevaluable", "unsupported_version")
+    assert report["axes"]["execution"]["status"] == "completed"
+    assert report["axes"]["execution"]["stage"] == "indicator_fixture"
+    assert report["input_checks"]["indicator_fixture"] == code
+    assert {"item": "history_check", "reason": f"indicator_fixture:{code}"} in (
+        report["axes"]["unexecuted"])
+
+
+# ---- 依存の確認 ------------------------------------------------------------------------
+
+def test_a_version_without_dependencies_never_builds_the_inventory(make, monkeypatch):
+    world = make()
+    version, target = world.stored()
+    meta = loader._discover_one(version, NAME)
+
+    def forbidden(*a, **kw):
+        raise AssertionError("the inventory must not be built")
+
+    monkeypatch.setattr(audit.tools_plugin_loader, "approved_plugins", forbidden)
+    assert audit._check_dependencies(world.conn, world.root, world.settings, meta, target) == (
+        True, "")
+    pinned = audit.AuditTarget(target.old_approval_id, NAME, target.artifact_hash,
+                               target.content_hash, {"x": {"plugin": "p", "content_hash": "h"}})
+    assert audit._check_dependencies(world.conn, world.root, world.settings, meta, pinned) == (
+        False, "pins_differ")
+
+
+# ---- report の作成と書込みの保護 -----------------------------------------------------------
+
+def test_a_report_that_cannot_be_built_is_left_as_an_unevaluable_report(make, monkeypatch):
+    world = make()
+    _v, target = world.stored()
+
+    def broken(*a, **kw):
+        raise RuntimeError("settings unreadable")
+
+    monkeypatch.setattr(audit, "_build_report", broken)
+    result = world.run(target)
+    (path,) = list(world.report_dir.iterdir())
+    assert json.loads(path.read_text()) == result.report
+    assert (result.report["result"]["overall"], result.report["result"]["reason"]) == (
+        "unevaluable", "failed")
+    assert result.report["axes"]["execution"]["status"] == "interrupted"
+    assert list(world.work_root.iterdir()) == []
+
+
+def test_an_interrupt_while_building_the_report_leaves_a_report_and_reraises(make, monkeypatch):
+    world = make()
+    _v, target = world.stored()
+
+    def interrupted(*a, **kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(audit, "_build_report", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        world.run(target)
+    (path,) = list(world.report_dir.iterdir())
+    report = json.loads(path.read_text())
+    assert (report["result"]["overall"], report["result"]["reason"]) == (
+        "unevaluable", "interrupted")
+    assert list(world.work_root.iterdir()) == []
+
+
+def test_an_interrupt_while_writing_the_report_is_retried_as_an_interrupted_report(
+        make, monkeypatch):
+    world = make()
+    _v, target = world.stored()
+    real = audit._write_report
+    calls = []
+
+    def once(report_dir, trial_id, report):
+        calls.append(report["result"]["overall"])
+        if len(calls) == 1:
+            raise KeyboardInterrupt
+        return real(report_dir, trial_id, report)
+
+    monkeypatch.setattr(audit, "_write_report", once)
+    with pytest.raises(KeyboardInterrupt):
+        world.run(target)
+    assert calls == ["pass", "unevaluable"]
+    (path,) = list(world.report_dir.iterdir())
+    assert json.loads(path.read_text())["result"]["reason"] == "interrupted"

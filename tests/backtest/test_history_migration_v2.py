@@ -363,13 +363,97 @@ def test_the_old_approval_hashes_of_a_non_deployed_row_are_checked(tmp_path, roo
                for p in _verify(tmp_path, manifest, root, variant="hash"))
 
 
-def test_the_current_validity_of_an_evidence_is_a_separate_question(tmp_path, root):
+def test_a_passing_report_whose_evidence_fails_the_current_rules_is_refused(tmp_path, root):
     manifest, e, name = _one(root)
     report = json.loads((root / name).read_text())
-    assert hm.evidence_currently_valid(
-        report, no_bars_path=tmp_path / "none.yaml").ok
+    assert hm.evidence_currently_valid(report, no_bars_path=tmp_path / "none.yaml").ok
     report["axes"]["history"]["evidence"]["calendar_version"] = "older"
     (root / name).write_text(json.dumps(report))
     assert not hm.evidence_currently_valid(report, no_bars_path=tmp_path / "none.yaml").ok
-    # 記録の整合は、現在の方針が変わっても歴史 report を落とさない
-    assert not any("calendar" in p for p in _verify(tmp_path, manifest, root))
+    assert any("current history rules" in p for p in _verify(tmp_path, manifest, root))
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda ev: ev.update(threshold_snapshot={"forged": 1}),
+    lambda ev: ev.update(version=ev["version"] + 1),
+    lambda ev: ev.update(no_bars_digest="0" * 64),
+    lambda ev: ev.pop("checked_at"),
+])
+def test_a_tampered_evidence_in_a_passing_report_is_refused(tmp_path, root, mutate):
+    manifest, e, name = _one(root)
+    report = json.loads((root / name).read_text())
+    mutate(report["axes"]["history"]["evidence"])
+    (root / name).write_text(json.dumps(report))
+    assert _verify(tmp_path, manifest, root)
+
+
+# ---- 読み切りと型の防御 ----------------------------------------------------------------
+
+def test_a_short_read_is_looped_until_the_whole_report_is_read(tmp_path, root, monkeypatch):
+    manifest, _e, _name = _one(root)
+    real = os.read
+    monkeypatch.setattr(hm.os, "read", lambda fd, n: real(fd, min(n, 7)))
+    assert _verify(tmp_path, manifest, root) == []
+
+
+def test_a_report_that_ends_before_its_recorded_size_is_flagged(tmp_path, root, monkeypatch):
+    manifest, _e, name = _one(root)
+    real = os.read
+    calls = []
+
+    def truncated(fd, n):
+        calls.append(n)
+        return real(fd, n)[:10] if len(calls) == 1 else b""
+
+    monkeypatch.setattr(hm.os, "read", truncated)
+    assert any("changed while it was read" in p for p in _verify(tmp_path, manifest, root))
+
+
+def test_a_report_that_grew_past_its_recorded_size_is_flagged(tmp_path, root, monkeypatch):
+    manifest, _e, name = _one(root)
+    real = os.read
+    state = {"done": False}
+
+    def grown(fd, n):
+        data = real(fd, n)
+        if data and not state["done"]:
+            state["done"] = True
+            return data + b" "
+        return data
+
+    monkeypatch.setattr(hm.os, "read", grown)
+    assert any("changed while it was read" in p or "too large" in p
+               for p in _verify(tmp_path, manifest, root))
+
+
+def test_a_report_that_passes_the_limit_while_being_read_is_flagged(tmp_path, root, monkeypatch):
+    manifest, _e, name = _one(root)
+    size = (root / name).stat().st_size
+    monkeypatch.setattr(hm, "_MAX_REPORT_BYTES", size)
+    real = os.read
+    state = {"extra": True}
+
+    def endless(fd, n):
+        data = real(fd, n)
+        if not data and state["extra"]:
+            state["extra"] = False
+            return b" "
+        return data
+
+    monkeypatch.setattr(hm.os, "read", endless)
+    assert any("too large" in p for p in _verify(tmp_path, manifest, root))
+
+
+@pytest.mark.parametrize("bad", [[1], {"a": 1}, [[]], None, 1.5, True])
+@pytest.mark.parametrize("version", [1, 2])
+def test_a_malformed_old_approval_id_is_a_problem_not_an_exception(bad, version):
+    manifest = corpus.base_manifest() if version == 1 else v2_manifest()
+    manifest["entries"][0]["old_approval_id"] = bad
+    problems = hm.validate_manifest(manifest)
+    assert problems and all(isinstance(p, str) for p in problems)
+
+
+def test_the_report_format_and_the_hash_pattern_are_defined_once():
+    from agentic_fx.plugin import history_audit
+    assert history_audit.REPORT_FORMAT is hm.REPORT_FORMAT
+    assert history_audit._HEX64 is hm.HEX64

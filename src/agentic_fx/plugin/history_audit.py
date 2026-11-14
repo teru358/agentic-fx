@@ -14,7 +14,6 @@ import hashlib
 import json
 import math
 import os
-import re
 import shutil
 import sqlite3
 import stat
@@ -27,7 +26,8 @@ from typing import Callable
 
 from agentic_fx.backtest import history_evidence
 from agentic_fx.backtest import history_health as hh
-from agentic_fx.backtest.history_migration import UNEVALUABLE_REASONS_V2
+from agentic_fx.backtest.history_migration import (
+    HEX64 as _HEX64, REPORT_FORMAT, UNEVALUABLE_REASONS_V2)
 from agentic_fx.core.history_epoch import history_epoch
 from agentic_fx.plugin import loader, strategy_gate, switch
 from agentic_fx.plugin.gate_pytest import (
@@ -38,9 +38,7 @@ from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import backtest_runs as backtest_runs_store
 from agentic_fx.tools import plugin_loader as tools_plugin_loader
 
-REPORT_FORMAT = 1
 LOCK_WAIT_SEC = 30.0
-_HEX64 = re.compile(r"[0-9a-f]{64}")
 _UTC = timezone.utc
 
 # 総合結果。
@@ -214,12 +212,31 @@ class FailureCollector:
         self.failures.append(failure)
 
 
+def _classify_pytest_exit(returncode: int | None) -> tuple[str, str]:
+    """pytest 段の終了の分類。版の自前 test が通常に失敗した (pytest の終了コード 1) ときだけ
+    不合格にし、信号終了・資源の上限・起動や収集の異常・終了コード 0 の不合格 (実行中の
+    hash 変化) は、版の評価ではなく評価不能にする。"""
+    if returncode == -1:
+        return UNEVALUABLE, "timeout"
+    if returncode is None:
+        return UNEVALUABLE, "failed"
+    if returncode < 0:
+        return UNEVALUABLE, "resource_unavailable"
+    if returncode == 0:
+        return UNEVALUABLE, "changed_during_evaluation"
+    if returncode == 1:
+        return FAIL, "pytest"
+    return UNEVALUABLE, "sandbox_unavailable"
+
+
 def classify_failure(failure: "switch.GateFailure") -> tuple[str, str]:
     """(総合結果, 固定理由)。構造化された段階・判別子だけで決め、文言は見ない。"""
     stage, detail, kind = failure.stage, failure.detail, failure.verdict_kind
     if stage == "pytest":
         if detail == "pytest":
-            return (UNEVALUABLE, "timeout") if failure.returncode == -1 else (FAIL, "pytest")
+            return _classify_pytest_exit(failure.returncode)
+        if failure.error_type == "CandidateSnapshotError":
+            return UNEVALUABLE, "invalid_snapshot"
         if failure.error_type == "RuntimeError":
             return UNEVALUABLE, "sandbox_unavailable"
         if failure.error_type in ("OSError", "MemoryError"):
@@ -229,7 +246,7 @@ def classify_failure(failure: "switch.GateFailure") -> tuple[str, str]:
         if failure.error_type == "CandidateSnapshotError":
             return UNEVALUABLE, "invalid_snapshot"
         return UNEVALUABLE, "failed"
-    if stage in ("source", "discovery", "contract", "indicator_static"):
+    if stage in ("source", "discovery", "contract", "indicator_static", "indicator_fixture"):
         return UNEVALUABLE, "unsupported_version"
     if stage == "hash":
         return UNEVALUABLE, "changed_during_evaluation"
@@ -363,6 +380,8 @@ def _latest_decision(conn: sqlite3.Connection, target: AuditTarget) -> dict | No
 def _check_dependencies(conn, plugins_root: Path, settings, meta, target: AuditTarget
                         ) -> tuple[bool, str]:
     """現在の承認済み inventory で、保存 pin と完全に同じ依存が live で承認されているか。"""
+    if not meta.indicators:
+        return (True, "") if not target.dependency_pins else (False, "pins_differ")
     inventory = tools_plugin_loader.approved_plugins(conn, plugins_root, settings=settings)
     try:
         resolved = resolve_indicator_deps(
@@ -477,17 +496,64 @@ def audit_non_deployed_version(
             detail = switch._failure_detail(exc)
             trial.stop(UNEVALUABLE, {"db_busy": "db_busy", "resource": "resource_unavailable",
                                      "no_history": hh.HISTORY_UNAVAILABLE}.get(detail, "failed"))
-        report = _build_report(target, trial_id, started, clock(), trial, settings, plugins_root)
-        written, error = None, None
+        report = None
         try:
-            written = _write_report(Path(report_dir), trial_id, report)
-        except Exception as exc:  # noqa: BLE001 - reported on its own, never turned into a pass
-            error = type(exc).__name__
+            report = _build_report(target, trial_id, started, clock(), trial, settings,
+                                   plugins_root)
+        except (KeyboardInterrupt, SystemExit) as exc:
+            pending = pending or exc
+            trial.interrupted = True
+            trial.stop(UNEVALUABLE, "interrupted")
+        except Exception:  # noqa: BLE001 - a report is still left, as unevaluable
+            trial.stop(UNEVALUABLE, "failed")
+        if report is None:
+            report = _fallback_report(target, trial_id, started, clock(), trial)
+        written, error = None, None
+        for attempt in range(2):
+            try:
+                written = _write_report(Path(report_dir), trial_id, report)
+                error = None
+                break
+            except (KeyboardInterrupt, SystemExit) as exc:
+                pending = pending or exc
+                trial.interrupted = True
+                trial.stop(UNEVALUABLE, "interrupted")
+                report = _fallback_report(target, trial_id, started, clock(), trial)
+                error = type(exc).__name__
+            except Exception as exc:  # noqa: BLE001 - reported on its own, never a pass
+                error = type(exc).__name__
+                break
     finally:
         shutil.rmtree(copy_dir, ignore_errors=True)
     if pending is not None:
         raise pending
     return AuditResult(report, written, error)
+
+
+def _fallback_report(target, trial_id, started, finished, trial: _Trial) -> dict:
+    """設定や外部の状態を読まずに作れる、評価不能の report (通常の report が作れないとき)。"""
+    reason = trial.reason if (trial.overall == UNEVALUABLE
+                              and trial.reason in UNEVALUABLE_REASONS_V2) else "failed"
+    return {
+        "report_format": REPORT_FORMAT,
+        "trial_id": trial_id,
+        "old_approval_id": target.old_approval_id,
+        "name": target.name,
+        "artifact_hash": target.artifact_hash,
+        "content_hash": target.content_hash,
+        "dependencies": [
+            {"alias": alias, "plugin": ref.get("plugin"), "content_hash": ref.get("content_hash")}
+            for alias, ref in sorted(target.dependency_pins.items()) if isinstance(ref, dict)],
+        "input_checks": trial.input_checks,
+        "evaluation": {"started_at": _iso(started), "finished_at": _iso(finished),
+                       "history_epoch": trial.epoch,
+                       "mode": {"floor_mode": "warn", "compare_mode": "off"}},
+        "axes": {"execution": {"status": "interrupted", "stage": trial.stage},
+                 "unexecuted": [{"item": "report", "reason": reason}]},
+        "changed_during_evaluation": trial.changed,
+        "result": {"overall": UNEVALUABLE, "reason": reason, "result_status": "unevaluable"},
+        "rows": [],
+    }
 
 
 def _precheck_and_copy(conn, target, trial, *, plugins_root, settings, copy_dir, lock_wait_sec,
@@ -540,12 +606,22 @@ def _run_gate(conn, target, trial, copy_dir, gate, collector, plugins_root, sett
             detail=switch._failure_detail(exc))
         trial.failure = failure
         trial.scope_rows = collect_scope_rows(failure.rows)
-        trial.stop(*classify_failure(failure))
+        verdict = classify_failure(failure)
+        if failure.stage == "indicator_fixture":
+            trial.input_checks["indicator_fixture"] = failure.detail
+        trial.stop(*verdict)
         trial.stage = "pytest" if (failure.stage, failure.detail) == ("pytest", "pytest") \
             else failure.stage
         return
     trial.outcome = outcome
     trial.scope_rows = collect_scope_rows(outcome.gate_rows)
+
+
+def _copy_differs(copy_dir: Path, target: AuditTarget) -> bool:
+    try:
+        return hashes_of(copy_dir) != (target.content_hash, target.artifact_hash)
+    except OSError:
+        return True
 
 
 def _end_recheck(conn, target, trial, copy_dir, plugins_root, settings, lock_wait_sec) -> None:
@@ -558,10 +634,7 @@ def _end_recheck(conn, target, trial, copy_dir, plugins_root, settings, lock_wai
                 changed.append("approval_row")
             if _latest_decision(conn, target) != trial.decision:
                 changed.append("latest_decision")
-            try:
-                if hashes_of(copy_dir) != (target.content_hash, target.artifact_hash):
-                    changed.append("copy_hash")
-            except OSError:
+            if _copy_differs(copy_dir, target):
                 changed.append("copy_hash")
             if trial.meta is not None:
                 ok, _why = _check_dependencies(conn, plugins_root, settings, trial.meta, target)
@@ -649,6 +722,8 @@ def _build_report(target, trial_id, started, finished, trial: _Trial, settings,
     stop_reason = reason if overall == UNEVALUABLE else None
     if failure is not None:
         stop_reason = failure.verdict_kind or failure.stage
+        if failure.stage == "indicator_fixture":
+            stop_reason = f"indicator_fixture:{failure.detail}"
     unexecuted: list[dict] = []
     for scope in SCOPES:
         for pair in pairs:

@@ -62,7 +62,8 @@ _ENTRY_KEYS = frozenset({
     "old_approval_id", "name", "artifact_hash", "content_hash", "dependency_pins",
     "deployed_at_inventory", "phase", "result_status", "new_reevaluation_approval_id",
     "unevaluable_reason", "evaluated_at", "evidence_ref", "human_decision", "decided_at"})
-_HEX64 = re.compile(r"[0-9a-f]{64}")
+HEX64 = re.compile(r"[0-9a-f]{64}")
+REPORT_FORMAT = 1
 
 
 def manifest_path(root: Path) -> Path:
@@ -78,18 +79,45 @@ def _aware(value: object) -> bool:
         return False
 
 
-def _entry_problems(entry: object, expected: tuple) -> list[str]:
+def _top_problems(manifest: object, *, version: int, aware) -> list[str]:
+    """top-level の形と版・必須の文字列・時刻の問題 (版 1 と 2 で共通。時刻の判定だけ引数)。"""
+    if not isinstance(manifest, dict) or set(manifest) != _TOP_KEYS:
+        return ["the manifest must have exactly the specified top-level fields"]
+    out: list[str] = []
+    if manifest["schema_version"] != version or (
+            version == SCHEMA_VERSION_V2 and isinstance(manifest["schema_version"], bool)):
+        out.append(f"schema_version must be {version}")
+    for key in ("base_commit", "backup_id", "recorded_by"):
+        if not _nonempty_str(manifest[key]):
+            out.append(f"{key} is required")
+    for key in ("created_at", "updated_at"):
+        if not aware(manifest[key]):
+            out.append(f"{key} must be an aware UTC time")
+    return out
+
+
+def _entries_problem(entries: object) -> str | None:
+    """entries が旧承認 15 件ちょうどか (問題の文言か None)。id は型を問わず文字列で比べ、
+    ハッシュ不能な値でも例外にしない。"""
+    if not isinstance(entries, list) or len(entries) != len(EXPECTED_ENTRIES):
+        return "entries must hold exactly the 15 old approvals"
+    ids = [str(e.get("old_approval_id")) if isinstance(e, dict) else "None" for e in entries]
+    if sorted(ids) != sorted(str(e[0]) for e in EXPECTED_ENTRIES) or len(set(ids)) != 15:
+        return "entries must be exactly the 15 old approvals, with no duplicate or gap"
+    return None
+
+
+def _entry_core_problems(entry: dict, expected: tuple) -> list[str]:
+    """entry 1 行の、版 1 と 2 で共通の検査 (id・名前・hash・pin の型・配備フラグ・語彙)。"""
     approval_id, name, prefix, deployed = expected
     label = f"#{approval_id}"
-    if not isinstance(entry, dict) or set(entry) != _ENTRY_KEYS:
-        return [f"{label}: the entry must have exactly the specified fields"]
     out: list[str] = []
     if entry["old_approval_id"] != approval_id or isinstance(entry["old_approval_id"], bool):
         out.append(f"{label}: old_approval_id differs")
     if entry["name"] != name:
         out.append(f"{label}: name differs")
     for key in ("artifact_hash", "content_hash"):
-        if not isinstance(entry[key], str) or not _HEX64.fullmatch(entry[key]):
+        if not isinstance(entry[key], str) or not HEX64.fullmatch(entry[key]):
             out.append(f"{label}: {key} must be the full 64-character hash")
     if (isinstance(entry["artifact_hash"], str)
             and not entry["artifact_hash"].startswith(prefix)):
@@ -98,11 +126,40 @@ def _entry_problems(entry: object, expected: tuple) -> list[str]:
         out.append(f"{label}: dependency_pins must be an object")
     if entry["deployed_at_inventory"] is not deployed:
         out.append(f"{label}: deployed_at_inventory differs from the inventory")
-    status = entry["result_status"]
-    if status not in RESULT_STATUSES:
+    if entry["result_status"] not in RESULT_STATUSES:
         out.append(f"{label}: result_status is unknown")
     if entry["human_decision"] not in HUMAN_DECISIONS:
         out.append(f"{label}: human_decision is unknown")
+    return out
+
+
+def _deployed_pair_problems(entries: list) -> list[str]:
+    """配備中の同じ版の旧承認 2 行が、同じ結果を記録しているか。"""
+    out: list[str] = []
+    by_version: dict[str, list[dict]] = {}
+    for entry in entries:
+        if entry["deployed_at_inventory"]:
+            by_version.setdefault(entry["artifact_hash"], []).append(entry)
+    for versions in by_version.values():
+        shape = {(e["result_status"], e["new_reevaluation_approval_id"], e["unevaluable_reason"])
+                 for e in versions}
+        if len(versions) != 2 or len(shape) != 1:
+            out.append(f"{versions[0]['name']}: the two old approvals of one deployed version "
+                       "must record the same result")
+    return out
+
+
+def _nonempty_str(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _entry_problems(entry: object, expected: tuple) -> list[str]:
+    approval_id, name, prefix, deployed = expected
+    label = f"#{approval_id}"
+    if not isinstance(entry, dict) or set(entry) != _ENTRY_KEYS:
+        return [f"{label}: the entry must have exactly the specified fields"]
+    out = _entry_core_problems(entry, expected)
+    status = entry["result_status"]
     if deployed:
         if entry["phase"] != "1a":
             out.append(f"{label}: a deployed version belongs to phase 1a")
@@ -138,39 +195,28 @@ def _validate_v1(manifest: object) -> list[str]:
     旧承認 15 件が一致し、配備中 8 行すべてに新しい承認 id か固定の評価不能理由と評価
     時刻・根拠参照があり、同じ版の旧承認 2 行が同じ結果を参照し、非配備 7 行が
     未評価 (phase 1b / deferred) のまま残っていること。"""
+    return _validate_common(manifest, version=SCHEMA_VERSION, aware=_aware,
+                            entry_problems=_entry_problems)
+
+
+def _validate_common(manifest: object, *, version: int, aware, entry_problems) -> list[str]:
+    out = _top_problems(manifest, version=version, aware=aware)
     if not isinstance(manifest, dict) or set(manifest) != _TOP_KEYS:
-        return ["the manifest must have exactly the specified top-level fields"]
-    out: list[str] = []
-    if manifest["schema_version"] != SCHEMA_VERSION:
-        out.append("schema_version must be 1")
-    for key in ("base_commit", "backup_id", "recorded_by"):
-        if not isinstance(manifest[key], str) or not manifest[key].strip():
-            out.append(f"{key} is required")
-    for key in ("created_at", "updated_at"):
-        if not _aware(manifest[key]):
-            out.append(f"{key} must be an aware UTC time")
-    entries = manifest["entries"]
-    if not isinstance(entries, list) or len(entries) != len(EXPECTED_ENTRIES):
-        return out + ["entries must hold exactly the 15 old approvals"]
-    ids = [e.get("old_approval_id") if isinstance(e, dict) else None for e in entries]
-    if sorted(map(str, ids)) != sorted(str(e[0]) for e in EXPECTED_ENTRIES) or len(set(ids)) != 15:
-        out.append("entries must be exactly the 15 old approvals, with no duplicate or gap")
         return out
-    by_id = {e["old_approval_id"]: e for e in entries}
+    entries = manifest["entries"]
+    problem = _entries_problem(entries)
+    if problem is not None:
+        return out + [problem]
+    by_id = {str(e["old_approval_id"]): e for e in entries}
     for expected in EXPECTED_ENTRIES:
-        out += _entry_problems(by_id[expected[0]], expected)
+        out += entry_problems(by_id[str(expected[0])], expected)
     if out:
         return out
-    by_version: dict[str, list[dict]] = {}
-    for entry in entries:
-        if entry["deployed_at_inventory"]:
-            by_version.setdefault(entry["artifact_hash"], []).append(entry)
-    for versions in by_version.values():
-        shape = {(e["result_status"], e["new_reevaluation_approval_id"], e["unevaluable_reason"])
-                 for e in versions}
-        if len(versions) != 2 or len(shape) != 1:
-            out.append(f"{versions[0]['name']}: the two old approvals of one deployed version "
-                       "must record the same result")
+    out += _deployed_pair_problems(entries)
+    if version == SCHEMA_VERSION_V2:
+        refs = [e["audit_ref"] for e in entries if e["audit_ref"] is not None]
+        if len(refs) != len(set(refs)):
+            out.append("two entries point at the same audit report")
     return out
 
 
@@ -255,7 +301,6 @@ def _verify_v1(manifest: dict, conn: sqlite3.Connection, *, no_bars_path: Path) 
 # ---- 版 2 --------------------------------------------------------------------------
 
 _V2_ENTRY_KEYS = _ENTRY_KEYS | {"audit_ref"}
-REPORT_FORMAT = 1
 _MAX_REPORT_BYTES = 4 * 1024 * 1024
 _REPORT_SCOPES = ("in_sample", "holdout")
 _REPORT_PASS, _REPORT_FAIL, _REPORT_UNEVALUABLE = "pass", "fail", "unevaluable"
@@ -264,17 +309,7 @@ _RESULT_STATUS_OF = {_REPORT_PASS: "evaluated", _REPORT_FAIL: "evaluated",
 
 
 def _aware_utc(value: object) -> bool:
-    if not isinstance(value, str):
-        return False
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return False
-    return parsed.tzinfo is not None and parsed.utcoffset() == timedelta(0)
-
-
-def _nonempty_str(value: object) -> bool:
-    return isinstance(value, str) and bool(value.strip())
+    return _aware(value) and datetime.fromisoformat(value).utcoffset() == timedelta(0)
 
 
 def _audit_ref_problem(value: object) -> str | None:
@@ -296,26 +331,8 @@ def _entry_problems_v2(entry: object, expected: tuple) -> list[str]:
     label = f"#{approval_id}"
     if not isinstance(entry, dict) or set(entry) != _V2_ENTRY_KEYS:
         return [f"{label}: the entry must have exactly the specified fields"]
-    out: list[str] = []
-    if entry["old_approval_id"] != approval_id or isinstance(entry["old_approval_id"], bool):
-        out.append(f"{label}: old_approval_id differs")
-    if entry["name"] != name:
-        out.append(f"{label}: name differs")
-    for key in ("artifact_hash", "content_hash"):
-        if not isinstance(entry[key], str) or not _HEX64.fullmatch(entry[key]):
-            out.append(f"{label}: {key} must be the full 64-character hash")
-    if (isinstance(entry["artifact_hash"], str)
-            and not entry["artifact_hash"].startswith(prefix)):
-        out.append(f"{label}: artifact_hash does not start with {prefix}")
-    if not isinstance(entry["dependency_pins"], dict):
-        out.append(f"{label}: dependency_pins must be an object")
-    if entry["deployed_at_inventory"] is not deployed:
-        out.append(f"{label}: deployed_at_inventory differs from the inventory")
+    out = _entry_core_problems(entry, expected)
     status = entry["result_status"]
-    if status not in RESULT_STATUSES:
-        out.append(f"{label}: result_status is unknown")
-    if entry["human_decision"] not in HUMAN_DECISIONS:
-        out.append(f"{label}: human_decision is unknown")
     problem = _audit_ref_problem(entry["audit_ref"])
     if problem is not None:
         out.append(f"{label}: {problem}")
@@ -365,43 +382,8 @@ def _entry_problems_v2(entry: object, expected: tuple) -> list[str]:
 
 
 def _validate_v2(manifest: object) -> list[str]:
-    if not isinstance(manifest, dict) or set(manifest) != _TOP_KEYS:
-        return ["the manifest must have exactly the specified top-level fields"]
-    out: list[str] = []
-    if manifest["schema_version"] != SCHEMA_VERSION_V2 or isinstance(
-            manifest["schema_version"], bool):
-        out.append("schema_version must be 2")
-    for key in ("base_commit", "backup_id", "recorded_by"):
-        if not _nonempty_str(manifest[key]):
-            out.append(f"{key} is required")
-    for key in ("created_at", "updated_at"):
-        if not _aware_utc(manifest[key]):
-            out.append(f"{key} must be an aware UTC time")
-    entries = manifest["entries"]
-    if not isinstance(entries, list) or len(entries) != len(EXPECTED_ENTRIES):
-        return out + ["entries must hold exactly the 15 old approvals"]
-    ids = [e.get("old_approval_id") if isinstance(e, dict) else None for e in entries]
-    if sorted(map(str, ids)) != sorted(str(e[0]) for e in EXPECTED_ENTRIES) or len(set(ids)) != 15:
-        return out + ["entries must be exactly the 15 old approvals, with no duplicate or gap"]
-    by_id = {e["old_approval_id"]: e for e in entries}
-    for expected in EXPECTED_ENTRIES:
-        out += _entry_problems_v2(by_id[expected[0]], expected)
-    if out:
-        return out
-    by_version: dict[str, list[dict]] = {}
-    for entry in entries:
-        if entry["deployed_at_inventory"]:
-            by_version.setdefault(entry["artifact_hash"], []).append(entry)
-    for versions in by_version.values():
-        shape = {(e["result_status"], e["new_reevaluation_approval_id"], e["unevaluable_reason"])
-                 for e in versions}
-        if len(versions) != 2 or len(shape) != 1:
-            out.append(f"{versions[0]['name']}: the two old approvals of one deployed version "
-                       "must record the same result")
-    refs = [e["audit_ref"] for e in entries if e["audit_ref"] is not None]
-    if len(refs) != len(set(refs)):
-        out.append("two entries point at the same audit report")
-    return out
+    return _validate_common(manifest, version=SCHEMA_VERSION_V2, aware=_aware_utc,
+                            entry_problems=_entry_problems_v2)
 
 
 def validate_manifest(manifest: object) -> list[str]:
@@ -462,7 +444,24 @@ def _read_report(report_root: Path, audit_ref: str) -> tuple[dict | None, str | 
         except OSError:
             return None, "the report cannot be opened"
         try:
-            data = os.read(rfd, _MAX_REPORT_BYTES + 1)
+            opened = os.fstat(rfd)
+            if (not stat.S_ISREG(opened.st_mode)
+                    or (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino)):
+                return None, "the report changed while it was read"
+            chunks, total = [], 0
+            while True:
+                chunk = os.read(rfd, min(65536, _MAX_REPORT_BYTES + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > _MAX_REPORT_BYTES:
+                    return None, "the report is too large"
+            if total != st.st_size or os.fstat(rfd).st_size != st.st_size:
+                return None, "the report changed while it was read"
+            data = b"".join(chunks)
+        except OSError:
+            return None, "the report cannot be read"
         finally:
             os.close(rfd)
     finally:
@@ -482,7 +481,7 @@ def _pins_view(pins: dict) -> list:
 
 
 def _report_problems(entry: dict, report: dict, ref: str, no_bars_path: Path) -> list[str]:
-    """report が、その行の版・時刻・結果・理由と一致するか (実行時の記録整合)。"""
+    """report が、その行の版・時刻・結果・理由と一致し、pass の証跡が現在の規則に合うか。"""
     out: list[str] = []
     label = f"#{entry['old_approval_id']}"
 
@@ -560,14 +559,15 @@ def _report_problems(entry: dict, report: dict, ref: str, no_bars_path: Path) ->
             "source": dataset.get("source"), "base_interval": dataset.get("base_interval")} \
             or evidence.get("pairs") != pairs or evidence.get("verdict") != "ready":
         bad("the ready evidence does not belong to this evaluation")
+        return out
+    if not evidence_currently_valid(report, no_bars_path=no_bars_path).ok:
+        bad("the ready evidence does not hold under the current history rules")
     return out
 
 
 def evidence_currently_valid(report: dict, *, no_bars_path: Path):
-    """report の ready 証跡が、現在の方針に今も合うか (記録の整合とは別の問い)。
-
-    後日の方針変更で落ちても歴史 report は無効にならない。再評価済みの事実や rollback の
-    許可と混同しないこと。"""
+    """report の ready 証跡が、現在の方針・無足日一覧に合うか。pass の report の照合
+    (`_report_problems`) が使う。方針が変わった後は、古い pass は照合で落ちる。"""
     history = (report.get("axes") or {}).get("history") or {}
     evaluation = report.get("evaluation") or {}
     dataset = evaluation.get("dataset") or {}

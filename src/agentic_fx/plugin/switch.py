@@ -91,6 +91,14 @@ class GateCheckError(ValueError):
         self.returncode = returncode
 
 
+class IndicatorFixtureReject(ValueError):
+    """kind=indicator の fixture 検査が候補を拒否した。`code` は固定語の判別子。"""
+
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 class PluginBusyError(RuntimeError):
     """ops 要求の deadline 内に plugin flock を取得できなかった。"""
 
@@ -1252,7 +1260,7 @@ class GateFailure:
     """`_run_full_gate` が失敗の直前に記録先へ渡す、構造化された失敗の情報。
 
     `stage` は失敗した段階 (snapshot / source / discovery / contract / indicator_static /
-    pytest / hash / kind_gate / verdict)、`detail` は構造化された判別子
+    pytest / hash / kind_gate / verdict / indicator_fixture)、`detail` は構造化された判別子
     (`GateCheckError.kind`・`SandboxError.code`・gate の `verdict_kind` 等)。
     `rows` はそこまでに集めた gate の行、`mission_outcome` はその行を保存するときの分類
     (保存しない失敗は None)。`message` は診断用で、分類には使わない。"""
@@ -1303,6 +1311,8 @@ def _failure_detail(exc: BaseException) -> str:
 
     if isinstance(exc, GateCheckError):
         return exc.kind
+    if isinstance(exc, IndicatorFixtureReject):
+        return exc.code
     if isinstance(exc, SandboxError):
         return exc.code
     if isinstance(exc, sqlite3.OperationalError):
@@ -1515,10 +1525,16 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
         raise ValueError(f"plugin {name!r}: strategy not evaluable")
 
     if meta.kind == "indicator":
-        outcome = _run_indicator_fixture_stage(
-            conn, meta, name=name, lane=lane, settings=settings,
-            plugins_root=plugins_root, inventory=inventory,
-            static_report=static_report, outcome=outcome, activity=activity)
+        try:
+            outcome = _run_indicator_fixture_stage(
+                conn, meta, name=name, lane=lane, settings=settings,
+                plugins_root=plugins_root, inventory=inventory,
+                static_report=static_report, outcome=outcome, activity=activity)
+        except BaseException as exc:
+            sink(GateFailure(
+                stage="indicator_fixture", error_type=type(exc).__name__,
+                detail=_failure_detail(exc), message=safe_error_text(exc)))
+            raise
     return meta, after_content, after_artifact, outcome
 
 
@@ -1544,14 +1560,16 @@ def _run_indicator_fixture_stage(conn, meta, *, name, lane, settings, plugins_ro
             static_warnings=(static_report.warnings
                              if static_report is not None else ()))
     except indicator_pipeline.IndicatorGateUnavailable as exc:
-        raise ValueError(f"plugin {name!r}: indicator_gate_unavailable") from exc
+        raise IndicatorFixtureReject(
+            f"plugin {name!r}: indicator_gate_unavailable",
+            code="indicator_gate_unavailable") from exc
     if activity is not None:
         for partner, detail in report.unavailable:
             activity.write(
                 Category.APPROVAL, "indicator_partner_unavailable",
                 f"name={name} partner={partner} detail={detail}")
     if not report.ok:
-        raise ValueError(f"plugin {name!r}: {report.code}")
+        raise IndicatorFixtureReject(f"plugin {name!r}: {report.code}", code=str(report.code))
     return dataclass_replace(
         outcome, gate_warnings=report.warnings, similar_to=report.similar_to,
         indicator_report=report)
