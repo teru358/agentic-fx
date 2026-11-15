@@ -607,3 +607,77 @@ def test_stop_event_cancels_waiting_for_core(rig):
         release.set()
         thread.join(5)
     assert _ledger(rig.conn) == []
+
+
+class _StaleAutopilotStore(StateStore):
+    """入口の確認 (load) だけ autopilot が無いと答える。保持中の直接検査が拒むかを見る。"""
+
+    def load(self, **kwargs):
+        from dataclasses import replace
+        return replace(super().load(**kwargs), autopilot=False)
+
+
+def test_autopilot_turned_on_after_the_entry_check_is_caught_under_the_guard(rig):
+    token = _preview(rig)["preview_token"]
+    rig.state.update(autopilot=True)
+    store = _StaleAutopilotStore(rig.state._path)
+    service = rig.env.service(rebase=rig.wiring, state_store=store)
+    with pytest.raises(OpsError) as raised:
+        service.rebase_kill_switch(APPROVER, 1, token)
+    assert raised.value.code is ErrorCode.AUTOPILOT_RESTRICTED
+    assert _ledger(rig.conn) == []
+
+
+# ------------------------------------------------------- 実 UDS の応答
+
+def test_over_the_real_uds_preview_post_and_the_two_new_errors(rig):
+    from ._api import make_api
+    api = make_api(rig.env, service_kwargs={"rebase": rig.wiring})
+    try:
+        client = api.client(Principal.APPROVER)
+        view = client.get("/v1/killswitch/rebase-preview?expected_generation=1")
+        assert view.status_code == 200
+        data = view.json()["data"]
+        assert data["eligible"] is True and len(data["preview_token"]) == 64
+        stale = client.post("/v1/killswitch/rebase",
+                            json={"expected_generation": 1, "preview_token": "0" * 64})
+        assert stale.status_code == 409
+        assert stale.json()["error"]["code"] == "preview_changed"
+        invalid = client.post("/v1/killswitch/rebase",
+                              json={"expected_generation": 1, "preview_token": "nope"})
+        assert invalid.status_code == 400
+        assert api.client(Principal.OPERATOR).get(
+            "/v1/killswitch/rebase-preview?expected_generation=1").status_code == 403
+        assert api.client(Principal.OPERATOR).post(
+            "/v1/killswitch/rebase",
+            json={"expected_generation": 1, "preview_token": "0" * 64}).status_code == 403
+        done = client.post("/v1/killswitch/rebase",
+                           json={"expected_generation": 1,
+                                 "preview_token": data["preview_token"]})
+        assert done.status_code == 200
+        assert set(done.json()["data"]) - {"display_timezone"} == {
+            "rebase_id", "snapshot_id", "generation", "latched"}
+        rig.env.wall.now = datetime(2026, 11, 14, 12, 0, tzinfo=UTC)
+        closed = client.post("/v1/killswitch/rebase",
+                             json={"expected_generation": 1, "preview_token": "0" * 64})
+        assert closed.status_code == 409
+        assert closed.json()["error"]["code"] == "market_closed"
+    finally:
+        for c in api.clients:
+            c.close()
+        api.server.stop(5.0)
+
+
+def test_success_projects_only_the_existing_ops_activity_and_terminal_event(rig):
+    _post(rig, _preview(rig)["preview_token"])
+    text = rig.env.activity_path.read_text(encoding="utf-8")
+    assert "ops_killswitch_rebase" in text and "kill_switch_hwm_rebased" not in text
+    request_id = _rebase_requests(rig.conn)[0]["id"]
+    assert f"audit={request_id} result=ok" in text
+    codes = [r["code"] for r in rig.conn.execute("SELECT code FROM ops_events").fetchall()]
+    assert "ops_request_terminal" in codes
+    assert "guard_state_changed" not in codes and "risk_budget_rebased" not in codes
+    fields = [json.loads(r["fields_json"]) for r in rig.conn.execute(
+        "SELECT fields_json FROM ops_events WHERE code='ops_request_terminal'").fetchall()]
+    assert fields[-1]["endpoint_code"] == "killswitch_rebase"
+    assert not any(k in json.dumps(fields) for k in ("hwm", "cut", "equity"))
