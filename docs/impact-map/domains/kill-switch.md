@@ -106,6 +106,16 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 - **F76** `afx-ops/afx_ops/gate/render.py::wants_ops_event` — OPS_EVENT_SPECS の既定 (guard は有効) か ops_notices が all のとき真。 Resource: `event:guard_state_changed`.
 - **F77** `afx-ops/afx_ops/gate/render.py::render_event` — 検証済み payload を固定 template の一行にし、長すぎれば汎用文へ落とす。mention は設定値から付ける。 Resource: `event:guard_state_changed`.
 - **F78** `afx-ops/afx_ops/notify/runtime.py::_Loop._wants` — improve と取引以外の event (guard・terminal・stream health) は設定を見ず常に配送する。bot の ops_notices による絞込みとは別。 Resource: `event:guard_state_changed`.
+- **F79** `afx-ops/afx_ops/api_client.py::BotClient.events` — bot の event 取得入口。`/v1/events` を after・limit だけで GET し、code を選ばず返す。guard・terminal・stream health は同じ page に混ざって bot へ渡る。 Resource: `event:guard_state_changed`, `event:ops_request_terminal`, `event:event_stream_health`.
+- **F80** `afx-ops/afx_ops/api_client.py::NotifyClient.events` — notify の event 取得入口。bot と同じ GET を principal だけ変えて呼ぶ。読取り専用で actor を付けない。code は選ばない。 Resource: `event:guard_state_changed`, `event:ops_request_terminal`, `event:event_stream_health`.
+- **F81** `afx-ops/afx_ops/events_page.py::parse_page` — bot と notify が共有する page parser。応答形を検査して失敗は注入された failure("events_invalid") で返し、id が読める event を id 順に並べ、high watermark は応答値と最大 id の大きい方、読めない id に当たったら打ち切って件数を返す。code には依存しない。 Resource: `event:guard_state_changed`, `event:ops_request_terminal`, `event:event_stream_health`.
+- **F82** `afx-ops/afx_ops/bot/adapter.py::_event_content` — 通知本文の最終射影。plan の mention と本文を連結し、2000 字を超えたら mention だけを外す。code に依らず全 event の本文がここを通る。 Resource: `event:guard_state_changed`, `event:ops_request_terminal`, `event:event_stream_health`.
+- **F83** `afx-ops/afx_ops/notify/runtime.py::_Loop._deliver` — encode 済み body を retry 経由で注入された送信へ渡す。RetryError は _Failure に写し、event ごとの cursor 保存は呼出し側で行う。 Resource: `event:guard_state_changed`, `event:ops_request_terminal`, `event:event_stream_health`.
+- **F84** `afx-ops/afx_ops/notify/runtime.py::_Loop._deliver.attempt` — retry に注入される callback。self._send(target, body) を実行し、DeliveryError を再試行可否付きの RetryError に写す。 Resource: `event:guard_state_changed`, `event:ops_request_terminal`, `event:event_stream_health`.
+- **F85** `src/agentic_fx/service.py::build_splash` — 起動 splash で state.reconcile_marker() の有無に応じ、確認要求の行を加える。marker を直接読む。 Resource: `marker:reset_marker`.
+- **F86** `src/agentic_fx/loops/improve_loop.py::ImproveLoop._persist_gate_rows` — gate_rows を mission_outcome 付きで save_harness_run へ渡し、harness の metrics (latch 数を含む) を保存する。 Resource: `metric:kill_switch_latches`.
+- **F87** `src/agentic_fx/loops/improve_loop.py::ImproveLoop._persist_ledger_rows` — 受理された run_backtest の result_summary から行引数を射影し、harness metrics を save_harness_run で保存する。 Resource: `metric:kill_switch_latches`.
+- **F88** `src/agentic_fx/plugin/approval.py::run_kind_gate._sink` — harness の行を rows に積み、注入された record_fn があれば同じ行を渡す callback。metrics を含む行がそのまま通る。 Resource: `metric:kill_switch_latches`.
 
 ## K — 守る契約
 
@@ -182,6 +192,18 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 - **E41** `src/agentic_fx/loops/improve_loop.py::ImproveLoop._build_rpc_handlers.run_backtest_handler` → `src/agentic_fx/backtest/holdout.py::run_in_sample`; resource `metric:kill_switch_latches`。改善 loop の run_backtest RPC が in-sample 評価を呼ぶ。E40 へ続く。F27、K-REPLAY。
 - **E42** `src/agentic_fx/plugin/strategy_gate.py::evaluate_strategy_adoption_gate` → `src/agentic_fx/backtest/holdout.py::run_holdout_gate`; resource `metric:kill_switch_latches`。採用 gate が holdout 評価を呼ぶ (in-sample も同様)。run_holdout_gate_fn で差し替え可能。E40 へ続く。F27、K-REPLAY。
 - **E43** `src/agentic_fx/plugin/strategy_gate.py::_build_comparison` → `src/agentic_fx/plugin/strategy_gate.py::_project`; resource `metric:kill_switch_latches`。候補と配備済みの指標を比較表示用の key へ射影する。F66、F67。
+- **E44** `afx-ops/afx_ops/bot/adapter.py::_page` → `afx-ops/afx_ops/events_page.py::parse_page`; resource `event:guard_state_changed`, `event:ops_request_terminal`, `event:event_stream_health`。bot の page wrapper。BotFailure を注入して共通 parser に渡す。F81。
+- **E45** `afx-ops/afx_ops/notify/runtime.py::_page` → `afx-ops/afx_ops/events_page.py::parse_page`; resource `event:guard_state_changed`, `event:ops_request_terminal`, `event:event_stream_health`。notify の page wrapper。_Failure を注入して共通 parser に渡す。F81。
+- **E46** `src/agentic_fx/loops/improve_loop.py::ImproveLoop._persist_gate_rows` → `src/agentic_fx/store/backtest_runs.py::save_harness_run`; resource `metric:kill_switch_latches`。gate の行を harness run として保存する。F86、K-REPLAY。
+- **E47** `src/agentic_fx/loops/improve_loop.py::ImproveLoop._persist_ledger_rows` → `src/agentic_fx/store/backtest_runs.py::save_harness_run`; resource `metric:kill_switch_latches`。台帳の run_backtest 行を harness run として保存する。F87、K-REPLAY。
+- **E48** `src/agentic_fx/loops/improve_loop.py::ImproveLoop._run_strategy_gate` → `src/agentic_fx/plugin/strategy_gate.py::evaluate_strategy_adoption_gate`; resource `metric:kill_switch_latches`。改善候補の採用 gate を呼び、record_fn・evaluation_sink・compare_mode を中継する。E42 へ続く。K-REPLAY。
+- **E49** `src/agentic_fx/plugin/approval.py::run_kind_gate` → `src/agentic_fx/plugin/strategy_gate.py::evaluate_strategy_adoption_gate`; resource `metric:kill_switch_latches`。strategy 分岐で採用 gate を呼び、結果行を _sink 経由で rows と record_fn に流す。F88、E42 へ続く。K-REPLAY。
+- **E50** `src/agentic_fx/plugin/switch.py::_evaluate_deployed` → `src/agentic_fx/plugin/strategy_gate.py::evaluate_strategy_adoption_gate`; resource `metric:kill_switch_latches`。配備済み strategy の再評価入口。record_fn に rows.append を渡して結果行を集める。E42 へ続く。K-REPLAY。
+- **E51** `src/agentic_fx/core/scheduler.py::Scheduler._tick_body` → `src/agentic_fx/service.py::build_app.on_trade_mission`; resource `state:app_state.kill_switch_latched`。trade mission の起動理由と decision_bars を注入 callback に渡す。callback は composition root が配線する。K-LATCH。
+- **E52** `src/agentic_fx/service.py::build_app.on_trade_mission` → `src/agentic_fx/core/supervisor.py::MissionSupervisor.try_submit`; resource `state:app_state.kill_switch_latched`。signal_max_id を固定し、kind=trade と trigger を supervisor に投入する。E51 から続く。K-LATCH。
+- **E53** `src/agentic_fx/core/supervisor.py::MissionSupervisor.try_submit` → `src/agentic_fx/core/supervisor.py::MissionSupervisor._run`; resource `state:app_state.kill_switch_latched`。受理した job を queue に入れ、別 thread の _run が取り出す。直接の呼出しではない。K-LATCH。
+- **E54** `src/agentic_fx/core/supervisor.py::MissionSupervisor._run` → `src/agentic_fx/core/supervisor.py::MissionSupervisor._dispatch`; resource `state:app_state.kill_switch_latched`。queue から取り出した kind と kwargs で _dispatch を実行する。K-LATCH。
+- **E55** `src/agentic_fx/core/supervisor.py::MissionSupervisor._dispatch` → `src/agentic_fx/service.py::build_app._trade_fn`; resource `state:app_state.kill_switch_latched`。kind=trade で trigger と残りの引数を注入された trade_fn に渡す。E25 へ続く。K-LATCH。
 
 ## 影響先と検証記録
 
@@ -1816,6 +1838,310 @@ status の marker 投影と StateStore の全分岐一致は未確認。
       "resource": "metric:kill_switch_latches",
       "ids": [
         "E43"
+      ],
+      "kind": "manual_edge"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/api_client.py::BotClient.events",
+      "resource": "event:guard_state_changed",
+      "ids": [
+        "F79"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/api_client.py::BotClient.events",
+      "resource": "event:ops_request_terminal",
+      "ids": [
+        "F79"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/api_client.py::BotClient.events",
+      "resource": "event:event_stream_health",
+      "ids": [
+        "F79"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/api_client.py::NotifyClient.events",
+      "resource": "event:guard_state_changed",
+      "ids": [
+        "F80"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/api_client.py::NotifyClient.events",
+      "resource": "event:ops_request_terminal",
+      "ids": [
+        "F80"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/api_client.py::NotifyClient.events",
+      "resource": "event:event_stream_health",
+      "ids": [
+        "F80"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/events_page.py::parse_page",
+      "resource": "event:guard_state_changed",
+      "ids": [
+        "F81"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/events_page.py::parse_page",
+      "resource": "event:ops_request_terminal",
+      "ids": [
+        "F81"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/events_page.py::parse_page",
+      "resource": "event:event_stream_health",
+      "ids": [
+        "F81"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/bot/adapter.py::_event_content",
+      "resource": "event:guard_state_changed",
+      "ids": [
+        "F82"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/bot/adapter.py::_event_content",
+      "resource": "event:ops_request_terminal",
+      "ids": [
+        "F82"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/bot/adapter.py::_event_content",
+      "resource": "event:event_stream_health",
+      "ids": [
+        "F82"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/notify/runtime.py::_Loop._deliver",
+      "resource": "event:guard_state_changed",
+      "ids": [
+        "F83"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/notify/runtime.py::_Loop._deliver",
+      "resource": "event:ops_request_terminal",
+      "ids": [
+        "F83"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/notify/runtime.py::_Loop._deliver",
+      "resource": "event:event_stream_health",
+      "ids": [
+        "F83"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/notify/runtime.py::_Loop._deliver.attempt",
+      "resource": "event:guard_state_changed",
+      "ids": [
+        "F84"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/notify/runtime.py::_Loop._deliver.attempt",
+      "resource": "event:ops_request_terminal",
+      "ids": [
+        "F84"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/notify/runtime.py::_Loop._deliver.attempt",
+      "resource": "event:event_stream_health",
+      "ids": [
+        "F84"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "src/agentic_fx/service.py::build_splash",
+      "resource": "marker:reset_marker",
+      "ids": [
+        "F85"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "src/agentic_fx/loops/improve_loop.py::ImproveLoop._persist_gate_rows",
+      "resource": "metric:kill_switch_latches",
+      "ids": [
+        "F86"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "src/agentic_fx/loops/improve_loop.py::ImproveLoop._persist_ledger_rows",
+      "resource": "metric:kill_switch_latches",
+      "ids": [
+        "F87"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "src/agentic_fx/plugin/approval.py::run_kind_gate._sink",
+      "resource": "metric:kill_switch_latches",
+      "ids": [
+        "F88"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/bot/adapter.py::_page",
+      "resource": "event:guard_state_changed",
+      "ids": [
+        "E44"
+      ],
+      "kind": "manual_edge"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/bot/adapter.py::_page",
+      "resource": "event:ops_request_terminal",
+      "ids": [
+        "E44"
+      ],
+      "kind": "manual_edge"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/bot/adapter.py::_page",
+      "resource": "event:event_stream_health",
+      "ids": [
+        "E44"
+      ],
+      "kind": "manual_edge"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/notify/runtime.py::_page",
+      "resource": "event:guard_state_changed",
+      "ids": [
+        "E45"
+      ],
+      "kind": "manual_edge"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/notify/runtime.py::_page",
+      "resource": "event:ops_request_terminal",
+      "ids": [
+        "E45"
+      ],
+      "kind": "manual_edge"
+    },
+    {
+      "symbol": "afx-ops/afx_ops/notify/runtime.py::_page",
+      "resource": "event:event_stream_health",
+      "ids": [
+        "E45"
+      ],
+      "kind": "manual_edge"
+    },
+    {
+      "symbol": "src/agentic_fx/loops/improve_loop.py::ImproveLoop._persist_gate_rows",
+      "resource": "metric:kill_switch_latches",
+      "ids": [
+        "E46"
+      ],
+      "kind": "manual_edge"
+    },
+    {
+      "symbol": "src/agentic_fx/loops/improve_loop.py::ImproveLoop._persist_ledger_rows",
+      "resource": "metric:kill_switch_latches",
+      "ids": [
+        "E47"
+      ],
+      "kind": "manual_edge"
+    },
+    {
+      "symbol": "src/agentic_fx/loops/improve_loop.py::ImproveLoop._run_strategy_gate",
+      "resource": "metric:kill_switch_latches",
+      "ids": [
+        "E48"
+      ],
+      "kind": "manual_edge"
+    },
+    {
+      "symbol": "src/agentic_fx/plugin/approval.py::run_kind_gate",
+      "resource": "metric:kill_switch_latches",
+      "ids": [
+        "E49"
+      ],
+      "kind": "manual_edge"
+    },
+    {
+      "symbol": "src/agentic_fx/plugin/switch.py::_evaluate_deployed",
+      "resource": "metric:kill_switch_latches",
+      "ids": [
+        "E50"
+      ],
+      "kind": "manual_edge"
+    },
+    {
+      "symbol": "src/agentic_fx/core/scheduler.py::Scheduler._tick_body",
+      "resource": "state:app_state.kill_switch_latched",
+      "ids": [
+        "E51"
+      ],
+      "kind": "manual_edge"
+    },
+    {
+      "symbol": "src/agentic_fx/service.py::build_app.on_trade_mission",
+      "resource": "state:app_state.kill_switch_latched",
+      "ids": [
+        "E52"
+      ],
+      "kind": "manual_edge"
+    },
+    {
+      "symbol": "src/agentic_fx/core/supervisor.py::MissionSupervisor.try_submit",
+      "resource": "state:app_state.kill_switch_latched",
+      "ids": [
+        "E53"
+      ],
+      "kind": "manual_edge"
+    },
+    {
+      "symbol": "src/agentic_fx/core/supervisor.py::MissionSupervisor._run",
+      "resource": "state:app_state.kill_switch_latched",
+      "ids": [
+        "E54"
+      ],
+      "kind": "manual_edge"
+    },
+    {
+      "symbol": "src/agentic_fx/core/supervisor.py::MissionSupervisor._dispatch",
+      "resource": "state:app_state.kill_switch_latched",
+      "ids": [
+        "E55"
       ],
       "kind": "manual_edge"
     }
