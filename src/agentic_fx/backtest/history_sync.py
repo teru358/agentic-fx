@@ -588,6 +588,8 @@ class _Run:
                           window_cap=self.lookback + RECENT_EXTRA_WINDOWS, cap_used=cap_used)
         if op.resumed:
             unprocessed = None
+            if op.status in ("ok", "completed_with_conflicts") and prior is not None and prior < op.start:
+                unprocessed = self._unprocessed_days(symbol, max(prior, self.boundary), op.start)
         elif op.status == "deferred" and op.reason == REASON_REQUEST_BUDGET:
             # 上限外の範囲は黙って落とさず、日ごとの未取得として queue に残す。
             first = start if prior is None else min(max(prior, self.boundary), start)
@@ -649,6 +651,7 @@ class _Run:
                 if op.reason == REASON_REQUEST_BUDGET:
                     self.result.deferred_reasons.append(REASON_REQUEST_BUDGET)
                     break
+                self._record_gap_attempt(row, op)
                 if op.reason not in self.result.deferred_reasons:
                     self.result.deferred_reasons.append(op.reason)
                 continue
@@ -663,6 +666,21 @@ class _Run:
         return executed
 
     def _record_gap_attempt(self, row, op: OpResult) -> None:
+        if op.status == "deferred":
+            retry = store.iso(self.now + timedelta(minutes=5))
+            def defer(c):
+                store.record_gap_attempt(
+                    c, source=SOURCE, interval=self.dataset.base_interval, symbol=row["symbol"],
+                    day_utc=row["day_utc"], kind=row["kind"], missing_before=row["missing_count"],
+                    missing_after=None, run_id=self.run_id, now=self.now)
+                c.execute(
+                    "UPDATE history_sync_gaps SET next_retry_at=? WHERE source=? AND interval=? "
+                    "AND symbol=? AND day_utc=? AND kind=? AND "
+                    "(next_retry_at IS NULL OR next_retry_at < ?)",
+                    (retry, SOURCE, self.dataset.base_interval, row["symbol"], row["day_utc"],
+                     row["kind"], retry))
+            self._write_required(f"gap_attempt:{row['symbol']}", defer)
+            return
         if op.status not in ("ok", "completed_with_conflicts"):
             return
         interval = self.dataset.base_interval

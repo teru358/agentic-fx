@@ -737,3 +737,33 @@ def test_the_final_scan_stops_at_e_so_the_margin_slot_is_never_observed(tmp_path
     monkeypatch.setattr(hs, "primary_day_missing", spy)
     result = _run(conn, settings)
     assert ends and set(ends) == {result.e}
+
+
+@pytest.mark.parametrize('previous_attempts', [0, 2])
+def test_until_done_backs_off_insufficient_gap_once_while_other_gaps_progress(tmp_path, previous_attempts):
+    conn, settings = _seeded(tmp_path, months=2)
+    stuck = date(2026, 10, 20)
+    progressing = date(2026, 10, 22)
+    _holes(conn, [stuck, progressing])
+    store.write_txn(conn, lambda c: store.observe_gap(
+        c, source='mt5', interval='15m', symbol=SYMBOL, day_utc=stuck.isoformat(),
+        kind='primary_exact', missing_count=96, run_id='old', now=T), sleep=lambda _s: None)
+    conn.execute("UPDATE history_sync_gaps SET attempts=?, no_improve_count=? WHERE day_utc=?",
+                 (previous_attempts, previous_attempts, stuck.isoformat()))
+    conn.commit()
+    bridge = FakeBridge(drop=lambda _symbol, t: t.date() == date(2026, 10, 19) and t.hour >= 22)
+    result = _run(conn, settings, bridge, until_done=True)
+    gaps = [op for op in result.ops if op.operation == 'gap']
+    stuck_ops = [op for op in gaps if op.day == stuck.isoformat()]
+    assert len(stuck_ops) == 1
+    assert stuck_ops[0].status == 'deferred'
+    assert stuck_ops[0].reason == 'inspection_insufficient'
+    assert any(op.day == progressing.isoformat() and op.status == 'ok' for op in gaps)
+    assert result.subruns < hs.MAX_SUBRUNS
+    row = conn.execute("SELECT * FROM history_sync_gaps WHERE day_utc=? AND kind='primary_exact'",
+                       (stuck.isoformat(),)).fetchone()
+    assert row['state'] == 'open' and row['attempts'] == previous_attempts + 1
+    wait = timedelta(minutes=5) if previous_attempts == 0 else timedelta(hours=24)
+    assert datetime.fromisoformat(row['next_retry_at']) == T + wait
+    assert conn.execute("SELECT COUNT(*) FROM history_sync_series WHERE run_id=? AND operation='gap' AND day_utc=?",
+                        (result.run_id, stuck.isoformat())).fetchone()[0] == 1

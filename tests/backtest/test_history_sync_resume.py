@@ -273,3 +273,70 @@ def test_insufficient_gaps_count_toward_request_budget(tmp_path):
     assert sum(op.requests for op in gaps) == 32
     assert sum(op.reason == 'inspection_insufficient' and op.requests == 2 for op in gaps) == 16
     assert gaps[-1].reason == 'request_budget' and gaps[-1].requests == 0
+
+
+@pytest.mark.parametrize('target', [SYMBOL, 'JP225'])
+def test_interrupted_recent_queues_prior_days_when_resume_completes(tmp_path, monkeypatch, target):
+    from tests.backtest.history_sync_support import REF
+    conn, settings = _seeded(tmp_path, symbols=(SYMBOL, REF))
+    prior = _dt(2026, 11, 3, 12)
+    store.write_txn(conn, lambda c: store.advance_cursor(
+        c, 'mt5', '15m', target, last_processed_e=prior, run_id='old', now=T),
+        sleep=lambda _s: None)
+    original = hs._Run._progress
+    armed = [False]
+
+    def progress(self, series_id, symbol, *args, **kwargs):
+        callback = original(self, series_id, symbol, *args, **kwargs)
+        def on_batch(c, batch):
+            callback(c, batch)
+            if symbol == target:
+                armed[0] = True
+        return on_batch
+
+    def clock():
+        if armed[0] and not conn.in_transaction:
+            raise KeyboardInterrupt()
+        return 0.0
+
+    monkeypatch.setattr(hs._Run, '_progress', progress)
+    with pytest.raises(KeyboardInterrupt):
+        _run(conn, settings, FakeBridge(), run_kw={'max_rows': 50, 'monotonic': clock})
+    checkpoint = conn.execute(
+        "SELECT * FROM history_sync_resume WHERE symbol=? AND op_key='recent'", (target,)
+    ).fetchone()
+    assert checkpoint is not None
+    assert conn.execute("SELECT COUNT(*) FROM history_sync_gaps WHERE symbol=? AND kind='unprocessed'",
+                        (target,)).fetchone()[0] == 0
+    monkeypatch.setattr(hs._Run, '_progress', original)
+    result = _run(conn, settings, FakeBridge())
+    resumed = next(op for op in result.ops if op.symbol == target and op.resumed)
+    assert resumed.status == 'ok' and resumed.end == E
+    assert result.cursors[target] == E.isoformat()
+    days = [r['day_utc'] for r in conn.execute(
+        "SELECT day_utc FROM history_sync_gaps WHERE symbol=? AND kind='unprocessed' ORDER BY day_utc",
+        (target,))]
+    assert days[:6] == ['2026-11-03', '2026-11-04', '2026-11-05',
+                        '2026-11-06', '2026-11-08', '2026-11-09']
+
+
+def test_resumed_queue_stops_at_original_start_when_current_window_moves(tmp_path, monkeypatch):
+    conn, settings, _, first = _partial_run(tmp_path)
+    assert first.ops[0].status == 'partial'
+    original_start = first.ops[0].start
+    store.write_txn(conn, lambda c: store.advance_cursor(
+        c, 'mt5', '15m', SYMBOL, last_processed_e=_dt(2026, 11, 3, 12),
+        run_id='old', now=T), sleep=lambda _s: None)
+    captured = []
+    original = hs._Run._save_unprocessed
+
+    def capture(self, c, symbol, days):
+        if symbol == SYMBOL and days:
+            captured.append(days)
+        return original(self, c, symbol, days)
+
+    monkeypatch.setattr(hs._Run, '_save_unprocessed', capture)
+    result = _run(conn, settings, FakeBridge(), now=T + timedelta(days=1))
+    assert result.ops[0].resumed and result.ops[0].status == 'ok'
+    assert max(datetime.fromisoformat(span[1]) for spans in captured[0].values()
+               for span in spans) == original_start
