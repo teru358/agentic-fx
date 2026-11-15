@@ -49,59 +49,95 @@
 - 正解表について補完者が挙げた注記 (正解表は変えていない): `daily_start_snapshot` は日次損失の基準で DD kill の HWM 入力ではない / `PaperBroker.equity` の relation の向きが読みにくい。T2 の正解表見直しで扱う。
 - 実測 (一回): extract 1.85 秒 (367 file)。初回 run1 は 0.82 秒。cold/warm の反復は T2。
 
-### 非 critical FN (47 件) と処置
+### 非 critical FN と処置 (最終測定 final2 の 83 件)
 
-処置: いずれも表示・読取側の consumer や補助的な literal site で、初回の合格要件 (critical) の外。頁への手動補完は T2 で行う (それまで頁はこの範囲を被覆しないと明示する)。
+処置: いずれも非 critical (表示・読取の consumer、API の中継、補助的な literal site)。初回の合格要件 (critical) の外で、頁への手動補完は T2 で行う。それまで頁はこの範囲を被覆しないと明示する。下表は最終測定の集合そのもの (以前の 47 件の表を置き換えた)。
 
-| resource | symbol |
-|---|---|
-| `activity:kill_switch_latched_durability_uncertain` | `src/agentic_fx/core/executor.py::Executor._notify` |
-| `activity:kill_switch_latched_durability_uncertain` | `src/agentic_fx/core/notifier.py::Notifier.send` |
-| `activity:kill_switch_reset` | `afx-ops/afx_ops/display_time.py::kill_switch_reset` |
-| `activity:kill_switch_reset` | `src/agentic_fx/core/display_time.py::kill_switch_reset` |
-| `activity:kill_switch_reset` | `src/agentic_fx/ops/service.py::OpsService.activity` |
-| `config:risk.drawdown_kill_pct` | `src/agentic_fx/config.py::RiskSettings` |
-| `config:risk.drawdown_kill_pct` | `src/agentic_fx/config.py::Settings._warn_high_drawdown_kill_pct` |
-| `event:event_stream_health` | `src/agentic_fx/ops/events.py::EventStore.emit` |
-| `event:event_stream_health` | `src/agentic_fx/ops/events.py::EventStore.poll` |
-| `event:guard_state_changed` | `src/agentic_fx/ops/events.py::EventStore.poll` |
-| `event:guard_state_changed` | `src/agentic_fx/ops/service.py::OpsService.events_after` |
-| `event:guard_state_changed` | `src/agentic_fx/service.py::_GuardNoticeProbe.__call__` |
-| `event:ops_request_terminal` | `src/agentic_fx/ops/events.py::EventStore.emit` |
-| `event:ops_request_terminal` | `src/agentic_fx/ops/events.py::EventStore.poll` |
-| `event:ops_request_terminal` | `src/agentic_fx/ops/service.py::OpsService._mutate` |
-| `event:ops_request_terminal` | `src/agentic_fx/ops/service.py::OpsService._project` |
-| `event:ops_request_terminal` | `src/agentic_fx/ops/service.py::OpsService.recover_after_journal` |
-| `event:ops_request_terminal` | `src/agentic_fx/service.py::_recover_ops` |
-| `event:ops_request_terminal` | `src/agentic_fx/service.py::build_app` |
-| `marker:reset_marker` | `src/agentic_fx/commands.py::Commands._status` |
-| `marker:reset_marker` | `src/agentic_fx/ops/client.py::format_status` |
-| `metric:kill_switch_latches` | `afx-ops/afx_ops/metric_words.py::metric_items` |
-| `metric:kill_switch_latches` | `afx-ops/afx_ops/web/render.py::_baseline_section` |
-| `metric:kill_switch_latches` | `src/agentic_fx/commands.py::Commands._baseline_comparison_lines` |
-| `metric:kill_switch_latches` | `src/agentic_fx/commands.py::Commands._comparison_metrics_line` |
-| `metric:kill_switch_latches` | `src/agentic_fx/loops/improve_loop.py::ImproveLoop._FLOOR_REPORT_METRIC_KEYS` |
-| `metric:kill_switch_latches` | `src/agentic_fx/loops/improve_loop.py::ImproveLoop._render_comparison_report_detail` |
-| `metric:kill_switch_latches` | `src/agentic_fx/loops/improve_loop.py::ImproveLoop._render_floor_report_detail` |
-| `metric:kill_switch_latches` | `src/agentic_fx/metric_words.py::metric_items` |
-| `metric:kill_switch_latches` | `src/agentic_fx/ops/change.py::_metric_row` |
-| `ops:guard_kind` | `afx-ops/afx_ops/web/render.py::<module>.ACTIVITY_FIELDS` |
-| `ops:guard_lane_not_held` | `src/agentic_fx/ops/service.py::GuardLaneNotHeld` |
-| `ops:guard_lane_not_held` | `src/agentic_fx/ops/service.py::OpsService._guard_notices_in_lane` |
-| `ops:guard_lane_reentry` | `src/agentic_fx/ops/service.py::GuardLaneReentry` |
-| `ops:guard_lane_reentry` | `src/agentic_fx/ops/service.py::OpsService._reject_lane_reentry` |
-| `ops:guard_notice_generation` | `src/agentic_fx/service.py::_build_ops_service.status_provider` |
-| `ops:guard_notice_pending` | `src/agentic_fx/service.py::_build_ops_service.status_provider` |
-| `state:app_state.kill_switch_generation` | `src/agentic_fx/ops/client.py::Runner._op_killswitch_show` |
-| `state:app_state.kill_switch_generation` | `src/agentic_fx/ops/service.py::OpsService.status` |
-| `state:app_state.kill_switch_latched` | `src/agentic_fx/commands.py::Commands._projected_state` |
-| `state:app_state.kill_switch_latched` | `src/agentic_fx/commands.py::Commands._status` |
-| `state:app_state.kill_switch_latched` | `src/agentic_fx/ops/client.py::Runner._op_killswitch_show` |
-| `state:app_state.kill_switch_latched` | `src/agentic_fx/ops/client.py::format_status` |
-| `state:app_state.kill_switch_latched` | `src/agentic_fx/status.py::collect_status` |
-| `state:app_state.kill_switch_latched` | `src/agentic_fx/status.py::render_status` |
-| `state:app_state.kill_switch_latched` | `src/agentic_fx/store/state.py::StateStore.file_value` |
-| `state:app_state.kill_switch_latched_at` | `src/agentic_fx/ops/service.py::OpsService.status` |
+| resource | symbol | relation |
+|---|---|---|
+| `activity:kill_switch_latched` | `afx-ops/afx_ops/web/render.py::render_activity` | consumes |
+| `activity:kill_switch_latched` | `src/agentic_fx/ops/client.py::Runner._op_activity` | consumes |
+| `activity:kill_switch_latched` | `src/agentic_fx/ops/service.py::OpsService.activity` | exposes |
+| `activity:kill_switch_latched` | `src/agentic_fx/status.py::_activity` | consumes |
+| `activity:kill_switch_latched_durability_uncertain` | `afx-ops/afx_ops/web/render.py::render_activity` | consumes |
+| `activity:kill_switch_latched_durability_uncertain` | `src/agentic_fx/core/executor.py::Executor._notify` | invokes |
+| `activity:kill_switch_latched_durability_uncertain` | `src/agentic_fx/core/executor.py::Executor.defer_notifications` | consumes |
+| `activity:kill_switch_latched_durability_uncertain` | `src/agentic_fx/core/notifier.py::Notifier.send` | consumes |
+| `activity:kill_switch_latched_durability_uncertain` | `src/agentic_fx/loops/trade_loop.py::TradeLoop._run_once_impl` | exposes |
+| `activity:kill_switch_latched_durability_uncertain` | `src/agentic_fx/loops/trade_loop.py::TradeLoop._run_signal_mission` | exposes |
+| `activity:kill_switch_latched_durability_uncertain` | `src/agentic_fx/ops/client.py::Runner._op_activity` | consumes |
+| `activity:kill_switch_latched_durability_uncertain` | `src/agentic_fx/ops/service.py::OpsService.activity` | exposes |
+| `activity:kill_switch_latched_durability_uncertain` | `src/agentic_fx/status.py::_activity` | consumes |
+| `activity:kill_switch_reconcile_confirmed` | `afx-ops/afx_ops/web/render.py::render_activity` | consumes |
+| `activity:kill_switch_reconcile_confirmed` | `src/agentic_fx/ops/client.py::Runner._op_activity` | consumes |
+| `activity:kill_switch_reconcile_confirmed` | `src/agentic_fx/ops/service.py::OpsService.activity` | exposes |
+| `activity:kill_switch_reconcile_confirmed` | `src/agentic_fx/status.py::_activity` | consumes |
+| `activity:kill_switch_reconcile_failed` | `afx-ops/afx_ops/web/render.py::render_activity` | consumes |
+| `activity:kill_switch_reconcile_failed` | `src/agentic_fx/ops/client.py::Runner._op_activity` | consumes |
+| `activity:kill_switch_reconcile_failed` | `src/agentic_fx/ops/service.py::OpsService.activity` | exposes |
+| `activity:kill_switch_reconcile_failed` | `src/agentic_fx/status.py::_activity` | consumes |
+| `activity:kill_switch_reconcile_required` | `afx-ops/afx_ops/web/render.py::render_activity` | consumes |
+| `activity:kill_switch_reconcile_required` | `src/agentic_fx/ops/client.py::Runner._op_activity` | consumes |
+| `activity:kill_switch_reconcile_required` | `src/agentic_fx/ops/service.py::OpsService.activity` | exposes |
+| `activity:kill_switch_reconcile_required` | `src/agentic_fx/status.py::_activity` | consumes |
+| `activity:kill_switch_reset` | `afx-ops/afx_ops/display_time.py::kill_switch_reset` | duplicates |
+| `activity:kill_switch_reset` | `src/agentic_fx/core/display_time.py::kill_switch_reset` | produces |
+| `activity:kill_switch_reset` | `src/agentic_fx/ops/client.py::Runner._op_activity` | consumes |
+| `activity:kill_switch_reset` | `src/agentic_fx/ops/service.py::OpsService.activity` | exposes |
+| `activity:kill_switch_reset` | `src/agentic_fx/status.py::_activity` | consumes |
+| `activity:kill_switch_state_uncertain` | `afx-ops/afx_ops/web/render.py::render_activity` | consumes |
+| `activity:kill_switch_state_uncertain` | `src/agentic_fx/ops/client.py::Runner._op_activity` | consumes |
+| `activity:kill_switch_state_uncertain` | `src/agentic_fx/ops/service.py::OpsService.activity` | exposes |
+| `activity:kill_switch_state_uncertain` | `src/agentic_fx/status.py::_activity` | consumes |
+| `config:risk.drawdown_kill_pct` | `src/agentic_fx/config.py::RiskSettings` | schema |
+| `config:risk.drawdown_kill_pct` | `src/agentic_fx/config.py::Settings._warn_high_drawdown_kill_pct` | reads |
+| `config:risk.drawdown_kill_pct` | `src/agentic_fx/service.py::build_splash` | exposes |
+| `event:event_stream_health` | `src/agentic_fx/ops/api_server.py::_call` | invokes |
+| `event:event_stream_health` | `src/agentic_fx/ops/events.py::EventStore.emit` | writes |
+| `event:event_stream_health` | `src/agentic_fx/ops/events.py::EventStore.poll` | reads |
+| `event:guard_state_changed` | `src/agentic_fx/ops/api_server.py::_call` | invokes |
+| `event:guard_state_changed` | `src/agentic_fx/ops/events.py::EventStore.poll` | reads |
+| `event:guard_state_changed` | `src/agentic_fx/ops/service.py::OpsService.events_after` | invokes |
+| `event:guard_state_changed` | `src/agentic_fx/service.py::_GuardNoticeProbe.__call__` | invokes |
+| `event:ops_request_terminal` | `src/agentic_fx/ops/api_server.py::_call` | invokes |
+| `event:ops_request_terminal` | `src/agentic_fx/ops/events.py::EventStore.emit` | writes |
+| `event:ops_request_terminal` | `src/agentic_fx/ops/events.py::EventStore.poll` | reads |
+| `event:ops_request_terminal` | `src/agentic_fx/ops/service.py::OpsService._mutate` | invokes |
+| `event:ops_request_terminal` | `src/agentic_fx/ops/service.py::OpsService._project` | produces |
+| `event:ops_request_terminal` | `src/agentic_fx/ops/service.py::OpsService.recover_after_journal` | produces |
+| `event:ops_request_terminal` | `src/agentic_fx/service.py::_recover_ops` | invokes |
+| `event:ops_request_terminal` | `src/agentic_fx/service.py::build_app` | invokes |
+| `marker:reset_marker` | `src/agentic_fx/commands.py::Commands._status` | reads |
+| `marker:reset_marker` | `src/agentic_fx/ops/client.py::format_status` | exposes |
+| `metric:kill_switch_latches` | `afx-ops/afx_ops/metric_words.py::metric_items` | duplicates |
+| `metric:kill_switch_latches` | `afx-ops/afx_ops/web/render.py::_baseline_section` | reads |
+| `metric:kill_switch_latches` | `src/agentic_fx/commands.py::Commands._baseline_comparison_lines` | invokes |
+| `metric:kill_switch_latches` | `src/agentic_fx/commands.py::Commands._comparison_metrics_line` | reads |
+| `metric:kill_switch_latches` | `src/agentic_fx/loops/improve_loop.py::ImproveLoop._FLOOR_REPORT_METRIC_KEYS` | schema |
+| `metric:kill_switch_latches` | `src/agentic_fx/loops/improve_loop.py::ImproveLoop._render_comparison_report_detail` | reads |
+| `metric:kill_switch_latches` | `src/agentic_fx/loops/improve_loop.py::ImproveLoop._render_floor_report_detail` | reads |
+| `metric:kill_switch_latches` | `src/agentic_fx/metric_words.py::metric_items` | reads |
+| `metric:kill_switch_latches` | `src/agentic_fx/ops/change.py::_metric_row` | reads |
+| `ops:guard_kind` | `afx-ops/afx_ops/web/render.py::<module>.ACTIVITY_FIELDS` | schema |
+| `ops:guard_lane_not_held` | `src/agentic_fx/ops/service.py::GuardLaneNotHeld` | schema |
+| `ops:guard_lane_not_held` | `src/agentic_fx/ops/service.py::OpsService._guard_notices_in_lane` | exposes |
+| `ops:guard_lane_reentry` | `src/agentic_fx/ops/service.py::GuardLaneReentry` | schema |
+| `ops:guard_lane_reentry` | `src/agentic_fx/ops/service.py::OpsService._reject_lane_reentry` | exposes |
+| `state:app_state.kill_switch_generation` | `src/agentic_fx/ops/client.py::Runner._op_killswitch_show` | reads |
+| `state:app_state.kill_switch_generation` | `src/agentic_fx/ops/service.py::OpsService.status` | exposes |
+| `state:app_state.kill_switch_latched` | `afx-ops/afx_ops/web/render.py::<module>.STATUS_FIELDS` | schema |
+| `state:app_state.kill_switch_latched` | `afx-ops/afx_ops/web/render.py::<module>._EMPHASIS` | schema |
+| `state:app_state.kill_switch_latched` | `afx-ops/afx_ops/web/render.py::render_status` | exposes |
+| `state:app_state.kill_switch_latched` | `src/agentic_fx/commands.py::Commands._projected_state` | reads |
+| `state:app_state.kill_switch_latched` | `src/agentic_fx/commands.py::Commands._status` | exposes |
+| `state:app_state.kill_switch_latched` | `src/agentic_fx/ops/client.py::Runner._op_killswitch_show` | reads |
+| `state:app_state.kill_switch_latched` | `src/agentic_fx/ops/client.py::format_status` | exposes |
+| `state:app_state.kill_switch_latched` | `src/agentic_fx/service.py::build_splash` | exposes |
+| `state:app_state.kill_switch_latched` | `src/agentic_fx/status.py::collect_status` | invokes |
+| `state:app_state.kill_switch_latched` | `src/agentic_fx/status.py::render_status` | exposes |
+| `state:app_state.kill_switch_latched` | `src/agentic_fx/store/state.py::StateStore.file_value` | reads |
+| `state:app_state.kill_switch_latched_at` | `src/agentic_fx/commands.py::Commands._dispatch` | reads |
+| `state:app_state.kill_switch_latched_at` | `src/agentic_fx/ops/service.py::OpsService.status` | exposes |
 
 ## 履歴再現 (C4 前の 558cb9fd、§4.3)
 
@@ -144,7 +180,7 @@
 
 - 頁の是正: page_overclaim 8 件を source で確かめて全件是正 (被覆を外す / 入れ子の symbol に直す / 本文の誤読を直す)、`guard_notice_*` を `log:` に直した。補完者の報告で抜取りではなく全件確認。
 - 残る頁の FP 3 件は正解表の漏れ候補 (`log:guard_notice_backfill_skipped` × `OpsService._sweep_kill_switch`、`log:guard_notice_deferred` × `OpsService.emit_pending_notices`、`state:app_state.kill_switch_latched_at` × `StateStore.reset_kill_switch`)。FP は合否条件ではないので、正解表の再変更は重ねず T2 の正解表見直しで扱う。
-- 非 critical FN 83 件は T2 で頁を補完する (それまで頁は被覆しないと明示)。
+- 非 critical FN 83 件は上の「非 critical FN と処置」の表に全件 (T2 で頁を補完)。
 
 ## 初回 T1 の結論 (最終)
 
