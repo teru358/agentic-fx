@@ -566,7 +566,14 @@ class Terminal:
             os.close(self._fd)
             self._fd = -1
 
-    def ask(self, prompt: str) -> str | None:
+    def show(self, text: str) -> None:
+        """確認と同じ端末にだけ書く (stdout へは出さない)。"""
+        view = memoryview(text.encode())
+        while view:
+            view = view[os.write(self._fd, view):]
+
+    def ask(self, prompt: str, *, exact: bool = False) -> str | None:
+        """1 行を読む。exact なら末尾の改行だけを除き、空白・タブはそのまま返す。"""
         os.write(self._fd, prompt.encode())
         data = b""
         while not data.endswith(b"\n"):
@@ -574,7 +581,10 @@ class Terminal:
             if not chunk:
                 return None
             data += chunk
-        return data.decode(errors="replace").strip()
+        text = data.decode(errors="replace")
+        if exact:
+            return text.removesuffix("\n").removesuffix("\r")
+        return text.strip()
 
     def yes(self, prompt: str) -> bool:
         answer = self.ask(f"{prompt} [y/N]: ")
@@ -1806,10 +1816,9 @@ class Runner:
                 raise ClientError(RC_FAILED, text)
             if sent_token is not None and token != sent_token:
                 raise ClientError(RC_FAILED, _REBASE_MOVED)
-            for line in rebase_view.preview_lines(data, generation,
-                                                  lambda value: _when(value, tz)):
-                self.say(line)
-            answer = terminal.ask(rebase_view.confirm_sentence(data, generation))
+            terminal.show("".join(line + "\n" for line in rebase_view.preview_lines(
+                data, generation, lambda value: _when(value, tz))))
+            answer = terminal.ask(rebase_view.confirm_sentence(data, generation), exact=True)
             if answer != f"rebase {generation}":
                 raise ClientError(RC_FAILED, MESSAGES["cancelled"])
             reply = self._post("/v1/killswitch/rebase",

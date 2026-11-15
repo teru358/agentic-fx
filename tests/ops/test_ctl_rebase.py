@@ -66,9 +66,15 @@ class _Typed:
     def __init__(self, *answers):
         self.answers = list(answers)
         self.prompts = []
+        self.shown = []
+        self.exact = []
 
-    def ask(self, prompt):
+    def show(self, text):
+        self.shown.append(text)
+
+    def ask(self, prompt, *, exact=False):
         self.prompts.append(prompt)
+        self.exact.append(exact)
         return self.answers.pop(0) if self.answers else None
 
 
@@ -145,7 +151,8 @@ def test_shows_every_item_the_dto_carries_without_recomputing(tmp_path):
         _ok({"rebase_id": 1, "snapshot_id": 2, "generation": 3, "latched": False})])
     terminal = _Typed("rebase 3")
     runner._op_killswitch_rebase(3, terminal=terminal)
-    shown = out.getvalue() + "".join(terminal.prompts)
+    shown = "".join(terminal.shown) + "".join(terminal.prompts)
+    assert "".join(terminal.shown).strip() not in out.getvalue()
     for text in ("111.11", "22.22", "33.33", "44.44", "555.55", "66.66", "77.77",
                  "1,234.50", "888.80", "999.90", "11.11", "5.50", "id=41", "paper"):
         assert text in shown, text
@@ -175,8 +182,9 @@ def test_cumulative_warning_is_shown_only_when_the_dto_says_so(tmp_path):
         api, out, runner = _runner(tmp_path, [
             _status(), _preview(cumulative_warning=flag), _ok(
                 {"rebase_id": 1, "snapshot_id": 2, "generation": 3, "latched": True})])
-        runner._op_killswitch_rebase(3, terminal=_Typed("rebase 3"))
-        text = out.getvalue()
+        terminal = _Typed("rebase 3")
+        runner._op_killswitch_rebase(3, terminal=terminal)
+        text = "".join(terminal.shown)
         warning = "警告: 累積切下げ率（各回率の合計）が現在の DD 閾値の3倍を超えます。"
         assert (warning in text) is shown
         assert ("過去の損失を受け入れ、追加の損失余地を戻します。" in text) is shown
@@ -328,7 +336,8 @@ def test_untrusted_dto_text_is_sanitized_and_bad_numbers_show_dash(tmp_path):
         _ok({"rebase_id": 1, "snapshot_id": 2, "generation": 3, "latched": True})])
     terminal = _Typed("rebase 3")
     runner._op_killswitch_rebase(3, terminal=terminal)
-    shown = out.getvalue() + "".join(terminal.prompts)
+    shown = "".join(terminal.shown) + "".join(terminal.prompts)
+    assert "".join(terminal.shown).strip() not in out.getvalue()
     assert "\x1b" not in shown
 
 
@@ -344,3 +353,77 @@ def test_reset_success_adds_the_fixed_rebase_guidance_after_the_fixed_warning(tm
     assert lines[-1] == ("HWM を付け直すには `afx ctl --as approver killswitch rebase 3` を"
                          "実行してください")
     assert out.getvalue().count("閾値以上のまま") == 1
+
+
+@pytest.mark.parametrize("answer", [" rebase 3", "rebase 3 ", "rebase\t3", "rebase 3\t",
+                                    "\trebase 3", "rebase 3 \r"])
+def test_surrounding_whitespace_does_not_confirm(tmp_path, answer):
+    api, out, runner = _runner(tmp_path, [_status(), _preview()])
+    terminal = _Typed(answer)
+    with pytest.raises(client.ClientError) as caught:
+        runner._op_killswitch_rebase(3, terminal=terminal)
+    assert caught.value.rc == 1 and "取り消しました" in caught.value.message
+    assert api.posts() == []
+    assert terminal.exact == [True]
+
+
+def _pty_terminal():
+    import os
+    import pty
+    master, slave = pty.openpty()
+    return master, client.Terminal(slave)
+
+
+def _drain(master):
+    import os
+    import select
+    data = b""
+    while select.select([master], [], [], 0.2)[0]:
+        try:
+            chunk = os.read(master, 65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        data += chunk
+    return data.decode(errors="replace")
+
+
+def test_pty_terminal_shows_preview_and_warning_before_the_prompt_and_stdout_stays_empty(tmp_path):
+    import os
+    master, terminal = _pty_terminal()
+    try:
+        api, out, runner = _runner(tmp_path, [_status(), _preview(cumulative_warning=True),
+                                              _ok({"rebase_id": 1, "snapshot_id": 2,
+                                                   "generation": 3, "latched": True})])
+        os.write(master, b"rebase 3\n")
+        assert runner._op_killswitch_rebase(3, terminal=terminal) == 0
+        screen = _drain(master).replace("\r\n", "\n")
+    finally:
+        os.close(master)
+        terminal.close()
+    prompt_at = screen.index("続けるには `rebase 3`")
+    before = screen[:prompt_at]
+    for text in ("LATCHED", "現在 DD=10.00%", "閾値=8.00%", "なし (flat)", "3倍を超えます",
+                 "ラッチを解除しません", "日次損失・総リスク", "閉場中は付け直せません",
+                 "1,000.00", "900.00", "150.00"):
+        assert text in before, text
+    # 金額は stdout (file へ向けられうる側) に出ない。成功の文だけが出る。
+    for text in ("1,000.00", "900.00", "150.00", "10.00%", "flat", "3倍"):
+        assert text not in out.getvalue(), text
+    assert "rebase_id=1" in out.getvalue()
+
+
+@pytest.mark.parametrize("typed,exact,expected", [
+    (" rebase 3 ", True, " rebase 3 "), ("rebase\t3", True, "rebase\t3"),
+    ("rebase 3", True, "rebase 3"), (" reset ", False, "reset"),
+])
+def test_terminal_ask_exact_keeps_whitespace_and_only_drops_the_newline(typed, exact, expected):
+    import os
+    master, terminal = _pty_terminal()
+    try:
+        os.write(master, typed.encode() + b"\n")
+        assert terminal.ask("? ", exact=exact) == expected
+    finally:
+        os.close(master)
+        terminal.close()
