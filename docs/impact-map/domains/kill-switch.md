@@ -1,5 +1,5 @@
 ---
-{"id": "kill-switch", "owner_role": "conductor", "literals": {"marker:reset_marker": [".reset-in-progress"]}, "resources": ["state:app_state.kill_switch_latched", "state:app_state.kill_switch_generation", "state:app_state.kill_switch_latched_at", "marker:reset_marker", "event:guard_state_changed", "event:ops_request_terminal", "event:event_stream_health", "event:guard_notice_deferred", "event:guard_notice_backfill_skipped", "activity:kill_switch_latched", "activity:kill_switch_latched_durability_uncertain", "activity:kill_switch_reset", "activity:kill_switch_reconcile_required", "activity:kill_switch_reconcile_confirmed", "activity:kill_switch_reconcile_failed", "activity:kill_switch_state_uncertain", "db:account_snapshots", "config:risk.drawdown_kill_pct", "metric:kill_switch_latches", "metric:kill_switch_events", "ops:guard_lane_reentry", "ops:guard_lane_not_held", "ops:guard_state_unavailable", "ops:guard_notice_pending", "ops:guard_notice_generation", "ops:guard_kind"], "anchors": ["src/agentic_fx/core/risk_gate.py::evaluate", "src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open", "src/agentic_fx/store/state.py::StateStore.load", "src/agentic_fx/store/state.py::StateStore.update", "src/agentic_fx/store/state.py::StateStore.reset_kill_switch", "src/agentic_fx/store/state.py::StateStore.confirm_latched", "src/agentic_fx/ops/service.py::OpsService.reset_kill_switch", "src/agentic_fx/ops/service.py::OpsService.reconcile_kill_switch", "src/agentic_fx/ops/service.py::plan_kill_switch_notice", "src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch", "src/agentic_fx/ops/service.py::OpsService._guard_step", "src/agentic_fx/ops/service.py::OpsService.emit_pending_guard_notices", "src/agentic_fx/commands.py::Commands.dispatch", "src/agentic_fx/commands.py::Commands._dispatch", "src/agentic_fx/commands.py::Commands._killswitch_reconcile", "src/agentic_fx/commands.py::Commands._data_resume", "src/agentic_fx/ops/service.py::OpsService.resume_data", "src/agentic_fx/ops/events.py::EventStore.emit_best_effort", "src/agentic_fx/ops/events.py::EventStore.emit", "src/agentic_fx/ops/service.py::OpsService._terminal", "src/agentic_fx/service.py::build_app", "src/agentic_fx/ops/service.py::OpsService.emit_pending_notices", "src/agentic_fx/ops/service.py::OpsService._current_state", "src/agentic_fx/core/accounting.py::record_snapshot", "src/agentic_fx/core/accounting.py::current_account", "src/agentic_fx/backtest/runner.py::_auto_release_kill_switch", "src/agentic_fx/backtest/runner.py::run_replay", "src/agentic_fx/backtest/metrics.py::compute_metrics", "afx-ops/afx_ops/gate/render.py::_event_text_for_code", "afx-ops/afx_ops/bot/adapter.py::BotAdapter.deliver_events", "afx-ops/afx_ops/notify/payload.py::encode_event", "afx-ops/afx_ops/notify/runtime.py::_Loop._poll_once", "src/agentic_fx/status.py::read_state", "afx-ops/afx_ops/web/render.py::render_activity", "src/agentic_fx/ops/service.py::OpsService.status", "src/agentic_fx/ops/events.py::<module>.FIELDS", "src/agentic_fx/service.py::_build_ops_service"], "related": ["auto-killswitch-latch-emits-no-event", "killswitch-reset-hwm-rebase", "datafeed-outage-discord-notice", "killswitch-latched-activity-repeats", "bot-gateway-disconnect-is-silent"], "tests": ["tests/store/test_state.py", "tests/core/test_executor.py", "tests/ops/test_ac51_killswitch_api.py", "tests/test_commands.py"]}
+{"id": "kill-switch", "owner_role": "conductor", "literals": {"marker:reset_marker": [".reset-in-progress"]}, "resources": ["state:app_state.kill_switch_latched", "state:app_state.kill_switch_generation", "state:app_state.kill_switch_latched_at", "marker:reset_marker", "event:guard_state_changed", "event:ops_request_terminal", "event:event_stream_health", "log:guard_notice_deferred", "log:guard_notice_backfill_skipped", "activity:kill_switch_latched", "activity:kill_switch_latched_durability_uncertain", "activity:kill_switch_reset", "activity:kill_switch_reconcile_required", "activity:kill_switch_reconcile_confirmed", "activity:kill_switch_reconcile_failed", "activity:kill_switch_state_uncertain", "db:account_snapshots", "config:risk.drawdown_kill_pct", "metric:kill_switch_latches", "metric:kill_switch_events", "ops:guard_lane_reentry", "ops:guard_lane_not_held", "ops:guard_state_unavailable", "ops:guard_notice_pending", "ops:guard_notice_generation", "ops:guard_kind"], "anchors": ["src/agentic_fx/core/risk_gate.py::evaluate", "src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open", "src/agentic_fx/store/state.py::StateStore.load", "src/agentic_fx/store/state.py::StateStore.update", "src/agentic_fx/store/state.py::StateStore.reset_kill_switch", "src/agentic_fx/store/state.py::StateStore.confirm_latched", "src/agentic_fx/ops/service.py::OpsService.reset_kill_switch", "src/agentic_fx/ops/service.py::OpsService.reconcile_kill_switch", "src/agentic_fx/ops/service.py::plan_kill_switch_notice", "src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch", "src/agentic_fx/ops/service.py::OpsService._guard_step", "src/agentic_fx/ops/service.py::OpsService.emit_pending_guard_notices", "src/agentic_fx/commands.py::Commands.dispatch", "src/agentic_fx/commands.py::Commands._dispatch", "src/agentic_fx/commands.py::Commands._killswitch_reconcile", "src/agentic_fx/commands.py::Commands._data_resume", "src/agentic_fx/ops/service.py::OpsService.resume_data", "src/agentic_fx/ops/events.py::EventStore.emit_best_effort", "src/agentic_fx/ops/events.py::EventStore.emit", "src/agentic_fx/ops/service.py::OpsService._terminal", "src/agentic_fx/service.py::build_app", "src/agentic_fx/ops/service.py::OpsService.emit_pending_notices", "src/agentic_fx/ops/service.py::OpsService._current_state", "src/agentic_fx/core/accounting.py::record_snapshot", "src/agentic_fx/core/accounting.py::current_account", "src/agentic_fx/backtest/runner.py::_auto_release_kill_switch", "src/agentic_fx/backtest/runner.py::run_replay", "src/agentic_fx/backtest/metrics.py::compute_metrics", "afx-ops/afx_ops/gate/render.py::_event_text_for_code", "afx-ops/afx_ops/bot/adapter.py::BotAdapter.deliver_events", "afx-ops/afx_ops/notify/payload.py::encode_event", "afx-ops/afx_ops/notify/runtime.py::_Loop._poll_once", "src/agentic_fx/status.py::read_state", "afx-ops/afx_ops/web/render.py::render_activity", "src/agentic_fx/ops/service.py::OpsService.status", "src/agentic_fx/ops/events.py::<module>.FIELDS", "src/agentic_fx/service.py::_build_ops_service", "src/agentic_fx/service.py::_build_ops_service.status_provider", "src/agentic_fx/backtest/runner.py::_kill_switch_event", "src/agentic_fx/store/state.py::<module>._BOOL_FIELDS", "src/agentic_fx/store/state.py::<module>._REQUIRED_KEYS"], "related": ["auto-killswitch-latch-emits-no-event", "killswitch-reset-hwm-rebase", "datafeed-outage-discord-notice", "killswitch-latched-activity-repeats", "bot-gateway-disconnect-is-silent"], "tests": ["tests/store/test_state.py", "tests/core/test_executor.py", "tests/ops/test_ac51_killswitch_api.py", "tests/test_commands.py"]}
 ---
 # Kill switch / guard state
 
@@ -35,18 +35,18 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 - **F07** `src/agentic_fx/ops/service.py::OpsService.reset_kill_switch` — ops lane の mutation 内で操作前・結果・現 state の順に guard step を試す。通知失敗と mutation 結果は分離する。 Resource: `state:app_state.kill_switch_latched`, `event:guard_state_changed`.
 - **F08** `src/agentic_fx/ops/service.py::OpsService.reconcile_kill_switch` — confirm の前・結果・現 state で guard step を試し、finally で通知失敗を処理する。 Resource: `marker:reset_marker`, `event:guard_state_changed`.
 - **F09** `src/agentic_fx/ops/service.py::plan_kill_switch_notice` — 世代と発動時刻を使って該当 incarnation の event を照合。latched 不足を補い、clear は既存 latched がある場合だけ released を補う。released 済みは閉じ、履歴を捏造しない。 Resource: `state:app_state.kill_switch_latched`, `state:app_state.kill_switch_generation`, `state:app_state.kill_switch_latched_at`, `event:guard_state_changed`, `ops:guard_kind`.
-- **F10** `src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch` — lane 所有を要求し、plan に基づき最大一件を guard_kind=kill_switch で発行する (kill switch の guard event を INSERT する唯一の箇所)。発動時刻を not_before とし、閉じた世代の欠落を固定 code で記録する。 Resource: `event:guard_state_changed`, `event:guard_notice_backfill_skipped`, `ops:guard_lane_not_held`, `ops:guard_kind`.
-- **F11** `src/agentic_fx/ops/service.py::OpsService._guard_step` — sweep 例外を捕捉し rollback を試み失敗を記録する。_finish_notices が固定 code を記録し、元の操作に失敗を伝えない。 Resource: `event:guard_notice_deferred`, `event:guard_state_changed`.
+- **F10** `src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch` — lane 所有を要求し、plan に基づき最大一件を guard_kind=kill_switch で発行する (kill switch の guard event を INSERT する唯一の箇所)。発動時刻を not_before とし、閉じた世代の欠落は warning log の固定 code (event ではない) で一度だけ記録する。発動時刻 (latched_at) は event の not_before にだけ渡す。 Resource: `event:guard_state_changed`, `log:guard_notice_backfill_skipped`, `state:app_state.kill_switch_latched_at`, `ops:guard_lane_not_held`, `ops:guard_kind`.
+- **F11** `src/agentic_fx/ops/service.py::OpsService._guard_step` — sweep 例外を捕捉し rollback を試み、失敗は run の旗に立てるだけで、元の操作に失敗を伝えない。固定 code の warning log は後段の _finish_notices が出し、この関数自身は log も event も出さない。 Resource: `event:guard_state_changed`.
 - **F12** `src/agentic_fx/ops/service.py::OpsService.emit_pending_guard_notices` — 公開 wrapper は同一 thread の lane 再入を拒否し、lane 内で after と現在 state を照合する。 Resource: `ops:guard_lane_reentry`, `event:guard_state_changed`.
 - **F13** `src/agentic_fx/commands.py::Commands._dispatch` — (`dispatch` は通知失敗を集める wrapper で、reset の本体はここ) shell reset は store を直接操作し前後に wrapper を呼ぶ。ResetNotApplied も投影 state で通知を試みる。state 不確実は別 activity。 Resource: `activity:kill_switch_reset`, `activity:kill_switch_state_uncertain`, `event:guard_state_changed`.
 - **F14** `src/agentic_fx/commands.py::Commands._killswitch_reconcile` — shell confirm は直接 store を呼び、操作前後に wrapper を呼ぶ。失敗を activity に記録する。 Resource: `marker:reset_marker`, `activity:kill_switch_reconcile_confirmed`, `activity:kill_switch_reconcile_failed`, `event:guard_state_changed`.
-- **F15** `src/agentic_fx/commands.py::Commands._data_resume` — outage.request_resume を直接呼び、ops lane と guard event を経由しない。 Resource: `event:guard_state_changed`.
+- **F15** `src/agentic_fx/commands.py::Commands._data_resume` — outage.request_resume を直接呼び、ops lane と OpsService.resume_data を通らないため guard event を生成しない (D04)。
 - **F16** `src/agentic_fx/ops/service.py::OpsService.resume_data` — 注入 callback の成功後、data_feed の resume_requested を _guard_event で発行する。 Resource: `event:guard_state_changed`, `ops:guard_kind`.
 - **F17** `src/agentic_fx/ops/events.py::EventStore.emit_best_effort` — INSERT 失敗は rollback と失敗集計で隔離し、後の成功時に health event を試す。schema と時刻下限の検証は try の外にある。 Resource: `event:event_stream_health`, `event:guard_state_changed`.
 - **F18** `src/agentic_fx/ops/events.py::EventStore.emit` — schema 検証と INSERT・commit を行い、失敗を呼出し元へ伝える。not_before は event 時刻の下限。 Resource: `event:guard_state_changed`.
 - **F19** `src/agentic_fx/ops/service.py::OpsService._terminal` — mutation の監査終端に対応する terminal event を発行する。guard event とは別である。 Resource: `event:ops_request_terminal`.
 - **F20** `src/agentic_fx/service.py::build_app` — 起動時に reconcile_marker を読み、marker があれば確認要求 activity を記録し、ops service と起動時 sweep を呼ぶ。 Resource: `activity:kill_switch_reconcile_required`, `marker:reset_marker`, `event:guard_state_changed`.
-- **F21** `src/agentic_fx/ops/service.py::OpsService.emit_pending_notices` — 起動時と scheduler tick で lane 内の improve と guard の通知を別々に試す。 Resource: `event:guard_state_changed`, `event:guard_notice_deferred`.
+- **F21** `src/agentic_fx/ops/service.py::OpsService.emit_pending_notices` — 起動時と scheduler tick で lane 内の improve と guard の通知を別々に試す。guard 側の失敗や lane 不獲得は warning log の固定 code (event ではない) で記録し、次の周期に回す。 Resource: `event:guard_state_changed`, `log:guard_notice_deferred`.
 - **F22** `src/agentic_fx/ops/service.py::OpsService._current_state` — state store が無い場合に固定 code を送出し、通常は marker 投影済み state を読む。 Resource: `ops:guard_state_unavailable`, `state:app_state.kill_switch_latched`.
 - **F23** `src/agentic_fx/core/accounting.py::record_snapshot` — live の account snapshot を INSERT する。HWM と equity は DD 入力に関係する。 Resource: `db:account_snapshots`.
 - **F24** `src/agentic_fx/core/accounting.py::current_account` — 最新 snapshot を口座入力に利用する。 Resource: `db:account_snapshots`.
@@ -61,7 +61,7 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 - **F33** `afx-ops/afx_ops/web/render.py::render_activity` — web は activity を描画する。event 配送の成功を表すものではない。 Resource: `activity:kill_switch_reset`.
 - **F34** `src/agentic_fx/ops/service.py::OpsService.status` — status は投影 state と marker の確認情報を返す。 Resource: `state:app_state.kill_switch_latched`, `marker:reset_marker`.
 - **F35** `src/agentic_fx/ops/events.py::<module>.FIELDS` — event 種別ごとの固定 field 表。guard は guard_kind・state・generation、terminal は endpoint_code・result_code・authenticated_principal、stream health は failure_count・first_failed_at・last_failed_at。 Resource: `event:guard_state_changed`, `event:ops_request_terminal`, `event:event_stream_health`, `ops:guard_kind`.
-- **F36** `src/agentic_fx/service.py::_build_ops_service` — read-only pending 投影と data_resume callback を OpsService に配線する。 Resource: `ops:guard_notice_pending`, `ops:guard_notice_generation`, `event:guard_state_changed`.
+- **F36** `src/agentic_fx/service.py::_build_ops_service` — OpsService に read-only pending 投影と data_resume callback を配線する。event の生成は OpsService 側で、この関数は配線だけを行う。status への pending 投影そのものは入れ子の status_provider (F92) にある。
 
 - **F37** `afx-ops/afx_ops/gate/render.py::<module>.OPS_EVENT_SPECS` — guard の既定通知を有効、terminal と stream health を無効として同じ文面関数に登録する。 Resource: `event:guard_state_changed`, `event:ops_request_terminal`, `event:event_stream_health`.
 - **F38** `afx-ops/afx_ops/gate/render.py::_event_text_for_code` — guard_kind と state により kill switch と data feed の文面を分ける。 Resource: `ops:guard_kind`.
@@ -116,6 +116,10 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 - **F86** `src/agentic_fx/loops/improve_loop.py::ImproveLoop._persist_gate_rows` — gate_rows を mission_outcome 付きで save_harness_run へ渡し、harness の metrics (latch 数を含む) を保存する。 Resource: `metric:kill_switch_latches`.
 - **F87** `src/agentic_fx/loops/improve_loop.py::ImproveLoop._persist_ledger_rows` — 受理された run_backtest の result_summary から行引数を射影し、harness metrics を save_harness_run で保存する。 Resource: `metric:kill_switch_latches`.
 - **F88** `src/agentic_fx/plugin/approval.py::run_kind_gate._sink` — harness の行を rows に積み、注入された record_fn があれば同じ行を渡す callback。metrics を含む行がそのまま通る。 Resource: `metric:kill_switch_latches`.
+- **F89** `src/agentic_fx/backtest/runner.py::_kill_switch_event` — replay の latched 遷移の reason を、同時刻・同 kind の activity 行の text で置き換える (無ければ既定文)。activity は replay 内の入力として読むだけ。 Resource: `activity:kill_switch_latched`.
+- **F90** `src/agentic_fx/store/state.py::<module>._BOOL_FIELDS` — kill_switch_latched を bool 型検証の対象にし、parse_state が bool 以外の状態読込を拒否する。 Resource: `state:app_state.kill_switch_latched`.
+- **F91** `src/agentic_fx/store/state.py::<module>._REQUIRED_KEYS` — kill_switch_latched を必須 key にし、欠落した state 文書の読込を parse_state が拒否する。 Resource: `state:app_state.kill_switch_latched`.
+- **F92** `src/agentic_fx/service.py::_build_ops_service.status_provider` — 入れ子の status 生成で guard_notice の (pending, generation) を status の guard_notice_pending / guard_notice_generation に投影する。観測であり判断や event 生成には使わない。 Resource: `ops:guard_notice_pending`, `ops:guard_notice_generation`.
 
 ## K — 守る契約
 
@@ -154,7 +158,7 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 - **E04** `src/agentic_fx/core/executor.py::Executor.handle_intent` → `src/agentic_fx/core/executor.py::Executor._open`; resource `state:app_state.kill_switch_latched`。replay open へ分岐。F02、K-LATCH。
 - **E05** `src/agentic_fx/core/executor.py::Executor._open` → `src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open`; resource `config:risk.drawdown_kill_pct`。共有 gate へ合流。F01–F02、K-LATCH。
 - **E06** `src/agentic_fx/core/executor.py::Executor.open_from_snapshot` → `src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open`; resource `config:risk.drawdown_kill_pct`。live snapshot から共有 gate へ合流。F01–F02、K-LATCH。
-- **E07** `src/agentic_fx/commands.py::Commands._data_resume` → `src/agentic_fx/datafeed/outage.py::OutageStateMachine.request_resume`; resource `event:guard_state_changed`。shell の直接呼出し、event は出さない。F15、D04。
+- **E07** `src/agentic_fx/commands.py::Commands._data_resume` → `src/agentic_fx/datafeed/outage.py::OutageStateMachine.request_resume`; resource なし。shell の直接呼出し。復旧要求を永続化するだけで guard event は出さず、event の生成は API 側 resume_data にだけある (resource なし)。F15、D04。
 - **E08** `src/agentic_fx/service.py::_build_ops_service` → `src/agentic_fx/ops/service.py::OpsService.resume_data`; resource `event:guard_state_changed`。data_resume callback を注入。F16、F36、D04。
 - **E17** `src/agentic_fx/service.py::build_app` → `src/agentic_fx/service.py::_build_ops_service`; resource `event:guard_state_changed`。ops service と callback の構築を委譲。F20、F36、D04。
 - **E09** `src/agentic_fx/ops/service.py::OpsService.resume_data` → `src/agentic_fx/ops/service.py::OpsService._guard_event`; resource `event:guard_state_changed`。callback 成功後に data_feed を通知。F16、D04。
@@ -204,6 +208,7 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 - **E53** `src/agentic_fx/core/supervisor.py::MissionSupervisor.try_submit` → `src/agentic_fx/core/supervisor.py::MissionSupervisor._run`; resource `state:app_state.kill_switch_latched`。受理した job を queue に入れ、別 thread の _run が取り出す。直接の呼出しではない。K-LATCH。
 - **E54** `src/agentic_fx/core/supervisor.py::MissionSupervisor._run` → `src/agentic_fx/core/supervisor.py::MissionSupervisor._dispatch`; resource `state:app_state.kill_switch_latched`。queue から取り出した kind と kwargs で _dispatch を実行する。K-LATCH。
 - **E55** `src/agentic_fx/core/supervisor.py::MissionSupervisor._dispatch` → `src/agentic_fx/service.py::build_app._trade_fn`; resource `state:app_state.kill_switch_latched`。kind=trade で trigger と残りの引数を注入された trade_fn に渡す。E25 へ続く。K-LATCH。
+- **E56** `src/agentic_fx/backtest/runner.py::run_replay` → `src/agentic_fx/backtest/runner.py::_kill_switch_event`; resource `activity:kill_switch_latched`。遷移ごとに activity.entries を渡し、latched の理由を activity の text から取り込む。F26、F89、K-REPLAY。
 
 ## 影響先と検証記録
 
@@ -366,22 +371,6 @@ status の marker 投影と StateStore の全分岐一致は未確認。
         "E03"
       ],
       "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/commands.py::Commands._data_resume",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "E07"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/commands.py::Commands._data_resume",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F15"
-      ],
-      "kind": "page"
     },
     {
       "symbol": "src/agentic_fx/commands.py::Commands._emit_guard_notices",
@@ -573,14 +562,6 @@ status の marker 投影と StateStore の全分岐一致は未確認。
       "kind": "page"
     },
     {
-      "symbol": "src/agentic_fx/datafeed/outage.py::OutageStateMachine.request_resume",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "E07"
-      ],
-      "kind": "manual_edge"
-    },
-    {
       "symbol": "src/agentic_fx/loops/trade_loop.py::TradeLoop._run_once_impl",
       "resource": "state:app_state.kill_switch_latched",
       "ids": [
@@ -662,14 +643,6 @@ status の marker 投影と StateStore の全分岐一致は未確認。
     },
     {
       "symbol": "src/agentic_fx/ops/service.py::OpsService._guard_step",
-      "resource": "event:guard_notice_deferred",
-      "ids": [
-        "F11"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService._guard_step",
       "resource": "event:guard_state_changed",
       "ids": [
         "E10",
@@ -688,7 +661,7 @@ status の marker 投影と StateStore の全分岐一致は未確認。
     },
     {
       "symbol": "src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch",
-      "resource": "event:guard_notice_backfill_skipped",
+      "resource": "log:guard_notice_backfill_skipped",
       "ids": [
         "F10"
       ],
@@ -752,7 +725,7 @@ status の marker 投影と StateStore の全分岐一致は未確認。
     },
     {
       "symbol": "src/agentic_fx/ops/service.py::OpsService.emit_pending_notices",
-      "resource": "event:guard_notice_deferred",
+      "resource": "log:guard_notice_deferred",
       "ids": [
         "F21"
       ],
@@ -900,39 +873,6 @@ status の marker 投影と StateStore の全分岐一致は未確認。
       "resource": "state:app_state.kill_switch_latched_at",
       "ids": [
         "F09"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/service.py::_build_ops_service",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "E08",
-        "E17"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/service.py::_build_ops_service",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F36"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/service.py::_build_ops_service",
-      "resource": "ops:guard_notice_generation",
-      "ids": [
-        "F36"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/service.py::_build_ops_service",
-      "resource": "ops:guard_notice_pending",
-      "ids": [
-        "F36"
       ],
       "kind": "page"
     },
@@ -2144,6 +2084,62 @@ status の marker 投影と StateStore の全分岐一致は未確認。
         "E55"
       ],
       "kind": "manual_edge"
+    },
+    {
+      "symbol": "src/agentic_fx/backtest/runner.py::_kill_switch_event",
+      "resource": "activity:kill_switch_latched",
+      "ids": [
+        "F89"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "src/agentic_fx/backtest/runner.py::run_replay",
+      "resource": "activity:kill_switch_latched",
+      "ids": [
+        "E56"
+      ],
+      "kind": "manual_edge"
+    },
+    {
+      "symbol": "src/agentic_fx/store/state.py::<module>._BOOL_FIELDS",
+      "resource": "state:app_state.kill_switch_latched",
+      "ids": [
+        "F90"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "src/agentic_fx/store/state.py::<module>._REQUIRED_KEYS",
+      "resource": "state:app_state.kill_switch_latched",
+      "ids": [
+        "F91"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch",
+      "resource": "state:app_state.kill_switch_latched_at",
+      "ids": [
+        "F10"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "src/agentic_fx/service.py::_build_ops_service.status_provider",
+      "resource": "ops:guard_notice_pending",
+      "ids": [
+        "F92"
+      ],
+      "kind": "page"
+    },
+    {
+      "symbol": "src/agentic_fx/service.py::_build_ops_service.status_provider",
+      "resource": "ops:guard_notice_generation",
+      "ids": [
+        "F92"
+      ],
+      "kind": "page"
     }
   ]
 }
