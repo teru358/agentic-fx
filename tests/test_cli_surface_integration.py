@@ -155,7 +155,7 @@ Plugin を採否・配備する:
 
 保護状態を回復する:
   [読取] killswitch reset
-  [変更] [確認] [approver] killswitch reset <世代> / killswitch reconcile [confirm]
+  [変更] [確認] [approver] killswitch reset <世代> / killswitch reconcile [confirm] / killswitch rebase <世代>
   [変更] [確認] [approver] data resume [--acknowledge]
 
 互換名: improve add <idea> / approvals list / approvals show / approval <id> / retry <id>
@@ -552,6 +552,7 @@ _CTL_GRAMMAR = {
     "afx ctl killswitch reset": (["killswitch", "reset"], "killswitch_show"),
     "afx ctl killswitch reset <generation>": (["killswitch", "reset", "7"], "killswitch_reset"),
     "afx ctl killswitch reconcile [confirm]": (["killswitch", "reconcile"], "killswitch_reconcile"),
+    "afx ctl killswitch rebase <generation>": (["killswitch", "rebase", "7"], "killswitch_rebase"),
     "afx ctl data resume [--acknowledge]": (["data", "resume"], "data_resume"),
     "afx stop": (["stop"], "stop"),
 }
