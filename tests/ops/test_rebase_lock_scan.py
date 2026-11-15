@@ -210,6 +210,25 @@ def test_unresolved_calls_are_audited():
     assert scan.unresolved_calls(index) == ["synthetic0.py:f worker.run() (with)"]
 
 
+def test_unresolved_call_count_is_kept_so_a_duplicate_added_in_the_same_region_is_red():
+    one = _synthetic("def f(self, worker):\n    with self._core_lock:\n        worker.run()\n")
+    two = _synthetic("def f(self, worker):\n    with self._core_lock:\n"
+                     "        worker.run()\n        worker.run()\n")
+    assert scan.unresolved_calls(one) == ["synthetic0.py:f worker.run() (with)"]
+    assert scan.unresolved_calls(two) == ["synthetic0.py:f worker.run() (with) x2"]
+    assert scan.unresolved_calls(one) != scan.unresolved_calls(two)
+
+
+def test_unresolved_call_list_ignores_unrelated_line_shifts_but_not_a_duplicate():
+    base = "def f(self, worker):\n    with self._core_lock:\n        worker.run()\n"
+    shifted = "x = 1\n\n\n" + base
+    assert scan.unresolved_calls(_synthetic(shifted)) == scan.unresolved_calls(_synthetic(base))
+    other_form = ("def f(self, worker):\n    with self._core_lock:\n        worker.run()\n"
+                  "    with self._core_lock:\n        worker.run()\n")
+    assert scan.unresolved_calls(_synthetic(other_form)) == [
+        "synthetic0.py:f worker.run() (with) x2"]
+
+
 UNRESOLVED_CALLS = [
     'loops/reflection_cycle.py:ReflectionCycle._consume_attempt self.clock.now() (with)',
     'loops/reflection_cycle.py:ReflectionCycle._reflect_one Mission(prompt=prompt, tools=[], output_schema=_SCHEMA, max_turns=2, timeout_sec=self.settings.llama_swap.timeout_sec) (with)',
@@ -239,9 +258,9 @@ UNRESOLVED_CALLS = [
     "loops/trade_loop.py:TradeLoop._run_once_impl missions.start(self.conn, 'trade', self.settings.runner.trade.backend, self.settings.runner.trade.model, now, trigger=trigger) (with)",
     "loops/trade_loop.py:TradeLoop._run_once_impl self.activity.write(Category.AGGREGATE, 'intent_execution_failed', safe_error_text(e) + self._market_tool_calls_suffix(result), ref_id=str(mid)) (with)",
     "loops/trade_loop.py:TradeLoop._run_once_impl self.activity.write(Category.TRADE, 'gate_rejected', reason, ref_id=str(iid)) (with)",
-    "loops/trade_loop.py:TradeLoop._run_once_impl self.activity.write(Category.TRADE, 'gate_rejected', reasons[0], ref_id=str(iid)) (with)",
+    "loops/trade_loop.py:TradeLoop._run_once_impl self.activity.write(Category.TRADE, 'gate_rejected', reasons[0], ref_id=str(iid)) (with) x2",
     'loops/trade_loop.py:TradeLoop._run_once_impl self.clock.now() (with)',
-    'loops/trade_loop.py:TradeLoop._run_once_impl str(iid) (with)',
+    'loops/trade_loop.py:TradeLoop._run_once_impl str(iid) (with) x3',
     'loops/trade_loop.py:TradeLoop._run_once_impl str(mid) (with)',
     'loops/trade_loop.py:TradeLoop._run_once_impl tuple((event.id for event in view.active)) (with)',
     'loops/trade_loop.py:TradeLoop._run_signal_mission Mission(prompt=prompt, tools=list(SIGNAL_DECISION_TOOLS), output_schema=DECISION_SCHEMA, max_turns=self.settings.llama_swap.max_turns, timeout_sec=self.settings.llama_swap.timeout_sec) (with)',
@@ -249,7 +268,7 @@ UNRESOLVED_CALLS = [
     "loops/trade_loop.py:TradeLoop._run_signal_mission MissionResult('failed', {'detail': 'invalid_reject_code'}, result.transcript) (with)",
     'loops/trade_loop.py:TradeLoop._run_signal_mission datetime.fromisoformat(fresh_until) (with)',
     "loops/trade_loop.py:TradeLoop._run_signal_mission deferred_notifications.append(f'[agentic-fx] 注文処理失敗: {reason}') (with)",
-    'loops/trade_loop.py:TradeLoop._run_signal_mission isinstance(parsed, Accept) (with)',
+    'loops/trade_loop.py:TradeLoop._run_signal_mission isinstance(parsed, Accept) (with) x2',
     'loops/trade_loop.py:TradeLoop._run_signal_mission list(SIGNAL_DECISION_TOOLS) (with)',
     "loops/trade_loop.py:TradeLoop._run_signal_mission missions.start(self.conn, 'trade', self.settings.runner.trade.backend, self.settings.runner.trade.model, now, trigger='signal') (with)",
     "loops/trade_loop.py:TradeLoop._run_signal_mission self.activity.write(Category.AGGREGATE, 'intent_execution_failed', reason, ref_id=str(mid)) (with)",
@@ -262,7 +281,7 @@ UNRESOLVED_CALLS = [
     'loops/trade_loop.py:TradeLoop._run_signal_mission self.executor.state_fn() (with)',
     "loops/trade_loop.py:TradeLoop._run_signal_mission str(claimed['id']) (with)",
     'loops/trade_loop.py:TradeLoop._run_signal_mission str(mid) (with)',
-    'loops/trade_loop.py:TradeLoop._run_signal_mission str(signal_id) (with)',
+    'loops/trade_loop.py:TradeLoop._run_signal_mission str(signal_id) (with) x4',
     'ops/service.py:OpsService._rebase_under_core min(deadline, self._monotonic() + self._REBASE_HOLD_SECONDS) (acquire)',
     'ops/service.py:OpsService._rebase_under_core self._monotonic() (acquire)',
     'ops/service.py:OpsService._rebase_under_core stack.enter_context(self._conn.waiting_until(hold)) (acquire)',
@@ -280,10 +299,10 @@ UNRESOLVED_CALLS = [
     'store/state.py:StateStore.confirm_latched self._clock.now().astimezone(timezone.utc).isoformat() (with)',
     'store/state.py:StateStore.reset_kill_switch GenerationMismatch(current.kill_switch_generation, current.kill_switch_latched_at) (with)',
     'store/state.py:StateStore.reset_kill_switch NotLatched() (with)',
-    "store/state.py:StateStore.reset_kill_switch ResetNotApplied('kill switch reset did not finish; marker kept') (with)",
+    "store/state.py:StateStore.reset_kill_switch ResetNotApplied('kill switch reset did not finish; marker kept') (with) x2",
     "store/state.py:StateStore.reset_kill_switch StateUncertain('a previous reset did not finish; run `killswitch reconcile`') (with)",
     'store/state.py:StateStore.reset_kill_switch replace(current, kill_switch_latched=False) (with)',
-    "store/state.py:StateStore.update changes.get('kill_switch_latched') (with)",
+    "store/state.py:StateStore.update changes.get('kill_switch_latched') (with) x2",
     'store/state.py:StateStore.update replace(current, **changes) (with)',
     'store/state.py:StateStore.update self._clock.now() (with)',
     'store/state.py:StateStore.update self._clock.now().astimezone(timezone.utc) (with)',
