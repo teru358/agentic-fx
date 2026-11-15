@@ -469,7 +469,8 @@ def collect(root: Path, settings: Any, conn: sqlite3.Connection | None, tz: str,
                 base_interval=dataset.base_interval),
                 HistorySync(SyncState.NOT_APPLICABLE, now, source=dataset.source,
                             base_interval=dataset.base_interval,
-                            effective_reason="source_not_mt5"))
+                            effective_reason="source_not_mt5",
+                            executor_unsupported=getattr(settings.datafeed.mt5, "history_executor_url", None) is not None))
         if conn is None:
             return unavailable(now, unavailable_reason or ReasonCode.DATABASE_UNAVAILABLE)
         grace = timedelta(seconds=settings.datafeed.closed_bar_grace_sec)
@@ -628,7 +629,9 @@ def render(status: HistoryStatus, tz: str) -> tuple[str, ...]:
     """表示 tz の文字列行。構造化結果の値を並べるだけで判定はしない。"""
     h = status.evaluation_history
     if h.state is State.NOT_CONFIGURED:
-        return ("evaluation history: not configured (backtest.eval_source is none)",)
+        return ("evaluation history: not configured (backtest.eval_source is none)",
+                *(render_sync(status.history_sync, tz) if isinstance(status.history_sync, HistorySync)
+                  and status.history_sync.executor_unsupported else ()))
     if h.state is State.UNAVAILABLE and h.source is None:
         return (UNAVAILABLE_LINE, f"  reason: {h.reason_code.value}",
                 *(f"  next: {_NEXT_TEXT[a]}" for a in h.next_actions or _next_actions(h.state)))

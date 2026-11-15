@@ -361,3 +361,10 @@ def test_the_dto_states_use_the_design_words_and_the_renderer_keeps_the_display_
     assert result.evaluation_history.state.value == "stale"
     assert "evaluation history: history_stale" in "\n".join(status_history.render(result, "UTC"))
     assert status_history.State("gap") is status_history.State.GAP
+
+
+def test_unconfigured_source_reports_executor_unsupported(world):
+    settings = _settings(eval_source="none")
+    settings.datafeed.mt5.history_executor_url = "https://history.example.invalid"
+    result = status_history.collect(world[0], settings, None, "UTC", NOW)
+    assert status_history.EXECUTOR_UNSUPPORTED_LINE in "\n".join(status_history.render(result, "UTC"))
