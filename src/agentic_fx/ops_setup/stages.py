@@ -22,7 +22,7 @@ from agentic_fx.store.instance_lock import InstanceAlreadyRunning, acquire_insta
 from . import interfaces as interface_listing
 from .feature_config import InterfaceLookupFailed, collect, web_access_reason
 from .probe import run_probe
-from .systemd import _BETWEEN_STATES, _STOPPED_STATES, _UP_STATES, Systemd, SystemdError
+from .systemd import AFX_RUNNING, AFX_STOPPED, Systemd, SystemdError
 from .write_key import KEY_MISMATCH_CODES, Inconsistent, check_write_key_consistency, stage_mode
 from .units import (OpsExecNotFound, UnitPaths, atomic_write, bot_dropin_exact, bot_systemd_problem, install_units,
                     remove_durably, resolve_ops_exec, uninstall_feature, units_match)
@@ -43,7 +43,7 @@ _STAGES = {"enable": _ENABLE_ORDER, "disable": _DISABLE_ORDER}
 Hook = Callable[[str], None]
 _KEY_MISMATCH_CODES = KEY_MISMATCH_CODES
 # enable 前に afx がこの状態だったときだけ、enable の最後に afx を起こす。
-_AFX_RUNNING = frozenset({"active", "activating", "reloading"})
+_AFX_RUNNING = AFX_RUNNING
 
 
 class SystemdPort(Protocol):
@@ -191,7 +191,7 @@ def _config_complete(root: Path, feature: str) -> bool:
 
 
 _RECOVERY_MAX_BYTES = 4096
-_RECOVERY_STATES = _STOPPED_STATES | _UP_STATES | _BETWEEN_STATES
+_RECOVERY_STATES = AFX_STOPPED | AFX_RUNNING
 _RECOVERY_KEYS = frozenset({"version", "afx_before_stop"})
 
 
@@ -252,7 +252,7 @@ def read_write_recovery(root: Path) -> dict[str, Any] | None:
     if type(data["version"]) is not int or data["version"] != 1:
         raise _recovery_invalid(root, "version が 1 でない")
     if not isinstance(data["afx_before_stop"], str) or data["afx_before_stop"] not in _RECOVERY_STATES:
-        raise _recovery_invalid(root, "afx_before_stop が既知の ActiveState でない")
+        raise _recovery_invalid(root, "afx_before_stop が停止 (inactive / failed) か稼働 (active / activating / reloading) でない")
     return data
 
 

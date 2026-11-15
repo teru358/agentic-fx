@@ -234,14 +234,38 @@ def test_a_resumed_recovery_with_a_running_afx_asks_again_and_a_non_tty_cannot_a
 
 
 @pytest.mark.parametrize("value, started", [("active", True), ("activating", True), ("reloading", True),
-                                            ("inactive", False), ("failed", False), ("unknown", False),
-                                            ("deactivating", False), ("refreshing", False), ("maintenance", False)])
+                                            ("inactive", False), ("failed", False)])
 def test_only_a_running_state_before_the_stop_makes_the_recovery_start_afx(tmp_path, monkeypatch, value, started):
     bundle = prepared(tmp_path, monkeypatch, "disabled", "ro_key_active", "inactive")
     put_record(bundle, value)
     result, _ = run(bundle, False)
     assert result.rc == 0, result
     assert bool(starts(bundle)) is started and record_of(bundle) is None
+
+
+@pytest.mark.parametrize("value", ["unknown", "deactivating", "refreshing", "maintenance"])
+def test_a_recorded_state_that_is_neither_stopped_nor_running_is_invalid(tmp_path, monkeypatch, value):
+    bundle = prepared(tmp_path, monkeypatch, "disabled", "ro_key_active", "inactive")
+    put_record(bundle, value)
+    before = world(bundle)
+    result, _ = run(bundle, False)
+    assert (result.rc, result.reason_code) == (1, "write_recovery_invalid")
+    assert world(bundle) == before
+
+
+@pytest.mark.parametrize("value", ["unknown", "deactivating", "refreshing", "maintenance"])
+def test_a_transient_afx_state_stops_before_the_record_is_made(tmp_path, monkeypatch, value):
+    bundle = prepared(tmp_path, monkeypatch, "disabled", "ro_key_active", "inactive")
+    bundle.systemd.afx_state = value
+    bundle.systemd.calls.clear()
+    before = world(bundle)
+    result, io = run(bundle, False)
+    assert (result.rc, result.reason_code) == (1, "afx_state_transient")
+    assert "落ち着いてから" in "".join(io.err)
+    assert world(bundle) == before and record_of(bundle) is None and io.asked == []
+    assert [c for c in bundle.systemd.calls if c[0] in ("stop", "start")] == []
+    bundle.systemd.afx_state = "inactive"
+    assert run(bundle, False)[0].rc == 0
 
 
 def test_a_start_that_does_not_end_in_a_running_state_keeps_the_record(tmp_path, monkeypatch):
@@ -447,8 +471,9 @@ def test_a_record_beside_an_enabled_or_unfinished_web_stage_is_refused_unchanged
     bundle = make(tmp_path, monkeypatch)
     put_record(bundle)
     before = world(bundle)
-    result, _ = run(bundle, True)
+    result, io = run(bundle, True)
     assert (result.rc, result.reason_code) == (1, "invalid_state") and world(bundle) == before
+    assert "web.write-recovery.json" in "".join(io.err) and "手で確かめる" in "".join(io.err)
 
 
 # --- 記録の厳密な読取り -------------------------------------------------------------------------------------
@@ -474,9 +499,8 @@ def test_a_malformed_record_is_invalid(tmp_path, monkeypatch, raw):
     assert caught.value.reason == "write_recovery_invalid" and "web.write-recovery.json" in caught.value.detail
 
 
-@pytest.mark.parametrize("value", ["active", "reloading", "refreshing", "inactive", "failed", "unknown",
-                                   "activating", "deactivating", "maintenance"])
-def test_every_known_active_state_is_accepted(tmp_path, monkeypatch, value):
+@pytest.mark.parametrize("value", ["active", "reloading", "inactive", "failed", "activating"])
+def test_every_stopped_or_running_state_is_accepted(tmp_path, monkeypatch, value):
     bundle = prepared(tmp_path, monkeypatch)
     put_record(bundle, value)
     assert read_write_recovery(bundle.root) == {"version": 1, "afx_before_stop": value}
@@ -698,3 +722,25 @@ def test_a_new_setup_resumes_from_the_files_and_the_manager_state_alone(tmp_path
     assert consistent(bundle, False)
     assert len(starts(bundle)) == (1 if afx == "active" else 0)
     assert bundle.systemd.afx_state == afx
+
+
+def test_a_resume_with_nothing_to_align_does_not_need_the_read_key(tmp_path, monkeypatch):
+    bundle = prepared(tmp_path, monkeypatch, "disabled", "ro_key_active", "active")
+    _crash_at(bundle, "after_unmark", False)
+    assert read_marker(bundle.root) is None and consistent(bundle, False) and record_of(bundle) is not None
+    _revoke_read_key(bundle)
+    bundle.systemd.calls.clear()
+    result, _ = run(bundle, False)
+    assert result.rc == 0 and record_of(bundle) is None and len(starts(bundle)) == 1
+    assert bundle.systemd.afx_state == "active"
+
+
+def test_a_resume_that_still_has_to_move_keys_checks_the_read_key_first(tmp_path, monkeypatch):
+    bundle = prepared(tmp_path, monkeypatch, "disabled", "ro_key_active", "active")
+    _crash_at(bundle, "after_stop", False)
+    _revoke_read_key(bundle)
+    bundle.systemd.calls.clear()
+    before = world(bundle)
+    result, _ = run(bundle, False)
+    assert (result.rc, result.reason_code) == (1, "principal_key_mismatch")
+    assert afx_calls(bundle, "stop") == [] and world(bundle) == before and record_of(bundle) is not None

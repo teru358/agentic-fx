@@ -21,8 +21,8 @@ from agentic_fx.ops_setup.feature_config import (_WEB_ACCESS, is_loopback, web_a
 from agentic_fx.ops_setup.stages import (_AFX_RUNNING, _ENABLE_TERMINAL, _KEY_MISMATCH_CODES, _WRITE_PRINCIPALS,
                                          InvalidState, OpsSetup, StageResult, _remove_marker, _describe,
                                          _write_stage, read_marker, read_stage, read_write_recovery,
-                                         remove_write_recovery, write_write_recovery)
-from agentic_fx.ops_setup.systemd import SystemdError
+                                         remove_write_recovery, write_recovery_path, write_write_recovery)
+from agentic_fx.ops_setup.systemd import AFX_RUNNING, AFX_STOPPED, SystemdError
 from agentic_fx.ops_setup.web_setup import WRITE_CHANGE_GUIDANCE
 from agentic_fx.ops_setup.write_key import (CONFIG_PATH, RECOVERY, Consistent, Inconsistent,
                                             check_write_key_consistency, stage_mode)
@@ -35,7 +35,7 @@ CONFIG_GUIDANCE = ("loopback の bind と Basic 認証にする: afx ops web rec
                    "--password-file <file>")
 UNREADABLE_GUIDANCE = f"ops.toml が構文か schema の検査を通らない。対象は {CONFIG_PATH}。{RECOVERY}"
 _MAX_KEY_PASSES = 4
-_AFX_DOWN = frozenset({"inactive", "failed"})
+_AFX_DOWN = AFX_STOPPED
 
 
 def _mismatch(setup: OpsSetup, state: dict[str, Any], principal: Principal, code: str) -> InvalidState:
@@ -164,10 +164,15 @@ def _recover_idle(setup: OpsSetup, saved: dict[str, Any] | None, record: dict[st
             raise InvalidState(verdict.reason, verdict.guidance)
     state: dict[str, Any] = {"feature": "web", "operation": "disable", "stage": "disabled", "unrecorded": True}
     setup._check_key_dir()
-    check_read_key(setup, state, target, required=saved is not None)
+    required = saved is not None
     confirmed = False
     if record is None:
+        # 新規の回復は必ず鍵を動かす分岐に入るので、記録を作る前に読取鍵まで検査する。
+        check_read_key(setup, state, target, required=required)
         before = _afx_state(setup)
+        if before not in AFX_STOPPED | AFX_RUNNING:
+            raise InvalidState("afx_state_transient", f"afx の ActiveState が {before} で遷移中か未知。"
+                               "afx の状態が落ち着いてから同じコマンドを再実行する")
         if before in _AFX_RUNNING and confirm is not None:
             if not confirm():
                 raise InvalidState("setup_aborted")
@@ -181,6 +186,7 @@ def _recover_idle(setup: OpsSetup, saved: dict[str, Any] | None, record: dict[st
     lock = None
     try:
         if verdict != Consistent(target) or read_marker(root) is not None:
+            check_read_key(setup, state, target, required=required)
             now = _afx_state(setup)
             if before in _AFX_DOWN and now not in _AFX_DOWN:
                 raise InvalidState("write_recovery_afx_running", _afx_running_detail(setup))
@@ -243,7 +249,8 @@ def _switch(setup: OpsSetup, target: bool, confirm: Callable[[], bool] | None) -
     record = read_write_recovery(root)
     if record is not None or stage_mode(saved) == "idle":
         if stage_mode(saved) != "idle":
-            raise InvalidState("invalid_state")
+            raise InvalidState("invalid_state", f"path={write_recovery_path(root)} 回復の記録があるのに web の stage が"
+                               "無効 (idle) でない。afx を止めて stage file と記録の内容を手で確かめる")
         return _recover_idle(setup, saved, record, target, confirm)
     if not (saved["operation"] == "enable" and saved["stage"] == _ENABLE_TERMINAL):
         raise InvalidState("invalid_state")
