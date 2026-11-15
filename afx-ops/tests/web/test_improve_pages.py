@@ -194,7 +194,21 @@ def test_a_not_improved_run_shows_the_comparison_against_the_deployed_version():
 def test_the_handoff_comes_from_the_parent_summary():
     text = detail_page("insufficient_trades")
     assert "次回への申し送り" in text and "strategy:未配備指標@1h@USDJPY" in text
-    assert "agent の申告なし" in text
+    assert "未提出" in text
+
+
+@pytest.mark.parametrize("word, expected", [
+    ("not_submitted", "未提出"), ("duplicate", "重複"),
+    ("pending", "承認待ち"), ("approved", "承認済み"),
+    ("rejected_by_human", "人による却下"), ("expired", "期限切れ"),
+    ("invalidated", "無効化"), ("revoked", "取り消し"),
+    ("unclassified", "分類なし"), ("future_word", "不明 (future_word)"),
+])
+def test_handoff_outcomes_are_displayed(word, expected):
+    data = dto("insufficient_trades")
+    data["summary"]["items"]["handoff"] = {
+        "family": "family", "attempts": 1, "outcomes": {word: 1}}
+    assert expected in detail_page(data)
 
 
 @pytest.mark.parametrize("key", sorted(k for k in DTOS if not k.startswith("_")))

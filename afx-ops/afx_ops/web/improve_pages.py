@@ -58,6 +58,13 @@ OMIT_CLI = "全件は afx ctl improve runs で確認してください"
 TRIGGER = {"manual": "手動", "scheduled": "週次"}
 RESULT = {"submitted": "候補を提出", "observation": "提出なし", "gate_failed": "見送り",
           "failed": "失敗", "report": "レポートを公開"}
+HANDOFF_OUTCOME = {
+    "not_submitted": "未提出", "duplicate": "重複", "pending": "承認待ち",
+    "approved": "承認済み", "rejected_by_human": "人による却下",
+    "expired": "期限切れ", "invalidated": "無効化", "revoked": "取り消し",
+    "unclassified": "分類なし",
+}
+
 REASON = {
     "not_submitted": "agent の申告なし", "demoted_recovered": "回収経由のため降格",
     "risk_gate_unsupported": "risk_gate は未対応", "duplicate_logic": "既存候補と同じロジック",
@@ -407,7 +414,7 @@ def _handoff_section(items: dict) -> str:
     if type(outcomes) is dict:
         for word, count in sorted(outcomes.items())[:20]:
             if type(word) is str and type(count) is int:
-                rows.append([html.escape(label(REASON, word), quote=True), _num(count)])
+                rows.append([html.escape(label(HANDOFF_OUTCOME, word), quote=True), _num(count)])
     body = render._rows([("系統", render._cut(handoff.get("family"), FAMILY_CHARS) or "-"),
                          ("試行回数", render._count_text(handoff.get("attempts")))])
     if rows:
