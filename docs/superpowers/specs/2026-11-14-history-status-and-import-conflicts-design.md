@@ -134,7 +134,8 @@ N=0や新規異値1件だけでは系列ずれを検出できない。bridge の
 | `state` | TEXT NOT NULL DEFAULT `open`、CHECK `open/kept/replaced/superseded` |
 | `first_seen_at, last_seen_at` | TEXT NOT NULL、注入したUTC clock。最初は同値 |
 | `seen_count` | INTEGER NOT NULL DEFAULT 1、CHECK >=1 |
-| `first_run_id, last_run_id` | nullable TEXT。手動importはNULL、同期導入後もFKは張らない。参照先runの最小identityをtombstoneとして保持し論理参照を保つ (SQLite ALTERでのFK後付けを前提にしない) |
+| `first_run_id, last_run_id` | nullable TEXT。手動importはNULL (最後の観測の識別であり、置換の証明には使わない)、同期導入後もFKは張らない。参照先runの最小identityをtombstoneとして保持し論理参照を保つ (SQLite ALTERでのFK後付けを前提にしない) |
+| `bridge_verified_run_id` | nullable TEXT。検査尾の判定 (遮断・検査不足) を通過して確定した MT5 取得 (sync) の run だけが、衝突の upsert と同じ transaction で設定する。再観測のたびに上書きし、検証を伴わない観測 (手動import等) は NULL に戻す。置換の証明に使う列で、`last_run_id` は証明に使わない。旧い記録・手動importの記録は NULL で、同epoch・同digestを sync で再観測して確定すれば付く。参照先runの最小identityは series 詳細のGCからも守る。既存DBへは ALTER ADD COLUMN で足す |
 | `resolved_at, resolved_by, resolution_action, reason_ref, revision_id` | nullable。人間操作の監査用予約列。actionは `keep_existing/replace_with_incoming/supersede` の固定語、価格や自由理由はagentに渡さない |
 
 UNIQUE は **`(source, interval, symbol, bar_time, history_epoch, existing_digest, incoming_digest)`**。同epoch内ではr1の6成分案と同じ同一性であり、epochを加えるのはrepair前の記録が修復後の別足を指さないため (M10)。r1の6成分だけの案はこの点で修正採用する。値の組が変われば別記録、epochが変わっても別記録。originはkeyに入れず、手動と同期の同一観測をまとめる。
@@ -271,6 +272,7 @@ import/syncの語彙は次を共有し、別名のpartial成功を作らない�
 | 2026-11-14 | C2.1 | §2.5a に stage の期限到達時の処理 (未確定 batch の rollback、prefix と cursor の維持、lease 解放、`stage_expired`、次 cycle で suffix を新 generation で再取得) と受入を追加 | terra の C2 閉鎖確認 Minor 1 | — |
 | 2026-11-14 | C2.2 | C_new/C_known・N_test、表示と遮断の分離、小N維持、足幅別検査尾と検査不足、段1 T3正本、rc/FK整合 | 同期r2 I-4を利用者指定のsol推奨で閉鎖、m12/m14/m18追随 | — (未commit) |
 | 2026-11-14 | C2.3 | §2.3 の同期への参照を同期 C5 へ。T4 の `ImportConflictError` の記述を廃止済みの実態へ。time repair は mutation lease と WriterAdmission の順に参加し、移動元・移動先の open 記録の supersede を同じ transaction で行う (T5) | 段1a・UTC 時刻規則 spec の食い違い訂正 (T6)、repair の実装 | — |
+| 2026-11-15 | C2.4 | 衝突に `bridge_verified_run_id` を足し、replace_with_incoming を sync の検証済み取得で最後に観測された記録に限る (§2.4)。手動importの記録は NULL で keep は可・replace は拒否、手動importの証明対応は後続 | 置換の根拠を origin ラベルだけにしない (正本C2付録E) | — (未commit) |
 
 ## 6. 短い task 表
 

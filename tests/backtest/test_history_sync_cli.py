@@ -204,10 +204,14 @@ def _populate(root):
     conn.execute("INSERT INTO ohlcv_history (symbol, interval, bar_time, open, high, low, close, "
                  "volume, source) VALUES ('USDJPY','15m','2026-11-03T13:45:00+00:00',1,2,0.5,1,0,'mt5')")
     conn.commit()
+    store.write_txn(conn, lambda c: store.insert_run(
+        c, run_id="proof", owner="offline", trigger="manual", source="mt5", interval="15m",
+        calendar_version="v", lookback_days=2, epoch="none", t=T, b=T, e=T, started_at=T))
     hc.upsert(conn, source="mt5", interval="15m", symbol="USDJPY",
               bar_time="2026-11-03T13:45:00+00:00", history_epoch="none",
               existing=(1, 2, 0.5, 1, 0, None), incoming=(1, 2, 0.5, 1.4, 0, None),
-              origin="import", seen_at="2026-11-03T14:00:00+00:00")
+              origin="sync", seen_at="2026-11-03T14:00:00+00:00", run_id="proof",
+              verified_run_id="proof")
     conn.commit()
     conn.close()
 

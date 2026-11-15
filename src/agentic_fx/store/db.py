@@ -378,6 +378,7 @@ CREATE TABLE IF NOT EXISTS history_conflicts (
   resolved_at TEXT, resolved_by TEXT,
   resolution_action TEXT CHECK(resolution_action IN ('keep_existing','replace_with_incoming','supersede')),
   reason_ref TEXT, revision_id TEXT,
+  bridge_verified_run_id TEXT,
   UNIQUE(source, interval, symbol, bar_time, history_epoch, existing_digest, incoming_digest)
 );
 """
@@ -2286,6 +2287,8 @@ def init_db(conn: sqlite3.Connection, *, root: Path | None = None) -> None:
         _migrate_ohlcv_split(conn)      # v2 → ohlcv_cache/ohlcv_history (新設)
     _migrate_ohlcv_cache_purge_pre_closed_v1(conn)
     _ensure_column(conn, "missions", "trigger", "trigger TEXT")
+    _ensure_column(conn, "history_conflicts", "bridge_verified_run_id",
+                   "bridge_verified_run_id TEXT")
     _ensure_column(conn, "econ_events", "superseded_by",
                    "superseded_by INTEGER REFERENCES econ_events(id)")
     _migrate_signals(conn)

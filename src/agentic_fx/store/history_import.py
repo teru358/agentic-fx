@@ -294,6 +294,9 @@ def _classify_and_apply(conn, spec, op, rows, *, origin, run_id, seen_at, monoto
             status="deferred", deferred_reason="inspection_insufficient",
             resume_from=_iso(spec.requested_start), **common)
 
+    # 検査尾の判定を通した MT5 取得 (sync) の確定だけが、衝突の置換の根拠になる。
+    verified_run_id = (run_id if origin == "sync" and spec.source == "mt5"
+                       and inspection_tail_bars is not None else None)
     entries = list(classification.entries)
     totals = dict(inserted=0, unchanged=0, new=0, known=0)
     last_committed = None
@@ -311,7 +314,7 @@ def _classify_and_apply(conn, spec, op, rows, *, origin, run_id, seen_at, monoto
             conn, sub, origin=origin, seen_at=seen_at, run_id=run_id,
             max_rows=max_rows, budget_seconds=budget_seconds,
             admission=admission, before_batch=before_batch,
-            before_commit=before_batch, on_batch=on_batch)
+            before_commit=before_batch, on_batch=on_batch, verified_run_id=verified_run_id)
         totals["inserted"] += res.inserted
         totals["unchanged"] += res.unchanged
         totals["new"] += res.conflicted_new

@@ -652,7 +652,8 @@ def apply_classified_history(conn: sqlite3.Connection,
                              budget_seconds: float = BATCH_BUDGET_SECONDS,
                              clock=time.monotonic,
                              on_batch=None, admission=None,
-                             before_batch=None, before_commit=None) -> ApplyResult:
+                             before_batch=None, before_commit=None,
+                             verified_run_id: str | None = None) -> ApplyResult:
     """分類済みの系列を短い BEGIN IMMEDIATE batch に分けて確定する。
 
     各 batch で履歴 INSERT と衝突 upsert を同じ transaction で確定する。
@@ -733,7 +734,7 @@ def apply_classified_history(conn: sqlite3.Connection,
                         symbol=entry.symbol, bar_time=entry.bar_time,
                         history_epoch=classification.epoch, existing=entry.existing,
                         incoming=entry.incoming, origin=origin, seen_at=stamp,
-                        run_id=run_id)
+                        run_id=run_id, verified_run_id=verified_run_id)
                     if entry.known:
                         b_known += 1
                     else:

@@ -30,10 +30,22 @@ def _db(tmp_path):
     return conn, path
 
 
-def _conflict(conn, *, incoming=NEW, origin="import", bar=BAR, state=None):
+def _sync_run(conn, run_id="r1", *, source="mt5", interval="15m"):
+    conn.execute(
+        "INSERT OR IGNORE INTO history_sync_runs (id, owner, trigger, status, source, interval, "
+        "calendar_version, lookback_days, history_epoch, t_utc, b_utc, e_utc, started_at) "
+        "VALUES (?, 'offline', 'manual', 'ok', ?, ?, 'v', 2, 'none', 't', 'b', 'e', 's')",
+        (run_id, source, interval))
+    conn.commit()
+
+
+def _conflict(conn, *, incoming=NEW, origin="sync", bar=BAR, state=None, verified="r1"):
+    if verified:
+        _sync_run(conn, verified)
     hc.upsert(conn, source="mt5", interval="15m", symbol="USDJPY", bar_time=bar,
               history_epoch=history_epoch(conn), existing=OLD, incoming=incoming,
-              origin=origin, seen_at="2026-11-13T00:00:00+00:00")
+              origin=origin, seen_at="2026-11-13T00:00:00+00:00", run_id=verified,
+              verified_run_id=verified)
     conn.commit()
     cid = conn.execute("SELECT MAX(id) FROM history_conflicts").fetchone()[0]
     if state:
@@ -151,7 +163,7 @@ def test_a_live_compare_record_is_never_replaceable_by_origin_or_last_origin(tmp
         _resolve(conn, path, cid, "replace-with-incoming")
     assert err.value.code == "replace_refused_live_compare"
     assert _bar(conn) == OLD and conn.execute("SELECT COUNT(*) FROM history_revisions").fetchone()[0] == 0
-    cid2 = _conflict(conn, incoming=(1.0, 2.0, 0.5, 1.5, 1.0, None), origin="import")
+    cid2 = _conflict(conn, incoming=(1.0, 2.0, 0.5, 1.5, 1.0, None))
     conn.execute("UPDATE history_conflicts SET last_origin='live_compare' WHERE id=?", (cid2,))
     conn.commit()
     with pytest.raises(hr.ResolveError) as err:
@@ -250,3 +262,74 @@ def test_the_reason_text_is_kept_only_in_the_human_audit_columns(tmp_path, caplo
         done = _resolve(conn, path, cid, "replace-with-incoming", reason=secret)
     assert secret not in caplog.text and secret not in repr(done)
     assert conn.execute("SELECT reason_ref FROM history_revisions").fetchone()[0] == secret
+
+
+# ---- 置換の根拠 (検証済みの MT5 取得への結び付け) ----------------------------------
+
+def _refused(conn, path, cid):
+    before = (_bar(conn), conn.execute("SELECT COUNT(*) FROM history_revisions").fetchone()[0],
+              history_epoch(conn))
+    with pytest.raises(hr.ResolveError) as err:
+        _resolve(conn, path, cid, "replace-with-incoming")
+    assert err.value.code == "replace_refused_unverified" and "afx history sync" in err.value.hint
+    after = (_bar(conn), conn.execute("SELECT COUNT(*) FROM history_revisions").fetchone()[0],
+             history_epoch(conn))
+    assert before == after and _row(conn, cid)["state"] in ("open", "kept")
+    assert not list(path.parent.glob("*.bak-history-replace-*"))      # backup も作らない
+
+
+def test_a_record_without_a_bridge_proof_is_refused_for_replace_but_keep_is_allowed(tmp_path):
+    conn, path = _db(tmp_path)
+    cid = _conflict(conn, origin="import", verified=None)
+    _refused(conn, path, cid)
+    assert _resolve(conn, path, cid, "keep-existing").state == "kept"
+    _refused(conn, path, cid)                                      # keep のあとも根拠は増えない
+
+
+def test_a_proof_pointing_to_a_missing_or_foreign_run_is_refused(tmp_path):
+    conn, path = _db(tmp_path)
+    cid = _conflict(conn)
+    conn.execute("DELETE FROM history_sync_runs")
+    conn.commit()
+    _refused(conn, path, cid)
+    _sync_run(conn, "r1", interval="1m")                            # 足幅が違う run
+    _refused(conn, path, cid)
+    conn.execute("DELETE FROM history_sync_runs")
+    _sync_run(conn, "r1", source="dukascopy")                      # source が違う run
+    _refused(conn, path, cid)
+
+
+def test_a_non_sync_last_observation_is_refused_even_with_a_proof_column_value(tmp_path):
+    conn, path = _db(tmp_path)
+    cid = _conflict(conn)
+    conn.execute("UPDATE history_conflicts SET last_origin='import' WHERE id=?", (cid,))
+    conn.commit()
+    _refused(conn, path, cid)
+
+
+def test_the_proof_is_rechecked_inside_the_replace_transaction(tmp_path):
+    conn, path = _db(tmp_path)
+    cid = _conflict(conn)
+
+    def drop_proof(point):
+        if point == "after_backup":
+            conn.execute("UPDATE history_conflicts SET bridge_verified_run_id=NULL WHERE id=?",
+                         (cid,))
+            conn.commit()
+    with pytest.raises(hr.ResolveError) as err:
+        _resolve(conn, path, cid, "replace-with-incoming", hook=drop_proof)
+    assert err.value.code == "replace_refused_unverified"
+    assert _bar(conn) == OLD
+    assert conn.execute("SELECT COUNT(*) FROM history_revisions").fetchone()[0] == 0
+
+
+def test_an_unverified_reobservation_returns_the_proof_to_null(tmp_path):
+    conn, _path = _db(tmp_path)
+    cid = _conflict(conn)
+    assert _row(conn, cid)["bridge_verified_run_id"] == "r1"
+    hc.upsert(conn, source="mt5", interval="15m", symbol="USDJPY", bar_time=BAR,
+              history_epoch=history_epoch(conn), existing=OLD, incoming=NEW, origin="import",
+              seen_at="2026-11-14T00:00:00+00:00")
+    conn.commit()
+    row = _row(conn, cid)
+    assert row["bridge_verified_run_id"] is None and row["seen_count"] == 2

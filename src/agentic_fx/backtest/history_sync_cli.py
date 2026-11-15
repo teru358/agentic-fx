@@ -251,6 +251,8 @@ def run_resolve_command(args: argparse.Namespace, root: Path) -> int:
         except history_resolve.ResolveError as exc:
             print(f"{exc.code}: 解決しませんでした (conflict id={args.conflict_id})",
                   file=sys.stderr)
+            if exc.hint:
+                print(exc.hint, file=sys.stderr)
             return exc.rc
         note = "" if done.changed else " (すでに同じ状態です。変更なし)"
         print(f"resolved id={done.conflict_id} action={done.action} state={done.state}{note}")

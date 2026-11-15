@@ -206,7 +206,7 @@ first/last_run_idにFKは張らず、runのtombstoneで論理参照を保持す�
 
 revisionsをconflict id最大値へ畳む案は不採用。衝突idは初出順で改訂順でなく、古いidを後から置換してもepochが変わる保証にならない。独立した単調revisionが必要である。epochは正本のversion付き合成tokenとしsnapshotではない。
 
-live比較は段3から外し、二表統合の調査へ送る。既存/将来のorigin=live_compare記録へreplaceを許さない。originがimport/syncでもlast_origin=live_compareやincoming由来が不明なら置換不可。初出origin不変のupsertを由来証明と誤解せず、bridge由来の別観測・検証を必要とする。正本C2付録Eの禁止を守る。
+live比較は段3から外し、二表統合の調査へ送る。既存/将来のorigin=live_compare記録へreplaceを許さない。originがimport/syncでもlast_origin=live_compareやincoming由来が不明なら置換不可。初出origin不変のupsertを由来証明と誤解せず、bridge由来の別観測・検証を必要とする。段2は、衝突のnullableな `bridge_verified_run_id` を、検査尾の判定を通過して確定したMT5取得 (sync) の共通coreが衝突upsertと同じtransactionでだけ設定し、検証を伴わない再観測ではNULLに戻す。replaceはtransaction内でこの列が同source・足幅の同期runを指し最後の観測がsyncであることを再照合し、証明なし (NULL・不一致・live_compare・旧記録・手動import) は履歴/revision変更0で拒否する (keepは可)。`last_run_id` は証明に使わない。拒否時は「`afx history sync` で再観測すれば証明が付く。取得範囲外なら後続対応」と案内する。手動importの証明対応は段2では作らない。正本C2付録Eの禁止を守る。
 
 keep/replaceのstate、CAS、backup、lease、supersededの集合、原子的監査は正本をそのまま使う。replace一件でglobal epochが変わるため全strategyの旧pending承認・rollbackが照合不一致になり得る。既存売買・配備を自動停止しない。置換にはdaemon停止が必要で、その間daemonのkill switch監視も止まる運用費用を表示し、通常の保守手順内で人が行う。大量衝突の一括resolveを追加せず、repair-time型の調査へ送る。
 
@@ -300,6 +300,7 @@ rollbackは新コードのうちにauto_enabled=falseへ変更して再起動し
 | 2026-11-14 | C4 | r3全件裁定。有界prefix/既存key固定尾、開場時間予算、自己計測lifecycle/timeout帰属/完了slot、UTC :40、header互換、共有v6、運用案内 | opus r3と利用者方向づけ、経路A維持 | — (旧版、未commit) |
 | 2026-11-14 | C5 | 取得前不足/取得後遮断優先、計測不能時の手動復旧とcursor初期化、slot none継続時の表示/復旧/実装可能性、T3正本追随条件を補足 | terra C4閉鎖確認 Important 2 / Minor 2、histbugs C2.2 §2.3との整合 | — (本改訂、未commit) |
 | 2026-11-15 | C5.1 | recent始端を `max(B,E-D日)` に戻し、offline recent上限をD+1からD+2窓/系列・要求上限を `(D+2)N+32` に改訂。追記・後ろ窓・尾の和集合をUTC日で数え、上限外・cursor遅れの未取得をunprocessedとして明示queue、cursor前進と同transaction | 始端が日中だと範囲だけでD+1窓となり、尾が前UTC日へ出るとD+2になって毎日数時間request_budgetになるため (sol裁定) | — (未commit) |
+| 2026-11-15 | C5.2 | 置換の由来証明を `bridge_verified_run_id` に具体化 (sync の検証済み取得のみ設定、再観測で上書き、replace tx内で再照合、手動importは段2で証明なし) | sol裁定 (b)。originラベルだけの証明は付録Eが禁止 | — (未commit) |
 
 ## 6. 短い task 表
 

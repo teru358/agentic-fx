@@ -6,7 +6,9 @@ instance lock を保持) に限り、backup を取り、epoch と既存値の di
 履歴の変更・revision の追記・解決の監査を 1 つの transaction で確定する。
 置換は global epoch を変えるため、旧 epoch に結びついた pending の承認・rollback は
 照合不一致になり得る (売買・配備は自動では止まらない)。
-live 比較由来の記録は置換できない。理由 (自由文) は人間専用でログ・event へ出さない。
+live 比較由来の記録は置換できない。incoming への置換は、その衝突が検査を通過した MT5 取得 (sync) で
+最後に観測されたと証明できる (`bridge_verified_run_id` が同 source・足幅の同期 run を指す) ときだけ許す。
+証明のない記録 (手動 import・旧い記録・未検証の再観測) は拒否し、keep は許す。理由 (自由文) は人間専用でログ・event へ出さない。
 """
 from __future__ import annotations
 
@@ -30,10 +32,17 @@ REASON_MAX = 500
 class ResolveError(Exception):
     """解決を拒否・失敗した。code は固定語、rc は終了コード (引数不備 2、状態・競合 1)。"""
 
-    def __init__(self, code: str, rc: int = 1):
+    def __init__(self, code: str, rc: int = 1, hint: str | None = None):
         super().__init__(code)
         self.code = code
         self.rc = rc
+        self.hint = hint
+
+
+UNVERIFIED_HINT = (
+    "この衝突は、検査を通過した MT5 取得 (afx history sync) として再観測されていないため、"
+    "incoming への置換はできません。`afx history sync` で同じ足を再観測すれば証明が付きます。"
+    "同期の取得範囲外の足は後続の対応が必要です。既存値の維持 (keep-existing) は選べます。")
 
 
 @dataclass(frozen=True)
@@ -58,6 +67,16 @@ def _clean_reason(reason: str | None) -> str:
     if len(text) > REASON_MAX or any(ord(ch) < 32 and ch not in "\n\t" for ch in text):
         raise ResolveError("reason_invalid", 2)
     return text
+
+
+def _bridge_verified(conn, row) -> bool:
+    """証明の run が、この衝突と同じ source・足幅の同期 run として残っているか。"""
+    run_id = row["bridge_verified_run_id"]
+    if not run_id or row["source"] != "mt5" or row["last_origin"] != "sync":
+        return False
+    run = conn.execute("SELECT source, interval FROM history_sync_runs WHERE id=?",
+                       (run_id,)).fetchone()
+    return run is not None and run["source"] == row["source"] and run["interval"] == row["interval"]
 
 
 def _row(conn, conflict_id: int) -> sqlite3.Row:
@@ -114,6 +133,8 @@ def _replace(conn, db_path: Path, first, reason: str, stamp: str, hook) -> Resol
         raise ResolveError("replace_refused_live_compare")
     if first["state"] not in ("open", "kept"):
         raise ResolveError("conflict_closed")
+    if not _bridge_verified(conn, first):
+        raise ResolveError("replace_refused_unverified", hint=UNVERIFIED_HINT)
     if shutil.disk_usage(db_path.parent).free < db_path.stat().st_size * 2:
         raise ResolveError("insufficient_free_space")
     try:
@@ -132,6 +153,8 @@ def _replace(conn, db_path: Path, first, reason: str, stamp: str, hook) -> Resol
                 row = _row(conn, conflict_id)
                 if row["state"] not in ("open", "kept"):
                     raise ResolveError("conflict_closed")
+                if not _bridge_verified(conn, row):
+                    raise ResolveError("replace_refused_unverified", hint=UNVERIFIED_HINT)
                 epoch_before = history_epoch(conn)
                 if row["history_epoch"] != epoch_before:
                     raise ResolveError("epoch_changed")

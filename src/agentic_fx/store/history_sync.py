@@ -429,7 +429,8 @@ def collect_garbage(conn, *, now: datetime, retention_days: int = RETENTION_DAYS
                 "SELECT last_run_id FROM history_sync_gaps UNION "
                 "SELECT last_run_id FROM history_sync_series_state UNION "
                 "SELECT first_run_id FROM history_conflicts UNION "
-                "SELECT last_run_id FROM history_conflicts",):
+                "SELECT last_run_id FROM history_conflicts UNION "
+                "SELECT bridge_verified_run_id FROM history_conflicts",):
         referenced.update(r[0] for r in conn.execute(sql) if r[0])
     old = [r["id"] for r in conn.execute(
         "SELECT id FROM history_sync_runs WHERE status != 'running' AND "

@@ -31,23 +31,27 @@ def canonical_values(values):
 
 
 def upsert(conn, *, source, interval, symbol, bar_time, history_epoch,
-           existing, incoming, origin, seen_at, run_id=None):
+           existing, incoming, origin, seen_at, run_id=None, verified_run_id=None):
+    """`verified_run_id` は、遮断・検査不足を通過して確定した MT5 取得の run (sync) だけが渡す。
+    再観測のたびに上書きするので、検証を伴わない観測は証明を NULL に戻す。"""
     existing_json, existing_digest = canonical_values(existing)
     incoming_json, incoming_digest = canonical_values(incoming)
     conn.execute("""
         INSERT INTO history_conflicts
           (source, interval, symbol, bar_time, history_epoch,
            existing_json, incoming_json, existing_digest, incoming_digest,
-           origin, last_origin, first_seen_at, last_seen_at, first_run_id, last_run_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           origin, last_origin, first_seen_at, last_seen_at, first_run_id, last_run_id,
+           bridge_verified_run_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source, interval, symbol, bar_time, history_epoch,
                     existing_digest, incoming_digest) DO UPDATE SET
           last_seen_at = max(history_conflicts.last_seen_at, excluded.last_seen_at),
           seen_count = history_conflicts.seen_count + 1,
-          last_origin = excluded.last_origin, last_run_id = excluded.last_run_id
+          last_origin = excluded.last_origin, last_run_id = excluded.last_run_id,
+          bridge_verified_run_id = excluded.bridge_verified_run_id
     """, (source, interval, symbol, bar_time, history_epoch, existing_json,
           incoming_json, existing_digest, incoming_digest, origin, origin,
-          seen_at, seen_at, run_id, run_id))
+          seen_at, seen_at, run_id, run_id, verified_run_id))
 
 
 
