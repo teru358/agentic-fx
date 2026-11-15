@@ -18,7 +18,7 @@ from agentic_fx.ops_setup.stages import (InvalidState, WRITE_SWITCH_GUIDANCE, re
                                          read_write_recovery)
 from agentic_fx.ops_setup.write_key import Consistent, check_write_key_consistency
 from agentic_fx.ops_setup.web_setup import WebOptions
-from test_web_write_switch import (BASIC, READ, WRITE, Crash, _crash_at, _idle_base, _reconf_to_9000,
+from test_web_write_switch import (BASIC, READ, WRITE, Crash, _crash_at, _idle_base, _reconf_to_9000, restart,
                                    _revoke_read_key, afx_calls, apply_state, entry, run, toml_of, world)
 from web_support import CANDIDATES, ScriptIO
 
@@ -61,7 +61,7 @@ def prepared(tmp_path, monkeypatch, kind="disabled", state="ro_key_active", afx=
 
 
 def quiet(bundle):
-    bundle.setup.hook = lambda _name: None
+    restart(bundle)
 
 
 def consistent(bundle, target):
@@ -641,3 +641,60 @@ def test_a_systemd_or_marker_failure_keeps_the_record_and_a_rerun_converges(tmp_
     assert bundle.stage_file.read_bytes() == stage_before
 
 
+
+
+def _bound_socket(path):
+    import socket
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(str(path))
+    return sock
+
+
+@pytest.mark.parametrize("kind", ["fifo", "socket"])
+def test_a_record_that_is_not_a_regular_file_is_refused_without_blocking(tmp_path, monkeypatch, kind):
+    import threading
+    bundle = prepared(tmp_path, monkeypatch)
+    path = record_path(bundle)
+    sock = None
+    if kind == "fifo":
+        os.mkfifo(path, 0o600)
+    else:
+        sock = _bound_socket(path)
+    outcome: dict = {}
+
+    def probe():
+        try:
+            read_write_recovery(bundle.root)
+        except InvalidState as error:
+            outcome["reason"] = error.reason
+        result, _ = run(bundle, False)
+        outcome["entry"] = (result.rc, result.reason_code)
+
+    worker = threading.Thread(target=probe, daemon=True)
+    worker.start()
+    worker.join(10)
+    stuck = worker.is_alive()
+    if stuck and kind == "fifo":
+        fd = os.open(path, os.O_WRONLY)
+        os.close(fd)
+        worker.join(5)
+    if sock is not None:
+        sock.close()
+    assert not stuck, "the record check blocked on a non-regular file"
+    assert outcome == {"reason": "write_recovery_invalid", "entry": (1, "write_recovery_invalid")}
+
+
+@pytest.mark.parametrize("afx", ["active", "inactive"])
+@pytest.mark.parametrize("point", ["after_stop", "after_config", "after_unmark"])
+def test_a_new_setup_resumes_from_the_files_and_the_manager_state_alone(tmp_path, monkeypatch, point, afx):
+    bundle = prepared(tmp_path, monkeypatch, "disabled", "ro_key_active", afx)
+    crashed = bundle.setup
+    _crash_at(bundle, point, False)
+    assert bundle.setup is not crashed
+    assert record_of(bundle) == {"version": 1, "afx_before_stop": afx}
+    bundle.systemd.calls.clear()
+    result, _ = run(bundle, False)
+    assert result.rc == 0 and read_marker(bundle.root) is None and record_of(bundle) is None
+    assert consistent(bundle, False)
+    assert len(starts(bundle)) == (1 if afx == "active" else 0)
+    assert bundle.systemd.afx_state == afx

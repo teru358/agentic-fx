@@ -219,7 +219,7 @@ def read_write_recovery(root: Path) -> dict[str, Any] | None:
     """idle の write 回復の記録を厳密に読む。無ければ None、読めない・形が違えば write_recovery_invalid。"""
     path = write_recovery_path(root)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except FileNotFoundError:
         return None
     except OSError as error:
