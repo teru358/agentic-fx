@@ -1088,6 +1088,12 @@ class ApprovalPage:
         return ApprovalView(page, tab, False, self.block if tab == "overview" else "")
 
 
+def _approval_skeleton(tz: str | None, at: str) -> int:
+    """仮想ページの骨格 (nav・帯・再読込を含む) の長さ。帯の長さはどのタブでも同じ。"""
+    return len(_document("Approval", "", tz, current="/plugins",
+                         tabs=tab_table.bar(tab_table.APPROVAL_DETAIL, "overview", at=at)))
+
+
 def _virtual_page(data: Mapping[str, object], at: str, sections: Mapping[str, str], extras_fit,
                   *, diff_bytes: int = 0, plans: Sequence[FilePlan] = (), params_total: int = 0,
                   scale: Sequence[str] = (), block_change: Mapping[str, object] | None = None,
@@ -1096,8 +1102,7 @@ def _virtual_page(data: Mapping[str, object], at: str, sections: Mapping[str, st
     extra_bytes = sum(_bytes(section) for _tab, section in kept)
     if omitted_tabs:
         extra_bytes += _bytes(EXTRA_OMITTED_SECTION)
-    skeleton = len(_document("Approval", "", tz, current="/plugins",
-                             tabs=tab_table.bar(tab_table.APPROVAL_DETAIL, "overview", at=at)))
+    skeleton = _approval_skeleton(tz, at)
     total = skeleton + sum(_bytes(section) for section in sections.values()) + extra_bytes
     block = _decision_block(data, at, change=block_change, scale=scale, tz=tz)
     return ApprovalPage(sections, kept, omitted_tabs, total, diff_bytes, total - diff_bytes,
@@ -1110,8 +1115,7 @@ def _unchanged_virtual(data: Mapping[str, object], message: str,
     tz = zone_of(data)
     overview = ("<section><h2>概要</h2>" + _approval_groups(data, tz) + "</section>"
                 "<section><h2>変更内容</h2><p>" + message + "</p></section>")
-    skeleton = len(_document("Approval", "", tz, current="/plugins",
-                             tabs=tab_table.bar(tab_table.APPROVAL_DETAIL, "overview", at=at)))
+    skeleton = _approval_skeleton(tz, at)
     fit = _fit_tagged_extras(skeleton + _bytes(overview), extra_sections)
     return _virtual_page(data, at, {"overview": overview}, fit, tz=tz)
 
@@ -1137,8 +1141,7 @@ def compose_approval_page(data: Mapping[str, object], change: Mapping[str, objec
     frame = _bytes(diff_html) - diff_bytes
     tz = zone_of(data)
     at = _approval_at(data, approval_id)
-    skeleton = len(_document("Approval", "", tz, current="/plugins",
-                             tabs=tab_table.bar(tab_table.APPROVAL_DETAIL, "overview", at=at)))
+    skeleton = _approval_skeleton(tz, at)
     params_total = len(_params_rows(change)[0])
 
     def build(show_params: int | None, claim_limit: int, parent: bool) -> dict[str, str]:

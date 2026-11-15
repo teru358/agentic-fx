@@ -192,12 +192,8 @@ def _time_value(raw: object) -> datetime | None:
         return None
 
 
-def _int_value(raw: object) -> int | None:
-    return raw if type(raw) is int else None
-
-
-def _text_value(raw: object) -> str | None:
-    return raw if type(raw) is str else None
+_int_value = plugin_pages._int_value
+_text_value = plugin_pages._text_value
 
 
 SORT_COLUMNS: dict[str, plugin_pages.SortColumn] = {
