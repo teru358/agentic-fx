@@ -37,7 +37,7 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 - **F09** `src/agentic_fx/ops/service.py::plan_kill_switch_notice` — 世代と発動時刻を使って該当 incarnation の event を照合。latched 不足を補い、clear は既存 latched がある場合だけ released を補う。released 済みは閉じ、履歴を捏造しない。 Resource: `state:app_state.kill_switch_latched`, `state:app_state.kill_switch_generation`, `state:app_state.kill_switch_latched_at`, `event:guard_state_changed`, `ops:guard_kind`.
 - **F10** `src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch` — lane 所有を要求し、plan に基づき最大一件を guard_kind=kill_switch で発行する (kill switch の guard event を INSERT する唯一の箇所)。発動時刻を not_before とし、閉じた世代の欠落は warning log の固定 code (event ではない) で一度だけ記録する。発動時刻 (latched_at) は event の not_before にだけ渡す。 Resource: `event:guard_state_changed`, `log:guard_notice_backfill_skipped`, `state:app_state.kill_switch_latched_at`, `ops:guard_lane_not_held`, `ops:guard_kind`.
 - **F11** `src/agentic_fx/ops/service.py::OpsService._guard_step` — sweep 例外を捕捉し rollback を試み、失敗は run の旗に立てるだけで、元の操作に失敗を伝えない。固定 code の warning log は後段の _finish_notices が出し、この関数自身は log も event も出さない。 Resource: `event:guard_state_changed`.
-- **F12** `src/agentic_fx/ops/service.py::OpsService.emit_pending_guard_notices` — 公開 wrapper は同一 thread の lane 再入を拒否し、lane 内で after と現在 state を照合する。 Resource: `ops:guard_lane_reentry`, `event:guard_state_changed`.
+- **F12** `src/agentic_fx/ops/service.py::OpsService.emit_pending_guard_notices` — 公開 wrapper は同一 thread の lane 再入を拒否し、lane 内で after と現在 state を照合する。改善通知の公開入口 (emit_pending_improve_notices) も、この再入の例外は握らず伝える。 Resource: `ops:guard_lane_reentry`, `event:guard_state_changed`.
 - **F13** `src/agentic_fx/commands.py::Commands._dispatch` — (`dispatch` は通知失敗を集める wrapper で、reset の本体はここ) shell reset は store を直接操作し前後に wrapper を呼ぶ。ResetNotApplied も投影 state で通知を試みる。state 不確実は別 activity。 reset の activity 本文には操作前の発動時刻を渡す。 Resource: `activity:kill_switch_reset`, `activity:kill_switch_state_uncertain`, `event:guard_state_changed`, `state:app_state.kill_switch_latched_at`.
 - **F14** `src/agentic_fx/commands.py::Commands._killswitch_reconcile` — shell confirm は直接 store を呼び、操作前後に wrapper を呼ぶ。失敗を activity に記録する。 Resource: `marker:reset_marker`, `activity:kill_switch_reconcile_confirmed`, `activity:kill_switch_reconcile_failed`, `event:guard_state_changed`.
 - **F15** `src/agentic_fx/commands.py::Commands._data_resume` — outage.request_resume を直接呼び、ops lane と OpsService.resume_data を通らないため guard event を生成しない (D04)。
@@ -54,7 +54,7 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 - **F26** `src/agentic_fx/backtest/runner.py::run_replay` — replay は遷移と理由から event artifact と latch 数を構成し、snapshot を結果に含める。 Resource: `metric:kill_switch_events`, `metric:kill_switch_latches`, `db:account_snapshots`.
 - **F27** `src/agentic_fx/backtest/metrics.py::compute_metrics` — replay 結果の latch 数を比較 metric に出す。 Resource: `metric:kill_switch_latches`.
 - **F28** `afx-ops/afx_ops/gate/render.py::_event_text_for_code` — guard と terminal の表示を分岐する。terminal は既定で投稿対象外。 Resource: `event:guard_state_changed`, `event:ops_request_terminal`.
-- **F29** `afx-ops/afx_ops/bot/adapter.py::BotAdapter.deliver_events` — poll・送信・cursor を扱う。送信失敗時は cursor を進めず再試行する。 Resource: `event:guard_state_changed`, `event:ops_request_terminal`, `event:event_stream_health`.
+- **F29** `afx-ops/afx_ops/bot/adapter.py::BotAdapter.deliver_events` — poll・送信・cursor を扱う。一時の送信失敗は cursor を進めず次の周回で同じ event から再試行する。恒久の拒否は cursor を進めず BotFailure で bot を止める。その event 固有の不正な本文 (投稿一件に閉じた 400 等) は、本文を含まない固定の代替文を一度だけ送り、通れば確定して後続を止めない。送信の前後は progress に記録する。 Resource: `event:guard_state_changed`, `event:ops_request_terminal`, `event:event_stream_health`.
 - **F30** `afx-ops/afx_ops/notify/payload.py::encode_event` — event schema を検査し配送用 payload に展開する。 Resource: `event:guard_state_changed`, `event:ops_request_terminal`, `event:event_stream_health`.
 - **F31** `afx-ops/afx_ops/notify/runtime.py::_Loop._poll_once` — notify は bot と独立した cursor を使用し、送信後に保存する。初回は high まで skip する。 Resource: `event:guard_state_changed`, `event:ops_request_terminal`, `event:event_stream_health`.
 - **F32** `src/agentic_fx/status.py::read_state` — StateStore と別に raw と marker を読み、安全側表示する。marker の lstat 失敗も存在扱い。 Resource: `marker:reset_marker`, `state:app_state.kill_switch_latched`.
@@ -155,6 +155,8 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 - **F126** `src/agentic_fx/commands.py::Commands._projected_state` — store.load の marker 投影後の state を返す。 Resource: `state:app_state.kill_switch_latched`.
 - **F127** `src/agentic_fx/status.py::render_status` — offline status が `state:` 行に read_state の kill_switch の値を載せる。 Resource: `state:app_state.kill_switch_latched`.
 - **F128** `src/agentic_fx/store/state.py::StateStore.file_value` — marker を無視した file のままの state を共有 lock 下で返す。reconcile の表示用。 Resource: `state:app_state.kill_switch_latched`.
+- **F129** `src/agentic_fx/ops/service.py::OpsService._ops_lane` — ops lane の取得口。取得の前に同一 thread の再入を拒否し、取得後に thread-local の所有 flag を立て、解放時に下ろす。guard 専用ではなく lane を使う全 mutation の共通入口。 Resource: `ops:guard_lane_reentry`.
+- **F130** `src/agentic_fx/core/kill_switch_words.py::<module>.KILL_SWITCH_RESET_WARNING` — reset は HWM を付け直さない旨の固定文。shell の reset 成功の戻り値と ctl の reset 成功時 (`src/agentic_fx/ops/client.py::Runner._op_killswitch_reset`) が同じ文を出す。数値は含めず、API の field と event の field にも載せない。
 
 ## K — 守る契約
 
@@ -170,7 +172,7 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 - **K-VIEW**: pending と対象世代は短命 read-only 接続の観測で、取引判断に使わない。web は status/activity を表示し、event 配送成功と混同しない（F20、F32–F34、F36）。
 - **K-CONSUME**: bot と notify は各 cursor を持ち送信後に保存する。送信後保存前の crash による重複は許容する。C4 の無進捗・恒久 4xx の終了と回復例外は同設計 §5.2 に従う（F28–F31）。
 - **K-REPLAY**: replay の理由、artifact、比較 metric と解除時補償を保つ。backtest から手動 rebase module・ledger・source を参照しない（F25–F27、HWM §2.4–2.5）。
-- **K-RESET-UI**: shell と ctl は reset 成功時に固定警告を表示する。ctl の rebase 案内は HWM 実装の契約であり、この revision では未実装（F13、K-REBASE）。
+- **K-RESET-UI**: shell と ctl は reset 成功時に固定警告を表示する。ctl の rebase 案内は HWM 実装の契約であり、この revision では未実装（F13、F130、K-REBASE）。
 - **K-REBASE**: 承認済み・未実装（branch で実装中）。独立した approver の明示操作で、PaperBroker、注文状態、新鮮 snapshot、DD、世代、autopilot、閉場を検査する。HWM のみ変更し latch・世代・時刻を保持、値 CAS と ledger/snapshot の原子性を守る。通常 reset や shell/bot/web に入口を加えない。詳細と認可境界は HWM 設計 §1–2、§4–5 を正本とする（F23–F24 は既存入力の根拠）。
 
 ## D — 既知の逸脱と残余リスク
@@ -2582,6 +2584,14 @@ status の marker 投影と StateStore の全分岐一致は未確認。
    "resource": "ops:guard_lane_reentry",
    "ids": [
     "F121"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._ops_lane",
+   "resource": "ops:guard_lane_reentry",
+   "ids": [
+    "F129"
    ],
    "kind": "page"
   },

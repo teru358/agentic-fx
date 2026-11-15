@@ -203,3 +203,28 @@
 - 人手の裁定 (`base_declarations_partial`、0dbcb27f): base の頁は a58dc4bb で置いた雛形 (front matter の resources・anchors が空、covers marker 無し) で、破損ではないことを履歴で確かめた。base 側の宣言は空として扱うので、0dbcb27f..HEAD で依存の削除は検出できない (この区間では頁が初めて書かれたので、削除される宣言も無い)。
 - 新 resource の保守的検出の実測 (0dbcb27f..HEAD、HWM の差分): HWM が足した resource は `db:kill_switch_hwm_rebases` (`store/db.py` の `_SCHEMA`・`TABLE_NAMES`)、ops の endpoint `killswitch_rebase`・`killswitch_rebase_preview` (`ops/service.py` の `ENDPOINTS`・`ops/api_server.py::_call`・`ops/client.py`・`cli_surface.py`)、ops の error code (`ops/contracts.py` の `preview_changed`・`market_closed`、新しい 3 file の拒否 code)、`log:rebase_release_failed` (`OpsService`)。既知 literal の無い file の未宣言 symbol を候補に出さない規則では `cli_surface.py`・`ops/contracts.py`・`ops/client.py` (宣言済みの 1 symbol を除く)・`afx-ops/afx_ops/web/write.py` が一件も出なかった。規則を外すと `unmapped_changed_unmapped_symbol` は 15 → 38 件で、これらがすべて出る。
 - T2 の閉鎖: 道具に入った追加 — 副 anchor (`path::symbol#callee[@literal]`、最小 statement の hash)、`ambiguous_sub_anchor` / `coarse_symbol` / `coarse_parent_changed` / `base_declarations_partial` の情報項目 (閉鎖時に必ず読む、exit 0 は照合済みではない)、既存の照合記録の reason・evidence の再検査、根拠 test 名の AST 照合、既知 literal の無い file も候補走査、base と head の resource の和集合、照合記録の原子的・排他の書込み、直呼び検査の scope 単位の may-alias。tests/scripts/test_impact_map*.py 95 本。実頁: `check` 終了コード 0 (人が読む項目は E13 の 1 件)、0dbcb27f..HEAD の `affected` 58 項目。所要: `check` 約 0.9 秒、`affected` 約 4.7 秒。
+
+## T3 一件目: C4 の遡及運用確認 (§6.4)
+
+**これは遡及運用確認であり、「関係を変える code と頁が同 commit で更新された」ことの実地試験ではない。** C4 の merge 時点 (0dbcb27f) の頁は雛形で、今の頁は C4 の後に書かれたものである。
+
+- 手順: 0dbcb27f の使い捨て worktree (repo 外) に今の `docs/impact-map/` と `scripts/impact_map.py` を写して一時 commit し、`affected --page kill-switch --base d7025768^1 --head <一時 commit>` を回した (差分は C4 の merge の親 → merge 結果、first-parent の 5 merge)。一時 commit が足す docs と scripts は裁定から除いた。終了後に worktree を remove した。
+- 出力: 185 項目 (終了コード 0)。内訳は `unmapped_changed_unmapped_symbol` 109、`symbol_changed` 33、`literal_candidates_changed` 32、`unmapped_new_file` 8、`ambiguous_sub_anchor` 1、`coarse_parent_changed` 1、`base_declarations_partial` 1。
+- 裁定 (全件、source で。差分 40 file のうち src と afx-ops を読んだ。この差分は kill switch の通知 (guard event の sweep) と bot の health・終了分類の二つの機能を含む):
+
+| 区分 | 件数 | 裁定 |
+|---|---|---|
+| 頁の記述と一致 (更新不要) | 約 150 | `symbol_changed` のうち 30 と `literal_candidates_changed` 32 (入口 `dispatch` → `_dispatch` の分割に伴う literal の移動を含む)、`coarse_parent_changed` 1 (`build_app` の sweep 入口の差し替え、F20・F21・E16 と一致)、`ambiguous_sub_anchor` 1 (E13、T2 の裁定のとおり再確認)、通知機構の `unmapped` 約 20 (F09〜F12・F17〜F18・F21・F70・K-LANE・K-NOTICE の本文で説明済みの補助 symbol) |
+| kill switch と無関係 (頁に載せない) | 約 130 | bot の REST 分類・進捗・watchdog・health snapshot・logsafe・終了コード、`ops_setup` の systemd drop-in と units、snapshot の I/O 失敗の型、`status` と `web/render.py::render_status` の bot health 表示 (`unmapped_new_file` 7 のうち 6 と `unmapped_changed_unmapped_symbol` の約 100)。`kill` / `guard` / `latch` / `reset_marker` を含む変更行は一行も無いことを grep で確認した。D09 の関連 ticket の範囲 |
+| 頁の更新が要った | 4 | 下記 |
+
+- `base_declarations_partial` 1 (`covers_absent`): base の頁が雛形のため想定どおり。この区間の削除は検出できないが、頁が初めて書かれた区間なので削除される宣言も無い。
+- 頁の更新が要った 4 点 (頁が拾えなかった変更。いずれも source で確かめて直した):
+  1. F29 (`BotAdapter.deliver_events`): 「送信失敗時は cursor を進めず再試行」だけでは不足だった。C4 で、恒久の拒否は BotFailure で止まり、event 固有の不正な本文は固定の代替文を送って確定する経路が加わった。F29 を三経路に書き直した。
+  2. `OpsService._ops_lane` (新 F129): 同一 thread の lane 再入の拒否と thread-local の所有 flag は guard 専用でなく ops lane を使う全 mutation の共通入口にある。F121 (`_reject_lane_reentry`) だけでは入口が読めなかった。被覆を `ops:guard_lane_reentry` に宣言した。
+  3. `core/kill_switch_words.py` の `KILL_SWITCH_RESET_WARNING` と ctl の reset 成功時の出力 (新 F130、`unmapped_new_file`): K-RESET-UI は shell 側 (F13) しか指していなかった。
+  4. `OpsService.emit_pending_improve_notices` が `GuardLaneReentry` を握らず伝える点 (`unmapped_changed_unmapped_symbol`): F12 に一文を足した。
+- 変更前の F06・F07・F09・D との照合: F06 (`confirm_latched`) の store は差分に無く不変。F07 (`reset_kill_switch`) は操作前・結果・現 state の guard step に変わり、頁の記述と一致。F09 (`plan_kill_switch_notice`) は新規で、released 済みを閉じ履歴を捏造しない規則と一致。D01・D04・D05 は C4 後の source と一致 (D04 の `_data_resume` と `resume_data` の `_guard_event` は差分に無い)。
+- 見つけた欠陥・見落とし: 上の 4 点 (すべて F の本文・入口の抜けで、被覆や辺の誤りではない)。道具の欠陥は無かった。ただし `unmapped_changed_unmapped_symbol` 109 件の大半は別機能 (bot の health) の変更で、頁の領域外か否かの切り分けは人手の grep が要った (resource の literal を含む変更行の有無を領域外の根拠にできるが、道具は出さない)。
+- 所要時間 (おおよそ): 道具の実行は数秒。裁定 (source の読み取り) と頁の更新を含めて約 40 分。
+- 更新後の `check --page kill-switch` は終了コード 0 (人が読む項目は E13 の 1 件のみ)。
