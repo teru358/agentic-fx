@@ -320,7 +320,8 @@ def test_the_result_is_a_typed_dto_with_separate_slots(world):
     result = _collect(world)
     assert isinstance(result, status_history.HistoryStatus)
     assert result.observed_at == NOW
-    assert result.history_sync == status_history.NOT_COLLECTED
+    assert isinstance(result.history_sync, status_history.HistorySync)
+    assert result.history_sync.state is status_history.SyncState.NEVER_RUN
     assert result.eval_window == status_history.NOT_COLLECTED
     block = result.evaluation_history
     assert block.state is status_history.State.READY

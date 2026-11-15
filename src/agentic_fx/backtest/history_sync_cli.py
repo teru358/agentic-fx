@@ -148,10 +148,12 @@ def _gaps_list(conn, root: Path) -> int:
         if r["state"] != "open":
             continue
         shown += 1
+        detail = sync_store.gap_detail_text(sync_store.read_gap_detail(r["detail_json"]))
         print(f"gap symbol={r['symbol']} day={r['day_utc']} kind={r['kind']} "
               f"missing={r['missing_count'] if r['missing_count'] is not None else '-'} "
               f"attempts={r['attempts']} no_improve={r['no_improve_count']} "
-              f"next_retry={r['next_retry_at'] or 'due'} first_seen={r['first_seen_at']}")
+              f"next_retry={r['next_retry_at'] or 'due'} first_seen={r['first_seen_at']}"
+              + (f" {detail}" if detail else ""))
     if not shown:
         print("open gap はありません")
     if expired:

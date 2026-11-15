@@ -232,6 +232,27 @@ def test_gaps_list_shows_open_gaps_and_a_non_actionable_expired_count(tmp_path, 
     assert "next" not in out.lower().replace("next_retry", "")
 
 
+def test_gaps_list_reads_the_new_and_the_legacy_reference_detail_without_mixing_units(tmp_path, capsys):
+    root = _root(tmp_path)
+    _populate(root)
+    conn = connect(root / "data" / "agentic.db")
+    from agentic_fx.store import history_sync as store
+    store.write_txn(conn, lambda c: [
+        store.observe_gap(c, source="mt5", interval="15m", symbol="JP225", day_utc="2026-10-21",
+                          kind="reference_suspected", missing_count=4,
+                          detail={"median_fill_ppm": 987000}, run_id=None, now=T),
+        store.observe_gap(c, source="mt5", interval="15m", symbol="JP225", day_utc="2026-10-22",
+                          kind="reference_suspected", missing_count=0, run_id=None, now=T),
+        c.execute("UPDATE history_sync_gaps SET detail_json='{\"twice_median\":247}' "
+                  "WHERE day_utc='2026-10-22'")])
+    conn.close()
+    assert cli.dispatch(_args("gaps", "list"), root) == 0
+    out = capsys.readouterr().out
+    assert "day=2026-10-21 kind=reference_suspected" in out and "median_fill=98.70%" in out
+    assert "day=2026-10-22 kind=reference_suspected" in out and "median_bars=123.5 (旧形式)" in out
+    assert "twice_median" not in out
+
+
 def test_readonly_commands_never_write_the_database_or_create_one(tmp_path, capsys):
     root = _root(tmp_path)
     assert cli.dispatch(_args("gaps", "list"), root) == 1

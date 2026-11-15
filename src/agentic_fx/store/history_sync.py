@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable
 
@@ -288,6 +289,42 @@ def clear_resume(conn, source, interval, symbol, op_key: str) -> None:
 def _day_end(day: str) -> datetime:
     d = date.fromisoformat(day)
     return datetime(d.year, d.month, d.day, tzinfo=timezone.utc) + timedelta(days=1)
+
+
+@dataclass(frozen=True)
+class GapDetail:
+    """参照の疑いの detail_json の読取結果。`median_fill_ppm` は直前の有足日の充足率の中央値 (ppm)。
+    旧形式の行は `twice_median` (中央値の本数の 2 倍) だけを持つので、単位の違う別の値として運ぶ。"""
+    median_fill_ppm: int | None = None
+    legacy_median_bars: float | None = None
+
+
+def read_gap_detail(detail_json: str | None) -> GapDetail:
+    """detail_json を読む。新旧どちらのキーも受け、読めなければ空。書込みには使わない。"""
+    if not detail_json:
+        return GapDetail()
+    try:
+        data = json.loads(detail_json)
+    except (TypeError, ValueError):
+        return GapDetail()
+    if not isinstance(data, dict):
+        return GapDetail()
+    ppm = data.get("median_fill_ppm")
+    if isinstance(ppm, int) and not isinstance(ppm, bool) and ppm >= 0:
+        return GapDetail(median_fill_ppm=ppm)
+    legacy = data.get("twice_median")
+    if isinstance(legacy, int) and not isinstance(legacy, bool) and legacy >= 0:
+        return GapDetail(legacy_median_bars=legacy / 2)
+    return GapDetail()
+
+
+def gap_detail_text(detail: GapDetail) -> str:
+    """人間向けの 1 語。新旧の単位を混ぜない。値が無ければ空文字。"""
+    if detail.median_fill_ppm is not None:
+        return f"median_fill={detail.median_fill_ppm / 10_000:.2f}%"
+    if detail.legacy_median_bars is not None:
+        return f"median_bars={detail.legacy_median_bars:g} (旧形式)"
+    return ""
 
 
 def observe_gap(conn, *, source, interval, symbol, day_utc: str, kind: str,
