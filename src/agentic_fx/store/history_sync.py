@@ -218,6 +218,33 @@ def get_rr_cursor(conn, source, interval) -> str | None:
     return None if row is None else row["rr_cursor"]
 
 
+# ---- 再開点 ---------------------------------------------------------------
+
+def get_resume(conn, source, interval, symbol, op_key: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM history_sync_resume WHERE source=? AND interval=? AND symbol=? "
+        "AND op_key=?", (source, interval, symbol, op_key)).fetchone()
+
+
+def save_resume(conn, *, source, interval, symbol, op_key: str, range_start: datetime,
+                range_end: datetime, tail_start: datetime, prefix_end: datetime,
+                now: datetime) -> None:
+    conn.execute(
+        "INSERT INTO history_sync_resume (source, interval, symbol, op_key, range_start, "
+        "range_end, tail_start, prefix_end, updated_at) VALUES (?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(source, interval, symbol, op_key) DO UPDATE SET "
+        "range_start=excluded.range_start, range_end=excluded.range_end, "
+        "tail_start=excluded.tail_start, prefix_end=excluded.prefix_end, "
+        "updated_at=excluded.updated_at",
+        (source, interval, symbol, op_key, iso(range_start), iso(range_end), iso(tail_start),
+         iso(prefix_end), iso(now)))
+
+
+def clear_resume(conn, source, interval, symbol, op_key: str) -> None:
+    conn.execute("DELETE FROM history_sync_resume WHERE source=? AND interval=? AND symbol=? "
+                 "AND op_key=?", (source, interval, symbol, op_key))
+
+
 # ---- gap queue ------------------------------------------------------------
 
 def _day_end(day: str) -> datetime:

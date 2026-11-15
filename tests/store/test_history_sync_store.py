@@ -11,7 +11,7 @@ from agentic_fx.store import history_sync as hs
 from agentic_fx.store.db import TABLE_NAMES, connect, init_db
 
 NEW_TABLES = ("history_sync_runs", "history_sync_series", "history_sync_series_state",
-              "history_sync_gaps", "history_revisions")
+              "history_sync_gaps", "history_sync_resume", "history_revisions")
 NOW = datetime(2026, 11, 11, 12, 0, tzinfo=timezone.utc)
 SRC, IV = "mt5", "15m"
 
@@ -390,3 +390,20 @@ def test_a_day_whose_end_equals_b_is_expired_and_one_ending_after_b_is_not(tmp_p
     just_before = boundary - timedelta(minutes=15)
     assert _txn(conn2, lambda c: hs.expire_gaps(c, source=SRC, interval=IV,
                                                 boundary=just_before, now=NOW)) == 0
+
+
+# ---- 再開点 ---------------------------------------------------------------
+
+def test_a_resume_point_is_saved_replaced_and_cleared_by_operation_key(tmp_path):
+    conn = _conn(tmp_path)
+    a, e0 = NOW - timedelta(days=2), NOW
+    for prefix_end in (a + timedelta(hours=3), a + timedelta(hours=9)):
+        _txn(conn, lambda c, p=prefix_end: hs.save_resume(
+            c, source=SRC, interval=IV, symbol="USDJPY", op_key="recent", range_start=a,
+            range_end=e0, tail_start=a - timedelta(hours=2), prefix_end=p, now=NOW))
+    row = hs.get_resume(conn, SRC, IV, "USDJPY", "recent")
+    assert row["prefix_end"] == (a + timedelta(hours=9)).isoformat()
+    assert conn.execute("SELECT COUNT(*) FROM history_sync_resume").fetchone()[0] == 1
+    assert hs.get_resume(conn, SRC, IV, "USDJPY", "gap:2026-11-04:primary_exact") is None
+    _txn(conn, lambda c: hs.clear_resume(c, SRC, IV, "USDJPY", "recent"))
+    assert hs.get_resume(conn, SRC, IV, "USDJPY", "recent") is None

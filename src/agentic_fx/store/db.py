@@ -448,6 +448,15 @@ CREATE TABLE IF NOT EXISTS history_sync_gaps (
   first_run_id TEXT, last_run_id TEXT,
   PRIMARY KEY (source, interval, symbol, day_utc, kind)
 );
+-- 中断した取得操作の再開点。固定した検査尾の始端と確定 prefix の終端を持ち、次回は尾と suffix だけを取る。
+CREATE TABLE IF NOT EXISTS history_sync_resume (
+  source TEXT NOT NULL, interval TEXT NOT NULL, symbol TEXT NOT NULL,
+  op_key TEXT NOT NULL,
+  range_start TEXT NOT NULL, range_end TEXT NOT NULL,
+  tail_start TEXT NOT NULL, prefix_end TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (source, interval, symbol, op_key)
+);
 CREATE TABLE IF NOT EXISTS history_revisions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   kind TEXT NOT NULL CHECK(kind IN ('replace_with_incoming')),
@@ -878,7 +887,7 @@ BEFORE DELETE ON improve_run_summaries BEGIN SELECT RAISE(ABORT, 'improve_run_su
 TABLE_NAMES = frozenset({
     "ohlcv_cache", "ohlcv_history", "history_conflicts", "history_sync_runs",
     "history_sync_series", "history_sync_series_state", "history_sync_gaps",
-    "history_revisions", "data_migrations", "missions", "trade_intents", "orders",
+    "history_sync_resume", "history_revisions", "data_migrations", "missions", "trade_intents", "orders",
     "reflections", "account_snapshots", "improvement_backlog",
     "improvement_runs", "econ_events", "approval_requests", "news_sources",
     "backtest_runs", "analysis_runs", "signals", "reflection_attempts",

@@ -268,7 +268,9 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
                base_url: str, fetch=None, interval: str = "1m",
                clock: Callable[[], datetime] | None = None,
                grace: timedelta = DEFAULT_GRACE, skip_window=None,
-               utc_day_windows: bool = False, **run_kw) -> SeriesOutcome:
+               utc_day_windows: bool = False,
+               exclude_range: tuple[datetime, datetime] | None = None,
+               **run_kw) -> SeriesOutcome:
     """MT5 bridge から足を 1 日窓でページングして全取得し、遮断判定のうえ取り込む。
 
     Args:
@@ -283,6 +285,8 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
         grace: 確定判定の猶予。ライブの closed_bar_grace_sec と同じ値を渡す。
         skip_window / utc_day_windows: 同期用。窓を UTC 日境界で区切り、`skip_window` が真の窓は
             要求しない。既定は従来どおり start から 1 日ずつ全窓を要求する。
+        exclude_range: 確定済みの区間 [開始, 終了)。全体がこの区間に入る窓は要求せず、取得した行の
+            うちこの区間のものは分類・分母に入れない (中断した同期の再開用)。
         run_kw: `history_import.run_series` へ渡す (origin / run_id / admission 等)。
 
     終端: 保存するのは ``start <= t < E`` かつ ``t + 幅 + grace <= T`` の足だけ。
@@ -335,11 +339,22 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
         _log.info("import_mt5: no confirmed bars to import for symbol=%s "
                   "(effective end %s)", symbol, end.isoformat())
 
+    window_skip = skip_window
+    if exclude_range is not None:
+        ex_start, ex_end = exclude_range
+
+        def window_skip(ws, we, _inner=skip_window):
+            return (ws >= ex_start and we <= ex_end) or bool(_inner and _inner(ws, we))
+
     def fetch_rows() -> list[tuple]:
-        return _fetch_all_windows(
+        rows = _fetch_all_windows(
             symbol=symbol, interval=interval, start=start, end=end,
             base_url=base_url, fetch=fetch, now=now, grace=grace,
-            skip_window=skip_window, utc_day_windows=utc_day_windows)
+            skip_window=window_skip, utc_day_windows=utc_day_windows)
+        if exclude_range is None:
+            return rows
+        return [r for r in rows
+                if not (exclude_range[0] <= datetime.fromisoformat(r[2]) < exclude_range[1])]
 
     spec = SeriesSpec("mt5", interval, symbol, start, requested_end,
                       max(start, end), fetch_rows)

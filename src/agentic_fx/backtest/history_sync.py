@@ -114,6 +114,10 @@ class OpResult:
     requests: int = 0
     recorded: bool = True
     outcome: SeriesOutcome | None = None
+    op_key: str = "recent"
+    resumed: bool = False
+    #: 再開点の更新: ("save", 元の始端, 元の終端, 尾の始端, 確定 prefix の終端) / ("clear",) / None
+    resume_action: tuple | None = None
 
 
 @dataclass
@@ -360,27 +364,63 @@ class _Run:
             return []
         return present_times(self.conn, self.dataset, symbol, max(lo, self.boundary), anchor)
 
+    def _load_resume(self, symbol: str, op_key: str):
+        """有効な再開点 (元の範囲・固定尾・確定 prefix) を返す。B が追い越した再開点は捨てる。"""
+        row = store.get_resume(self.conn, SOURCE, self.dataset.base_interval, symbol, op_key)
+        if row is None:
+            return None
+        a = datetime.fromisoformat(row["range_start"])
+        e0 = datetime.fromisoformat(row["range_end"])
+        ts = datetime.fromisoformat(row["tail_start"])
+        p = datetime.fromisoformat(row["prefix_end"])
+        if ts < self.boundary or a < self.boundary or e0 > self.limit or not ts <= a <= p:
+            return ("stale",)
+        return (a, e0, ts, min(p, e0))
+
     def _run_op(self, *, operation: str, symbol: str, range_kind: str, start: datetime,
                 end: datetime, day: str | None, window_cap: int | None,
-                cap_used: int = 0) -> OpResult:
-        """1 系列・1 範囲の取得操作。取得前に尾と要求数を固定し、上限外は 0 要求で後送りにする。"""
+                cap_used: int = 0, op_key: str = "recent") -> OpResult:
+        """1 系列・1 範囲の取得操作。取得前に尾と要求数を固定し、上限外は 0 要求で後送りにする。
+
+        中断した同じ操作の再開点があれば、元の範囲と固定した検査尾を使い、確定 prefix は取得も
+        分類もしない (尾と未確定の suffix だけを取る)。"""
         self.op_seq += 1
-        op = OpResult(self.op_seq, operation, symbol, range_kind, start, end, day, "running")
+        resume = self._load_resume(symbol, op_key)
+        resume_stale = resume == ("stale",)
+        if resume_stale:
+            resume = None
+        if resume is not None:
+            start, end = resume[0], resume[1]
+        op = OpResult(self.op_seq, operation, symbol, range_kind, start, end, day, "running",
+                      op_key=op_key, resumed=resume is not None)
         excluded = self.no_bars.dates_for(self.dataset.source, self.dataset.base_interval,
                                           symbol)
-        tail = plan.select_tail(self._existing_before(symbol, start), start,
-                                width=self.width, is_open=self.is_open,
-                                excluded_dates=excluded, boundary=self.boundary)
+        exclude_range = None
         windows = 0
-        if tail.ok:
-            request_start = max(tail.tail.start, self.boundary)
-            windows = plan.request_count([(request_start, end)], is_open=self.is_open)
-            if window_cap is not None and cap_used + windows > window_cap:
-                tail = plan.TailResult(None, REASON_REQUEST_BUDGET)
+        if resume is not None:
+            _a, _e0, tail_start, prefix_end = resume
+            tail = plan.TailResult(plan.Tail(tail_start, start, 0, 0))
+            request_start = tail_start
+            ranges = [(tail_start, start), (prefix_end, end)]
+            if prefix_end > start:
+                exclude_range = (start, prefix_end)
+            windows = plan.request_count([r for r in ranges if r[0] < r[1]],
+                                         is_open=self.is_open)
+        else:
+            tail = plan.select_tail(self._existing_before(symbol, start), start,
+                                    width=self.width, is_open=self.is_open,
+                                    excluded_dates=excluded, boundary=self.boundary)
+            if tail.ok:
+                request_start = max(tail.tail.start, self.boundary)
+                windows = plan.request_count([(request_start, end)], is_open=self.is_open)
+        if tail.ok and window_cap is not None and cap_used + windows > window_cap:
+            tail = plan.TailResult(None, REASON_REQUEST_BUDGET)
         series_id = self._start_series(op)
         if not tail.ok:
             op.status, op.reason = "deferred", tail.reason
             self._finish_series(series_id, op)
+            if resume_stale:
+                op.resume_action = ("clear",)
             return op
         before = self.gate.count
         outcome = import_mt5(
@@ -389,7 +429,7 @@ class _Run:
             skip_window=lambda ws, we: not plan.has_open_time(ws, we, is_open=self.is_open),
             utc_day_windows=True, origin="sync", run_id=self.run_id,
             inspection_tail_bars=self.tail_k, on_batch=self._progress(series_id),
-            **self.run_kw)
+            exclude_range=exclude_range, **self.run_kw)
         op.requests = self.gate.count - before
         op.outcome = outcome
         op.status = outcome.status
@@ -397,7 +437,19 @@ class _Run:
         op.inserted, op.unchanged = outcome.inserted, outcome.unchanged
         op.conflicted_new, op.conflicted_known = outcome.conflicted_new, outcome.conflicted_known
         self._finish_series(series_id, op)
+        op.resume_action = self._resume_action(op, outcome, resume, resume_stale,
+                                               start, end, request_start)
         return op
+
+    def _resume_action(self, op: OpResult, outcome, resume, stale: bool, start: datetime,
+                       end: datetime, request_start: datetime):
+        if outcome.status in ("ok", "completed_with_conflicts"):
+            return ("clear",)
+        if outcome.status == "partial" and outcome.last_committed_bar_time is not None:
+            committed = datetime.fromisoformat(outcome.last_committed_bar_time) + self.width
+            prior_end = resume[3] if resume is not None else start
+            return ("save", start, end, request_start, min(end, max(start, prior_end, committed)))
+        return ("clear",) if stale else None
 
     def _start_series(self, op: OpResult) -> int | None:
         holder = {}
@@ -456,6 +508,13 @@ class _Run:
 
         def work(c):
             self._save_unprocessed(c, op.symbol, unprocessed or {})
+            action = op.resume_action
+            if action is not None and action[0] == "clear":
+                store.clear_resume(c, SOURCE, interval, op.symbol, op.op_key)
+            elif action is not None:
+                store.save_resume(c, source=SOURCE, interval=interval, symbol=op.symbol,
+                                  op_key=op.op_key, range_start=action[1], range_end=action[2],
+                                  tail_start=action[3], prefix_end=action[4], now=self.now)
             if confirmed and advance_to is not None:
                 store.advance_cursor(c, SOURCE, interval, op.symbol,
                                      last_processed_e=advance_to, run_id=self.run_id,
@@ -469,27 +528,36 @@ class _Run:
 
     # -- recent --
     def recent_phase(self) -> None:
-        interval = self.dataset.base_interval
         if self.limit <= self.boundary:
             self.result.deferred_reasons.append(REASON_NO_RANGE)
             return
         for symbol in self.targets:
-            start = plan.lookback_start(self.limit, self.lookback, self.boundary)
-            row = store.get_state(self.conn, SOURCE, interval, symbol)
-            prior = None
-            if row is not None and row["last_processed_e"]:
-                prior = datetime.fromisoformat(row["last_processed_e"])
+            op = self._recent_once(symbol)
+            # 中断した操作の再開が完走したときだけ、続けて今回の recent を行う。
+            if op.resumed and op.status in ("ok", "completed_with_conflicts"):
+                self._recent_once(symbol)
+
+    def _recent_once(self, symbol: str) -> OpResult:
+        interval = self.dataset.base_interval
+        start = plan.lookback_start(self.limit, self.lookback, self.boundary)
+        row = store.get_state(self.conn, SOURCE, interval, symbol)
+        prior = None
+        if row is not None and row["last_processed_e"]:
+            prior = datetime.fromisoformat(row["last_processed_e"])
+        unprocessed = None
+        if prior is not None and prior < start:
+            unprocessed = self._unprocessed_days(symbol, max(prior, self.boundary), start)
+        op = self._run_op(operation="recent", symbol=symbol, range_kind="recent",
+                          start=start, end=self.limit, day=None,
+                          window_cap=self.lookback + RECENT_EXTRA_WINDOWS)
+        if op.resumed:
             unprocessed = None
-            if prior is not None and prior < start:
-                unprocessed = self._unprocessed_days(symbol, max(prior, self.boundary), start)
-            op = self._run_op(operation="recent", symbol=symbol, range_kind="recent",
-                              start=start, end=self.limit, day=None,
-                              window_cap=self.lookback + RECENT_EXTRA_WINDOWS)
-            if op.status == "deferred" and op.reason == REASON_REQUEST_BUDGET:
-                # 上限外の範囲は黙って落とさず、日ごとの未取得として queue に残す。
-                first = start if prior is None else min(max(prior, self.boundary), start)
-                unprocessed = self._unprocessed_days(symbol, first, self.limit)
-            self._after_op(op, advance_to=self.limit, unprocessed=unprocessed)
+        elif op.status == "deferred" and op.reason == REASON_REQUEST_BUDGET:
+            # 上限外の範囲は黙って落とさず、日ごとの未取得として queue に残す。
+            first = start if prior is None else min(max(prior, self.boundary), start)
+            unprocessed = self._unprocessed_days(symbol, first, self.limit)
+        self._after_op(op, advance_to=op.end, unprocessed=unprocessed)
+        return op
 
     def _unprocessed_days(self, symbol: str, start: datetime, end: datetime
                           ) -> dict[str, list[list[str]]]:
@@ -534,7 +602,8 @@ class _Run:
                 continue
             op = self._run_op(operation="gap", symbol=row["symbol"], range_kind=row["kind"],
                               start=clipped[0], end=clipped[1], day=row["day_utc"],
-                              window_cap=OLD_GAP_WINDOWS, cap_used=used)
+                              window_cap=OLD_GAP_WINDOWS, cap_used=used,
+                              op_key=f"gap:{row['day_utc']}:{row['kind']}")
             if op.status == "deferred":
                 if op.reason == REASON_REQUEST_BUDGET:
                     self.result.deferred_reasons.append(REASON_REQUEST_BUDGET)
