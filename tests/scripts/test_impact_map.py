@@ -193,9 +193,9 @@ def test_assignment_symbols_and_field_target(tmp_path):
 def test_string_identifier_boundaries(tmp_path):
     root = tmp_path / 'source'
     root.mkdir()
-    (root / 'a.py').write_text("def f():\n return ['target', 'FROM target;', '$.target.key', 'pretarget', 'target_1', '1target']\n")
+    (root / 'a.py').write_text("def exact(): return 'target'\ndef sql(): return 'FROM target;'\ndef jsonpath(): return '$.target.key'\ndef prefix(): return 'pretarget'\ndef suffix(): return 'target_1'\ndef digit(): return '1target'\n")
     _, raw = run_extract(tmp_path, ['event:target'])
-    assert {r['match_kind'] for r in json.loads(raw)['records']} == {'string_exact', 'string_token'}
+    assert {(r['symbol'], r['match_kind']) for r in json.loads(raw)['records']} == {('exact', 'string_exact'), ('sql', 'string_token'), ('jsonpath', 'string_token')}
 
 
 def test_explicit_marker_literals(tmp_path):
