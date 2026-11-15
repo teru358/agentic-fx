@@ -96,23 +96,27 @@ class Visitor(ast.NodeVisitor):
 
     def visit_Assign(self, node):
         names = [n.id for target in node.targets for n in ast.walk(target) if isinstance(n, ast.Name)]
-        if not self.stack and names:
+        direct_class = self.scopes and isinstance(self.scopes[-1], ast.ClassDef)
+        if (not self.stack or direct_class) and names:
             for name in names:
-                self.stack.extend(['<module>', name])
+                prefix = ['<module>', name] if not self.stack else [name]
+                self.stack.extend(prefix)
                 self.visit(node.value)
-                self.stack.pop()
-                self.stack.pop()
+                del self.stack[-len(prefix):]
         else:
             self.generic_visit(node)
 
     def visit_AnnAssign(self, node):
-        if self.scopes and isinstance(self.scopes[-1], ast.ClassDef) and isinstance(node.target, ast.Name):
+        direct_class = self.scopes and isinstance(self.scopes[-1], ast.ClassDef)
+        if direct_class and isinstance(node.target, ast.Name):
             self.add(node.target.id, 'attribute', node.lineno)
-        if not self.stack and isinstance(node.target, ast.Name):
-            self.stack.extend(['<module>', node.target.id])
-            self.generic_visit(node)
-            self.stack.pop()
-            self.stack.pop()
+        if (not self.stack or direct_class) and isinstance(node.target, ast.Name):
+            prefix = ['<module>', node.target.id] if not self.stack else [node.target.id]
+            self.stack.extend(prefix)
+            self.visit(node.annotation)
+            if node.value is not None:
+                self.visit(node.value)
+            del self.stack[-len(prefix):]
         else:
             self.generic_visit(node)
 
@@ -224,13 +228,22 @@ def evaluate(args):
         path = k[1].split('::', 1)[0]
         return any(d['reason'] in ('parse_error', 'missing_root', 'symlink_outside_root') and
                    (path == d['path'] or path.startswith(d['path'].rstrip('/') + '/')) for d in diagnostics)
+    def matches(expected, candidate):
+        return expected[0] == candidate[0] and (candidate[1] == expected[1] or candidate[1].startswith(expected[1] + '.'))
+
     def cell(name, subset, candidates):
         expected = {key(r) for r in subset}
         critical = {key(r) for r in subset if r['critical']}
-        found, missed = expected & candidates, expected - candidates
+        if name == 'machine':
+            found = {e for e in expected if any(matches(e, c) for c in candidates)}
+            matched_candidates = {c for c in candidates if any(matches(e, c) for e in expected)}
+        else:
+            found = expected & candidates
+            matched_candidates = found
+        missed = expected - found
         unscanned_keys = {k for k in expected if unscanned(k)} if name == 'machine' else set()
         unknown = (unresolved_by_cell[name] & expected) | unscanned_keys
-        false_positives = candidates - expected
+        false_positives = candidates - matched_candidates
         def counts(scope):
             return {'population': len(expected & scope), 'tp': len(found & scope),
                     'fn': len(missed & scope), 'u': len(unknown & scope),
@@ -249,7 +262,7 @@ def evaluate(args):
         result['critical'] = counts(critical)
         result['critical']['fp'] = None
         result['unsupported'] = not expected or (name == 'machine' and bool(unsupported))
-        result['precision'] = len(found) / len(candidates) if candidates else None
+        result['precision'] = len(matched_candidates) / len(candidates) if candidates else None
         result['recall'] = len(found) / len(expected) if expected else None
         return result
     machine = cell('machine', [r for r in rows if r['class'] == 'G_lit'], index_keys)
@@ -257,7 +270,7 @@ def evaluate(args):
     classifications = []
     for row in sorted(rows, key=lambda r: (key(r), r['class'], r['relation'], r['rationale'])):
         k = key(row)
-        classification = 'index_found' if k in index_keys else 'page_manual' if k in cover_map else 'both_missed'
+        classification = 'index_found' if any(matches(k, c) for c in index_keys) else 'page_manual' if k in cover_map else 'both_missed'
         classifications.append({**row, 'classification': classification, 'covers': cover_map.get(k, [])})
     passed = all(not c['unsupported'] and c['critical']['fn'] == 0 and c['critical']['u'] == 0 for c in (machine, page))
     result = {'domain': args.domain, 'machine': machine, 'page': page, 'rows': classifications,

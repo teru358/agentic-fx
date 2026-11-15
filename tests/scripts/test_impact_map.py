@@ -185,9 +185,9 @@ def test_evaluate_rejects_missing_evidence(tmp_path):
 def test_assignment_symbols_and_field_target(tmp_path):
     root = tmp_path / 'source'
     root.mkdir()
-    (root / 'a.py').write_text("X = 'target'\nY: str = 'target'\nclass C:\n field: bool\n attr = 'target'\n")
+    (root / 'a.py').write_text("X = 'target'\nY: str = 'target'\nclass C:\n field: bool\n attr = 'target'\n typed: str = 'target'\n")
     _, raw = run_extract(tmp_path, ['event:target', 'state:x.field'])
-    assert {(r['resource'], r['symbol']) for r in json.loads(raw)['records']} == {('event:target', '<module>.X'), ('event:target', '<module>.Y'), ('event:target', 'C'), ('state:x.field', 'C')}
+    assert {(r['resource'], r['symbol']) for r in json.loads(raw)['records']} == {('event:target', '<module>.X'), ('event:target', '<module>.Y'), ('event:target', 'C.attr'), ('event:target', 'C.typed'), ('state:x.field', 'C')}
 
 
 def test_string_identifier_boundaries(tmp_path):
@@ -207,3 +207,15 @@ def test_explicit_marker_literals(tmp_path):
     out = tmp_path / 'out'
     subprocess.run([sys.executable, str(SCRIPT), 'extract', '--domain', 'x', '--page', str(page), '--root', str(root), '--out', str(out)], cwd=tmp_path, check=True)
     assert [(r['resource'], r['symbol']) for r in json.loads((out / 'index.json').read_text())['records']] == [('marker:reset_marker', 'f')]
+
+
+def test_evaluate_nested_symbols_are_directional(tmp_path):
+    resource = 'event:x'
+    rows = [row('a.py::outer', resource), row('a.py::inner.child', resource), row('a.py::other', resource)]
+    records = [{'resource': resource, 'path': 'a.py', 'symbol': s} for s in ('outer.nested', 'outer.second', 'inner', 'otherness')]
+    metrics = evaluate_fixture(tmp_path, rows, records)
+    machine = metrics['machine']
+    assert (machine['tp'], machine['fn'], machine['fp']) == (1, 2, 2)
+    assert machine['precision'] == 0.5
+    assert {r['symbol'] for r in machine['false_positives']} == {'a.py::inner', 'a.py::otherness'}
+    assert {r['symbol']: r['classification'] for r in metrics['rows']} == {'a.py::outer': 'index_found', 'a.py::inner.child': 'both_missed', 'a.py::other': 'both_missed'}
