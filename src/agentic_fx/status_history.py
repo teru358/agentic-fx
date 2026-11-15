@@ -409,16 +409,6 @@ def _executor_configured(settings: Any) -> bool:
         return False
 
 
-def _lock_state(root: Path | None) -> str:
-    if root is None:
-        return "unknown"
-    try:
-        from agentic_fx.status import probe_instance_lock
-        return probe_instance_lock(root)
-    except Exception:  # noqa: BLE001 - an unreadable lock is "not confirmed held"
-        return "unknown"
-
-
 def _collect_sync(conn: sqlite3.Connection, settings: Any, dataset: Any,
                   now: datetime, lock_state: str = "unknown") -> HistorySync:
     """同期の永続表を最小列だけ読む。読取専用接続で、表が無ければ not_initialized。"""
@@ -491,7 +481,7 @@ def _collect_sync(conn: sqlite3.Connection, settings: Any, dataset: Any,
     if last_run is None:
         state = SyncState.NEVER_RUN
     elif last_run.status == "running":
-        if lock_state == "locked":
+        if lock_state != "free":
             state = SyncState.RUNNING
         else:
             # lock が保持されていない running は強制終了などの停止の痕跡。
@@ -524,7 +514,8 @@ def _next_actions(state: State) -> tuple[NextAction, ...]:
 
 
 def collect(root: Path, settings: Any, conn: sqlite3.Connection | None, tz: str,
-            now: datetime, *, unavailable_reason: ReasonCode | None = None) -> HistoryStatus:
+            now: datetime, *, unavailable_reason: ReasonCode | None = None,
+            lock_state: str = "unknown") -> HistoryStatus:
     """評価履歴の構造化結果。計算できなければ固定理由つきの unavailable。送出しない。
 
     `unavailable_reason` は呼出側が既に分かっている理由 (例: DB を開けなかった) を渡す。
@@ -566,7 +557,7 @@ def collect(root: Path, settings: Any, conn: sqlite3.Connection | None, tz: str,
                 references = References("holdout_zero_bar_days", now, health.holdout_start,
                                         health.holdout_end, True, ReasonCode.REFERENCE_QUERY_FAILED)
         try:
-            observed = _collect_sync(conn, settings, dataset, now, _lock_state(root))
+            observed = _collect_sync(conn, settings, dataset, now, lock_state)
         except Exception:  # noqa: BLE001 - one section must not hide the others
             observed = HistorySync(SyncState.UNAVAILABLE, now, reason_code=ReasonCode.SYNC_QUERY_FAILED,
                                source=dataset.source, base_interval=dataset.base_interval)

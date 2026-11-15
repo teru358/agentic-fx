@@ -190,7 +190,7 @@ def _locked_history(root: Path, now: datetime | None) -> tuple[str, tuple[str, .
                     conn = None
             if conn is None:
                 reason = status_history.ReasonCode.DATABASE_UNAVAILABLE
-        history = status_history.collect(root, settings, conn, tz, when, unavailable_reason=reason)
+        history = status_history.collect(root, settings, conn, tz, when, unavailable_reason=reason, lock_state="locked")
         return tz, status_history.render(history, tz)
     except Exception:  # noqa: BLE001 - history is fail-soft; locked info is always shown
         return tz, status_history.render(status_history.unavailable(
@@ -443,7 +443,8 @@ def collect_status(root: Path, *, run: Callable[..., Any] = subprocess.run,
         steps, pending_bad = _pending(root, instance, settings_value, conn)
         econ = _econ(conn, tz)
         history = status_history.collect(
-            root, settings_value, conn, tz, SystemClock().now() if now is None else now)
+            root, settings_value, conn, tz, SystemClock().now() if now is None else now,
+            lock_state=instance)
     finally:
         if conn is not None:
             conn.close()

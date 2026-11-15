@@ -39,13 +39,13 @@ def _settings_with_reference():
     return settings
 
 
-def _collect(world, settings=None):
+def _collect(world, settings=None, lock_state="unknown"):
     root, conn = world
-    return sh.collect(root, settings or _settings_with_reference(), conn, "Asia/Tokyo", NOW)
+    return sh.collect(root, settings or _settings_with_reference(), conn, "Asia/Tokyo", NOW, lock_state=lock_state)
 
 
-def _text(world, settings=None, tz="Asia/Tokyo"):
-    return "\n".join(sh.render(_collect(world, settings), tz))
+def _text(world, settings=None, tz="Asia/Tokyo", lock_state="unknown"):
+    return "\n".join(sh.render(_collect(world, settings, lock_state), tz))
 
 
 def _run(conn, run_id, *, status="ok", rc=0, trigger="manual", started=NOW, failure=None,
@@ -343,11 +343,11 @@ def _stale_running(conn, run_id="aa" * 6 + "4" + "000" + "8" + "0" * 15):
 def test_a_running_row_without_the_instance_lock_is_a_trace_of_a_stop(world):
     root, conn = world
     _stale_running(conn)
-    observed = _collect(world).history_sync
+    observed = _collect(world, lock_state="free").history_sync
     assert observed.state is sh.SyncState.ATTENTION
     assert observed.last_run.status == "interrupted"
     assert observed.next_actions == (sh.NextAction.STOP_DAEMON_THEN_SYNC,)
-    assert "history sync: attention" in _text(world)
+    assert "history sync: attention" in _text(world, lock_state="free")
 
 
 def test_a_running_row_under_a_held_instance_lock_is_shown_as_running(world):
@@ -424,3 +424,12 @@ def test_only_the_shown_suspected_rows_are_read_and_the_rest_is_counted(world):
     assert len(observed.suspected) == sh._MAX_DAYS_SHOWN
     assert dict(observed.open_gaps)["reference_suspected"] == 15
     assert "(+5 more)" in _text(world)
+
+
+def test_unknown_lock_does_not_mark_running_as_interrupted(world, monkeypatch):
+    from agentic_fx import status
+    _stale_running(world[1])
+    monkeypatch.setattr(status, "probe_instance_lock", lambda root: (_ for _ in ()).throw(AssertionError("unexpected probe")))
+    observed = _collect(world).history_sync
+    assert observed.last_run.status == "running"
+    assert observed.state == sh.SyncState.RUNNING

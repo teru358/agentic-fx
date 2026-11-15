@@ -759,6 +759,21 @@ def test_the_daemon_can_take_the_instance_lock_while_a_reader_is_waiting(tmp_pat
     assert shared == [fcntl.LOCK_SH | fcntl.LOCK_NB]
 
 
+def test_mt5_history_probes_instance_lock_once(tmp_path, monkeypatch, capsys):
+    root, lock, _db = _history_root(tmp_path)
+    real = status.probe_instance_lock
+    calls = []
+    def spy(path):
+        calls.append(path)
+        return real(path)
+    monkeypatch.setattr(status, "probe_instance_lock", spy)
+    log = _instance_flock_log(monkeypatch, lock)
+    status.main(root, run=make_run())
+    assert "evaluation history:" in capsys.readouterr().out
+    assert len(calls) == 1
+    assert len([op for op in log if op & fcntl.LOCK_SH]) == 1
+
+
 @pytest.mark.parametrize("instance", ["free", "unknown"])
 def test_the_instance_lock_is_taken_shared_at_most_once_per_run(tmp_path, monkeypatch, capsys, instance):
     root = _state_root(tmp_path, state_json())
