@@ -134,3 +134,19 @@
 - 仕分け: FP 70 件 (機械 54・頁 16) を A・B と別の仕分け者 (codex sol) が source で仕分けた。所要 **180 秒** (起動から完了まで、1 回)。内訳: literal_collision 31 (state field と activity kind などの同名 literal)、display_or_reader 16、**oracle_miss 15**、**page_overclaim 8**。
 - oracle_miss のうち重複を除く 13 行 (critical 11) を凍結表に追加 (state の検証定数 `_BOOL_FIELDS` / `_REQUIRED_KEYS`、`_sweep_kill_switch` の発動時刻の読取、replay の `_kill_switch_event` ほか)。指揮者が 2 件を抜取り照合。凍結表は 307 行 (critical 208)。出力を見た後の変更 (§4.1 (4))。frozen sha256: `cde1d229a985…` → `d745092e2753…`。
 - page_overclaim 8 件は頁の誤り: `Commands._data_resume` と `OutageStateMachine.request_resume` が guard event を出すかのような被覆宣言 (実際は出さない — D04 と矛盾)、`_build_ops_service` への帰属の過大 (正しくは入れ子の `status_provider`)、そして `guard_notice_deferred` / `guard_notice_backfill_skipped` を ops event として宣言したこと。後者 2 つは warning log の固定 code であり、resource の一覧で `event:` に入れたのは指揮者の誤り。namespace を `log:` に直す。
+
+## 最終測定 (fill4、凍結表 d745092e…)
+
+| セル | critical 母数 | TP | FN | U | 全体の FP |
+|---|---|---|---|---|---|
+| 機械 (G_lit) | 81 | 81 | 0 | 0 | 54 (仕分け済み、上記) |
+| 頁 (G_lit ∪ G_reach) | 208 | 208 | 0 | 0 | 3 |
+
+- 頁の是正: page_overclaim 8 件を source で確かめて全件是正 (被覆を外す / 入れ子の symbol に直す / 本文の誤読を直す)、`guard_notice_*` を `log:` に直した。補完者の報告で抜取りではなく全件確認。
+- 残る頁の FP 3 件は正解表の漏れ候補 (`log:guard_notice_backfill_skipped` × `OpsService._sweep_kill_switch`、`log:guard_notice_deferred` × `OpsService.emit_pending_notices`、`state:app_state.kill_switch_latched_at` × `StateStore.reset_kill_switch`)。FP は合否条件ではないので、正解表の再変更は重ねず T2 の正解表見直しで扱う。
+- 非 critical FN 83 件は T2 で頁を補完する (それまで頁は被覆しないと明示)。
+
+## 初回 T1 の結論 (最終)
+
+§4.3 の初回要件 — 機械セル G_lit critical FN=0 / U=0、頁セル G_lit ∪ G_reach critical FN=0 / U=0、誤った direct 断定 0 (初版は reader/writer を断定しない)、未裁定 U 0 (residual_unread 6 件を裁定済み、unresolved 0)、非 critical FN の全件列挙と処置、FP の件数と仕分け時間 (70 件・180 秒、1 回)、履歴再現 a/b/c — を満たした。**初回 T1 は合格**とする。
+ただしこの合格は次の経過を経たもので、索引と頁が初めから足りていたことを示さない: 抽出器を設計の形に合わせる是正 (run2 の機械 critical FN 41 → 0)、頁の手動補完 (初回の頁 critical FN 97 → 0)、正解表の追加・訂正 3 回 (§4.1 (4) の記録どおり)。速度の反復と FP の仕分け時間の反復は T2。
