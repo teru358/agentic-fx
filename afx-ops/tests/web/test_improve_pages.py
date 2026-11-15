@@ -441,7 +441,21 @@ def test_truncated_list_note_and_link_match_visible_rows():
     assert 0 < shown < 100
     assert f"最新 {shown} 件を表示" in body
     assert f"…({100 - shown} 件省略" in body
-    assert f'href="/improve?limit={min(100, shown * 2)}"' in body
+    # 予算で表を切ったときは limit を増やしても同じ頁に入らないので、続きの link は出さず CLI へ案内する。
+    assert 'href="/improve?limit=' not in body
+    assert "afx ctl improve runs" in body
+
+
+def test_truncated_list_with_a_small_limit_does_not_link_back_to_the_same_rows():
+    runs = [run_row(10**17 - i, plugin="p" * 64, failed_conditions=["pf"] * 5,
+                    approval_id=10**17) for i in range(50)]
+    listing = {"runs": runs, "has_more": True}
+    body = improve_pages.render_improve_list(listing, limit=50,
+                                               forms="<section>" + "x" * 50000 + "</section>").decode()
+    table = body.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
+    shown = table.count("<tr>")
+    assert 0 < shown < 50
+    assert 'href="/improve?limit=' not in body
 
 
 def test_reason_section_requires_parent_reason():

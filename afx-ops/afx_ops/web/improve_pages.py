@@ -229,7 +229,7 @@ def render_improve_list(data: Mapping[str, object], limit: int = DEFAULT_LIMIT,
     if rows:
         table, shown = plugin_pages.table_with_count(LIST_HEADERS, rows, budget, cli=OMIT_CLI)
         if shown < len(rows):
-            note = _more_note(shown, True, shown)
+            note = _more_note(shown, True, MAX_LIMIT)
     else:
         table = "<p>終了した改善 mission はありません</p>"
     return render._page("Improve", intro + table + note + forms, tz)
