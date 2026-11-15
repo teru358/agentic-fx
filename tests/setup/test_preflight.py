@@ -375,8 +375,12 @@ def test_service_and_check_run_the_same_startup_checks(tmp_path, monkeypatch):
     assert all(a is b for a, b in zip(check_calls, service_calls))
 
 
-def test_check_shows_the_reason_for_an_empty_pairs_list(tmp_path):
-    report = run_check(make_root(tmp_path, pairs=[]))
+@pytest.mark.parametrize("with_url", [False, True])
+def test_check_shows_the_reason_for_an_empty_pairs_list(tmp_path, with_url):
+    canary = "secret" + "-canary-123"
+    datafeed = {"mt5": {"history_executor_url": f"http://user:{canary}@example.com"}} if with_url else {}
+    report = run_check(make_root(tmp_path, pairs=[], datafeed=datafeed))
+    assert canary not in str(report)
     assert report.fatal == ["pairs_empty"]
     assert "pairs:" in report.messages["pairs_empty"]
     assert "pairs_empty: " in preflight.format_report(report)
@@ -389,8 +393,14 @@ def test_pairs_of_the_wrong_type_is_not_reported_as_empty(tmp_path):
     assert "空" not in report.messages["settings_invalid"]
 
 
-def test_check_shows_the_reason_for_an_unknown_primary_source(tmp_path):
-    report = run_check(make_root(tmp_path, datafeed={"primary": "typo-source"}))
+@pytest.mark.parametrize("with_url", [False, True])
+def test_check_shows_the_reason_for_an_unknown_primary_source(tmp_path, with_url):
+    canary = "secret" + "-canary-123"
+    datafeed = {"primary": "typo-source"}
+    if with_url:
+        datafeed["mt5"] = {"history_executor_url": f"http://user:{canary}@example.com"}
+    report = run_check(make_root(tmp_path, datafeed=datafeed))
+    assert canary not in str(report)
     assert report.fatal == ["datafeed_primary_unknown"]
     assert "datafeed.primary" in report.messages["datafeed_primary_unknown"]
     assert "fatal: datafeed_primary_unknown: " in preflight.format_report(report)
@@ -655,3 +665,13 @@ def test_startup_warnings_are_recorded_in_the_activity_log_by_code_only(tmp_path
     lines = [line.split("\t") for line in text.splitlines() if "\tstartup_warning\t" in line]
     assert lines and all(cols[3] in WARNING_CODES for cols in lines)
     assert str(tmp_path / "no-claude") not in text
+
+
+def test_secret_url_preserves_multiple_config_findings_without_input(tmp_path):
+    canary = "secret" + "-multi-canary"
+    root = make_root(tmp_path, pairs=[], datafeed={
+        "mt5": {"history_executor_url": f"http://user:{canary}@example.com", "unexpected": True},
+    })
+    report = run_check(root)
+    assert set(report.fatal) == {"pairs_empty", "settings_invalid"}
+    assert canary not in str(report)

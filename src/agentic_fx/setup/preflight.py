@@ -135,14 +135,13 @@ def _report(findings: list[Finding], notes: list[str] | None = None) -> CheckRep
 
 def _config_findings(exc: ConfigError) -> list[Finding]:
     """設定の検証失敗を、直す場所が分かる fatal に写す。入力値は文言に含めない。"""
-    cause = exc.__cause__
-    if not isinstance(cause, ValidationError):
+    errors = exc.validation_errors
+    if errors is None:
         return [Finding("settings_invalid", str(exc).splitlines()[0] if str(exc) else "")]
     found: list[Finding] = []
-    for error in cause.errors()[:8]:
-        location = ".".join(str(part) for part in error.get("loc", ())) or "settings"
-        message = str(error.get("msg", ""))
-        if location == "pairs" and error.get("type") in ("too_short", "missing"):
+    for loc, message, error_type in errors[:8]:
+        location = ".".join(str(part) for part in loc) or "settings"
+        if location == "pairs" and error_type in ("too_short", "missing"):
             code = "pairs_empty"
         elif "unknown_primary_source" in message:
             code = "datafeed_primary_unknown"

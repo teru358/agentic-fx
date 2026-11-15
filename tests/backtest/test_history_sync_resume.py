@@ -221,3 +221,55 @@ def test_multi_series_budget_includes_resumes_deferrals_and_gap_windows(tmp_path
     assert recent[1].status == 'deferred' and recent[1].requests == 0
     assert gap_requests == 32
     assert result.requests == len(bridge.calls) <= (2 + 2) * 2 + 32
+
+
+def test_insufficient_recent_discards_provisional_resume_and_next_day_uses_new_range(tmp_path):
+    conn, settings = _seeded(tmp_path)
+    first = _run(conn, settings, FakeBridge(drop=lambda _symbol, _t: True))
+    assert first.ops[0].reason == 'inspection_insufficient' and first.ops[0].requests > 0
+    assert _resume_row(conn) is None
+    second = _run(conn, settings, FakeBridge(), now=T + timedelta(days=1))
+    recent = second.ops[0]
+    assert not recent.resumed
+    assert recent.end == E + timedelta(days=1)
+    assert recent.start > first.ops[0].start
+
+
+def test_failed_resumed_operation_preserves_inherited_checkpoint(tmp_path):
+    conn, settings, _, _ = _partial_run(tmp_path)
+    before = dict(_resume_row(conn))
+    op = _run(conn, settings, FakeBridge(drop=lambda _symbol, _t: True)).ops[0]
+    assert op.resumed and op.reason == 'inspection_insufficient'
+    after = dict(_resume_row(conn))
+    for key in ('range_start', 'range_end', 'tail_start', 'prefix_end'):
+        assert after[key] == before[key]
+    assert after['prefix_end'] > after['range_start']
+
+
+def test_insufficient_gap_discards_provisional_resume(tmp_path):
+    from datetime import date
+    from tests.backtest.test_history_sync import _holes
+    conn, settings = _seeded(tmp_path)
+    _holes(conn, [date(2026, 10, 20)])
+    result = _run(conn, settings, FakeBridge(drop=lambda _symbol, _t: True))
+    gap = next(op for op in result.ops if op.operation == 'gap')
+    assert gap.reason == 'inspection_insufficient' and gap.requests > 0
+    assert conn.execute("SELECT 1 FROM history_sync_resume WHERE op_key LIKE 'gap:%'").fetchone() is None
+    second = _run(conn, settings, FakeBridge(), now=T + timedelta(days=1))
+    next_gap = next(op for op in second.ops if op.operation == "gap" and op.day == gap.day)
+    assert not next_gap.resumed and next_gap.status == "ok"
+
+
+def test_insufficient_gaps_count_toward_request_budget(tmp_path):
+    from datetime import date
+    from tests.backtest.test_history_sync import _holes, _weekdays
+    conn, settings = _seeded(tmp_path, months=2)
+    days = list(_weekdays(date(2026, 9, 14), date(2026, 11, 6)))[::2][:17]
+    assert len(days) == 17
+    _holes(conn, days)
+    result = _run(conn, settings, FakeBridge(drop=lambda _symbol, _t: True))
+    gaps = [op for op in result.ops if op.operation == 'gap']
+    assert len(gaps) == 17
+    assert sum(op.requests for op in gaps) == 32
+    assert sum(op.reason == 'inspection_insufficient' and op.requests == 2 for op in gaps) == 16
+    assert gaps[-1].reason == 'request_budget' and gaps[-1].requests == 0

@@ -480,7 +480,9 @@ class _Run:
             committed = datetime.fromisoformat(outcome.last_committed_bar_time) + self.width
             prior_end = resume[3] if resume is not None else start
             return ("save", start, end, request_start, min(end, max(start, prior_end, committed)))
-        return ("clear",) if stale else None
+        if resume is not None:
+            return ("save", *resume)
+        return ("clear",)
 
     def _start_series(self, op: OpResult) -> int | None:
         holder = {}
@@ -638,16 +640,18 @@ class _Run:
                               start=clipped[0], end=clipped[1], day=row["day_utc"],
                               window_cap=OLD_GAP_WINDOWS, cap_used=used,
                               op_key=f"gap:{row['day_utc']}:{row['kind']}")
+            used += max(op.requests, 0)
             if op.status == "deferred":
+                if op.resume_action is not None:
+                    self._after_op(op, advance_to=None)
+                else:
+                    self.result.ops.append(op)
                 if op.reason == REASON_REQUEST_BUDGET:
                     self.result.deferred_reasons.append(REASON_REQUEST_BUDGET)
-                    self.result.ops.append(op)
                     break
-                self.result.ops.append(op)
                 if op.reason not in self.result.deferred_reasons:
                     self.result.deferred_reasons.append(op.reason)
                 continue
-            used += max(op.requests, 0)
             executed += 1
             last_symbol = row["symbol"]
             self._after_op(op, advance_to=None)
