@@ -52,6 +52,7 @@ def test_with_write_off_the_approval_page_has_no_form_and_keeps_the_read_only_cs
     assert response.status == 200
     assert b"<form" not in response.body
     assert READ_ONLY_CSP_ACTION in response.headers["Content-Security-Policy"]
+    assert response.headers["Referrer-Policy"] == "no-referrer"
     assert rig.client.calls == [("approval", 7), ("approval_change", 7)]
 
 
@@ -86,8 +87,11 @@ def test_with_write_on_every_response_relaxes_form_action_to_self_only():
 
 def test_the_pending_plugin_approval_page_gets_decision_forms_without_auto_refresh():
     rig = _rig()
-    page = rig.send(rig.request("GET", "/approvals/7")).body.decode("utf-8")
+    response = rig.send(rig.request("GET", "/approvals/7"))
+    page = response.body.decode("utf-8")
     assert 'action="/approvals/7/approve"' in page and 'action="/approvals/7/reject"' in page
+    # form を載せた文書の referrer policy が、その form の POST の Origin を決める。
+    assert response.headers["Referrer-Policy"] == "same-origin"
     assert page.count(f'name="payload_sha256" value="{DIGEST}"') == 2
     assert 'http-equiv="refresh"' not in page
     assert page.endswith("</body></html>")
@@ -362,7 +366,9 @@ def test_the_first_step_only_shows_a_confirmation_and_never_calls_the_daemon():
     assert 'action="/confirm"' in body and 'http-equiv="refresh"' not in body
     assert rig.store.counts() == (1, 0)
     assert response.headers["Cache-Control"] == "no-store"
-    assert response.headers["Referrer-Policy"] == "no-referrer"
+    # no-referrer の文書から送る form の POST は、同じ origin でもブラウザが Origin: null を付ける
+    # (Fetch の append a request Origin header)。Origin の完全一致を要求するので same-origin にする。
+    assert response.headers["Referrer-Policy"] == "same-origin"
 
 
 def test_the_token_appears_only_in_the_hidden_field_of_the_confirmation():
