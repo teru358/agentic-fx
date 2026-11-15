@@ -362,7 +362,9 @@ def test_the_first_step_only_shows_a_confirmation_and_never_calls_the_daemon():
     assert 'action="/confirm"' in body and 'http-equiv="refresh"' not in body
     assert rig.store.counts() == (1, 0)
     assert response.headers["Cache-Control"] == "no-store"
-    assert response.headers["Referrer-Policy"] == "no-referrer"
+    # no-referrer の文書から送る form の POST は、同じ origin でもブラウザが Origin: null を付ける
+    # (Fetch の request origin の直列化)。Origin の完全一致を要求するので same-origin にする。
+    assert response.headers["Referrer-Policy"] == "same-origin"
 
 
 def test_the_token_appears_only_in_the_hidden_field_of_the_confirmation():
