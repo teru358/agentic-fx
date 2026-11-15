@@ -218,3 +218,14 @@ def test_atomic_write_refuses_non_regular_file(tmp_path):
     with pytest.raises(ValueError):
         atomic_write_settings(fifo, "a: 1\n")
     assert stat.S_ISFIFO(os.lstat(fifo).st_mode)
+
+
+def test_edit_validation_never_exposes_secret_input():
+    canary = 'secret' + '87'
+    text = ('display_timezone: Asia/Tokyo\ndatafeed:\n  mt5:\n'
+            '    history_executor_url: https://user:' + canary + '@host/x\n')
+    result = edit_settings(text, {})
+    assert not result.ok
+    assert 'primary_source_required' in result.reason
+    assert canary not in result.reason
+    assert canary[:8] not in result.reason

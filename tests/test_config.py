@@ -1421,3 +1421,17 @@ def test_settings_error_without_secret_keeps_original_validation_display():
     with pytest.raises(ConfigError) as actual:
         load_settings_text(yaml.safe_dump(raw))
     assert str(actual.value) == str(expected.value)
+
+
+def test_settings_secret_error_reports_location_without_input():
+    import yaml
+    from agentic_fx.config import ConfigError, load_settings_text
+    canary = 'secret' + '87'
+    raw = _mt5_raw(history_executor_url='https://user:' + canary + '@host/x')
+    raw['risk'] = 123
+    with pytest.raises(ConfigError) as exc:
+        load_settings_text(yaml.safe_dump(raw))
+    assert 'risk:' in str(exc.value)
+    assert 'input_value' not in str(exc.value)
+    assert canary not in str(exc.value)
+    assert canary[:8] not in str(exc.value)

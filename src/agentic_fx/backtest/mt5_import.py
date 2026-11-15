@@ -91,7 +91,7 @@ def effective_import_end(requested_end: datetime, now: datetime, *,
 
 def _window_url(base_url: str, symbol: str, start: datetime, end: datetime,
                 interval: str = "1m") -> str:
-    return (f"{base_url}/ohlcv/{symbol}?from={quote(start.isoformat())}"
+    return (f"{base_url}/ohlcv/{quote(symbol, safe='')}?from={quote(start.isoformat())}"
             f"&to={quote(end.isoformat())}&interval={interval}")
 
 

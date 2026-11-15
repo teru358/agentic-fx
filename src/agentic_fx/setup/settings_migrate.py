@@ -5,7 +5,7 @@ import re
 
 import yaml
 
-from agentic_fx.config import Settings
+from agentic_fx.config import load_settings_text
 from agentic_fx.setup.settings_edit import EditResult, find_duplicate_keys
 
 
@@ -48,7 +48,7 @@ def _migrate_zero_to_one(text: str) -> EditResult:
             "先頭の display_timezone の前に `schema_version: 1` を足して手で編集してください。")
     updated = "".join(lines[:insertion] + [_V1_SCHEMA_LINE] + lines[insertion:])
     try:
-        Settings.model_validate(yaml.safe_load(updated) or {})
+        load_settings_text(updated)
     except Exception as error:
         return _failure(f"移行後の型検証に失敗しました: {error}。手で編集してください。")
     return EditResult(ok=True, text=updated)
@@ -124,7 +124,7 @@ def _migrate_two_to_three(text: str) -> EditResult:
             lines[last + 1:last + 1] = additions
     updated = "".join(lines)
     try:
-        Settings.model_validate(yaml.safe_load(updated) or {})
+        load_settings_text(updated)
     except Exception as error:
         return _failure(f"移行後の型検証に失敗しました: {error}。手で編集してください。")
     return EditResult(ok=True, text=updated)
@@ -149,7 +149,7 @@ def _migrate_three_to_four(text: str) -> EditResult:
         return _failure("schema_version: 3 の行を書き換えられませんでした。手で編集してください。")
     updated = "".join(lines)
     try:
-        Settings.model_validate(yaml.safe_load(updated) or {})
+        load_settings_text(updated)
     except Exception as error:
         return _failure(f"移行後の型検証に失敗しました: {error}。手で編集してください。")
     return EditResult(ok=True, text=updated)
@@ -182,7 +182,7 @@ def _migrate_four_to_five(text: str) -> EditResult:
         return _failure("schema_version: 4 の行を書き換えられませんでした。手で編集してください。")
     updated = "".join(lines)
     try:
-        Settings.model_validate(yaml.safe_load(updated) or {})
+        load_settings_text(updated)
     except Exception as error:
         return _failure(f"移行後の型検証に失敗しました: {error}。手で編集してください。")
     return EditResult(ok=True, text=updated)
@@ -207,7 +207,7 @@ def _migrate_five_to_six(text: str) -> EditResult:
         return _failure("schema_version: 5 の行を書き換えられませんでした。手で編集してください。")
     updated = "".join(lines)
     try:
-        Settings.model_validate(yaml.safe_load(updated) or {})
+        load_settings_text(updated)
     except Exception as error:
         return _failure(f"移行後の型検証に失敗しました: {error}。手で編集してください。")
     return EditResult(ok=True, text=updated)

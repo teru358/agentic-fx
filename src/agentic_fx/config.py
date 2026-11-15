@@ -882,22 +882,30 @@ def load_settings(path: Path) -> Settings:
     return load_settings_text(path.read_text(encoding="utf-8"))
 
 
+def format_settings_validation_error(error: ValidationError, raw: object) -> str:
+    """Format settings errors without exposing a configured history executor URL."""
+    datafeed = raw.get("datafeed") if isinstance(raw, dict) else None
+    mt5 = datafeed.get("mt5") if isinstance(datafeed, dict) else None
+    if not isinstance(mt5, dict) or mt5.get("history_executor_url") is None:
+        return str(error)
+    return "\n".join(
+        f"{'.'.join(map(str, item['loc'])) or '<root>'}: {item['msg']}"
+        for item in error.errors(include_input=False))
+
+
 def load_settings_text(text: str) -> Settings:
     """Validate settings already read from a stable source snapshot."""
     try:
         raw = yaml.safe_load(text) or {}
         return Settings.model_validate(raw)
     except ValidationError as e:
+        message = format_settings_validation_error(e, raw)
+        details = e.errors(include_input=False)
+        errors = tuple((item["loc"], item["msg"], item["type"]) for item in details)
         datafeed = raw.get("datafeed") if isinstance(raw, dict) else None
         mt5 = datafeed.get("mt5") if isinstance(datafeed, dict) else None
         if not isinstance(mt5, dict) or mt5.get("history_executor_url") is None:
-            errors = tuple((item["loc"], item["msg"], item["type"]) for item in e.errors(include_input=False))
-            raise ConfigError(str(e), validation_errors=errors) from e
-        details = e.errors(include_input=False)
-        message = "\n".join(
-            f"{'.'.join(map(str, item['loc'])) or '<root>'}: {item['msg']}"
-            for item in details)
+            raise ConfigError(message, validation_errors=errors) from e
     except yaml.YAMLError as e:
         raise ConfigError(f"invalid YAML: {e}") from e
-    errors = tuple((item["loc"], item["msg"], item["type"]) for item in details)
     raise ConfigError(message, validation_errors=errors) from None

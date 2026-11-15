@@ -11,7 +11,9 @@ from typing import Any
 
 import yaml
 
-from agentic_fx.config import Settings
+from pydantic import ValidationError
+
+from agentic_fx.config import Settings, format_settings_validation_error
 
 
 _KEY_LINE = re.compile(r"^(?P<indent>[ ]*)(?P<key>[A-Za-z_][A-Za-z0-9_-]*):(?P<value>.*)$")
@@ -197,6 +199,8 @@ def edit_settings(text: str, changes: dict[str, Any]) -> EditResult:
             return _failure(f"意味的照合に失敗しました: {dotted} が見つかりません。")
     try:
         Settings.model_validate(raw)
+    except ValidationError as error:
+        return _failure(f"型検証に失敗しました: {format_settings_validation_error(error, raw)}")
     except Exception as error:
         return _failure(f"型検証に失敗しました: {error}")
     return EditResult(ok=True, text=updated)

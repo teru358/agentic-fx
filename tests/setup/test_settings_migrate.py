@@ -434,3 +434,16 @@ def test_history_sync_defaults_apply_when_the_keys_are_absent_and_bounds_are_enf
 def test_example_states_the_history_sync_defaults():
     raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
     assert raw["backtest"]["history_sync"] == {"auto_enabled": True, "lookback_days": 7}
+
+
+@pytest.mark.parametrize('version', [0, 2, 3, 4, 5])
+def test_migration_validation_never_exposes_secret_input(version):
+    canary = 'secret' + '87'
+    marker = '' if version == 0 else f'schema_version: {version}\n'
+    text = ('display_timezone: Asia/Tokyo\n' + marker +
+            'datafeed:\n  mt5:\n    history_executor_url: https://user:' + canary + '@host/x\n')
+    result = migrate(text)
+    assert not result.ok
+    assert 'primary_source_required' in result.reason
+    assert canary not in result.reason
+    assert canary[:8] not in result.reason
