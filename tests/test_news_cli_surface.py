@@ -86,7 +86,8 @@ def test_the_principle_table_lists_the_news_operations_in_the_market_row():
     row = next(line for line in OPS_API_DOC.read_text(encoding="utf-8").splitlines()
                if line.startswith("| 市場入力を整える |"))
     cells = [cell.strip() for cell in row.strip("|").split("|")]
-    assert cells[1] == ("`[変更]` `afx history import` / `[読取]` `afx history compare`・`coverage` / "
+    assert cells[1] == ("`[変更]` `afx history import`・`sync`・`conflicts resolve` / "
+                        "`[読取]` `afx history compare`・`coverage`・`gaps list`・`conflicts list`・`conflicts show` / "
                         "`[読取]` `afx news list`・`test` / `[変更]` `afx news add`・`enable`・`disable`")
     assert cells[2] == "—"
 
