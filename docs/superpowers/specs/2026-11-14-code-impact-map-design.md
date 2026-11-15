@@ -3,7 +3,7 @@
 - 日付: 2026-11-14 / 状態: C2.1。2026-11-14 利用者承認。T0 (頁の雛形と手順) に着手、T1 以降は opsalert の merge 後。
 - チケット: `docs/tickets/open/code-impact-map.md`
 - 文書照合 HEAD: `4562697450257a142d9337a3f428d574e92ce514`。C1/R2 のコード観測基準は `558cb9fd` / `6915548b`。§3 の F/D はその **C4 前の履歴観測** を修正したものであり、現在の並行実装の完成を主張しない。
-- 正式試行の基準 revision は **opsalert C4 の merge 後**。merge SHA と着地後コードで正解表を凍結する。現在は未確定。それまでは頁の雛形と手順だけを用意する。
+- 正式試行の基準 revision は **opsalert C4 の merge 後**。merge SHA と着地後コードで正解表を凍結する。基準は main の `0dbcb27f` (2026-11-14、履歴書換え後の sha) に確定した。
 - 利用者裁定は確定: docs/ に公開 commit、契約・責務・影響関係が変わるチケットだけ該当頁を同じ commit で更新、kill switch / guard state で試行。基本設計とは独立した現状の正本とする。
 - 本書は設計書。docs/impact-map/・scripts/・tests/ の成果物は task 表に従って別 commit で作る。
 
@@ -34,7 +34,7 @@
 - `docs/superpowers/specs/2026-11-14-ops-alert-delivery-design.md`（opsalert C4、承認済み、実装中）。§10 R1〜R5、§2、§4、§9 を参照する。
 - `docs/superpowers/specs/2026-11-14-killswitch-hwm-rebase-design.md`（HWM C2.1、承認済み、opsalert T1b 後に実装待ち）。§1〜2、§4〜5 を参照する。
 
-今回 C4 正本の内容確認に用いたのは、利用者指定の opsalert 作業 checkout にある同名 docs/ spec である。主 checkout の上記 C4 path は現時点で未収載。正式頁を公開する際は C4 spec が公開履歴から読めることを指揮者が確認し、未収載なら試行を開始しない（C4 merge 待ち）。正式頁の必須 link を私的な作業 checkout やレビュー記録へ向けない。利用者裁定を memory から推定しない。
+C4 spec は `0dbcb27f` で主 checkout と公開履歴に収載済み。正式頁を公開する際も C4 spec が公開履歴から読めることを指揮者が確認する。正式頁の必須 link を私的な作業 checkout やレビュー記録へ向けない。利用者裁定を memory から推定しない。
 
 ## 2. 仕組み — 小さい索引から始める
 
@@ -370,6 +370,7 @@ T2 以降の通常閉鎖では指揮者が、(a)新 tree の extract/check と *
 | 2026-11-14 | C1 | 小索引先行、種類×領域/件数判定、symbol内容鮮度、local閉鎖、試行F/K/D補完、承認済みC4/HWM反映 | r1の漏れ・工程負担・保証の過大一般化を是正。確定裁定を維持 | 未commit、HEAD6915548b。製品コード差分無し確認 |
 | 2026-11-14 | C2 | 初回縮小、機械/頁二セル、C4後基準と履歴再現、spec所有testへ一本化、隔離oracle/review、鮮度の後送と閉鎖手順 | R2 Critical1/Important8/Minor16・Y-1〜15を裁定し、literal索引の構造的限界と実装負担を是正 | 未commit（本書のみ）。文書照合HEAD45626974 |
 | 2026-11-14 | C2.1 | §4.3 の履歴再現を a/b/c すべて必須に。付録 A I-7 を履歴表現と明示 | terra の C2 閉鎖確認 Critical 1 (三型の再現が必須でない) / Minor 1 | 未 commit |
+| 2026-11-15 | C2.1 (記述更新) | 冒頭の基準 revision を 0dbcb27f に確定、§1 の C4 未収載の記述を収載済みに | opsalert C4 の merge と履歴書換えの後に古い記述が残っていた | 本 commit |
 
 
 ## 11. 短い task 表（将来の実装）
