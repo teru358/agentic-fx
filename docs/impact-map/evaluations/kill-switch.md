@@ -150,3 +150,8 @@
 
 §4.3 の初回要件 — 機械セル G_lit critical FN=0 / U=0、頁セル G_lit ∪ G_reach critical FN=0 / U=0、誤った direct 断定 0 (初版は reader/writer を断定しない)、未裁定 U 0 (residual_unread 6 件を裁定済み、unresolved 0)、非 critical FN の全件列挙と処置、FP の件数と仕分け時間 (70 件・180 秒、1 回)、履歴再現 a/b/c — を満たした。**初回 T1 は合格**とする。
 ただしこの合格は次の経過を経たもので、索引と頁が初めから足りていたことを示さない: 抽出器を設計の形に合わせる是正 (run2 の機械 critical FN 41 → 0)、頁の手動補完 (初回の頁 critical FN 97 → 0)、正解表の追加・訂正 3 回 (§4.1 (4) の記録どおり)。速度の反復と FP の仕分け時間の反復は T2。
+
+## /code-review high の是正後の再測定 (final2)
+
+- 採用 6 件 (代入先の添字・属性の照合、symlink 検査を repo 内に限定、致命的な診断で index.json を残さない、literal の正規表現の前計算、TP・FN・U の排他集計、構文解析の再帰・メモリ超過の診断) を入れて再測定。不採用 1 件 (頁の FP を合否に含める) は §4.3 が FP をゼロ条件にしないため。
+- 機械セル critical 81 / TP 81 / FN 0 / U 0 (全体 FP 54 → 49)、頁セル critical 208 / TP 208 / FN 0 / U 0 (全体 FP 3)。合否は変わらない。extract 0.97 秒 (一回)。
