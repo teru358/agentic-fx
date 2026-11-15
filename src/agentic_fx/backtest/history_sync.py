@@ -132,6 +132,7 @@ class SyncResult:
     deferred_reasons: list[str] = field(default_factory=list)
     stopped: str | None = None
     unrecorded_series: int = 0
+    required_write_failures: list[str] = field(default_factory=list)
     unprocessed: list[str] = field(default_factory=list)
 
     @property
@@ -320,6 +321,13 @@ class _Run:
         except Exception:  # 記録の失敗は当該の記録だけを落とし、取得結果は消さない
             return False
 
+    def _write_required(self, what: str, work) -> bool:
+        """状態の整合に要る書込み。失敗は run に累積し、最終結果を技術失敗にする。"""
+        if self._write(work):
+            return True
+        self.result.required_write_failures.append(what)
+        return False
+
     def open_run(self, owner: str) -> None:
         def work(c):
             store.mark_interrupted(c, owner_alive=lambda _o: False, now=self.now)
@@ -434,13 +442,18 @@ class _Run:
             op.recorded = False
             self.result.unrecorded_series += 1
 
-    def _after_op(self, op: OpResult, *, advance_to: datetime | None) -> None:
-        """取得の結果を系列状態へ反映する。成功だけ cursor を進め、失敗は待ちを延ばす。"""
+    def _after_op(self, op: OpResult, *, advance_to: datetime | None,
+                  unprocessed: dict | None = None) -> None:
+        """取得の結果を系列状態へ反映する。成功だけ cursor を進め、失敗は待ちを延ばす。
+
+        cursor より前の未取得 (unprocessed) の保存と cursor の前進は同じ transaction で、
+        保存できなければ cursor は進まない。"""
         interval = self.dataset.base_interval
         confirmed = op.status in ("ok", "completed_with_conflicts")
         failed = op.status in ("partial", "failed")
 
         def work(c):
+            self._save_unprocessed(c, op.symbol, unprocessed or {})
             if confirmed and advance_to is not None:
                 store.advance_cursor(c, SOURCE, interval, op.symbol,
                                      last_processed_e=advance_to, run_id=self.run_id,
@@ -449,7 +462,7 @@ class _Run:
                 store.record_series_failure(c, SOURCE, interval, op.symbol,
                                             error_code=op.reason or op.status,
                                             run_id=self.run_id, now=self.now)
-        self._write(work)
+        self._write_required(f"series_state:{op.symbol}", work)
         self.result.ops.append(op)
 
     # -- recent --
@@ -464,15 +477,17 @@ class _Run:
             prior = None
             if row is not None and row["last_processed_e"]:
                 prior = datetime.fromisoformat(row["last_processed_e"])
+            unprocessed = None
             if prior is not None and prior < start:
-                self._queue_unprocessed(symbol, max(prior, self.boundary), start)
+                unprocessed = self._unprocessed_days(symbol, max(prior, self.boundary), start)
             op = self._run_op(operation="recent", symbol=symbol, range_kind="recent",
                               start=start, end=self.limit, day=None,
                               window_cap=self.lookback + 1)
-            self._after_op(op, advance_to=self.limit)
+            self._after_op(op, advance_to=self.limit, unprocessed=unprocessed)
 
-    def _queue_unprocessed(self, symbol: str, start: datetime, end: datetime) -> None:
-        """cursor から後ろ窓の手前までの未取得を、日ごとの unprocessed 行として残す。"""
+    def _unprocessed_days(self, symbol: str, start: datetime, end: datetime
+                          ) -> dict[str, list[list[str]]]:
+        """cursor から後ろ窓の手前までの未取得を、日ごとの範囲として数える (書込みはしない)。"""
         excluded = self.no_bars.dates_for(self.dataset.source, self.dataset.base_interval,
                                           symbol)
         days: dict[str, list[list[str]]] = {}
@@ -482,15 +497,14 @@ class _Run:
             if slots:
                 days.setdefault(ws.date().isoformat(), []).append(
                     [store.iso(ws), store.iso(we)])
-        interval = self.dataset.base_interval
+        return days
 
-        def work(c):
-            for day, ranges in days.items():
-                store.observe_gap(c, source=SOURCE, interval=interval, symbol=symbol,
-                                  day_utc=day, kind="unprocessed", missing_count=None,
-                                  detail={"ranges": ranges}, run_id=self.run_id,
-                                  now=self.now)
-        self._write(work)
+    def _save_unprocessed(self, c, symbol: str, days: dict) -> None:
+        interval = self.dataset.base_interval
+        for day, ranges in days.items():
+            store.observe_gap(c, source=SOURCE, interval=interval, symbol=symbol,
+                              day_utc=day, kind="unprocessed", missing_count=None,
+                              detail={"ranges": ranges}, run_id=self.run_id, now=self.now)
 
     # -- 古い gap --
     def can_continue(self) -> bool:
@@ -567,7 +581,7 @@ class _Run:
                     c, source=SOURCE, interval=interval, symbol=symbol, day_utc=day_s,
                     kind=kind, missing_before=row["missing_count"], missing_after=after,
                     run_id=self.run_id, now=self.now)
-        self._write(work)
+        self._write_required(f"gap_attempt:{symbol}", work)
 
     # -- 後処理 --
     def reconcile(self) -> None:
@@ -592,7 +606,7 @@ class _Run:
                                      {d: (n, None) for d, n in days.items()})
             for symbol, days in found_refs.items():
                 self._reconcile_kind(c, symbol, "reference_suspected", days)
-        self._write(work)
+        self._write_required("reconcile", work)
 
     def _reconcile_kind(self, c, symbol: str, kind: str,
                         observed: dict[date, tuple[int, int | None]]) -> None:
@@ -644,10 +658,14 @@ class _Run:
         if name in ("ok", "deferred") and (result.primary_open_gaps
                                            or result.new_reference_suspects):
             name, rc = "completed_with_gaps", RC_COMPLETED_WITH_GAPS
-        if result.unrecorded_series and rc == RC_OK:
-            name, rc = "partial", RC_FAILURE
+        if result.unrecorded_series or result.required_write_failures:
+            # 状態の記録に失敗した run は、衝突・遮断・後送りより技術失敗を優先する。
+            confirmed = any(o.outcome is not None and o.outcome.confirmed for o in result.ops)
+            name, rc = ("partial" if confirmed else "failed"), RC_FAILURE
         result.result, result.rc = name, rc
         failures = [o.reason for o in result.ops if o.status in ("partial", "failed")]
+        if not failures and result.required_write_failures:
+            failures = ["state_write_failed"]
 
         def work(c):
             store.finish_run(
@@ -721,6 +739,9 @@ def render(result: SyncResult, dataset: HistoryDataset, *, until_done: bool) -> 
     if result.unrecorded_series:
         lines.append(f"unrecorded_series={result.unrecorded_series} "
                      "(記録に失敗した操作があります。次回の同期で再確認されます)")
+    if result.required_write_failures:
+        lines.append("write_failures=" + ",".join(sorted(set(result.required_write_failures)))
+                     + " (状態の保存に失敗しました。次回の同期で再確認されます)")
     lines.append(f"result={result.result} rc={result.rc}")
     lines.append(f"inserted={result.inserted} unchanged={result.unchanged} "
                  f"conflicted={result.conflicted}")
