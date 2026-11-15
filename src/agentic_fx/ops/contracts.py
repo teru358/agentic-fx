@@ -27,6 +27,8 @@ class ErrorCode(StrEnum):
     DECISION_IN_PROGRESS = "decision_in_progress"
     GENERATION_MISMATCH = "generation_mismatch"
     NOT_LATCHED = "not_latched"
+    PREVIEW_CHANGED = "preview_changed"
+    MARKET_CLOSED = "market_closed"
     DATABASE_BUSY = "database_busy"
     UNAVAILABLE = "unavailable"
     INTERNAL = "internal"

@@ -272,14 +272,14 @@ def _route(method: str, path: str, scope: Scope, handler: str, accepted: int = 2
 
 
 _ACCEPTED_202 = frozenset({"ask", "approve", "reject", "retry", "improve"})
-_ENDPOINT_COUNT = 33
+_ENDPOINT_COUNT = 35
 
 
 def build_routes(endpoints: dict) -> tuple[Route, ...]:
     """Endpoint 表から route を作る。表と route が別々に変わらないよう、
     route の定義は表だけに置き、形が崩れていれば起動時に fail closed で止める。"""
     if len(endpoints) != _ENDPOINT_COUNT:
-        raise RuntimeError("endpoint table must hold exactly 33 entries")
+        raise RuntimeError("endpoint table must hold exactly 35 entries")
     routes = []
     for code, endpoint in endpoints.items():
         method, _, path = endpoint.route.partition(" ")
@@ -290,7 +290,7 @@ def build_routes(endpoints: dict) -> tuple[Route, ...]:
     return tuple(routes)
 
 
-# local_guard の 3 本は UDS listener だけで routing する。
+# scope が local_guard の route は本数に依らず UDS listener だけで routing する (_match)。
 ROUTES = build_routes(ENDPOINTS)
 _PIDFD_REQUIRED = frozenset({Scope.DECIDE, Scope.LOCAL_GUARD})
 ACTOR_HEADER = "x-afx-asserted-actor"
@@ -376,6 +376,9 @@ def _call(ops, route: Route, params: dict, request: Request, principal: Principa
                                 deadline=deadline)
     if name == "policy_show":
         return ops.show_policy(principal, deadline=deadline)
+    if name == "killswitch_rebase_preview":
+        return ops.rebase_preview(principal, _int(q.get("expected_generation")),
+                                  deadline=deadline)
     body = _body(request)
     if name == "ask":
         return ops.ask(principal, key, body.get("question"), deadline=deadline)
@@ -394,6 +397,9 @@ def _call(ops, route: Route, params: dict, request: Request, principal: Principa
                                      deadline=deadline)
     if name == "killswitch_reconcile":
         return ops.reconcile_kill_switch(principal, deadline=deadline)
+    if name == "killswitch_rebase":
+        return ops.rebase_kill_switch(principal, body.get("expected_generation"),
+                                      body.get("preview_token"), deadline=deadline)
     if name == "reflection_retry":
         if "expected_attempts" not in body or "expected_last_attempt_at" not in body:
             raise OpsError(ErrorCode.INVALID_ARGUMENT)

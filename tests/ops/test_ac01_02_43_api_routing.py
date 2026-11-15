@@ -61,6 +61,10 @@ def _calls(api, env):
         ("killswitch_reset", "POST", "/v1/killswitch/reset", {"expected_generation": 0}, {},
          409),
         ("killswitch_reconcile", "POST", "/v1/killswitch/reconcile", {}, {}, 409),
+        ("killswitch_rebase_preview", "GET", "/v1/killswitch/rebase-preview"
+         "?expected_generation=0", None, {}, 200),
+        ("killswitch_rebase", "POST", "/v1/killswitch/rebase",
+         {"expected_generation": 0, "preview_token": "0" * 64}, {}, 503),
         ("reflection_retry", "POST", f"/v1/reflections/{order_id}/retry",
          {"expected_attempts": 0, "expected_last_attempt_at": None}, key, 200),
         ("improve", "POST", "/v1/improve/runs", {}, key, 202),
@@ -77,7 +81,7 @@ def _calls(api, env):
     ]
 
 
-def test_ac1_all_33_endpoints_over_real_uds(api):
+def test_ac1_all_endpoints_over_real_uds(api):
     from agentic_fx.ops.api_server import _match
     client = api.client(Principal.APPROVER)
     seen = set()
@@ -99,7 +103,7 @@ def test_ac1_all_33_endpoints_over_real_uds(api):
             _wait_job(client, ask_job)
         if expected == 202:
             jobs.append(payload["data"]["job_id"])
-    assert len(ROUTES) == 33 and seen == set(ROUTES)
+    assert len(ROUTES) == 35 and seen == set(ROUTES)
     for job_id in jobs:
         assert _wait_job(client, job_id)["state"] in ("done", "failed")
     codes = {client.post("/v1/killswitch/reset", json={"expected_generation": 0})
@@ -117,10 +121,16 @@ def test_ac1_unknown_path_and_method_are_404(api):
 
 
 @pytest.mark.parametrize("path", ["/v1/data/resume", "/v1/killswitch/reset",
-                                  "/v1/killswitch/reconcile"])
+                                  "/v1/killswitch/reconcile", "/v1/killswitch/rebase"])
 def test_ac1_local_guard_routes_do_not_match_tcp(path):
     assert _match("POST", path, "tcp") is None
     assert _match("POST", path, "uds") is not None
+
+
+def test_ac1_rebase_preview_route_does_not_match_tcp():
+    path = "/v1/killswitch/rebase-preview"
+    assert _match("GET", path, "tcp") is None
+    assert _match("GET", path, "uds") is not None
 
 
 # ---------------------------------------------------------------- AC-2
@@ -281,6 +291,8 @@ _EXPECTED_TABLE = {
     "retry": ("POST", "/v1/approvals/{id}/retry", Scope.DECIDE),
     "killswitch_reset": ("POST", "/v1/killswitch/reset", Scope.LOCAL_GUARD),
     "killswitch_reconcile": ("POST", "/v1/killswitch/reconcile", Scope.LOCAL_GUARD),
+    "killswitch_rebase_preview": ("GET", "/v1/killswitch/rebase-preview", Scope.LOCAL_GUARD),
+    "killswitch_rebase": ("POST", "/v1/killswitch/rebase", Scope.LOCAL_GUARD),
     "reflection_retry": ("POST", "/v1/reflections/{order_id}/retry", Scope.OPERATE),
     "improve": ("POST", "/v1/improve/runs", Scope.IMPROVE_RUN),
     "backlog_add": ("POST", "/v1/backlog", Scope.OPERATE),
@@ -298,7 +310,7 @@ _EXPECTED_TABLE = {
 
 def test_ac1_routes_and_endpoints_match_the_independent_table_exactly():
     from agentic_fx.ops.service import ENDPOINTS
-    assert len(_EXPECTED_TABLE) == 33
+    assert len(_EXPECTED_TABLE) == 35
     assert {code: (e.route.split(" ", 1)[0], e.route.split(" ", 1)[1], e.scope)
             for code, e in ENDPOINTS.items()} == _EXPECTED_TABLE
     assert {r.handler: (r.method, r.scope) for r in ROUTES} == {

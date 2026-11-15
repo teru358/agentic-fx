@@ -50,6 +50,9 @@ from .contracts import (ACTOR_PRINCIPALS, IMPROVE_RUNS_DEFAULT_LIMIT,
                         Principal, Scope, ShellCaller, assert_authorized,
                         validate_asserted_actor)
 from .events import EventSchemaError, EventStore
+from . import rebase_service
+from .rebase_accounting import RebaseOutcomeUnknown, apply_rebase
+from .rebase_service import RebaseWiring
 from .jobs import Job, JobRegistry, JobState, new_job_id
 from .tail import activity_filter, tail_lines
 
@@ -182,6 +185,10 @@ ENDPOINTS: dict[str, Endpoint] = {e.code: e for e in (
     Endpoint("killswitch_reset", "POST /v1/killswitch/reset", Scope.LOCAL_GUARD, True,
              autopilot_restricted=True),
     Endpoint("killswitch_reconcile", "POST /v1/killswitch/reconcile", Scope.LOCAL_GUARD, True),
+    Endpoint("killswitch_rebase_preview", "GET /v1/killswitch/rebase-preview",
+             Scope.LOCAL_GUARD, False),
+    Endpoint("killswitch_rebase", "POST /v1/killswitch/rebase", Scope.LOCAL_GUARD, True,
+             autopilot_restricted=True),
     Endpoint("reflection_retry", "POST /v1/reflections/{order_id}/retry", Scope.OPERATE, True,
              idempotent=True, autopilot_restricted=True),
     Endpoint("improve", "POST /v1/improve/runs", Scope.IMPROVE_RUN, True, idempotent=True,
@@ -732,7 +739,8 @@ class OpsService:
                  ask_submitter: Callable[[str], object] | None = None,
                  improve_supervisor=None, plugins_root: Path | None = None,
                  settings=None, activity_log=None,
-                 improve_reports_dir: Path | None = None) -> None:
+                 improve_reports_dir: Path | None = None,
+                 rebase: RebaseWiring | None = None) -> None:
         self.stop_event = stop_event or threading.Event()
         self._owns_decide_conn = decide_conn is None
         raw_decide = decide_conn if decide_conn is not None else self._open_peer(conn)
@@ -764,6 +772,7 @@ class OpsService:
         self._plugin_views = None
         self._improve_reports_dir = improve_reports_dir
         self._settings = settings
+        self._rebase = rebase
         self._activity_log = activity_log
         self.jobs = JobRegistry(monotonic=monotonic)
         self._ops_lock = threading.RLock()
@@ -964,7 +973,7 @@ class OpsService:
                 if not isinstance(exc, Exception):
                     # 割り込みは終端行を書かず伝播させる (再起動時の復旧が outcome_unknown にする)。
                     raise
-                if isinstance(exc, PolicyProjectionUnknown):
+                if isinstance(exc, (PolicyProjectionUnknown, RebaseOutcomeUnknown)):
                     self._terminal(accepted, caller, endpoint, ErrorCode.OUTCOME_UNKNOWN.value,
                                    _error_response(ErrorCode.OUTCOME_UNKNOWN),
                                    state="outcome_unknown")
@@ -1757,6 +1766,149 @@ class OpsService:
 
         return self._mutate(principal, ENDPOINTS["killswitch_reconcile"], {}, "killswitch",
                             action, deadline=deadline)
+
+    # ------------------------------------------------ HWM の付け直し
+
+    _REBASE_HOLD_SECONDS = 1.0
+
+    def _rebase_wiring(self) -> RebaseWiring | None:
+        """依存 (core lock / broker / state / settings) が揃っているときだけ返す。"""
+        if self._rebase is None or self._state_store is None or self._settings is None:
+            return None
+        return self._rebase
+
+    @staticmethod
+    def _rebase_args(expected_generation: object) -> None:
+        if type(expected_generation) is not int or expected_generation < 0:
+            raise OpsError(ErrorCode.INVALID_ARGUMENT)
+
+    def rebase_preview(self, principal: Caller, expected_generation: int, *,
+                       deadline: float | None = None) -> dict:
+        """付け直しの事前表示。DB / state を変えず、受理行も作らない。"""
+        # 入口の scope ではなく service の先頭で approver を直接検査する (シェルは scope を素通りする)。
+        if principal is not Principal.APPROVER:
+            raise OpsError(ErrorCode.FORBIDDEN)
+        _authorize(principal, "killswitch_rebase_preview")
+        self._rebase_args(expected_generation)
+        deadline = self._deadline(deadline)
+        wiring = self._rebase_wiring()
+        try:
+            if self._autopilot(deadline):
+                raise OpsError(ErrorCode.AUTOPILOT_RESTRICTED)
+            with self._ops_lane(deadline):
+                state, marker = None, False
+                if wiring is not None:
+                    state, marker = self._rebase_preview_state(deadline)
+                self._conn.execute("BEGIN")
+                try:
+                    evaluation = rebase_service.evaluate_rebase(
+                        self._conn, wiring=wiring, state=state, marker_pending=marker,
+                        expected_generation=expected_generation,
+                        settings=self._settings, now=self._wall_clock())
+                finally:
+                    with contextlib.suppress(Exception):
+                        self._conn.rollback()
+        except Exception as exc:
+            code = self._map_exception(exc)
+            if code is not None and not isinstance(exc, OpsError):
+                raise OpsError(code) from None
+            raise
+        return rebase_service.dto(evaluation)
+
+    def _rebase_preview_state(self, deadline: float):
+        from agentic_fx.store.state import (StateError, StateLockCancelled,
+                                            StateLockTimeout)
+        try:
+            state = self._state_store.load(deadline=self._foreign(deadline),
+                                           stop_event=self.stop_event)
+            return state, self._state_store.reconcile_marker() is not None
+        except (StateLockTimeout, StateLockCancelled):
+            raise
+        except (StateError, ValueError, OSError):
+            return None, False
+
+    def rebase_kill_switch(self, principal: Caller, expected_generation: int,
+                           preview_token: str, *, deadline: float | None = None) -> dict:
+        """表示した値のまま HWM を現在 equity へ付け直す (非 idempotent)。"""
+        if principal is not Principal.APPROVER:
+            raise OpsError(ErrorCode.FORBIDDEN)
+        _authorize(principal, "killswitch_rebase")
+        self._rebase_args(expected_generation)
+        if type(preview_token) is not str or re.fullmatch(r"[0-9a-f]{64}", preview_token) is None:
+            raise OpsError(ErrorCode.INVALID_ARGUMENT)
+
+        def action(deadline_: float, accepted: AcceptedRequest) -> dict:
+            return self._rebase_under_core(deadline_, accepted, expected_generation,
+                                           preview_token)
+
+        return self._mutate(principal, ENDPOINTS["killswitch_rebase"],
+                            {"expected_generation": expected_generation,
+                             "preview_token": preview_token}, "killswitch", action,
+                            deadline=deadline)
+
+    def _rebase_under_core(self, deadline: float, accepted: AcceptedRequest,
+                           expected_generation: int, preview_token: str) -> dict:
+        """ops lane → core lock → state 共有 flock → BEGIN IMMEDIATE の順で保持して適用する。
+
+        成功後の解放時の通常例外は成立済みの結果を変えない。保持区間では state の公開 load、
+        排他 flock、guard sweep を呼ばない (共有 flock の自己待ち・逆順を作らない)。"""
+        wiring = self._rebase_wiring()
+        if wiring is None:
+            raise OpsError(ErrorCode.UNAVAILABLE)
+        response: dict | None = None
+        try:
+            with contextlib.ExitStack() as stack:
+                self._acquire(wiring.core_lock, deadline, self.limits.request_deadline_seconds)
+                stack.callback(wiring.core_lock.release)
+                hold = min(deadline, self._monotonic() + self._REBASE_HOLD_SECONDS)
+                stack.enter_context(self._conn.waiting_until(hold))
+                guard = stack.enter_context(self._state_store.shared_guard(
+                    deadline=self._foreign(hold), stop_event=self.stop_event))
+                response = self._rebase_commit(wiring, guard, accepted, expected_generation,
+                                               preview_token)
+        except Exception:
+            if response is None:
+                raise
+            _log.warning("rebase_release_failed")
+        return response
+
+    def _rebase_commit(self, wiring: RebaseWiring, guard, accepted: AcceptedRequest,
+                       expected_generation: int, preview_token: str) -> dict:
+        from agentic_fx.store import snapshots
+        state = guard.state
+        if state is None or guard.marker_pending:
+            raise OpsError(ErrorCode[rebase_service.error_code_name("state_unavailable")])
+        if state.autopilot:
+            raise OpsError(ErrorCode.AUTOPILOT_RESTRICTED)
+        source = snapshots.latest(self._conn)
+        if source is None:
+            raise OpsError(ErrorCode.PREVIEW_CHANGED)
+        now = self._wall_clock()
+
+        def validate(conn) -> None:
+            evaluation = rebase_service.evaluate_rebase(
+                conn, wiring=wiring, state=state, marker_pending=guard.marker_pending,
+                expected_generation=expected_generation, settings=self._settings, now=now)
+            if evaluation.reason is not None:
+                raise OpsError(ErrorCode[rebase_service.error_code_name(evaluation.reason)])
+            if (evaluation.token != preview_token
+                    or evaluation.source_snapshot_id != source["id"]):
+                raise OpsError(ErrorCode.PREVIEW_CHANGED)
+
+        latched = state.kill_switch_latched
+        try:
+            result = apply_rebase(
+                self._conn, source_snapshot_id=source["id"], accepted_audit_id=accepted.audit_id,
+                applied_at=now, generation=state.kill_switch_generation,
+                latched_at=state.kill_switch_latched_at,
+                digest_version=rebase_service.DIGEST_VERSION, preview_token=preview_token,
+                hwm_before=source["hwm"], equity=source["equity"], balance=source["balance"],
+                threshold_pct=self._settings.risk.drawdown_kill_pct, now=now, validate=validate)
+        except ValueError:
+            raise OpsError(ErrorCode.PREVIEW_CHANGED) from None
+        # 台帳の金額は応答 / 監査 terminal に載せない。latched は guard の state の値。
+        return {"rebase_id": result["rebase_id"], "snapshot_id": result["snapshot_id"],
+                "generation": result["generation"], "latched": latched}
 
     def cancel_job(self, principal: Caller, job_id: str, *,
                    deadline: float | None = None, asserted_actor: str | None = None) -> dict:

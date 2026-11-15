@@ -72,7 +72,8 @@ KNOWN_DAEMON_CODES = frozenset({
     "idempotency_mismatch", "outcome_unknown", "job_running", "invalid_state",
     "attempt_changed", "already_decided", "payload_changed", "payload_too_large",
     "unsupported_kind", "plugin_busy", "mission_busy", "improve_running",
-    "decision_in_progress", "generation_mismatch", "not_latched", "database_busy",
+    "decision_in_progress", "generation_mismatch", "not_latched", "preview_changed",
+    "market_closed", "database_busy",
     "unavailable", "internal",
 })
 UNRECOGNIZED_CODE = "other"
