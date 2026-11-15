@@ -156,13 +156,17 @@ def apply_rebase(
         conn.set_authorizer(read_only_authorizer)
         try:
             validate(conn)
+            if not conn.in_transaction:
+                raise RuntimeError("validate must not end the rebase transaction")
+            now = _resolve_time(now)
+            applied_at = _resolve_time(applied_at)
+            if not conn.in_transaction:
+                raise RuntimeError("time callables must not end the rebase transaction")
         finally:
             conn.set_authorizer(None)
         if not conn.in_transaction:
             raise RuntimeError("validate must not end the rebase transaction")
         budget()
-        now = _resolve_time(now)
-        applied_at = _resolve_time(applied_at)
         if source_snapshot_id is None:
             if any(v is not None for v in (hwm_before, equity, balance)):
                 raise ValueError("source values need a source snapshot id")

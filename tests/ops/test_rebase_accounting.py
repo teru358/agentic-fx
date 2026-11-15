@@ -465,3 +465,28 @@ def test_source_values_without_a_source_id_are_rejected(tmp_path):
                      hwm_before=1000.0, threshold_pct=5.0, now=now,
                      validate=lambda db: None)
     assert _counts(path) == (0, 1)
+
+
+@pytest.mark.parametrize("time_arg", ["now", "applied_at"])
+@pytest.mark.parametrize("action", ["insert", "commit"])
+def test_time_callable_cannot_write_or_end_transaction(tmp_path, time_arg, action):
+    path = tmp_path / f"time-{time_arg}-{action}.db"
+    conn, now, source_id, audit_id = _commit_fault_db(path)
+
+    def bad_time():
+        if action == "insert":
+            conn.execute("INSERT INTO account_snapshots(ts,balance,equity,hwm) "
+                         "VALUES('x',1,1,1)")
+        else:
+            conn.execute("COMMIT")
+        return now
+
+    kwargs = {"now": now, "applied_at": now}
+    kwargs[time_arg] = bad_time
+    with pytest.raises(sqlite3.DatabaseError):
+        apply_rebase(conn, source_snapshot_id=source_id, accepted_audit_id=audit_id,
+                     generation=7, latched_at=None, digest_version=1,
+                     preview_token="time-guard", hwm_before=1000, equity=900,
+                     balance=900, threshold_pct=5, validate=lambda db: None, **kwargs)
+    conn.close()
+    assert _counts(path) == (0, 1)
