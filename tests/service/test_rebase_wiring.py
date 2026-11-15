@@ -28,6 +28,10 @@ def test_ops_service_shares_the_app_core_lock_and_the_runtime_broker(tmp_path):
         wiring = app.ops._rebase
         assert wiring is not None
         assert wiring.core_lock is app.core_lock
+        # commit-core / MTM / 振り返り / econ の書き手と同じ 1 個の lock を共有する。
+        assert app.trade_loop._core_lock is wiring.core_lock
+        assert app.reflection._core_lock is wiring.core_lock
+        assert app.econ_worker._core_lock is wiring.core_lock
         assert wiring.broker is app.broker and type(wiring.broker) is PaperBroker
         view = app.ops.rebase_preview(Principal.APPROVER, 0)
         assert view["reason"] != "rebase_unavailable"
