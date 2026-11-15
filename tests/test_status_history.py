@@ -368,3 +368,66 @@ def test_unconfigured_source_reports_executor_unsupported(world):
     settings.datafeed.mt5.history_executor_url = "https://history.example.invalid"
     result = status_history.collect(world[0], settings, None, "UTC", NOW)
     assert status_history.EXECUTOR_UNSUPPORTED_LINE in "\n".join(status_history.render(result, "UTC"))
+
+
+@pytest.mark.parametrize(("run_status", "failure", "deferred", "expected"), [
+    ("running", None, None, ()),
+    ("ok", None, None, ()),
+    ("deferred", None, "market_closed", ()),
+    ("deferred", None, "request_budget", ()),
+    ("deferred", None, "inspection_insufficient", ()),
+    ("completed_with_gaps", None, "market_closed", ()),
+    ("completed_with_conflicts", None, None, (status_history.NextAction.LIST_CONFLICTS,)),
+    ("conflict_circuit_open", None, None, (status_history.NextAction.LIST_CONFLICTS,)),
+    ("failed", "history_executor_unsupported", None, (status_history.NextAction.UPDATE_BRIDGE,)),
+    ("failed", "history_completion_pending", None, (status_history.NextAction.CHECK_COMPLETION_PENDING,)),
+    ("failed", "bridge_unavailable", None, (status_history.NextAction.STOP_DAEMON_THEN_SYNC,)),
+    ("partial", "state_write_failed", None, (status_history.NextAction.STOP_DAEMON_THEN_SYNC,)),
+    ("interrupted", None, None, (status_history.NextAction.STOP_DAEMON_THEN_SYNC,)),
+])
+def test_sync_next_depends_on_run_status_and_reason(world, run_status, failure, deferred, expected):
+    from agentic_fx.store import history_sync as store
+
+    conn = world[1]
+    store.insert_run(conn, run_id="run1", owner="owner", trigger="manual", source="mt5",
+                     interval="5m", calendar_version="v1", lookback_days=7, epoch="epoch",
+                     t=NOW, b=NOW, e=NOW, started_at=NOW)
+    conn.execute("UPDATE history_sync_runs SET status=?, failure_code=?, deferred_reason=?",
+                 (run_status, failure, deferred))
+    conn.execute("INSERT INTO history_sync_series_state "
+                 "(source, interval, symbol, next_retry_at, updated_at) VALUES (?,?,?,?,?)",
+                 ("mt5", "5m", "USDJPY", (NOW + timedelta(hours=1)).isoformat(), NOW.isoformat()))
+    sync = status_history._collect_sync(conn, _settings(), _settings().backtest.dataset(), NOW)
+    assert sync.next_actions == expected
+    rendered = "\n".join(status_history.render_sync(sync, "UTC"))
+    if deferred:
+        assert f"deferred={deferred}" in rendered
+        assert "next retry 2026-11-10 07:02:20 +00:00" in rendered
+
+
+def test_primary_gap_still_requests_sync_and_gap_listing(world):
+    conn = world[1]
+    conn.execute("INSERT INTO history_sync_gaps "
+                 "(source, interval, symbol, day_utc, kind, first_seen_at, last_observed_at) "
+                 "VALUES (?,?,?,?,?,?,?)", ("mt5", "5m", "USDJPY", "2026-11-10",
+                 "primary_exact", NOW.isoformat(), NOW.isoformat()))
+    sync = status_history._collect_sync(conn, _settings(), _settings().backtest.dataset(), NOW)
+    assert sync.next_actions == (status_history.NextAction.STOP_DAEMON_THEN_SYNC,
+                                 status_history.NextAction.LIST_GAPS)
+
+
+def test_completion_pending_with_open_gap_does_not_offer_manual_sync(world):
+    from agentic_fx.store import history_sync as store
+
+    conn = world[1]
+    store.insert_run(conn, run_id="run1", owner="owner", trigger="manual", source="mt5",
+                     interval="5m", calendar_version="v1", lookback_days=7, epoch="epoch",
+                     t=NOW, b=NOW, e=NOW, started_at=NOW)
+    conn.execute("UPDATE history_sync_runs SET status='failed', failure_code='history_completion_pending'")
+    conn.execute("INSERT INTO history_sync_gaps "
+                 "(source, interval, symbol, day_utc, kind, first_seen_at, last_observed_at) "
+                 "VALUES (?,?,?,?,?,?,?)", ("mt5", "5m", "USDJPY", "2026-11-10",
+                 "primary_exact", NOW.isoformat(), NOW.isoformat()))
+    sync = status_history._collect_sync(conn, _settings(), _settings().backtest.dataset(), NOW)
+    assert sync.next_actions == (status_history.NextAction.CHECK_COMPLETION_PENDING,
+                                 status_history.NextAction.LIST_GAPS)

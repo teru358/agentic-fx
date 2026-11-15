@@ -62,6 +62,8 @@ class NextAction(str, Enum):
     STOP_DAEMON_THEN_SYNC = "stop_daemon_then_sync"
     LIST_GAPS = "list_gaps"
     LIST_CONFLICTS = "list_conflicts"
+    UPDATE_BRIDGE = "update_bridge"
+    CHECK_COMPLETION_PENDING = "check_completion_pending"
 
 
 @dataclass(frozen=True)
@@ -353,15 +355,25 @@ def _tables(conn: sqlite3.Connection) -> set[str]:
     return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
 
-def _sync_next(sync: HistorySync, *, attention: bool) -> tuple[NextAction, ...]:
+def _sync_next(sync: HistorySync) -> tuple[NextAction, ...]:
     actions: list[NextAction] = []
     primary_open = dict(sync.open_gaps)
-    if attention or primary_open.get("primary_exact") or primary_open.get("unprocessed"):
+    run = sync.last_run
+    if run and run.status in ("failed", "partial", "interrupted"):
+        if run.failure_code == "history_executor_unsupported":
+            actions.append(NextAction.UPDATE_BRIDGE)
+        elif run.failure_code == "history_completion_pending":
+            actions.append(NextAction.CHECK_COMPLETION_PENDING)
+        else:
+            actions.append(NextAction.STOP_DAEMON_THEN_SYNC)
+    if (primary_open.get("primary_exact") or primary_open.get("unprocessed")) \
+            and NextAction.STOP_DAEMON_THEN_SYNC not in actions \
+            and NextAction.CHECK_COMPLETION_PENDING not in actions:
         actions.append(NextAction.STOP_DAEMON_THEN_SYNC)
     if primary_open.get("primary_exact") or primary_open.get("unprocessed") \
             or primary_open.get("reference_suspected"):
         actions.append(NextAction.LIST_GAPS)
-    if sync.open_conflicts:
+    if sync.open_conflicts or (run and run.status in ("completed_with_conflicts", "conflict_circuit_open")):
         actions.append(NextAction.LIST_CONFLICTS)
     return tuple(actions)
 
@@ -437,7 +449,7 @@ def _collect_sync(conn: sqlite3.Connection, settings: Any, dataset: Any,
         last_success=None if success is None else _sync_run(success), series=series,
         open_gaps=tuple(gap_counts.items()), expired_days=_count(expired), suspected=suspected,
         open_conflicts=conflicts)
-    return replace(sync, next_actions=_sync_next(sync, attention=attention))
+    return replace(sync, next_actions=_sync_next(sync))
 
 
 def unavailable(now: datetime, reason: ReasonCode) -> HistoryStatus:
@@ -522,8 +534,11 @@ _NEXT_TEXT = {
         "daemon を止めて `afx history sync` を実行 (停止中は kill switch の監視も止まります。"
         "自動同期はまだありません)、その後 `afx status`",
     NextAction.LIST_GAPS:
-        "`afx history gaps list` で範囲を確認 (自動修復の予定はありません。直すときは停止中の "
-        "`afx history sync`)",
+        "`afx history gaps list` で範囲を確認 (自動修復の予定はありません)",
+    NextAction.UPDATE_BRIDGE:
+        "bridge を更新し、前提成立後に daemon の自動自己計測を待つ (取得は停止中)",
+    NextAction.CHECK_COMPLETION_PENDING:
+        "完了証拠を確認できるまで取得を停止し、bridge の保守復旧手順を確認",
     NextAction.LIST_CONFLICTS:
         "`afx history conflicts list` / `show <id>` で確認 (置換には daemon の停止が必要)",
 }
