@@ -1582,7 +1582,7 @@
    "symbol": "src/agentic_fx/store/state.py::<module>._MARKER_SUFFIX"
   },
   {
-   "class": "G_lit",
+   "class": "G_reach",
    "critical": true,
    "origin": "both",
    "rationale": "realpath に揃えた state file に suffix を付加する。 / B: state file から marker path を作る。",

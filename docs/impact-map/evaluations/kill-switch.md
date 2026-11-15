@@ -21,3 +21,16 @@
 - 頁セル (G_lit ∪ G_reach critical): 母数 161、TP 64、FN 97、U 0。頁の被覆宣言 106 件に対し正解表 221 行。
 - 判定: **初回は不合格** (§4.3 の critical FN=0 を満たさない)。抽出器を設計の形へ合わせ、頁を手動補完して再測定する。再測定の点はこの初回の点と並べて記録する。
 - 実測: extract 367 file / 5.9 MB / 0.82 秒 (一回)。
+
+## 正解表の訂正 (run4 の後)
+
+- `src/agentic_fx/store/state.py::StateStore._marker` × `marker:reset_marker` の class を G_lit → G_reach に訂正。理由: この symbol は literal を持たず定数名 `_MARKER_SUFFIX` を参照するだけで、literal は `<module>._MARKER_SUFFIX` 側にある (G_lit の定義「宣言 literal を持つ site」に当たらない)。出力を見た後の訂正なので記録する。役割: 指揮者。frozen sha256: `ae6911f0f7b3…` → `b929322136ed…`。
+- 訂正前の点 (run4): 機械セル critical 母数 78 / TP 77 / FN 1 / U 0、頁セル critical 母数 161 / TP 64 / FN 97 / U 0。
+
+## 抽出器の是正の経過 (設計の形に合わせたもの、正解表は見せていない)
+
+| run | 変更 | 機械 critical FN | 頁 critical FN |
+|---|---|---|---|
+| run2 | 初回 | 41 / 78 | 97 / 161 |
+| run3 | module 定数 `<module>.NAME`、文字列中の識別子境界の一致、dataclass field、marker literal の明示 | 4 / 78 | 97 / 161 |
+| run4 | class 定数 `Class.NAME`、正解 symbol の入れ子を同じ symbol として数える、marker literal を suffix 文字列に | 1 / 78 | 97 / 161 |
