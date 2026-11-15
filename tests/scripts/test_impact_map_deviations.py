@@ -9,68 +9,127 @@ SOURCE = 'src/agentic_fx/commands.py'
 
 
 
-def compare(source, entries):
+def scan_sites(source):
     tree = ast.parse(source)
     classes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'Commands']
     if len(classes) != 1:
         raise ValueError('Commands class missing or ambiguous')
-    groups = {}
     methods = {'StateStore': {'reset_kill_switch', 'confirm_latched', 'update', 'save'},
                'OutageStateMachine': {'request_resume'}}
+    groups = {}
+
     class Visitor(ast.NodeVisitor):
         def __init__(self):
             self.stack = []
-            self.aliases = []
-        def receiver_kind(self, node):
-            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self":
-                return {"state": "StateStore", "outage": "OutageStateMachine"}.get(node.attr)
+            self.env = {}
+
+        def receiver(self, node):
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == 'self':
+                kind = {'state': 'StateStore', 'outage': 'OutageStateMachine'}.get(node.attr)
+                return {kind} if kind else {None}
             if isinstance(node, ast.Name):
-                return (self.aliases[-1].get(node.id) if self.aliases else None) or (node.id if node.id in methods else None)
-            return None
+                return self.env.get(node.id, {node.id} if node.id in methods else {None})
+            if isinstance(node, (ast.Dict, ast.List, ast.Set, ast.Tuple, ast.Constant)):
+                return {'other'}
+            return {None}
+
         def visit_Assign(self, node):
-            kind = self.receiver_kind(node.value)
+            self.visit(node.value)
+            value = self.receiver(node.value)
             for target in node.targets:
-                if isinstance(target, ast.Name) and self.aliases:
-                    if kind:
-                        self.aliases[-1][target.id] = kind
-                    else:
-                        self.aliases[-1].pop(target.id, None)
-            self.generic_visit(node)
+                if isinstance(target, ast.Name):
+                    self.env[target.id] = set(value)
+                else:
+                    self.visit(target)
+
+        def visit_AnnAssign(self, node):
+            if node.value is not None:
+                self.visit(node.value)
+            if isinstance(node.target, ast.Name):
+                if node.value is not None:
+                    self.env[node.target.id] = set(self.receiver(node.value))
+                elif isinstance(node.annotation, ast.Name) and node.annotation.id in methods:
+                    self.env[node.target.id] = {node.annotation.id}
+                else:
+                    self.env[node.target.id] = {None}
+
+        def visit_If(self, node):
+            self.visit(node.test)
+            before = {k: set(v) for k, v in self.env.items()}
+            for stmt in node.body:
+                self.visit(stmt)
+            left = self.env
+            self.env = {k: set(v) for k, v in before.items()}
+            for stmt in node.orelse:
+                self.visit(stmt)
+            right = self.env
+            self.env = {k: left.get(k, {None}) | right.get(k, {None})
+                        for k in left.keys() | right.keys()}
+
         def visit_FunctionDef(self, node):
             self.stack.append(node.name)
-            aliases = dict(self.aliases[-1]) if self.aliases else {}
-            for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs):
-                if isinstance(arg.annotation, ast.Name) and arg.annotation.id in methods:
-                    aliases[arg.arg] = arg.annotation.id
-            self.aliases.append(aliases)
-            self.generic_visit(node)
-            self.aliases.pop()
+            outer = self.env
+            self.env = {k: set(v) for k, v in outer.items()}
+            class Bindings(ast.NodeVisitor):
+                def __init__(self):
+                    self.names = set()
+                def visit_Name(self, item):
+                    if isinstance(item.ctx, (ast.Store, ast.Del)):
+                        self.names.add(item.id)
+                def visit_FunctionDef(self, item):
+                    self.names.add(item.name)
+                visit_AsyncFunctionDef = visit_FunctionDef
+                def visit_ClassDef(self, item):
+                    self.names.add(item.name)
+            bindings = Bindings()
+            for stmt in node.body:
+                bindings.visit(stmt)
+            for name in bindings.names:
+                self.env[name] = {None}
+            args = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs,
+                    *((node.args.vararg,) if node.args.vararg else ()),
+                    *((node.args.kwarg,) if node.args.kwarg else ()))
+            for arg in args:
+                self.env[arg.arg] = ({arg.annotation.id} if isinstance(arg.annotation, ast.Name)
+                                     and arg.annotation.id in methods else {None})
+            for stmt in node.body:
+                self.visit(stmt)
+            self.env = outer
             self.stack.pop()
         visit_AsyncFunctionDef = visit_FunctionDef
-        def visit_ClassDef(self, node):
-            self.stack.append(node.name)
-            self.generic_visit(node)
-            self.stack.pop()
+
         def visit_Call(self, node):
             func = node.func
-            if isinstance(func, ast.Attribute):
-                kind = self.receiver_kind(func.value)
-                if kind and func.attr in methods[kind] and self.stack:
+            if isinstance(func, ast.Attribute) and self.stack:
+                kinds = self.receiver(func.value)
+                candidates = {kind for kind in kinds if kind in methods and func.attr in methods[kind]}
+                for kind in candidates:
+                    status = 'certain' if kinds == {kind} else 'possible'
                     key = (SOURCE, 'Commands.' + '.'.join(self.stack), kind + '.' + func.attr)
-                    groups.setdefault(key, []).append(ast.dump(node, annotate_fields=True, include_attributes=False))
+                    groups.setdefault((status, key), []).append(ast.dump(node, annotate_fields=True, include_attributes=False))
+                if None in kinds and any(func.attr in names for names in methods.values()):
+                    key = (SOURCE, 'Commands.' + '.'.join(self.stack), func.attr)
+                    groups.setdefault(('unresolved', key), []).append(ast.dump(node, annotate_fields=True, include_attributes=False))
             self.generic_visit(node)
+
     visitor = Visitor()
     for node in classes[0].body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             visitor.visit(node)
-    actual = set()
-    for key, expressions in groups.items():
+    result = {'certain': set(), 'possible': set(), 'unresolved': set()}
+    for (status, key), expressions in groups.items():
         if len(expressions) == 1:
-            actual.add((*key, ''))
+            result[status].add((*key, ''))
         else:
             if len(set(expressions)) != len(expressions):
                 raise ValueError('duplicate sites cannot be distinguished')
-            actual.update((*key, expr) for expr in expressions)
+            result[status].update((*key, expr) for expr in expressions)
+    return result
+
+
+def compare(source, entries):
+    sites = scan_sites(source)
+    actual = sites['certain'] | sites['possible']
     declared = set()
     for row in entries:
         key = (row['path'], row['qualified_symbol'], row['callee_method'], row.get('fixed_expression', ''))
@@ -102,7 +161,10 @@ def test_deviations_match_actual_source():
     entries = json.loads((ROOT / 'docs/impact-map/deviations.json').read_text(encoding='utf-8'))
     for row in entries:
         assert all(isinstance(row.get(field), str) and row[field].strip() for field in ('d_id', 'reason', 'ticket', 'approval_boundary'))
-    unexpected, missing = compare((ROOT / SOURCE).read_text(encoding='utf-8'), entries)
+    source = (ROOT / SOURCE).read_text(encoding='utf-8')
+    sites = scan_sites(source)
+    assert not sites['possible'] and not sites['unresolved'], sites
+    unexpected, missing = compare(source, entries)
     assert not unexpected and not missing, f'unexpected={sorted(unexpected)} missing={sorted(missing)}'
 
 
@@ -120,3 +182,44 @@ class Commands:
     unexpected, missing = compare(source, [])
     assert not missing
     assert {k[2] for k in unexpected} == {'StateStore.update', 'StateStore.save', 'OutageStateMachine.request_resume'}
+
+
+def test_branch_join_preserves_possible_receiver():
+    source = '''class Commands:
+    def f(self, flag):
+        store = self.state
+        if flag:
+            store = {}
+        store.save()
+'''
+    sites = scan_sites(source)
+    assert sites['possible'] == {(SOURCE, 'Commands.f', 'StateStore.save', '')}
+    assert not sites['certain']
+
+
+def test_nested_scope_arguments_and_assignments_shadow_alias():
+    source = '''class Commands:
+    def f(self):
+        store = self.state
+        def arg(store):
+            store.save()
+        def assigned():
+            store.save()
+            store = {}
+        store.save()
+'''
+    sites = scan_sites(source)
+    assert sites['certain'] == {(SOURCE, 'Commands.f', 'StateStore.save', '')}
+    assert not sites['possible']
+    assert {row[1] for row in sites['unresolved']} == {'Commands.f.arg', 'Commands.f.assigned'}
+
+
+def test_straight_line_reassignment_removes_alias():
+    source = '''class Commands:
+    def f(self):
+        store = self.state
+        store = {}
+        store.save()
+'''
+    sites = scan_sites(source)
+    assert not sites['certain'] and not sites['possible']

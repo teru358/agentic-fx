@@ -48,3 +48,7 @@ python3 scripts/impact_map.py evaluate --domain kill-switch --index tmp/impact-m
 | `contract_unchanged` | 契約が変わらないことを確認 |
 | `relation_unchanged_refactor` | リファクタ後も関係が変わらないことを確認 |
 | `relation_changed_page_updated` | 関係の変更を頁に反映して確認 |
+
+AST hash 方式 `v1` は docstring、型注釈、文字列 literal、decorator、default 値を含む AST を保持し、位置情報だけを除く。
+規則を変更しない限り方式 version は維持する。
+`affected` の `coarse_parent_changed` は副 anchor を持つ 300 行超の親全体に変更があったことを示す情報項目で、辺の変更を意味せず、終了コードを変えない。

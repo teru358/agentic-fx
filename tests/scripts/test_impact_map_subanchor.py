@@ -68,3 +68,16 @@ def test_affected_subanchor_ignores_other_statement(tmp_path):
     source.write_text(source.read_text().replace('emit("one")', 'emit("one", 2)'))
     result = cli(tmp_path, 'affected', '--page', 'demo', '--base', 'HEAD', '--worktree')
     assert any(i['kind'] == 'symbol_changed' and i['anchor'] == 'app.py::big#emit@one' for i in json.loads(result.stdout)['items'])
+
+
+def test_affected_reports_changed_coarse_parent(tmp_path):
+    source, page = setup(tmp_path)
+    def affected():
+        result = cli(tmp_path, 'affected', '--page', 'demo', '--base', 'HEAD', '--worktree')
+        assert result.returncode == 0
+        return json.loads(result.stdout)['items']
+    assert not any(i['kind'] == 'coarse_parent_changed' for i in affected())
+    source.write_text(source.read_text().replace('other(1)', 'other(2)'))
+    items = affected()
+    assert {'kind': 'coarse_parent_changed', 'anchor': 'app.py::big'} in items
+    assert not any(i['kind'] == 'symbol_changed' for i in items)

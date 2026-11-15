@@ -86,3 +86,15 @@ def test_record_requires_allowed_reason_and_resolvable_evidence(tmp_path):
     ticket.parent.mkdir(parents=True)
     ticket.write_text('')
     assert record('contract_unchanged', 'T-1').returncode == 0
+
+
+def test_hash_preserves_docstrings_annotations_and_ignores_position(tmp_path):
+    source = tmp_path / 'sample.py'
+    source.write_text('def f(x: int):\n    """first"""\n    return x\n')
+    digest = json.loads(run(tmp_path).stdout)['current_hash']
+    source.write_text('\n\ndef f(x: int):\n    """first"""\n    return x\n')
+    assert json.loads(run(tmp_path).stdout)['current_hash'] == digest
+    source.write_text(source.read_text().replace('first', 'second'))
+    assert json.loads(run(tmp_path).stdout)['current_hash'] != digest
+    source.write_text(source.read_text().replace('second', 'first').replace('x: int', 'x: str'))
+    assert json.loads(run(tmp_path).stdout)['current_hash'] != digest

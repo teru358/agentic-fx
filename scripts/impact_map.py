@@ -362,6 +362,8 @@ def evaluate(args):
     return 0
 
 
+# v1 retains the complete AST, including docstrings, annotations, string literals,
+# decorators and defaults; only source location attributes are omitted.
 METHOD = f"python-{sys.version_info.major}.{sys.version_info.minor}:ast.dump(annotate_fields=True,include_attributes=False):v1"
 
 
@@ -677,6 +679,14 @@ def affected(args):
             return source.read_bytes() if source.is_file() else None
         items = set()
         sub_parents = {a.split('#', 1)[0] for a in declarations if '#' in a}
+        for parent in sorted(sub_parents):
+            path = parent.split('::', 1)[0]
+            old, new = declared_data(base, path), declared_data(head, path)
+            old_node, old_hash = anchor_digest(parent, old) if old is not None else (None, None)
+            new_node, new_hash = anchor_digest(parent, new) if new is not None else (None, None)
+            if (old_hash is not None and new_hash is not None and old_hash != new_hash and
+                    any(node and node.end_lineno - node.lineno + 1 > 300 for node in (old_node, new_node))):
+                items.add(('coarse_parent_changed', parent, '', ''))
         for anchor in sorted(declarations):
             path = anchor.split('::', 1)[0]
             old, new = declared_data(base, path), declared_data(head, path)
