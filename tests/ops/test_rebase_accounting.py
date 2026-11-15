@@ -413,6 +413,29 @@ def test_budget_is_checked_up_to_the_commit_and_expiry_rolls_back(tmp_path, fail
     assert _counts(path) == (0, 1)
 
 
+def test_expired_budget_after_validate_does_not_run_time_callables(tmp_path):
+    path = tmp_path / "budget-callable.db"
+    conn, now, _source_id, audit_id = _commit_fault_db(path)
+    calls, resolved = [], []
+
+    def budget():
+        calls.append(1)
+        if len(calls) == 2:
+            raise _Budget
+
+    def clock():
+        resolved.append(1)
+        return now
+
+    with pytest.raises(_Budget):
+        apply_rebase(conn, accepted_audit_id=audit_id, applied_at=clock, generation=7,
+                     latched_at=None, digest_version=1, preview_token="budget",
+                     threshold_pct=5.0, now=clock, validate=lambda db: None,
+                     check_budget=budget)
+    assert resolved == []
+    assert not conn.in_transaction and _counts(path) == (0, 1)
+
+
 def test_budget_is_checked_five_times_on_success(tmp_path):
     conn, now, _source_id, audit_id = _commit_fault_db(tmp_path / "ok.db")
     calls = []
