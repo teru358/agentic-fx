@@ -53,6 +53,8 @@ histbugs C2.2 §1.2の保持者別locked契約を継承する。最上位status�
 
 `history_sync` には「対象はholdout内と直近。in-sampleは作らない」を添える。expiredは「holdout外、自動修復なし N日」の情報行だけで、nextにはしない。
 
+段2のstatusは取得workerも自己計測も受入も無いため、`history_sync` に config (`auto_enabled`/`lookback_days`)・effective: disabled (理由は `auto_disabled` か `measurement_not_accepted`)・自己計測 `not_measured`・worker `not_running` を固定の語で出す。run/series/gap/conflictの固定語・件数・時刻だけを読み、表に保存された自由文字列は固定語の形でなければ出さない。参照の疑いのdetailは新キー `median_fill_ppm` (充足率の中央値、ppm) を表示し、旧キー `twice_median` (中央値の本数の2倍、単位が違う) は読取専用で別単位 (`median_bars`) として表示する。`eval_window` は評価区間C2の記録の読取が入るまで `not_collected` のまま。`datafeed.mt5.history_executor_url` の設定は値なしで「3b未実装・未対応」とだけ示す。
+
 | 観測 | next |
 |---|---|
 | ready、同期正常 | なし。参照の商品休場だけでimportを案内しない |
@@ -304,6 +306,7 @@ rollbackは新コードのうちにauto_enabled=falseへ変更して再起動し
 | 2026-11-15 | C5.3 | 参照の疑いを、日の本数そのものでなく共通暦の開場格子に対する充足率の中央値比較に改訂 | 正常な日曜・短縮日が疑いになる誤検出を避ける (利用者裁定 2026-11-14) | — (未commit) |
 | 2026-11-15 | C5.4 | 日別run集計の永続表 `history_sync_daily` を明記 (run終了と同transactionで加算、二重に数えない) | series詳細の90日GC後も日別を復元できるようにする | — (未commit) |
 | 2026-11-15 | C5.5 | 検査尾の候補を `[B,c)` に限る制限を撤廃し、始端がBのときもBより前の既存keyから尾を選ぶ。尾は比較・監査だけに使い、尾の欠落足は挿入しない | `max(B,E-D日)` と `[B,c)` 制限が両立せず、lookbackがBに届く設定と境界日のgapが進めなかった | — (未commit) |
+| 2026-11-15 | C5.6 | §1.3 に段2のstatusの固定表示 (effective disabled、自己計測/worker、参照の疑いの新旧detail、`eval_window` 未収集、3b未対応の情報行) を明記。HB C2.6・段1a C2.5・wizard案内と同時に原本を追随 | T3 (表示・運用原本) の実装 | — (未commit) |
 
 ## 6. 短い task 表
 

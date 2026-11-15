@@ -191,7 +191,7 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
   4. afx を動かすマシンから `curl <URL>/health` で `"mt5_connected": true` を確認する。
   5. bridge にキーを設定したなら、afx 側の `.env` に `MT5_BRIDGE_API_KEY=<同じ値>` を書く。
   6. `afx init` を再実行し、段 3 で「1. 使う・動いている」を選ぶ (接続試験が記録される)。
-  7. 戦略の採用審査に使う履歴を取り込む: `uv run afx history import --source mt5 --symbol USDJPY --from <開始日> --to <終了日> --interval 5m`。
+  7. 履歴を取り込む (daemon を止めて実行): 主 pair と参照 (`datafeed.watch_symbols`) の全銘柄を同じ開始日から、`backtest.base_interval` の足幅で 1 銘柄ずつ `uv run afx history import --source mt5 --symbol <銘柄> --from <開始日> --to <終了日> --interval <base_interval>`。主だけ古く入れると参照が評価から外れ得ます。以後の holdout 内の更新と穴修復は停止中の `uv run afx history sync` です。
   - 注: `mt5_bridge/README.md` は旧プロジェクトの手順を含むため、そこに書かれた設定キー (`mt5_bridge:`) は使わないこと (§10 で別チケット)。
 
 **分岐 3 (使わない)**
@@ -950,6 +950,7 @@ T10 → T1 → T3 → T2 → T4 → T13 → T11 → T5b → T7a → T7b → T12 
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-11-15 | v2.1 | 案内文の手順 7 を、主 pair と参照を同じ開始日から `backtest.base_interval` の足幅で daemon 停止中に import し、以後は停止中の `afx history sync` で更新する形に改めた (1 銘柄・5m 固定の例をやめた) | 評価用履歴の同期 (段 2) の導入。主だけ古く入れると参照が評価から外れ得るため | |
 | 2026-10-25 | v2.0 | 基本ニュースソースの seed を廃止。段 3 に副段「ニュース源」を足し (出口は 1 つにそろえ、どの分岐でも 1 度だけ通る)、入力された源だけを段 10 の DB transaction の中で登録する。`--non-interactive` と起動はニュース源を登録しない。範囲・範囲外・crash matrix・DB 行を合わせた | ニュース源は利用者が選ぶ裁定 (2026-10-25)。既定源の同梱が責任の所在を曖昧にするため | |
 | 2026-10-25 | v1.9 | ウィザード起動 argv と案内文、段 12 の managed 方針、`afx ops <feature> enable` の現行形を追補 | CLI surface の現行運用名を設計資料へ同期するため | |
 | 2026-10-02 | v0.1 | 草稿。流れを「集める層 → 確定 1 → 確定 2」に組み直し、B-2 (行単位 + G1〜G3)、B-7 の 3 分岐と未接続時の現物の振る舞い、B-8 ((b): `expected=0` の期の消費印)、unit の差し替え点と lock 解放の順序、未完の手順の一覧、不変条件 15・受入条件 21、task 8 本、未決 8 件、現物の問題 13 件を記述 | 裁定記録 (2026-10-02) と inventory を設計に落とすため | |

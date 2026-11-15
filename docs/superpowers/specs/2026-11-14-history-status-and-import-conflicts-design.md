@@ -2,7 +2,7 @@
 
 日付: 2026-11-14。対象: `status-history-hidden-while-daemon-runs` / `history-import-stops-at-first-conflict`。
 状態: C2.2。2026-11-14 利用者承認 (C2.1)、遮断器の既知除外を技術判断で追加。実装中。関連原本仕様・コードの変更は task とする。
-基準: 設計レビュー opus 1 周目と terra の閉鎖確認 2 回 (非公開の記録)。参照: 段1a `docs/superpowers/specs/2026-11-11-backtest-history-freshness-guard-design.md`、同期の設計 (段 2・3、レビュー中)、評価区間の設計 (レビュー中)。
+基準: 設計レビュー opus 1 周目と terra の閉鎖確認 2 回 (非公開の記録)。参照: 段1a `docs/superpowers/specs/2026-11-11-backtest-history-freshness-guard-design.md`、同期の設計 C5 `docs/superpowers/specs/2026-11-14-backtest-history-sync-design.md` (段 2 は実装済み、段 3 は未着手)、評価区間の設計 (レビュー中)。
 
 ## 1. 動作目線
 
@@ -50,7 +50,7 @@ unknown の DB 接続は **URI `mode=ro` を強制し、sidecar の有無にか�
 
 | 現在の主判定 | 履歴ブロック内の案内 |
 |---|---|
-| stale / gap | 不足 pair・範囲の確認、`afx history import`、その後 `afx status` |
+| stale / gap | 不足 pair・範囲の確認、daemon を止めて `afx history import` (初回・holdout より古い履歴) か `afx history sync` (holdout 内の更新・穴修復)、その後 `afx status`。`afx ctl history sync` は段 3 の導入後だけ案内する (同期 C5 §1.2) |
 | unavailable | 固定理由に沿う設定/DB/no-bars の確認と status 再実行。一律 import は案内しない |
 | ready | `next:` なし。参照の0本日があっても同じ |
 | not configured | 設定状態を表示。一律 import/再評価は案内しない |
@@ -224,7 +224,7 @@ import/syncの語彙は次を共有し、別名のpartial成功を作らない�
 | 衝突完走 | 非衝突行と全衝突記録をbatchごとに確定、rc=3 |
 | repair/置換の監査失敗 | その履歴変更transaction全体rollback。旧epochと記録の整合を維持 |
 
-配備順は新schema/core/表示を導入→daemon再起動→manual import。稼働中旧daemonの下で新importだけ先行させない。runbookと公開変更履歴にDukascopyのrc変更、取得失敗0件への変更、部分確定時の再実行を明記する。Dukascopy実機疎通はr1時点で接続元の制限が報告されており、本改訂でも未確認。偽fetchの受入と実機の確認を混同しない。
+配備順は新schema/core/表示を導入し、schema 導入のために再起動→daemon停止→manual import→再起動 (同期 C5 §1.2・§3)。稼働中の daemon の下では import しない (取得前の instance lock が拒否する)。稼働中旧daemonの下で新importだけ先行させない。runbookと公開変更履歴にDukascopyのrc変更、取得失敗0件への変更、部分確定時の再実行を明記する。Dukascopy実機疎通はr1時点で接続元の制限が報告されており、本改訂でも未確認。偽fetchの受入と実機の確認を混同しない。
 
 ## 4. test・受入
 
@@ -274,6 +274,7 @@ import/syncの語彙は次を共有し、別名のpartial成功を作らない�
 | 2026-11-14 | C2.3 | §2.3 の同期への参照を同期 C5 へ。T4 の `ImportConflictError` の記述を廃止済みの実態へ。time repair は mutation lease と WriterAdmission の順に参加し、移動元・移動先の open 記録の supersede を同じ transaction で行う (T5) | 段1a・UTC 時刻規則 spec の食い違い訂正 (T6)、repair の実装 | — |
 | 2026-11-15 | C2.4 | 衝突に `bridge_verified_run_id` を足し、replace_with_incoming を sync の検証済み取得で最後に観測された記録に限る (§2.4)。手動importの記録は NULL で keep は可・replace は拒否、手動importの証明対応は後続 | 置換の根拠を origin ラベルだけにしない (正本C2付録E) | — (未commit) |
 | 2026-11-15 | C2.5 | §2.3 の同期の検査用既存区間はBより前のkeyを含んでよく、比較・監査専用 (欠落足は挿入しない) とする。§2.5a の事前固定とprefix除外は不変 | 同期 C5.5 と整合 | — (未commit) |
+| 2026-11-15 | C2.6 | 参照先を同期 C5 に追随 (ヘッダ、§1.3 の stale / gap 案内に停止中の `afx history sync` を併記、ctl は段 3 の導入後)、§3 の配備順を「schema 導入で再起動 → daemon 停止 → manual import → 再起動」に、T2 の相互参照を C5 §1.3/§2.8 へ。`history_sync` スロットは同期の永続表の観測で埋まった (評価区間 `eval_window` は未収集のまま) | 同期 段 2 の表示・運用原本の実装 | — (未commit) |
 
 ## 6. 短い task 表
 
@@ -282,7 +283,7 @@ import/syncの語彙は次を共有し、別名のpartial成功を作らない�
 | 順 | task / 対象 | 完了条件 |
 |---|---|---|
 | T1 | locked契約: `status.py`, `store/db.py`, `tests/test_status_locks.py`, observer関連test、cli-surface spec §6.1/golden/AC-18、`docs/operations/first-run-acceptance.md:172` | unknownのみ履歴読取・ro強制、他保持者6行維持、timezoneと固定理由、helper docstringも整合 |
-| T2 | DTO/参照/案内: `status_history.py` と関連test、段1a §7、`docs/operations/reevaluate-deployed-after-history-repair.md` §7手順3、同期C2 §1.3/§2.8、評価区間C2 §2.5との接点 | watch正本、見出し、空文言/期待値、条件付きnext、再評価は具体的結果から案内、共通スロットの所有権を明示 |
+| T2 | DTO/参照/案内: `status_history.py` と関連test、段1a §7、`docs/operations/reevaluate-deployed-after-history-repair.md` §7手順3、同期C5 §1.3/§2.8、評価区間C2 §2.5との接点 | watch正本、見出し、空文言/期待値、条件付きnext、再評価は具体的結果から案内、共通スロットの所有権を明示 |
 | T3 | schema/core: `store/db.py`, `store/ohlcv.py`, 新 `store/history_conflicts.py`, schema/旧DB fixture/`TABLE_NAMES` test | 最終形、二段判定、epoch付きUNIQUE/upsert、closed state維持、agent隔離 |
 | T4 | import両source/CLI: `backtest/mt5_import.py`, Dukascopy `importer.py`, `cli.py`, import test、共通mutation lease | 操作・系列別全取得→遮断→batch、rc/進捗/再実行・stage寿命・generation/cursor、例外契約変更。`ImportConflictError` の廃止と docstring/全利用箇所の除去 (実装済み)、mt5末尾「1回の短いtransaction」コメント、ohlcvの古い件数だけ/窓分割前提コメントを更新または廃止 |
 | T5 | repair: `backtest/time_repair.py`, `core/history_epoch.py`との契約、修復test | 同じlease、移動元/先のsupersede原子性、既存epoch/no-op/backupの意味を維持 |

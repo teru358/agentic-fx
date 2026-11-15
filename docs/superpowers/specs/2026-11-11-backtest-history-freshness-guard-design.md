@@ -106,7 +106,7 @@ bridge応答のnaive日時は拒否する。aware応答はUTCへ正規化する�
 
 ### 2.3 衝突・閉場中の運用
 
-異値衝突は上書きしない。C2.2 が、旧契約 (停止・部分commit、新しい衝突テーブルを作らない) を置き換える。衝突は `history_conflicts` へ記録して非衝突行の確定を続け (completed_with_conflicts、rc=3)、系統的なずれは事前遮断器で系列の書込み 0 件とする (rc=4)。人間は記録と表示で旧新値を確認し、置換は同期 (段 2) の明示操作へ送る。
+異値衝突は上書きしない。C2.2 が、旧契約 (停止・部分commit、新しい衝突テーブルを作らない) を置き換える。衝突は `history_conflicts` へ記録して非衝突行の確定を続け (completed_with_conflicts、rc=3)、系統的なずれは事前遮断器で系列の書込み 0 件とする (rc=4)。人間は記録と表示で旧新値を確認し、置換は同期 (段 2、C5 §2.7) の明示操作へ送る。
 
 bridgeは閉場中、時刻規則を検証できず503を返す場合がある。これを「対象なし」や成功に変換しない。人間向け案内とrunbookに、開場後の再試行、期間を分けた取得、取得後の日別充足確認を書く。
 
@@ -419,7 +419,7 @@ rejectは使わず、人間の自由記述による履歴情報を改善prompt�
 - holdoutのpresent・expected・充足率、最悪の日の欠損本数と時間、欠損が60分ぶんを超える日。
 - `ready / history_stale / history_gap / unavailable`。複数理由があれば併記。
 - 参照銘柄 (`datafeed.watch_symbols` から主pairを除いたもの。空なら `no reference watch symbols`) について、主pairに足があるUTC日なのに0本だった日の一覧。見出しは「holdout 区間の 0 本日 (評価に使えるかは eval_window の表示を見る)」。
-- 主判定に応じた案内。stale / gap のときだけ「daemon を止めて `afx history import`」、unavailable のときは固定理由に沿う確認、ready と not configured では `next:` を出さない。配備中版の再評価は status の充足から推測せず、gate・再評価の具体的な結果から案内する。
+- 主判定に応じた案内。stale / gap のときだけ「daemon を止めて `afx history import` (初回・holdout より古い履歴) か `afx history sync` (holdout 内の更新・穴修復)」、unavailable のときは固定理由に沿う確認、ready と not configured では `next:` を出さない。配備中版の再評価は status の充足から推測せず、gate・再評価の具体的な結果から案内する。
 
 無足一覧のファイルパスはrepository rootを基準とする `config/history-no-bars.yaml` に固定し、実際に解決したパスを人間面に表示する。実行時のカレントディレクトリによって別の一覧を読まない。
 
@@ -647,8 +647,8 @@ improve・submit・bless・reevaluateの各入口に、`real_history_guard` mark
 | 段1b以降 | ctl・webのstatus、参照銘柄の20有足日中央値による欠損検知 |
 | 段1b以降 | archive候補の専用再提出・保全操作 |
 | 段1b以降・必要性を再検討 | 同じ読取transaction、snapshot/as-of、不変履歴による再現性 |
-| 段2 | 人間による置換、`afx history sync` (衝突の永続記録と衝突後続行は C2.2 が前倒し済み) |
-| 段3 | 開場中の定期同期、閉場時deferred、異常・悪化・回復通知 |
+| 段2 (同期 C5) | 停止中の手動 `afx history sync` / gap queue / 取得前の instance lock による import の稼働中拒否 / 人間による置換 (衝突の永続記録と衝突後続行は C2.2 が前倒し済み)、status の `history_sync` 表示 |
+| 段3 (同期 C5、段 2 の後) | 開場中の定期同期 (主 pair のみ。参照は計測後の別 task)、閉場時deferred、`afx ctl history sync` / `selftest`、異常・悪化・回復通知。段 2 だけで独立に導入できる |
 | 別チケット | cache/historyの二重保存解消・表統合 |
 
 証跡のない版への新規rollback拒否と人間専用の強行操作は、段1aに含める。
@@ -702,6 +702,7 @@ improve・submit・bless・reevaluateの各入口に、`real_history_guard` mark
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-11-15 | C2.5 | §10 の段名を同期 C5 の段 2・段 3 に合わせ、§2.3 の置換の参照先を C5 §2.7 に、§7 の stale / gap 案内に停止中の `afx history sync` を併記 (段 3 の ctl は導入後) | 同期 段 2 の表示・運用原本の実装 | — |
 | 2026-11-14 | C2.4 | §8.1・§8.3・§8.4・§8.5 に段1b設計C2の裁定を追記 (失効済み4版、現在の条件での再評価と現在inventoryのrequire、通常rollback接続の延期、manifestの版別境界)。過去の裁定は消していない | 段1bの利用者承認 (J0 = 7版すべて、J1 = 方式D) と、実装 (task 1.1〜1.3) の反映 | — |
 | 2026-11-14 | C2.3 | import の「停止・部分commit維持」と「衝突の永続記録は段2」を C2.2 が前倒しで置換したと、概要・§2.3・§7・§9・段の表に明記。status の読取条件を保持者別に訂正。schema version の記述を撤回 | C2.2 付録B 4・6・7。同期は C5 | — |
 | 2026-11-12 | C2.1 | §5 の保存時の再照合を実装に合わせて訂正 (現在の一覧を既存依頼自身の区間で照合) | 新評価の区間で照合すると、評価中に時計が進んだだけで適正な pending が無効になるため。入口ごとの実検査の結合 test を追加 | — |

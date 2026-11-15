@@ -1,17 +1,31 @@
 # 評価用履歴の import (`afx history import`) の運用
 
-評価用履歴 (`ohlcv_history`) を MT5 または Dukascopy から取り込む手順です。契約の正本は `docs/superpowers/specs/2026-11-14-history-status-and-import-conflicts-design.md` (C2.2) です。履歴の穴埋めのあとに承認を再評価する手順は `docs/operations/reevaluate-deployed-after-history-repair.md` §7 にあります。
+評価用履歴 (`ohlcv_history`) を MT5 または Dukascopy から取り込む手順です。契約の正本は `docs/superpowers/specs/2026-11-14-history-status-and-import-conflicts-design.md` (C2.2) と、同期 (停止中の手動 `afx history sync`・gap queue・稼働中拒否) の `docs/superpowers/specs/2026-11-14-backtest-history-sync-design.md` (C5) です。履歴の穴埋めのあとに承認を再評価する手順は `docs/operations/reevaluate-deployed-after-history-repair.md` §7 にあります。
 
-## 1. 配備の順序: 再起動してから import する
+## 1. 配備の順序: schema 導入で再起動 → daemon 停止 → import → 再起動
 
-新しい衝突の記録 (`history_conflicts`) と共通の import 経路は、コードを更新して **daemon を再起動した後**に使います。
+新しい衝突の記録 (`history_conflicts`) と同期の表 (`history_sync_*`)、共通の import 経路は、コードを更新して **daemon を再起動した後**に使います。
 
-1. コードを更新し、`systemctl --user restart afx` で daemon を再起動する。起動時に `history_conflicts` 表が作られる (既存 DB への追加は冪等で、再起動を重ねても変わらない)。
-2. `afx status` の `evaluation history` で状態を確かめる。
-3. `systemctl --user stop afx` で daemon を止め、開場中に `afx history import ...` を実行する (daemon を止めている間は kill switch の監視も止まる)。
+1. コードを更新し、`systemctl --user restart afx` で daemon を再起動する。起動時に新しい表が作られる (既存 DB への追加は冪等で、再起動を重ねても変わらない)。`afx status` が `history sync: not initialized` と出ている間は、まだ導入されていません。
+2. `afx status` の `evaluation history` と `history sync` で状態を確かめる。
+3. `systemctl --user stop afx` で daemon を止め、開場中に `afx history import ...` (初回・holdout より古い履歴) または `afx history sync` (holdout 内の更新・穴修復) を実行する (daemon を止めている間は kill switch の監視も止まる)。daemon などが稼働中だと、どちらも `instance_locked` (rc 1) で何も取得せずに終わります。`--allow-while-running` のような迂回はありません。
 4. 終わったら `systemctl --user start afx` で daemon を戻す。
 
 旧い daemon が動いたまま、新しい import だけを先に走らせてはいけません。取込と time repair は、DB と同じ directory の `history-mutation.lock` で互いに待たずに排他され、取れなければ `database_busy` で何も書かずに終わります。この lock は履歴を書く処理どうしだけを排他し、daemon の通常の取引 DB 書込みは止めません。
+
+## 1a. 初回の導入と、その後の同期
+
+- **初回は主 pair と参照を同じ開始日から入れる。** 対象は `pairs` と `datafeed.watch_symbols` の全銘柄で、足幅は設定の `backtest.base_interval` (1m / 5m / 15m) です。1 銘柄ずつ `afx history import --source mt5 --symbol <銘柄> --from <開始日> --to <終了日> --interval <base_interval>` を、daemon を止めて実行します。主だけを古くまで入れると、参照が評価から外れ得ます (評価区間の設計が確定した後は、その診断の表示に従ってください)。
+- **以後の更新と穴修復は同期で行う。** `afx history sync [--rescan-holdout] [--until-done]` は daemon 停止中の手動同期で、銘柄・期間を指定しません。対象は holdout 内と直近だけで、in-sample は作りません。`afx history gaps list` で未処理の穴と、holdout 外になって自動修復しない日数を、`afx history conflicts list` / `show <id>` で衝突を確かめます。
+- 自動同期 (daemon が開場中に主 pair を更新する段 3) と `afx ctl history sync` はまだありません。`afx status` の `history sync` は常に「effective: disabled」と表示され、手動同期だけが取得します。
+- `datafeed.mt5.history_executor_url` を設定しても、履歴取得専用の別 bridge (3b) は未実装で使われません。`afx status` に「3b は未実装・未対応」とだけ出ます (URL は表示しません)。
+
+## 1b. 旧コードへ戻す (rollback)
+
+1. 新コードのうちに `backtest.history_sync.auto_enabled: false` を書いて daemon を再起動する (段 3 の自動取得が入った後は、worker の取得が止まったことを `afx status` で確かめる。入っていない版では取得 worker は無いので、この手順は何も変えない)。
+2. 旧コードの settings は未知のキーを拒むので、旧コードへ戻す前に `config/settings.yaml` から `backtest.history_sync` と `datafeed.mt5.history_executor_url` の行を取り除き、`schema_version` を 5 へ戻す。評価区間の追加キーが入っているなら、それも戻す版の許可集合に合わせて取り除く (まださらに古い版へ戻すなら、その版に対応する marker にする)。旧コードの parser で検証してから起動する。
+3. DB の新しい表 (`history_sync_*`・`history_revisions`) は残す。旧コードの `init_db` は未知の表を消さず、履歴・衝突の記録・revision は削除しない。
+4. 旧コードへ戻した後は同期 worker が無いので、無効化の設定は要りません。旧版には `afx history sync` が無いので、そのコマンドが残るとは案内しません。
 
 ## 2. 終了コードと結果の読み方
 
