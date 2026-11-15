@@ -8,6 +8,7 @@ def test_route_table_is_exactly_the_read_only_surface():
         ("/", "status"), ("/approvals", "approvals"), ("/approvals/{id}", "approval"),
         ("/logs", "log"), ("/activity", "activity"),
         ("/plugins", "plugins"), ("/plugins/{name}", "plugin"),
+        ("/improve", "improve_list"), ("/improve/{id}", "improve_detail"),
     ]
     assert resolve_route("/approvals/42").values == {"id": 42}
     assert resolve_route("/approvals/0") is None
@@ -18,8 +19,8 @@ def test_write_route_table_is_exactly_the_decision_improve_and_job_surface():
     fixed = {path: (match.kind, match.methods) for path in
              ("/improve", "/improve/runs", "/confirm", "/confirm/check")
              if (match := resolve_write_route(path)) is not None}
-    assert fixed == {"/improve": ("improve_form", ("GET", "HEAD")),
-                     "/improve/runs": ("improve", ("POST",)),
+    # /improve (GET) は読む画面の route で、書込みの form はその末尾に足す
+    assert fixed == {"/improve/runs": ("improve", ("POST",)),
                      "/confirm": ("confirm", ("POST",)),
                      "/confirm/check": ("check", ("POST",))}
     approve = resolve_write_route("/approvals/42/approve")

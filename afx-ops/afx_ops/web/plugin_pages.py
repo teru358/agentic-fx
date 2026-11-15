@@ -149,12 +149,13 @@ def _usefulness_text(usefulness: object) -> str:
     return f"提出 {_count(useful.get('submitted'))} / 配備成功 {_count(useful.get('deployed'))}"
 
 
-def _table(headers: tuple[str, ...], rows: list[list[str]], budget: int, hidden: int = 0) -> str:
+def _table(headers: tuple[str, ...], rows: list[list[str]], budget: int, hidden: int = 0,
+           cli: str = OMIT_CLI) -> str:
     """cell は escape 済み。budget の byte に収まる行までを出し、残り (hidden を含む) は件数だけ示す。"""
     head = ("<table><thead><tr>" + "".join(f"<th>{item}</th>" for item in headers)
             + "</tr></thead><tbody>")
     tail = "</tbody></table>"
-    omit = _omitted_note(len(rows) + hidden)
+    omit = _omitted_note(len(rows) + hidden, cli)
     used = render._bytes(head) + render._bytes(tail) + render._bytes(omit)
     kept: list[str] = []
     for cells in rows:
@@ -164,12 +165,12 @@ def _table(headers: tuple[str, ...], rows: list[list[str]], budget: int, hidden:
         used += render._bytes(row)
         kept.append(row)
     omitted = len(rows) - len(kept) + hidden
-    note = _omitted_note(omitted) if omitted else ""
+    note = _omitted_note(omitted, cli) if omitted else ""
     return head + "".join(kept) + tail + note
 
 
-def _omitted_note(count: int) -> str:
-    return f"<p>…({count} 件省略。{OMIT_CLI})</p>"
+def _omitted_note(count: int, cli: str = OMIT_CLI) -> str:
+    return f"<p>…({count} 件省略。{cli})</p>"
 
 
 # ---------------------------------------------------------------- 一覧

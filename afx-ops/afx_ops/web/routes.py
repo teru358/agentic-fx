@@ -25,11 +25,14 @@ ROUTE_TABLE = (
     Route("/activity", "activity"),
     Route("/plugins", "plugins"),
     Route("/plugins/{name}", "plugin"),
+    Route("/improve", "improve_list"),
+    Route("/improve/{id}", "improve_detail"),
 )
 
 _EXACT = {route.path: route for route in ROUTE_TABLE if "{" not in route.path}
 _APPROVAL = re.compile(r"/approvals/([1-9][0-9]{0,17})\Z")
 # loader の名前の文法
+_IMPROVE = re.compile(r"/improve/([1-9][0-9]{0,17})\Z")
 _PLUGIN = re.compile(r"/plugins/([a-z][a-z0-9_]{0,63})\Z")
 _BY_PATH = {route.path: route for route in ROUTE_TABLE}
 
@@ -42,6 +45,9 @@ def resolve_route(path: str) -> RouteMatch | None:
     matched = _APPROVAL.fullmatch(path)
     if matched is not None:
         return RouteMatch(_BY_PATH["/approvals/{id}"], {"id": int(matched.group(1))})
+    matched = _IMPROVE.fullmatch(path)
+    if matched is not None:
+        return RouteMatch(_BY_PATH["/improve/{id}"], {"id": int(matched.group(1))})
     matched = _PLUGIN.fullmatch(path)
     if matched is not None:
         return RouteMatch(_BY_PATH["/plugins/{name}"], {"name": matched.group(1)})

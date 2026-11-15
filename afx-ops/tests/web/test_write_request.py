@@ -17,7 +17,7 @@ from _write_support import (
 
 READ_ONLY_CSP_ACTION = "form-action 'none'"
 WRITE_PATHS = ["/approvals/7/approve", "/approvals/7/reject", "/improve/runs", "/confirm",
-               "/confirm/check", "/improve", "/jobs/" + "0123456789abcdef" * 2,
+               "/confirm/check", "/jobs/" + "0123456789abcdef" * 2,
                "/jobs/" + "0123456789abcdef" * 2 + "/cancel"]
 
 
@@ -106,14 +106,26 @@ def test_other_approval_pages_get_no_form_and_keep_the_refresh(detail):
     assert "<form" not in page and 'http-equiv="refresh"' in page
 
 
-def test_the_improve_form_is_a_static_page_that_posts_to_the_first_step():
+def test_the_improve_page_ends_with_the_form_that_posts_to_the_first_step():
     rig = _rig()
     response = rig.send(rig.request("GET", "/improve"))
-    assert response.status == 200 and rig.client.calls == []
+    assert response.status == 200 and rig.client.calls == [("improve_list", 50)]
     body = response.body.decode("utf-8")
     assert 'action="/improve/runs"' in body and "token" not in body
+    assert 'http-equiv="refresh"' not in body and body.endswith("</body></html>")
+    assert body.index("終了した改善 mission") < body.index('action="/improve/runs"')
     head = rig.send(rig.request("HEAD", "/improve"))
     assert head.status == 200 and head.body == b""
+
+
+def test_the_improve_page_without_write_is_read_only_and_keeps_the_refresh():
+    rig = _rig()
+    response = rig.send(rig.request("GET", "/improve"), writable=False)
+    body = response.body.decode("utf-8")
+    assert response.status == 200 and "<form" not in body and 'http-equiv="refresh"' in body
+    assert READ_ONLY_CSP_ACTION in response.headers["Content-Security-Policy"]
+    assert rig.send(rig.request("POST", "/improve", {}), writable=False).status == 405
+    assert rig.send(rig.request("POST", "/improve/runs", {}), writable=False).status == 404
 
 
 def test_a_wrong_method_on_a_write_route_is_405_with_its_allow_list():
@@ -197,8 +209,10 @@ def test_a_non_loopback_non_tls_context_refuses_every_write_post_and_the_form():
                                         ("/confirm/check", {"token": token})]:
         response = rig.post(path, form)
         assert response.status == 403, path
-    assert rig.send(rig.request("GET", "/improve")).status == 403
-    assert rig.client.calls == [] and rig.store.counts() == (0, 0)
+    # 経路が書込みを許さないときは、読む画面だけを出し、form は足さない
+    page = rig.send(rig.request("GET", "/improve"))
+    assert page.status == 200 and b"<form" not in page.body
+    assert rig.client.calls == [("improve_list", 50)] and rig.store.counts() == (0, 0)
 
 
 def test_a_tls_context_without_loopback_is_allowed_to_write():
@@ -671,7 +685,8 @@ def test_a_get_never_changes_the_store():
     for path in ("/", "/approvals", "/approvals/7", "/improve", "/plugins"):
         rig.send(rig.request("GET", path))
     assert rig.store.counts() == (0, 0)
-    assert all(call[0] in {"status", "approvals", "approval", "approval_change", "plugins"}
+    assert all(call[0] in {"status", "approvals", "approval", "approval_change", "plugins",
+                              "improve_list"}
                for call in rig.client.calls)
 
 

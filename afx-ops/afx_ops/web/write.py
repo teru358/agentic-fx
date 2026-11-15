@@ -327,7 +327,6 @@ class WriteMatch:
 _APPROVAL_DECISION = re.compile(r"/approvals/([1-9][0-9]{0,17})/(approve|reject)\Z")
 _JOB_PATH = re.compile(r"/jobs/([0-9a-f]{32})(/cancel)?\Z")
 _FIXED = {
-    "/improve": WriteMatch("improve_form", ("GET", "HEAD")),
     "/improve/runs": WriteMatch(IMPROVE, ("POST",)),
     "/confirm": WriteMatch("confirm", ("POST",)),
     "/confirm/check": WriteMatch("check", ("POST",)),
