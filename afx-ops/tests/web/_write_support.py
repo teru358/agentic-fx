@@ -78,6 +78,13 @@ class FakeClient:
     def approvals(self, *, limit=20):
         return self._go("approvals", reply=Reply(200, {"approvals": []}, None))
 
+    def improve_list(self, *, limit=50):
+        return self._go("improve_list", limit, reply=Reply(
+            200, {"runs": [], "has_more": False, "display_timezone": "Asia/Tokyo"}, None))
+
+    def improve_detail(self, mission_id):
+        return self._go("improve_detail", mission_id, reply=Reply(404, None, "not_found"))
+
     def approval_change(self, approval_id):
         return self._go("approval_change", approval_id, reply=Reply(404, None, "not_found"))
 

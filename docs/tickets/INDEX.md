@@ -3,7 +3,7 @@
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 未完了: 175 件。完了分は closed/。
 
-## 実装中 (6)
+## 実装中 (5)
 
 ### 不具合 (3)
 
@@ -13,11 +13,10 @@
 | [history-import-stops-at-first-conflict](open/history-import-stops-at-first-conflict.md) | 中 | 2026-11-13 | history import は食い違う足 1 本で partial 停止し後続を取り込まない |
 | [status-history-hidden-while-daemon-runs](open/status-history-hidden-while-daemon-runs.md) | 中 | 2026-11-13 | daemon 稼働中は評価用履歴の状態を見る面が無い |
 
-### 機能 (2)
+### 機能 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
-| [web-plugin-improve-hub](open/web-plugin-improve-hub.md) | 高 | 2026-11-08 | 同梱 web に plugin と改善の画面群を作る (一覧・依存・承認・改善の実行) |
 | [killswitch-reset-hwm-rebase](open/killswitch-reset-hwm-rebase.md) | 高 | 2026-11-13 | kill switch の手動解除で HWM を付け直す明示操作が無い |
 
 ### 保守 (1)
@@ -78,7 +77,7 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (151)
+## 設計待ち (152)
 
 ### 不具合 (81)
 

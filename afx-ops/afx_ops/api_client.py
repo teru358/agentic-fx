@@ -558,6 +558,14 @@ class WebClient(_Client):
         """plugin 1 件の詳細。名前は loader の文法で照合し、decode しない。"""
         return self._get(f"/v1/plugins/{_plugin_name(name)}")
 
+    def improve_list(self, *, limit: int = 50) -> Reply:
+        """終端した改善 mission の一覧 (新しい順)。要約から取れる項目つき。"""
+        return self._get("/v1/improve/runs", limit=limit)
+
+    def improve_detail(self, mission_id: int) -> Reply:
+        """改善 mission 1 件の終端 snapshot と要約。"""
+        return self._get(f"/v1/improve/runs/{_int_id(mission_id)}")
+
     def log(self, *, n: int = 100) -> Reply:
         return self._get("/v1/log", n=n)
 

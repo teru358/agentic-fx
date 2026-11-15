@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from urllib.parse import parse_qsl
 
 from afx_ops.api_client import ApiError, with_detail
-from afx_ops.web import auth, plugin_pages, render, write, write_pages
+from afx_ops.web import auth, improve_pages, plugin_pages, render, write, write_pages
 from afx_ops.web.headers import response_headers
 from afx_ops.web.routes import RouteMatch, resolve_route
 
@@ -23,6 +23,7 @@ MAX_BODY_BYTES = 65536
 _METHOD = re.compile(r"[A-Z]+\Z")
 _TARGET = re.compile(r"/[!-~]*\Z")
 _INTEGER = re.compile(r"[1-9][0-9]{0,2}\Z")
+_NOT_FOUND_METHODS = frozenset({"plugin", "improve_detail"})
 _ACTIVITY_CATEGORIES = frozenset({"NEWS", "TECH", "AGGREGATE", "TRADE", "IMPROVE",
                                   "APPROVAL", "SYSTEM"})
 
@@ -224,6 +225,10 @@ def _check_reply_shape(route: str, data: dict) -> None:
                  and (not data.get("invalid_pending") or type(data["invalid_pending"]) is list))
     elif route == "plugin":
         valid = type(data.get("plugin")) is dict and type(data["plugin"].get("name")) is str
+    elif route == "improve_list":
+        valid = _list_of(data.get("runs"), dict) and type(data.get("has_more")) is bool
+    elif route == "improve_detail":
+        valid = type(data.get("id")) is int
     else:
         valid = False
     if not valid:
@@ -310,6 +315,15 @@ def _invoke(match: RouteMatch, query: dict[str, str], client, report: _Reporter)
         if query:
             raise _Reject(400)
         return _call(report, client.plugin, match.values["name"]), plugin_pages.render_plugin
+    if method == "improve_list":
+        limit = _positive(query, "limit", maximum=improve_pages.MAX_LIMIT,
+                          default=improve_pages.DEFAULT_LIMIT)
+        return (_call(report, client.improve_list, limit=limit),
+                functools.partial(improve_pages.render_improve_list, limit=limit))
+    if method == "improve_detail":
+        if query:
+            raise _Reject(400)
+        return _call(report, client.improve_detail, match.values["id"]), improve_pages.render_improve_detail
     raise _Reject(404)
 
 
@@ -438,19 +452,29 @@ def handle_request(request: Request | bytes, client, *,
         if request.body:
             raise _Reject(400)
         report = _Reporter(match.route.client_method, report_upstream)
-        reply, renderer = _invoke(match, request.query, client, report)
-        if (match.route.client_method == "plugin" and getattr(reply, "status", None) == 404
-                and getattr(reply, "code", None) == "not_found"):
-            return _error(404, head=head, writable=writable)
-        if getattr(reply, "status", None) != 200 or getattr(reply, "code", None) is not None or type(getattr(reply, "data", None)) is not dict:
-            _report_bad_reply(reply, report)
-            return _error(502, head=head, writable=writable)
         try:
-            _check_reply_shape(match.route.client_method, reply.data)
+            reply, renderer = _invoke(match, request.query, client, report)
+            if (match.route.client_method in _NOT_FOUND_METHODS and getattr(reply, "status", None) == 404
+                    and getattr(reply, "code", None) == "not_found"):
+                return _error(404, head=head, writable=writable)
+            if getattr(reply, "status", None) != 200 or getattr(reply, "code", None) is not None or type(getattr(reply, "data", None)) is not dict:
+                _report_bad_reply(reply, report)
+                raise _Upstream
+            try:
+                _check_reply_shape(match.route.client_method, reply.data)
+            except _Upstream:
+                report("shape=invalid")
+                raise
         except _Upstream:
-            report("shape=invalid")
+            if writable and match.route.client_method == "improve_list" and write_context.transport_ok:
+                body = render._page("Improve", "<p>一覧を取得できません</p>" + write_pages.improve_form_section())
+                return _response(200, write_pages.drop_refresh(body), head=head, writable=writable)
             raise
-        body = renderer(reply.data)
+        if writable and match.route.client_method == "improve_list" and write_context.transport_ok:
+            body = renderer(reply.data, forms=write_pages.improve_form_section())
+            body = write_pages.drop_refresh(body)
+        else:
+            body = renderer(reply.data)
         if writable and match.route.client_method == "approval":
             body = _with_decision_forms(body, reply.data)
         return _response(200, body, head=head, writable=writable)
@@ -483,10 +507,6 @@ def _write_response(context: write.WriteContext, match: write.WriteMatch, reques
     if request.method not in match.methods:
         return _error(405, head=head, extra={"Allow": ", ".join(match.methods)}, writable=True)
     try:
-        if match.kind == "improve_form":
-            if not context.transport_ok:
-                raise write.WriteReject(403)
-            return _response(200, write_pages.improve_form_page(), head=head, writable=True)
         if match.kind == "job_view":
             if not context.transport_ok:
                 raise write.WriteReject(403)

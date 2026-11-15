@@ -55,7 +55,7 @@ th, td { border: 1px solid #d0d7de; padding: 0.25rem 0.5rem; text-align: left; }
 """
 
 # nav に出す静的な route (表示順)。/approvals は /plugins から辿り、詳細は一覧の各項目から辿る
-_NAV_LABELS = {"/": "Status", "/plugins": "Plugins", "/logs": "Log", "/activity": "Activity"}
+_NAV_LABELS = {"/": "Status", "/plugins": "Plugins", "/improve": "Improve", "/logs": "Log", "/activity": "Activity"}
 _STATIC_ROUTES = frozenset(route.path for route in ROUTE_TABLE if "{" not in route.path)
 if not set(_NAV_LABELS) <= _STATIC_ROUTES:
     raise RuntimeError("nav label without a route")

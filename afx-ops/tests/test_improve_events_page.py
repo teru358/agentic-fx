@@ -38,7 +38,8 @@ def _names(tree) -> set[str]:
 
 
 def test_the_web_package_never_reads_events_or_an_improve_run():
-    """web は event も改善 run の読取り (`GET /v1/improve/runs*`) も持たない。"""
+    """web は event を読まない。改善 run の読取りは WebClient の improve_list / improve_detail だけで、
+    web package が `/v1/improve` の path や bot 用の improve_run を直接持つことはない。"""
     for name, tree in _web_trees():
         assert not _names(tree) & {"events", "parse_page", "encode_event"}, name
         strings = [n.value for n in ast.walk(tree)
