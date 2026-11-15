@@ -15,7 +15,7 @@ def test_extract_does_not_execute_and_records_sites(tmp_path):
     out = tmp_path / 'out'
     subprocess.run([sys.executable, str(SCRIPT), 'extract', '--domain', 'x', '--page', str(page), '--root', str(root), '--out', str(out)], check=True, cwd=tmp_path)
     records = json.loads((out / 'index.json').read_text())['records']
-    assert {(r['symbol'], r['match_kind']) for r in records} == {('C.f', 'string'), ('C.f', 'attribute'), ('C.f', 'keyword')}
+    assert {(r['symbol'], r['match_kind']) for r in records} == {('C.f', 'string_exact'), ('C.f', 'attribute'), ('C.f', 'keyword')}
 
 
 def run_extract(tmp_path, resources):
@@ -180,3 +180,30 @@ def test_evaluate_rejects_missing_evidence(tmp_path):
     page.write_text('<!-- impact-map:covers -->\n```json\n{"covers":[{"symbol":"a.py::f","resource":"event:x","ids":[],"kind":"page"}]}\n```\n<!-- /impact-map:covers -->')
     result = subprocess.run([sys.executable, str(SCRIPT), 'evaluate', '--domain', 'x', '--index', str(index), '--oracle', str(oracle), '--page', str(page), '--out', str(tmp_path / 'out')], cwd=tmp_path)
     assert result.returncode != 0
+
+
+def test_assignment_symbols_and_field_target(tmp_path):
+    root = tmp_path / 'source'
+    root.mkdir()
+    (root / 'a.py').write_text("X = 'target'\nY: str = 'target'\nclass C:\n field: bool\n attr = 'target'\n")
+    _, raw = run_extract(tmp_path, ['event:target', 'state:x.field'])
+    assert {(r['resource'], r['symbol']) for r in json.loads(raw)['records']} == {('event:target', '<module>.X'), ('event:target', '<module>.Y'), ('event:target', 'C'), ('state:x.field', 'C')}
+
+
+def test_string_identifier_boundaries(tmp_path):
+    root = tmp_path / 'source'
+    root.mkdir()
+    (root / 'a.py').write_text("def f():\n return ['target', 'FROM target;', '$.target.key', 'pretarget', 'target_1', '1target']\n")
+    _, raw = run_extract(tmp_path, ['event:target'])
+    assert {r['match_kind'] for r in json.loads(raw)['records']} == {'string_exact', 'string_token'}
+
+
+def test_explicit_marker_literals(tmp_path):
+    root = tmp_path / 'source'
+    root.mkdir()
+    (root / 'a.py').write_text("def f(x):\n return x._MARKER_SUFFIX\n")
+    page = tmp_path / 'page.md'
+    page.write_text('---\n' + json.dumps({'resources': ['marker:reset_marker'], 'literals': {'marker:reset_marker': ['_MARKER_SUFFIX']}}) + '\n---\n')
+    out = tmp_path / 'out'
+    subprocess.run([sys.executable, str(SCRIPT), 'extract', '--domain', 'x', '--page', str(page), '--root', str(root), '--out', str(out)], cwd=tmp_path, check=True)
+    assert [(r['resource'], r['symbol']) for r in json.loads((out / 'index.json').read_text())['records']] == [('marker:reset_marker', 'f')]

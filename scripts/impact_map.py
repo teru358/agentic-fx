@@ -32,14 +32,19 @@ def front_matter(path):
     return json.loads('\n'.join(lines[1:end]))
 
 
-def literals(resources):
+def literals(resources, overrides=None):
+    overrides = overrides or {}
     result = {}
     for resource in sorted(set(resources)):
         namespace, name = resource.split(':', 1)
         if not namespace or not name:
             raise ValueError('invalid resource')
         literal = name.rsplit('.', 1)[-1] if namespace in SUFFIX_NAMESPACES else name
-        result.setdefault(literal, []).append(resource)
+        values = overrides.get(resource, [literal])
+        if not isinstance(values, list) or not all(isinstance(v, str) and v for v in values):
+            raise ValueError('invalid literals')
+        for value in values:
+            result.setdefault(value, []).append(resource)
     return result
 
 
@@ -76,15 +81,40 @@ class Visitor(ast.NodeVisitor):
     def __init__(self, lookup, path, package, records):
         self.lookup, self.path, self.package, self.records = lookup, path, package, records
         self.stack = []
+        self.scopes = []
 
     def scope(self, node):
         self.stack.append(node.name)
+        self.scopes.append(node)
         self.generic_visit(node)
+        self.scopes.pop()
         self.stack.pop()
 
     visit_FunctionDef = scope
     visit_AsyncFunctionDef = scope
     visit_ClassDef = scope
+
+    def visit_Assign(self, node):
+        names = [n.id for target in node.targets for n in ast.walk(target) if isinstance(n, ast.Name)]
+        if not self.stack and names:
+            for name in names:
+                self.stack.extend(['<module>', name])
+                self.visit(node.value)
+                self.stack.pop()
+                self.stack.pop()
+        else:
+            self.generic_visit(node)
+
+    def visit_AnnAssign(self, node):
+        if self.scopes and isinstance(self.scopes[-1], ast.ClassDef) and isinstance(node.target, ast.Name):
+            self.add(node.target.id, 'attribute', node.lineno)
+        if not self.stack and isinstance(node.target, ast.Name):
+            self.stack.extend(['<module>', node.target.id])
+            self.generic_visit(node)
+            self.stack.pop()
+            self.stack.pop()
+        else:
+            self.generic_visit(node)
 
     def add(self, literal, kind, line):
         for resource in self.lookup.get(literal, []):
@@ -95,7 +125,11 @@ class Visitor(ast.NodeVisitor):
 
     def visit_Constant(self, node):
         if isinstance(node.value, str):
-            self.add(node.value, 'string', node.lineno)
+            for literal in self.lookup:
+                if node.value == literal:
+                    self.add(literal, 'string_exact', node.lineno)
+                elif re.search(r'(?<!\w)' + re.escape(literal) + r'(?!\w)', node.value):
+                    self.add(literal, 'string_token', node.lineno)
 
     def visit_Attribute(self, node):
         self.add(node.attr, 'attribute', node.lineno)
@@ -108,7 +142,8 @@ class Visitor(ast.NodeVisitor):
 
 
 def extract(args):
-    lookup = literals(front_matter(args.page)['resources'])
+    page = front_matter(args.page)
+    lookup = literals(page['resources'], page.get('literals'))
     diagnostics, records = [], {}
     inputs = size = 0
     roots = sorted(set(relative(Path(r).absolute()) for r in args.root))
