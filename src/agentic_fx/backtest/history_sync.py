@@ -45,6 +45,21 @@ REASON_NO_BRIDGE = "bridge_not_configured"
 REASON_REQUEST_BUDGET = "request_budget"
 REASON_NO_RANGE = "empty_range"
 
+# run・系列状態の failure_code / deferred_reason / last_error として保存し表示してよい固定語の
+# 正本。同期・import・取得の各層が出す語はここへ足す (表示側は個別に写さない)。
+REASON_CODES = frozenset({
+    REASON_NOT_APPLICABLE, REASON_NO_BRIDGE, REASON_REQUEST_BUDGET, REASON_NO_RANGE,
+    plan.REASON_UNINITIALIZED, plan.REASON_BACKLOG, plan.REASON_INSPECTION, plan.REASON_TAIL_LIMIT,
+    "failed", "partial", "fetch_failed", "too_large", "database_busy", "lease_unavailable",
+    "stage_expired", "invalid_response", "classify_failed", "conflict_lines_failed",
+    "write_failed", "state_write_failed", "epoch_changed", "concurrent_change",
+    "time_rule_mismatch", "time_rule_unverified", "market_closed", "tick_active",
+    "time_rule_pending", "bridge_unavailable", "bridge_auth", "symbol_unavailable",
+    "history_copy_failed", "history_executor_unsupported", "capacity_not_accepted",
+    "history_completion_pending", "history_lock_budget_exceeded", "history_metrics_unavailable",
+    "conflict_circuit_open", "interrupted",
+})
+
 
 class SyncRefused(Exception):
     """I/O の前に拒否する。code は固定語、rc は終了コード (引数・前提の不備は 2)。"""

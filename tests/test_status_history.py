@@ -397,7 +397,8 @@ def test_sync_next_depends_on_run_status_and_reason(world, run_status, failure, 
     conn.execute("INSERT INTO history_sync_series_state "
                  "(source, interval, symbol, next_retry_at, updated_at) VALUES (?,?,?,?,?)",
                  ("mt5", "5m", "USDJPY", (NOW + timedelta(hours=1)).isoformat(), NOW.isoformat()))
-    sync = status_history._collect_sync(conn, _settings(), _settings().backtest.dataset(), NOW)
+    sync = status_history._collect_sync(conn, _settings(), _settings().backtest.dataset(), NOW,
+                                        "locked" if run_status == "running" else "free")
     assert sync.next_actions == expected
     rendered = "\n".join(status_history.render_sync(sync, "UTC"))
     if deferred:

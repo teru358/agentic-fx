@@ -20,7 +20,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
-from agentic_fx.backtest import history_evidence, history_health as hh, history_sync as sync, history_sync_plan as plan
+from agentic_fx.backtest import history_evidence, history_health as hh, history_sync as sync_layer
 from agentic_fx.core.display_time import convert_or_raw
 from agentic_fx.store import history_sync as sync_store
 
@@ -135,29 +135,19 @@ class EvaluationHistory:
 class SyncState(str, Enum):
     OK = "ok"
     NEVER_RUN = "never_run"
+    RUNNING = "running"
+    DEFERRED = "deferred"
     ATTENTION = "attention"
     NOT_INITIALIZED = "not_initialized"
     NOT_APPLICABLE = "not_applicable"
     UNAVAILABLE = "unavailable"
 
 
-# 同期の run が要対応を示す結果。running は実行中の観測で、要対応に数えない。
-_RUN_OK = frozenset({"ok", "running"})
-_RUN_STATUSES = frozenset(sync_store._STATUS_COLUMN) | {"running"}
+# 同期の run が要対応を示す結果。running は instance lock の保持を確かめたときだけ実行中とみなす。
+# 許可集合の正本は同期・import の層 (呼出し時に引く)。
 _TRIGGERS = frozenset({"manual", "startup", "scheduled", "preclose", "retry"})
 _HEALTH = frozenset({"ok", "failed"})
-_REASONS = frozenset({
-    sync.REASON_NOT_APPLICABLE, sync.REASON_NO_BRIDGE, sync.REASON_REQUEST_BUDGET,
-    sync.REASON_NO_RANGE, plan.REASON_UNINITIALIZED, plan.REASON_BACKLOG,
-    plan.REASON_INSPECTION, plan.REASON_TAIL_LIMIT,
-    "fetch_failed", "too_large", "database_busy", "lease_unavailable", "stage_expired",
-    "invalid_response", "classify_failed", "conflict_lines_failed", "write_failed",
-    "state_write_failed", "epoch_changed", "concurrent_change", "time_rule_mismatch", "time_rule_unverified",
-    "market_closed", "tick_active", "time_rule_pending", "bridge_unavailable",
-    "bridge_auth", "symbol_unavailable", "history_copy_failed", "history_executor_unsupported",
-    "capacity_not_accepted", "history_completion_pending", "history_lock_budget_exceeded",
-    "history_metrics_unavailable", "conflict_circuit_open", "interrupted",
-})
+_DEFERRED_STATUSES = frozenset({"deferred", "completed_with_gaps"})
 _ID = re.compile(r"[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}\Z")
 _DAY = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
 NOT_INITIALIZED_LINE = "history sync: not initialized"
@@ -214,7 +204,6 @@ class HistorySync:
     base_interval: str | None = None
     auto_enabled: bool | None = None
     lookback_days: int | None = None
-    effective_enabled: bool = False
     effective_reason: str | None = None
     measurement: str = "not_measured"
     worker: str = "not_running"
@@ -374,12 +363,13 @@ def _count(value: Any) -> int:
 def _sync_run(row: sqlite3.Row) -> SyncRun:
     return SyncRun(
         _id(row["id"]), _id(row["request_id"]), _fixed(row["trigger"], _TRIGGERS),
-        _fixed(row["status"], _RUN_STATUSES) or "unknown",
+        _fixed(row["status"], sync_store.RUN_STATUSES) or "unknown",
         row["rc"] if type(row["rc"]) is int and row["rc"] in (0, 1, 2, 3, 4) else None,
         _utc(row["started_at"]), _utc(row["finished_at"]), _utc(row["b_utc"]), _utc(row["e_utc"]),
         _optional_count(row["requests"]), _optional_count(row["inserted"]), _optional_count(row["unchanged"]),
         _optional_count(row["conflicted_new"]), _optional_count(row["conflicted_known"]),
-        _fixed(row["failure_code"], _REASONS), _fixed(row["deferred_reason"], _REASONS))
+        _fixed(row["failure_code"], sync_layer.REASON_CODES),
+        _fixed(row["deferred_reason"], sync_layer.REASON_CODES))
 
 
 _RUN_COLUMNS = ("id, request_id, trigger, status, rc, started_at, finished_at, b_utc, e_utc, "
@@ -391,10 +381,11 @@ def _tables(conn: sqlite3.Connection) -> set[str]:
     return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
 
-def _sync_next(sync: HistorySync) -> tuple[NextAction, ...]:
+def _sync_next(observed: HistorySync) -> tuple[NextAction, ...]:
     actions: list[NextAction] = []
-    primary_open = dict(sync.open_gaps)
-    run = sync.last_run
+    open_gaps = dict(observed.open_gaps)
+    primary_open = bool(open_gaps.get("primary_exact") or open_gaps.get("unprocessed"))
+    run = observed.last_run
     if run and run.status in ("failed", "partial", "interrupted"):
         if run.failure_code == "history_executor_unsupported":
             actions.append(NextAction.UPDATE_BRIDGE)
@@ -402,27 +393,37 @@ def _sync_next(sync: HistorySync) -> tuple[NextAction, ...]:
             actions.append(NextAction.CHECK_COMPLETION_PENDING)
         else:
             actions.append(NextAction.STOP_DAEMON_THEN_SYNC)
-    if (primary_open.get("primary_exact") or primary_open.get("unprocessed")) \
-            and NextAction.STOP_DAEMON_THEN_SYNC not in actions \
-            and NextAction.CHECK_COMPLETION_PENDING not in actions \
-            and NextAction.UPDATE_BRIDGE not in actions:
+    if primary_open and not actions:
         actions.append(NextAction.STOP_DAEMON_THEN_SYNC)
-    if primary_open.get("primary_exact") or primary_open.get("unprocessed") \
-            or primary_open.get("reference_suspected"):
+    if primary_open or open_gaps.get("reference_suspected"):
         actions.append(NextAction.LIST_GAPS)
-    if sync.open_conflicts or (run and run.status in ("completed_with_conflicts", "conflict_circuit_open")):
+    if observed.open_conflicts or (run and run.status in ("completed_with_conflicts", "conflict_circuit_open")):
         actions.append(NextAction.LIST_CONFLICTS)
     return tuple(actions)
 
 
+def _executor_configured(settings: Any) -> bool:
+    try:
+        return getattr(settings.datafeed.mt5, "history_executor_url", None) is not None
+    except Exception:  # noqa: BLE001 - the flag alone is lost, never the block
+        return False
+
+
+def _lock_state(root: Path | None) -> str:
+    if root is None:
+        return "unknown"
+    try:
+        from agentic_fx.status import probe_instance_lock
+        return probe_instance_lock(root)
+    except Exception:  # noqa: BLE001 - an unreadable lock is "not confirmed held"
+        return "unknown"
+
+
 def _collect_sync(conn: sqlite3.Connection, settings: Any, dataset: Any,
-                  now: datetime) -> HistorySync:
+                  now: datetime, lock_state: str = "unknown") -> HistorySync:
     """同期の永続表を最小列だけ読む。読取専用接続で、表が無ければ not_initialized。"""
     source, interval = dataset.source, dataset.base_interval
-    try:
-        executor = getattr(settings.datafeed.mt5, "history_executor_url", None) is not None
-    except Exception:  # noqa: BLE001 - the flag alone is lost, never the block
-        executor = False
+    executor = _executor_configured(settings)
     try:
         cfg = settings.backtest.history_sync
         auto, lookback = bool(cfg.auto_enabled), int(cfg.lookback_days)
@@ -450,15 +451,21 @@ def _collect_sync(conn: sqlite3.Connection, settings: Any, dataset: Any,
         symbols = set(settings.pairs) | set(settings.datafeed.watch_symbols)
         series = tuple(
             SyncSeries(r["symbol"], _utc(r["last_processed_e"]), _optional_count(r["attempts"]),
-                       _utc(r["next_retry_at"]), _fixed(r["last_error"], _REASONS),
+                       _utc(r["next_retry_at"]), _fixed(r["last_error"], sync_layer.REASON_CODES),
                        _fixed(r["last_health"], _HEALTH))
             for r in conn.execute(
                 "SELECT symbol, last_processed_e, attempts, next_retry_at, last_error, last_health "
                 f"FROM history_sync_series_state {where} AND symbol <> ? ORDER BY symbol",
                 (*params, sync_store.CONTROL_SYMBOL)) if r["symbol"] in symbols)
+        # 件数と一覧は同じ条件 (現在の銘柄集合・検証できる日付) で数える。
+        listed = sorted(symbols)
+        marks = ",".join("?" * len(listed))
+        open_where = (f"{where} AND state='open' AND symbol IN ({marks}) "
+                      "AND date(day_utc)=day_utc")
+        open_params = (*params, *listed)
         gap_counts = {k: 0 for k in sync_store.GAP_KINDS}
-        for r in conn.execute(f"SELECT kind, COUNT(*) FROM history_sync_gaps {where} "
-                              "AND state='open' GROUP BY kind", params):
+        for r in conn.execute(f"SELECT kind, COUNT(*) FROM history_sync_gaps {open_where} "
+                              "GROUP BY kind", open_params):
             if r[0] in gap_counts:
                 gap_counts[r[0]] = _count(r[1])
         expired = conn.execute(
@@ -469,9 +476,8 @@ def _collect_sync(conn: sqlite3.Connection, settings: Any, dataset: Any,
                          sync_store.read_gap_detail(r["detail_json"]))
             for r in conn.execute(
                 "SELECT symbol, day_utc, missing_count, detail_json FROM history_sync_gaps "
-                f"{where} AND state='open' AND kind='reference_suspected' "
-                "ORDER BY symbol, day_utc", params)
-            if r["symbol"] in symbols and _day(r["day_utc"]) is not None)
+                f"{open_where} AND kind='reference_suspected' ORDER BY symbol, day_utc LIMIT ?",
+                (*open_params, _MAX_DAYS_SHOWN)))
         conflicts = 0
         if "history_conflicts" in present:
             conflicts = _count(conn.execute(
@@ -481,15 +487,28 @@ def _collect_sync(conn: sqlite3.Connection, settings: Any, dataset: Any,
         return HistorySync(SyncState.UNAVAILABLE, **common, reason_code=ReasonCode.SYNC_QUERY_FAILED,
                            effective_reason=reason)
     last_run = None if last is None else _sync_run(last)
-    attention = last_run is not None and last_run.status not in _RUN_OK
-    state = (SyncState.NEVER_RUN if last_run is None
-             else SyncState.ATTENTION if attention else SyncState.OK)
-    sync = HistorySync(
+    primary_open = bool(gap_counts["primary_exact"] or gap_counts["unprocessed"])
+    if last_run is None:
+        state = SyncState.NEVER_RUN
+    elif last_run.status == "running":
+        if lock_state == "locked":
+            state = SyncState.RUNNING
+        else:
+            # lock が保持されていない running は強制終了などの停止の痕跡。
+            last_run = replace(last_run, status="interrupted")
+            state = SyncState.ATTENTION
+    elif last_run.status in _DEFERRED_STATUSES and not primary_open:
+        state = SyncState.DEFERRED
+    elif last_run.status == "ok":
+        state = SyncState.OK
+    else:
+        state = SyncState.ATTENTION
+    observed = HistorySync(
         state, **common, effective_reason=reason, last_run=last_run,
         last_success=None if success is None else _sync_run(success), series=series,
         open_gaps=tuple(gap_counts.items()), expired_days=_count(expired), suspected=suspected,
         open_conflicts=conflicts)
-    return replace(sync, next_actions=_sync_next(sync))
+    return replace(observed, next_actions=_sync_next(observed))
 
 
 def unavailable(now: datetime, reason: ReasonCode) -> HistoryStatus:
@@ -522,7 +541,7 @@ def collect(root: Path, settings: Any, conn: sqlite3.Connection | None, tz: str,
                 HistorySync(SyncState.NOT_APPLICABLE, now, source=dataset.source,
                             base_interval=dataset.base_interval,
                             effective_reason="source_not_mt5",
-                            executor_unsupported=getattr(settings.datafeed.mt5, "history_executor_url", None) is not None))
+                            executor_unsupported=_executor_configured(settings)))
         if conn is None:
             return unavailable(now, unavailable_reason or ReasonCode.DATABASE_UNAVAILABLE)
         grace = timedelta(seconds=settings.datafeed.closed_bar_grace_sec)
@@ -547,16 +566,16 @@ def collect(root: Path, settings: Any, conn: sqlite3.Connection | None, tz: str,
                 references = References("holdout_zero_bar_days", now, health.holdout_start,
                                         health.holdout_end, True, ReasonCode.REFERENCE_QUERY_FAILED)
         try:
-            sync = _collect_sync(conn, settings, dataset, now)
+            observed = _collect_sync(conn, settings, dataset, now, _lock_state(root))
         except Exception:  # noqa: BLE001 - one section must not hide the others
-            sync = HistorySync(SyncState.UNAVAILABLE, now, reason_code=ReasonCode.SYNC_QUERY_FAILED,
+            observed = HistorySync(SyncState.UNAVAILABLE, now, reason_code=ReasonCode.SYNC_QUERY_FAILED,
                                source=dataset.source, base_interval=dataset.base_interval)
         return HistoryStatus(now, EvaluationHistory(
             state, ReasonCode.HISTORY_CHECK_UNAVAILABLE if state is State.UNAVAILABLE else None,
             reasons, dataset.source, dataset.base_interval, health.checked_at,
             health.holdout_start, health.holdout_end, hh.GUARD_VERSION, hh.CALENDAR_VERSION,
             hh.threshold_snapshot(), pairs, dataset.width.total_seconds() / 60,
-            _no_bars_info(root, health, load_error), references, _next_actions(state)), sync)
+            _no_bars_info(root, health, load_error), references, _next_actions(state)), observed)
     except Exception:  # noqa: BLE001 - the block alone becomes unavailable
         return unavailable(now, ReasonCode.HISTORY_CHECK_UNAVAILABLE)
 
@@ -638,6 +657,11 @@ def render_sync(sync: HistorySync | str, tz: str) -> tuple[str, ...]:
         lines = [f"history sync: not_applicable ({sync.effective_reason})"]
     elif sync.state is SyncState.UNAVAILABLE:
         lines = ["history sync: unavailable", f"  reason: {sync.reason_code.value}"]
+    elif sync.state is SyncState.RUNNING:
+        lines = [f"history sync: running (開始 {_shown(sync.last_run.started_at, tz)})"]
+    elif sync.state is SyncState.DEFERRED:
+        run = sync.last_run
+        lines = [f"history sync: {run.status} ({run.deferred_reason or run.failure_code or '-'})"]
     else:
         lines = [f"history sync: {sync.state.value}"]
     if sync.state not in (SyncState.NOT_APPLICABLE, SyncState.NOT_INITIALIZED,
@@ -649,7 +673,8 @@ def render_sync(sync: HistorySync | str, tz: str) -> tuple[str, ...]:
                f"lookback_days={sync.lookback_days}")
         lines.append(f"  config: {cfg}; effective: disabled ({sync.effective_reason}); "
                      f"self-measurement: {sync.measurement}; worker: {sync.worker}")
-    if sync.state in (SyncState.OK, SyncState.NEVER_RUN, SyncState.ATTENTION):
+    if sync.state in (SyncState.OK, SyncState.NEVER_RUN, SyncState.RUNNING, SyncState.DEFERRED,
+                      SyncState.ATTENTION):
         lines.append(_sync_run_line("last run", sync.last_run, tz))
         lines.append(_sync_run_line("last success", sync.last_success, tz))
         for item in sync.series:
@@ -666,8 +691,8 @@ def render_sync(sync: HistorySync | str, tz: str) -> tuple[str, ...]:
         lines.append(f"  open conflicts: {sync.open_conflicts}")
         if sync.suspected:
             lines.append("  reference_suspected (商品休場を含む疑い。採用可能とは解釈しない):")
-            lines += [_suspect_text(item) for item in sync.suspected[:_MAX_DAYS_SHOWN]]
-            more = len(sync.suspected) - _MAX_DAYS_SHOWN
+            lines += [_suspect_text(item) for item in sync.suspected]
+            more = dict(sync.open_gaps).get("reference_suspected", 0) - len(sync.suspected)
             if more > 0:
                 lines.append(f"    (+{more} more)")
         lines.append(f"  observed at {_shown(sync.observed_at, tz)}")

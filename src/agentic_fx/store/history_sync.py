@@ -96,6 +96,9 @@ _STATUS_COLUMN = {
     "interrupted": "runs_failed",
 }
 
+# run の status として表示してよい固定語 (集計列を持つ終端の結果と実行中)。
+RUN_STATUSES = frozenset(_STATUS_COLUMN) | {"running"}
+
 
 def _add_daily(conn, run_id: str, *, status: str, series_total: int, series_failed: int,
                inserted: int, unchanged: int, conflicted_new: int, conflicted_known: int,

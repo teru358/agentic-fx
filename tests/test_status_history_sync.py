@@ -105,13 +105,13 @@ def test_a_fresh_database_has_never_run_and_a_ready_history_has_no_next(world):
 
 def test_effective_state_is_disabled_until_a_worker_and_the_measurement_exist(world):
     on = _collect(world).history_sync
-    assert on.auto_enabled is True and on.effective_enabled is False
+    assert on.auto_enabled is True
     assert on.effective_reason == "measurement_not_accepted"
     assert on.measurement == "not_measured" and on.worker == "not_running"
     settings = _settings()
     settings.backtest.history_sync.auto_enabled = False
     off = _collect(world, settings).history_sync
-    assert off.auto_enabled is False and off.effective_enabled is False
+    assert off.auto_enabled is False
     assert off.effective_reason == "auto_disabled"
     text = _text(world, settings)
     assert "auto_enabled=false lookback_days=7; effective: disabled (auto_disabled)" in text
@@ -332,3 +332,95 @@ def test_the_structured_block_is_only_used_by_the_human_status_surface():
         for importer in _importers_of("status_history"):
             assert not importer.startswith(agent_facing)
 
+
+
+def _stale_running(conn, run_id="aa" * 6 + "4" + "000" + "8" + "0" * 15):
+    _run(conn, run_id, status="running", rc=0)
+    conn.execute("UPDATE history_sync_runs SET status='running', finished_at=NULL")
+    conn.commit()
+
+
+def test_a_running_row_without_the_instance_lock_is_a_trace_of_a_stop(world):
+    root, conn = world
+    _stale_running(conn)
+    observed = _collect(world).history_sync
+    assert observed.state is sh.SyncState.ATTENTION
+    assert observed.last_run.status == "interrupted"
+    assert observed.next_actions == (sh.NextAction.STOP_DAEMON_THEN_SYNC,)
+    assert "history sync: attention" in _text(world)
+
+
+def test_a_running_row_under_a_held_instance_lock_is_shown_as_running(world):
+    import fcntl
+    root, conn = world
+    _stale_running(conn)
+    (root / "data").mkdir(exist_ok=True)
+    with open(root / "data" / "instance.lock", "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        observed = _collect(world).history_sync
+        text = _text(world)
+    assert observed.state is sh.SyncState.RUNNING and observed.next_actions == ()
+    assert "history sync: running (開始 2026-11-10 15:02:20 +09:00)" in text
+
+
+def test_open_gaps_are_counted_by_the_same_conditions_as_the_lists(world):
+    root, conn = world
+    _gap(conn, "OLDSYM", "2026-11-05", "primary_exact")
+    _gap(conn, "OLDSYM", "2026-11-06", "unprocessed")
+    _gap(conn, "JP225", "2026-13-45", "reference_suspected")
+    _gap(conn, "JP225", "2026-02-30", "reference_suspected")
+    observed = _collect(world).history_sync
+    assert dict(observed.open_gaps) == {"primary_exact": 0, "reference_suspected": 0, "unprocessed": 0}
+    assert observed.suspected == () and observed.next_actions == ()
+    _gap(conn, "JP225", "2026-11-04", "reference_suspected")
+    again = _collect(world).history_sync
+    assert dict(again.open_gaps)["reference_suspected"] == 1
+    assert again.next_actions == (sh.NextAction.LIST_GAPS,)
+
+
+def test_the_allowed_reasons_come_from_the_sync_layer_alone(world, monkeypatch):
+    from agentic_fx.backtest import history_sync as layer
+    root, conn = world
+    _run(conn, "bb" * 6 + "4" + "111" + "9" + "1" * 15, status="failed", rc=1, failure="brand_new_code")
+    sync_store.record_series_failure(conn, "mt5", "5m", "USDJPY", error_code="partial",
+                                     run_id="bb" * 6 + "4" + "111" + "9" + "1" * 15, now=NOW)
+    shown = _collect(world).history_sync
+    assert shown.last_run.failure_code == "unknown"
+    assert shown.series[0].last_error == "partial"
+    monkeypatch.setattr(layer, "REASON_CODES", layer.REASON_CODES | {"brand_new_code"})
+    shown = _collect(world).history_sync
+    assert shown.last_run.failure_code == "brand_new_code"
+    assert {"failed", "partial"} <= layer.REASON_CODES
+
+
+def test_not_configured_survives_a_malformed_mt5_section(world):
+    root, conn = world
+    settings = _settings(eval_source="none")
+    settings.datafeed.mt5 = None
+    result = sh.collect(root, settings, conn, "UTC", NOW)
+    assert result.evaluation_history.state is sh.State.NOT_CONFIGURED
+    assert result.history_sync.executor_unsupported is False
+
+
+@pytest.mark.parametrize("status", ["deferred", "completed_with_gaps"])
+def test_a_deferred_last_run_without_a_primary_gap_is_not_an_alarm(world, status):
+    root, conn = world
+    _run(conn, "cc" * 6 + "4" + "222" + "a" + "2" * 15, status=status, rc=3)
+    conn.execute("UPDATE history_sync_runs SET deferred_reason='market_closed'")
+    conn.commit()
+    observed = _collect(world).history_sync
+    text = _text(world)
+    assert observed.state is sh.SyncState.DEFERRED and observed.next_actions == ()
+    assert f"history sync: {status} (market_closed)" in text and "history sync: attention" not in text
+    _gap(conn, "USDJPY", "2026-11-05", "primary_exact")
+    assert _collect(world).history_sync.state is sh.SyncState.ATTENTION
+
+
+def test_only_the_shown_suspected_rows_are_read_and_the_rest_is_counted(world):
+    root, conn = world
+    for day in range(1, 16):
+        _gap(conn, "JP225", f"2026-10-{day:02d}", "reference_suspected")
+    observed = _collect(world).history_sync
+    assert len(observed.suspected) == sh._MAX_DAYS_SHOWN
+    assert dict(observed.open_gaps)["reference_suspected"] == 15
+    assert "(+5 more)" in _text(world)
