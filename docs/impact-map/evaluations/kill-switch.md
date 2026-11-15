@@ -214,9 +214,12 @@
 
 | 区分 | 件数 | 裁定 |
 |---|---|---|
-| 頁の記述と一致 (更新不要) | 約 150 | `symbol_changed` のうち 30 と `literal_candidates_changed` 32 (入口 `dispatch` → `_dispatch` の分割に伴う literal の移動を含む)、`coarse_parent_changed` 1 (`build_app` の sweep 入口の差し替え、F20・F21・E16 と一致)、`ambiguous_sub_anchor` 1 (E13、T2 の裁定のとおり再確認)、通知機構の `unmapped` 約 20 (F09〜F12・F17〜F18・F21・F70・K-LANE・K-NOTICE の本文で説明済みの補助 symbol) |
-| kill switch と無関係 (頁に載せない) | 約 130 | bot の REST 分類・進捗・watchdog・health snapshot・logsafe・終了コード、`ops_setup` の systemd drop-in と units、snapshot の I/O 失敗の型、`status` と `web/render.py::render_status` の bot health 表示 (`unmapped_new_file` 7 のうち 6 と `unmapped_changed_unmapped_symbol` の約 100)。`kill` / `guard` / `latch` / `reset_marker` を含む変更行は一行も無いことを grep で確認した。D09 の関連 ticket の範囲 |
+| 頁の記述と一致 (更新不要) | 79 | `symbol_changed` 28 と `literal_candidates_changed` 32 (入口 `dispatch` → `_dispatch` の分割に伴う literal の移動を含む)、`coarse_parent_changed` 1 (`build_app` の sweep 入口の差し替え、F20・F21・E16 と一致)、`ambiguous_sub_anchor` 1 (E13、T2 の裁定のとおり再確認)、通知機構の `unmapped_changed_unmapped_symbol` 17 (F09〜F12・F17〜F18・F21・F70・K-LANE・K-NOTICE の本文で説明済みの補助 symbol) |
+| kill switch と無関係 (頁に載せない) | 101 | bot の REST 分類・進捗・watchdog・health snapshot・logsafe・終了コード、`ops_setup` の systemd drop-in と units、snapshot の I/O 失敗の型 (`unmapped_changed_unmapped_symbol` 90、`unmapped_new_file` 7)、`status`・`ctl` の status 整形・web の `render_status` の bot health 表示 (`symbol_changed` 4)。これらの file の変更行に `kill` / `guard` / `latch` / `reset_marker` を含むものは無いことを grep で確認した。D09 の関連 ticket の範囲 |
 | 頁の更新が要った | 4 | 下記 |
+| 道具の情報項目 | 1 | `base_declarations_partial` (下記) |
+
+(計 185。F29 の `deliver_events` は `symbol_changed` 1、`_ops_lane` と `emit_pending_improve_notices` は `unmapped_changed_unmapped_symbol` 2、`kill_switch_words.py` は `unmapped_new_file` 1。)
 
 - `base_declarations_partial` 1 (`covers_absent`): base の頁が雛形のため想定どおり。この区間の削除は検出できないが、頁が初めて書かれた区間なので削除される宣言も無い。
 - 頁の更新が要った 4 点 (頁が拾えなかった変更。いずれも source で確かめて直した):
@@ -226,5 +229,5 @@
   4. `OpsService.emit_pending_improve_notices` が `GuardLaneReentry` を握らず伝える点 (`unmapped_changed_unmapped_symbol`): F12 に一文を足した。
 - 変更前の F06・F07・F09・D との照合: F06 (`confirm_latched`) の store は差分に無く不変。F07 (`reset_kill_switch`) は操作前・結果・現 state の guard step に変わり、頁の記述と一致。F09 (`plan_kill_switch_notice`) は新規で、released 済みを閉じ履歴を捏造しない規則と一致。D01・D04・D05 は C4 後の source と一致 (D04 の `_data_resume` と `resume_data` の `_guard_event` は差分に無い)。
 - 見つけた欠陥・見落とし: 上の 4 点 (すべて F の本文・入口の抜けで、被覆や辺の誤りではない)。道具の欠陥は無かった。ただし `unmapped_changed_unmapped_symbol` 109 件の大半は別機能 (bot の health) の変更で、頁の領域外か否かの切り分けは人手の grep が要った (resource の literal を含む変更行の有無を領域外の根拠にできるが、道具は出さない)。
-- 所要時間 (おおよそ): 道具の実行は数秒。裁定 (source の読み取り) と頁の更新を含めて約 40 分。
+- 所要時間 (おおよそ): 道具の実行は数秒。裁定 (source の読み取り) と頁の更新を含めて約 15 分 (この session の実測では、道具の実行を含めて開始から頁の commit まで約 3〜4 分の wall clock。source の読取りは大半を diff の通読で済ませた)。
 - 更新後の `check --page kill-switch` は終了コード 0 (人が読む項目は E13 の 1 件のみ)。
