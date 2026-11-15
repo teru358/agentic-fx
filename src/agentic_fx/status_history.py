@@ -20,7 +20,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
-from agentic_fx.backtest import history_evidence, history_health as hh
+from agentic_fx.backtest import history_evidence, history_health as hh, history_sync as sync, history_sync_plan as plan
 from agentic_fx.core.display_time import convert_or_raw
 from agentic_fx.store import history_sync as sync_store
 
@@ -143,7 +143,23 @@ class SyncState(str, Enum):
 
 # 同期の run が要対応を示す結果。running は実行中の観測で、要対応に数えない。
 _RUN_OK = frozenset({"ok", "running"})
-_FIXED_WORD = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+_RUN_STATUSES = frozenset(sync_store._STATUS_COLUMN) | {"running"}
+_TRIGGERS = frozenset({"manual", "startup", "scheduled", "preclose", "retry"})
+_HEALTH = frozenset({"ok", "failed"})
+_REASONS = frozenset({
+    sync.REASON_NOT_APPLICABLE, sync.REASON_NO_BRIDGE, sync.REASON_REQUEST_BUDGET,
+    sync.REASON_NO_RANGE, plan.REASON_UNINITIALIZED, plan.REASON_BACKLOG,
+    plan.REASON_INSPECTION, plan.REASON_TAIL_LIMIT,
+    "fetch_failed", "too_large", "database_busy", "lease_unavailable", "stage_expired",
+    "invalid_response", "classify_failed", "conflict_lines_failed", "write_failed",
+    "state_write_failed", "epoch_changed", "concurrent_change", "time_rule_mismatch", "time_rule_unverified",
+    "market_closed", "tick_active", "time_rule_pending", "bridge_unavailable",
+    "bridge_auth", "symbol_unavailable", "history_copy_failed", "history_executor_unsupported",
+    "capacity_not_accepted", "history_completion_pending", "history_lock_budget_exceeded",
+    "history_metrics_unavailable", "conflict_circuit_open", "interrupted",
+})
+_ID = re.compile(r"[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}\Z")
+_DAY = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
 NOT_INITIALIZED_LINE = "history sync: not initialized"
 SYNC_SCOPE_NOTE = "対象は holdout 内と直近。in-sample は作らない"
 EXECUTOR_UNSUPPORTED_LINE = ("history_executor_url: 設定あり。3b (履歴専用の別 bridge) は未実装・未対応で、"
@@ -161,11 +177,11 @@ class SyncRun:
     finished_at: datetime | None
     range_start: datetime | None
     range_end: datetime | None
-    requests: int
-    inserted: int
-    unchanged: int
-    conflicted_new: int
-    conflicted_known: int
+    requests: int | None
+    inserted: int | None
+    unchanged: int | None
+    conflicted_new: int | None
+    conflicted_known: int | None
     failure_code: str | None
     deferred_reason: str | None
 
@@ -174,7 +190,7 @@ class SyncRun:
 class SyncSeries:
     symbol: str
     last_processed_e: datetime | None
-    attempts: int
+    attempts: int | None
     next_retry_at: datetime | None
     last_error: str | None
     last_health: str | None
@@ -327,9 +343,28 @@ def _utc(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def _word(value: Any) -> str | None:
-    """表に保存された固定語だけを通す。自由な文字列は出さない。"""
-    return value if isinstance(value, str) and _FIXED_WORD.match(value) else None
+def _fixed(value: Any, allowed: frozenset[str]) -> str | None:
+    if value is None:
+        return None
+    return value if isinstance(value, str) and value in allowed else "unknown"
+
+
+def _id(value: Any) -> str | None:
+    return value if isinstance(value, str) and _ID.fullmatch(value) else None
+
+
+def _day(value: Any) -> str | None:
+    if not isinstance(value, str) or not _DAY.fullmatch(value):
+        return None
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return None
+    return value
+
+
+def _optional_count(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
 def _count(value: Any) -> int:
@@ -338,12 +373,13 @@ def _count(value: Any) -> int:
 
 def _sync_run(row: sqlite3.Row) -> SyncRun:
     return SyncRun(
-        _word(row["id"]), _word(row["request_id"]), _word(row["trigger"]),
-        _word(row["status"]) or "unrecognized", row["rc"] if isinstance(row["rc"], int) else None,
+        _id(row["id"]), _id(row["request_id"]), _fixed(row["trigger"], _TRIGGERS),
+        _fixed(row["status"], _RUN_STATUSES) or "unknown",
+        row["rc"] if type(row["rc"]) is int and row["rc"] in (0, 1, 2, 3, 4) else None,
         _utc(row["started_at"]), _utc(row["finished_at"]), _utc(row["b_utc"]), _utc(row["e_utc"]),
-        _count(row["requests"]), _count(row["inserted"]), _count(row["unchanged"]),
-        _count(row["conflicted_new"]), _count(row["conflicted_known"]),
-        _word(row["failure_code"]), _word(row["deferred_reason"]))
+        _optional_count(row["requests"]), _optional_count(row["inserted"]), _optional_count(row["unchanged"]),
+        _optional_count(row["conflicted_new"]), _optional_count(row["conflicted_known"]),
+        _fixed(row["failure_code"], _REASONS), _fixed(row["deferred_reason"], _REASONS))
 
 
 _RUN_COLUMNS = ("id, request_id, trigger, status, rc, started_at, finished_at, b_utc, e_utc, "
@@ -410,13 +446,15 @@ def _collect_sync(conn: sqlite3.Connection, settings: Any, dataset: Any,
         success = conn.execute(
             f"SELECT {_RUN_COLUMNS} FROM history_sync_runs {where} AND status='ok' "
             "ORDER BY started_at DESC, id DESC LIMIT 1", params).fetchone()
+        symbols = set(settings.pairs) | set(settings.datafeed.watch_symbols)
         series = tuple(
-            SyncSeries(r["symbol"], _utc(r["last_processed_e"]), _count(r["attempts"]),
-                       _utc(r["next_retry_at"]), _word(r["last_error"]), _word(r["last_health"]))
+            SyncSeries(r["symbol"], _utc(r["last_processed_e"]), _optional_count(r["attempts"]),
+                       _utc(r["next_retry_at"]), _fixed(r["last_error"], _REASONS),
+                       _fixed(r["last_health"], _HEALTH))
             for r in conn.execute(
                 "SELECT symbol, last_processed_e, attempts, next_retry_at, last_error, last_health "
                 f"FROM history_sync_series_state {where} AND symbol <> ? ORDER BY symbol",
-                (*params, sync_store.CONTROL_SYMBOL)))
+                (*params, sync_store.CONTROL_SYMBOL)) if r["symbol"] in symbols)
         gap_counts = {k: 0 for k in sync_store.GAP_KINDS}
         for r in conn.execute(f"SELECT kind, COUNT(*) FROM history_sync_gaps {where} "
                               "AND state='open' GROUP BY kind", params):
@@ -426,12 +464,13 @@ def _collect_sync(conn: sqlite3.Connection, settings: Any, dataset: Any,
             f"SELECT COUNT(DISTINCT day_utc) FROM history_sync_gaps {where} AND state='expired'",
             params).fetchone()[0]
         suspected = tuple(
-            SuspectedDay(r["symbol"], r["day_utc"], r["missing_count"],
+            SuspectedDay(r["symbol"], r["day_utc"], _optional_count(r["missing_count"]),
                          sync_store.read_gap_detail(r["detail_json"]))
             for r in conn.execute(
                 "SELECT symbol, day_utc, missing_count, detail_json FROM history_sync_gaps "
                 f"{where} AND state='open' AND kind='reference_suspected' "
-                "ORDER BY symbol, day_utc", params))
+                "ORDER BY symbol, day_utc", params)
+            if r["symbol"] in symbols and _day(r["day_utc"]) is not None)
         conflicts = 0
         if "history_conflicts" in present:
             conflicts = _count(conn.execute(
@@ -562,6 +601,10 @@ def _reference_lines(refs: References, tz: str) -> list[str]:
     return lines
 
 
+def _number(value: int | None) -> str:
+    return "-" if value is None else str(value)
+
+
 def _sync_run_line(label: str, run: SyncRun | None, tz: str) -> str:
     if run is None:
         return f"  {label}: none"
@@ -573,9 +616,9 @@ def _sync_run_line(label: str, run: SyncRun | None, tz: str) -> str:
         if value:
             fixed.append(f"{key}={value}")
     return (f"  {label}: {' '.join(fixed)} started {_shown(run.started_at, tz)} "
-            f"finished {_shown(run.finished_at, tz)} range {span} requests={run.requests} "
-            f"inserted={run.inserted} unchanged={run.unchanged} "
-            f"conflicted={run.conflicted_new}+{run.conflicted_known}")
+            f"finished {_shown(run.finished_at, tz)} range {span} requests={_number(run.requests)} "
+            f"inserted={_number(run.inserted)} unchanged={_number(run.unchanged)} "
+            f"conflicted={_number(run.conflicted_new)}+{_number(run.conflicted_known)}")
 
 
 def _suspect_text(item: SuspectedDay) -> str:
@@ -612,7 +655,7 @@ def render_sync(sync: HistorySync | str, tz: str) -> tuple[str, ...]:
             retry = "-" if item.next_retry_at is None else _shown(item.next_retry_at, tz)
             cursor = ("uninitialized" if item.last_processed_e is None
                       else _shown(item.last_processed_e, tz))
-            lines.append(f"  series {item.symbol}: cursor {cursor} attempts={item.attempts} "
+            lines.append(f"  series {item.symbol}: cursor {cursor} attempts={_number(item.attempts)} "
                          f"next retry {retry} error={item.last_error or '-'} "
                          f"health={item.last_health or '-'}")
         gaps = " ".join(f"{k}={n}" for k, n in sync.open_gaps)

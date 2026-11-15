@@ -431,3 +431,95 @@ def test_completion_pending_with_open_gap_does_not_offer_manual_sync(world):
     sync = status_history._collect_sync(conn, _settings(), _settings().backtest.dataset(), NOW)
     assert sync.next_actions == (status_history.NextAction.CHECK_COMPLETION_PENDING,
                                  status_history.NextAction.LIST_GAPS)
+
+
+@pytest.mark.parametrize("column", ["failure_code", "deferred_reason", "last_error", "last_health",
+                                    "id", "request_id", "trigger", "status", "symbol",
+                                    "day_utc", "missing_count"])
+@pytest.mark.parametrize("secret", ["host", "alphanumeric"])
+def test_sync_untrusted_values_do_not_leak(world, column, secret):
+    from agentic_fx.store import history_sync as store
+
+    canary = ("history" + ".example" + ".invalid" if secret == "host"
+              else "Secret" + "Token" + "927634")
+    conn = world[1]
+    conn.execute("PRAGMA ignore_check_constraints=ON")
+    store.insert_run(conn, run_id="run1", owner="owner", trigger="manual", source="mt5",
+                     interval="5m", calendar_version="v1", lookback_days=7, epoch="epoch",
+                     t=NOW, b=NOW, e=NOW, started_at=NOW)
+    conn.execute("INSERT INTO history_sync_series_state "
+                 "(source, interval, symbol, updated_at) VALUES (?,?,?,?)",
+                 ("mt5", "5m", "USDJPY", NOW.isoformat()))
+    conn.execute("INSERT INTO history_sync_gaps "
+                 "(source, interval, symbol, day_utc, kind, missing_count, first_seen_at, last_observed_at) "
+                 "VALUES (?,?,?,?,?,?,?,?)", ("mt5", "5m", "USDJPY", "2026-11-10",
+                 "reference_suspected", 3, NOW.isoformat(), NOW.isoformat()))
+    if column in {"id", "request_id", "trigger", "status", "failure_code", "deferred_reason"}:
+        conn.execute(f"UPDATE history_sync_runs SET {column}=?", (canary,))
+    elif column in {"last_error", "last_health"}:
+        conn.execute(f"UPDATE history_sync_series_state SET {column}=?", (canary,))
+    elif column == "symbol":
+        conn.execute("UPDATE history_sync_series_state SET symbol=?", (canary,))
+        conn.execute("UPDATE history_sync_gaps SET symbol=?", (canary,))
+    else:
+        conn.execute(f"UPDATE history_sync_gaps SET {column}=?", (canary,))
+    sync = status_history._collect_sync(conn, _settings(), _settings().backtest.dataset(), NOW)
+    text = "\n".join(status_history.render_sync(sync, "UTC"))
+    assert sync.state is not status_history.SyncState.UNAVAILABLE
+    assert canary not in text
+
+
+def test_sync_valid_values_are_preserved(world):
+    from agentic_fx.store import history_sync as store
+    from uuid import uuid4
+
+    conn = world[1]
+    run_id, request_id = uuid4().hex, uuid4().hex
+    store.insert_run(conn, run_id=run_id, request_id=request_id, owner="owner", trigger="manual",
+                     source="mt5", interval="5m", calendar_version="v1", lookback_days=7,
+                     epoch="epoch", t=NOW, b=NOW, e=NOW, started_at=NOW)
+    conn.execute("UPDATE history_sync_runs SET status='failed', failure_code='fetch_failed'")
+    conn.execute("INSERT INTO history_sync_series_state "
+                 "(source, interval, symbol, last_error, last_health, updated_at) VALUES (?,?,?,?,?,?)",
+                 ("mt5", "5m", "USDJPY", "fetch_failed", "failed", NOW.isoformat()))
+    conn.execute("INSERT INTO history_sync_gaps "
+                 "(source, interval, symbol, day_utc, kind, missing_count, first_seen_at, last_observed_at) "
+                 "VALUES (?,?,?,?,?,?,?,?)", ("mt5", "5m", "JP225", "2026-11-10",
+                 "reference_suspected", 3, NOW.isoformat(), NOW.isoformat()))
+    settings = _watching("JP225")
+    sync = status_history._collect_sync(conn, settings, settings.backtest.dataset(), NOW)
+    text = "\n".join(status_history.render_sync(sync, "UTC"))
+    for value in (run_id, request_id, "trigger=manual", "error=fetch_failed", "health=failed",
+                  "JP225 2026-11-10 bars=3"):
+        assert value in text
+
+
+def test_sync_rejects_invalid_dates_and_numeric_values(world):
+    from agentic_fx.store import history_sync as store
+
+    conn = world[1]
+    store.insert_run(conn, run_id="run1", owner="owner", trigger="manual", source="mt5",
+                     interval="5m", calendar_version="v1", lookback_days=7, epoch="epoch",
+                     t=NOW, b=NOW, e=NOW, started_at=NOW)
+    conn.execute("UPDATE history_sync_runs SET rc=98765, requests=-5")
+    conn.execute("INSERT INTO history_sync_gaps "
+                 "(source, interval, symbol, day_utc, kind, missing_count, first_seen_at, last_observed_at) "
+                 "VALUES (?,?,?,?,?,?,?,?)", ("mt5", "5m", "USDJPY", "2026-02-30",
+                 "reference_suspected", -17, NOW.isoformat(), NOW.isoformat()))
+    sync = status_history._collect_sync(conn, _settings(), _settings().backtest.dataset(), NOW)
+    text = "\n".join(status_history.render_sync(sync, "UTC"))
+    assert "rc=98765" not in text and "requests=0" not in text
+    assert "2026-02-30" not in text and "bars=-17" not in text
+
+
+@pytest.mark.parametrize("reason", ["epoch_changed", "concurrent_change"])
+def test_sync_shows_known_write_failure_codes(world, reason):
+    from agentic_fx.store import history_sync as store
+
+    conn = world[1]
+    store.insert_run(conn, run_id="run1", owner="owner", trigger="manual", source="mt5",
+                     interval="5m", calendar_version="v1", lookback_days=7, epoch="epoch",
+                     t=NOW, b=NOW, e=NOW, started_at=NOW)
+    conn.execute("UPDATE history_sync_runs SET status='failed', failure_code=?", (reason,))
+    sync = status_history._collect_sync(conn, _settings(), _settings().backtest.dataset(), NOW)
+    assert f"error={reason}" in "\n".join(status_history.render_sync(sync, "UTC"))
