@@ -11,7 +11,7 @@ spec・チケットを含む他資料から、本番の時刻・event 行や件�
 既存の Python 3 を選び、公開入力だけを指定する。出力は非公開の作業領域に置く。正解表は独立作成・裁定後に指定する。
 
 ```sh
-python3 scripts/impact_map.py extract --domain kill-switch --page docs/impact-map/domains/kill-switch.md --root . --out tmp/impact-map/current
+python3 scripts/impact_map.py extract --domain kill-switch --page docs/impact-map/domains/kill-switch.md --root src/agentic_fx --root afx-ops/afx_ops --out tmp/impact-map/current
 python3 scripts/impact_map.py evaluate --domain kill-switch --index tmp/impact-map/current/index.json --oracle docs/impact-map/oracle/kill-switch-frozen.json --page docs/impact-map/domains/kill-switch.md --out tmp/impact-map/current
 ```
 
