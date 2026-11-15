@@ -319,7 +319,8 @@ def test_an_oversized_baseline_section_is_clipped_whole_with_an_omission_line():
         dict(DETAIL), data["change"], data,
         extra_sections=[("result", _baseline_big_section()), ("overview", gate_section)])
     overview, result = tab_text(built, "overview"), tab_text(built, "result")
-    assert "GATE-LINE" in overview and "bbbbbbbbbb" not in result
+    assert "GATE-LINE" in overview
+    assert not any("bbbbbbbbbb" in tab_text(built, tab) for tab in tabs.tab_names(tabs.APPROVAL_DETAIL))
     assert render.EXTRA_OMITTED_SECTION in result and render.EXTRA_OMITTED_SECTION not in overview
     assert built.other_bytes <= render.OTHER_BUDGET_BYTES and not built.clipped
 
@@ -388,4 +389,7 @@ def test_a_missing_or_invalid_change_still_keeps_gate_rows_and_the_omission_line
     assert len(overview) < render.PAGE_LIMIT_BYTES
     text = overview.decode()
     assert text.count("警告: " + "あ" * 80) == render.MAX_GATE_LINES
-    assert render.EXTRA_OMITTED_SECTION in result.decode() and "bbbbbbbbbb" not in result.decode()
+    assert render.EXTRA_OMITTED_SECTION in result.decode()
+    every_tab = b"".join(render.render_approval(detail, None, tab)
+                         for tab in tabs.tab_names(tabs.APPROVAL_DETAIL))
+    assert b"bbbbbbbbbb" not in every_tab

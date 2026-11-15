@@ -833,7 +833,8 @@ def test_improve_list_failure_with_write_is_502_with_the_bar_and_a_link_to_the_r
     assert b"internal" not in got.body and (method == "GET" or response.body == b"")
 
 
-@pytest.mark.parametrize("reply", [Reply(500, None, "internal"), Reply(200, {"runs": "bad"}, None)])
+@pytest.mark.parametrize("reply", [Reply(500, None, "internal"), Reply(200, {"runs": "bad"}, None),
+                                   Reply(404, None, "not_found")])
 def test_improve_list_failure_without_write_is_the_plain_error_page(reply):
     rig = _rig()
     rig.client.improve_list = lambda **kwargs: reply
