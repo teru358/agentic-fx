@@ -191,3 +191,10 @@
 
 - 採用 6 件 (代入先の添字・属性の照合、symlink 検査を repo 内に限定、致命的な診断で index.json を残さない、literal の正規表現の前計算、TP・FN・U の排他集計、構文解析の再帰・メモリ超過の診断) を入れて再測定。不採用 1 件 (頁の FP を合否に含める) は §4.3 が FP をゼロ条件にしないため。
 - 機械セル critical 81 / TP 81 / FN 0 / U 0 (全体 FP 54 → 49)、頁セル critical 208 / TP 208 / FN 0 / U 0 (全体 FP 3)。合否は変わらない。extract 0.97 秒 (一回)。
+
+## T2 (verify / check / affected / 固有例外台帳 / 非 critical の頁補完)
+
+- 道具: `verify` (正規化 AST hash と方式 version、期待 hash が一致したときだけ照合記録)、`check` (stale・根拠消失・必須違反は 1、解析失敗・宣言不正・方式不整合・履歴取得不能は 2)、`affected` (revision 間または作業 tree との差を種類別に)、固有例外台帳 `deviations.json` と Commands の直呼び検査 (D02 の shell reset / confirm、D04 の data resume)。
+- 頁の補完: 非 critical 83 行のうち 82 行を頁に足した。残る 1 行 (`ImproveLoop._FLOOR_REPORT_METRIC_KEYS`) は、class 直下の定数を extract は `Class.NAME` で記録するのに verify / check の anchor 解決が解けない食い違いのため、頁に被覆を書くと check が落ちる。解決側を extract に揃える是正を入れてから被覆する。
+- 正解表の追加 (§4.1 (4)): 頁の FP 3 件を source で確かめた結果、頁の宣言が正しかった (正解表の漏れ) ので非 critical として凍結表に足した — `OpsService._sweep_kill_switch` × `log:guard_notice_backfill_skipped`、`OpsService.emit_pending_notices` × `log:guard_notice_deferred`、`StateStore.reset_kill_switch` × `state:app_state.kill_switch_latched_at` (reads)。凍結表 310 行。frozen sha256: `d745092e…` → `65ee08c7…`。
+- 0dbcb27f..HEAD (HWM の merge を含む) の affected: dependency_changed 1 (`store/db.py::<module>._SCHEMA`)、symbol_changed 4 (`ops/api_server.py::_call`・`ops/client.py::Runner._op_killswitch_reset`・`service.py::_build_ops_service`・`service.py::build_app`)、literal_candidates_changed 13、unmapped_new_file 3 (`ops/rebase_accounting.py`・`ops/rebase_service.py`・`ops/rebase_view.py`)。HWM の実運用確認 (§6.4 の二件目、T3) の材料。
