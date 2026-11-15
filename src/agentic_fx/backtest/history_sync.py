@@ -441,13 +441,25 @@ class _Run:
             if resume_stale:
                 op.resume_action = ("clear",)
             return op
+        prior_end = resume[3] if resume is not None else start
+
+        def save_start(c):
+            store.save_resume(c, source=SOURCE, interval=self.dataset.base_interval,
+                              symbol=symbol, op_key=op_key, range_start=start, range_end=end,
+                              tail_start=request_start, prefix_end=prior_end, now=self.now)
+        if not self._write_required(f"resume:{symbol}", save_start):
+            op.status, op.reason = "failed", "state_write_failed"
+            self._finish_series(series_id, op)
+            return op
         before = self.gate.count
         outcome = import_mt5(
             self.conn, symbol, request_start, end, base_url=self.base_url, fetch=self.gate,
             interval=self.dataset.base_interval, clock=lambda: self.now, grace=self.grace,
             skip_window=lambda ws, we: not plan.has_open_time(ws, we, is_open=self.is_open),
             utc_day_windows=True, origin="sync", run_id=self.run_id,
-            inspection_tail_bars=self.tail_k, on_batch=self._progress(series_id),
+            inspection_tail_bars=self.tail_k,
+            on_batch=self._progress(series_id, symbol, op_key, start, end, request_start,
+                                    prior_end),
             exclude_range=exclude_range, **self.run_kw)
         op.requests = self.gate.count - before
         op.outcome = outcome
@@ -483,16 +495,19 @@ class _Run:
         op.recorded = False
         return None
 
-    def _progress(self, series_id: int | None):
-        if series_id is None:
-            return None
-
+    def _progress(self, series_id: int | None, symbol, op_key, start, end, tail_start, prior_end):
         def on_batch(conn, progress):
             last = progress.batch_bar_time_end
             prefix_end = store.iso(datetime.fromisoformat(last) + self.width)
-            store.update_series_progress(conn, series_id, committed_prefix_end=prefix_end,
-                                         next_cursor=progress.resume_from,
-                                         last_committed_bar_time=last)
+            if series_id is not None:
+                store.update_series_progress(conn, series_id, committed_prefix_end=prefix_end,
+                                             next_cursor=progress.resume_from,
+                                             last_committed_bar_time=last)
+            committed = datetime.fromisoformat(last) + self.width
+            store.save_resume(conn, source=SOURCE, interval=self.dataset.base_interval,
+                              symbol=symbol, op_key=op_key, range_start=start, range_end=end,
+                              tail_start=tail_start,
+                              prefix_end=min(end, max(start, prior_end, committed)), now=self.now)
         return on_batch
 
     def _finish_series(self, series_id: int | None, op: OpResult) -> None:
@@ -554,9 +569,9 @@ class _Run:
             op = self._recent_once(symbol)
             # 中断した操作の再開が完走したときだけ、続けて今回の recent を行う。
             if op.resumed and op.status in ("ok", "completed_with_conflicts"):
-                self._recent_once(symbol)
+                self._recent_once(symbol, cap_used=op.requests)
 
-    def _recent_once(self, symbol: str) -> OpResult:
+    def _recent_once(self, symbol: str, *, cap_used: int = 0) -> OpResult:
         interval = self.dataset.base_interval
         start = plan.lookback_start(self.limit, self.lookback, self.boundary)
         row = store.get_state(self.conn, SOURCE, interval, symbol)
@@ -568,7 +583,7 @@ class _Run:
             unprocessed = self._unprocessed_days(symbol, max(prior, self.boundary), start)
         op = self._run_op(operation="recent", symbol=symbol, range_kind="recent",
                           start=start, end=self.limit, day=None,
-                          window_cap=self.lookback + RECENT_EXTRA_WINDOWS)
+                          window_cap=self.lookback + RECENT_EXTRA_WINDOWS, cap_used=cap_used)
         if op.resumed:
             unprocessed = None
         elif op.status == "deferred" and op.reason == REASON_REQUEST_BUDGET:

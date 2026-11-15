@@ -159,6 +159,8 @@ class Mt5Settings(SourceToggle):
 
     URL は秘密として扱い、表示・ログ・repr・dump (worker への handshake を含む) に出さない。`bridge_url` への
     fallback はしない: 未設定なら履歴取得の実行先は無い。"""
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     history_executor_url: SecretStr | None = Field(default=None, exclude=True)
 
     @field_validator("history_executor_url")
@@ -884,6 +886,14 @@ def load_settings_text(text: str) -> Settings:
         raw = yaml.safe_load(text) or {}
         return Settings.model_validate(raw)
     except ValidationError as e:
-        raise ConfigError(str(e)) from e
+        datafeed = raw.get("datafeed") if isinstance(raw, dict) else None
+        mt5 = datafeed.get("mt5") if isinstance(datafeed, dict) else None
+        if not isinstance(mt5, dict) or mt5.get("history_executor_url") is None:
+            raise ConfigError(str(e)) from e
+        details = e.errors(include_input=False)
+        message = "\n".join(
+            f"{'.'.join(map(str, item['loc'])) or '<root>'}: {item['msg']}"
+            for item in details)
     except yaml.YAMLError as e:
         raise ConfigError(f"invalid YAML: {e}") from e
+    raise ConfigError(message) from None

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import pytest
 
 from agentic_fx.backtest import history_sync as hs
 from agentic_fx.store import history_sync as store
@@ -64,7 +65,9 @@ def test_the_next_run_fetches_only_the_tail_and_the_suffix_and_completes(tmp_pat
     assert resumed.unchanged == 8 + 50                       # 尾 8 + suffix 50 だけを分類した
     assert _resume_row(conn) is None
     assert result.cursors[SYMBOL] == E.isoformat() and result.rc == 0
-    assert [o.resumed for o in result.ops] == [True, False]    # 完走後に今回の recent が続く
+    recent = [o for o in result.ops if o.operation == "recent"]
+    assert [o.resumed for o in recent] == [True, False]
+    assert recent[1].status == "deferred" and recent[1].requests == 0
 
 
 def test_a_resume_is_not_diluted_by_the_confirmed_prefix(tmp_path):
@@ -146,3 +149,75 @@ def test_a_partial_gap_day_resumes_from_its_confirmed_prefix(tmp_path):
     assert resumed.inserted == 24                       # 穴の 6 時間だけが入る
     assert resumed.unchanged == 8 + (54 - 24)          # 尾 8 + suffix の既存分。prefix 42 本は分類しない
     assert conn.execute("SELECT COUNT(*) FROM history_sync_resume").fetchone()[0] == 0
+
+
+def test_resume_and_normal_recent_share_each_series_budget(tmp_path):
+    conn, settings, _bridge, _first = _partial_run(tmp_path)
+    result = _run(conn, settings, FakeBridge())
+    recent = [o for o in result.ops if o.operation == 'recent']
+    assert recent[0].resumed and recent[0].requests == 3
+    assert (recent[1].status, recent[1].reason, recent[1].requests) == (
+        'deferred', 'request_budget', 0)
+    assert result.cursors[SYMBOL] == E.isoformat()
+    assert conn.execute("SELECT 1 FROM history_sync_gaps WHERE kind='unprocessed'").fetchone()
+
+
+@pytest.mark.parametrize('change_epoch', [False, True])
+def test_committed_batch_survives_process_interruption(tmp_path, monkeypatch, change_epoch):
+    from agentic_fx.core.history_epoch import history_epoch
+    from agentic_fx.store.db import connect
+    conn, settings = _seeded(tmp_path)
+    armed = [False]
+    original = hs._Run._progress
+
+    def progress(self, *args, **kwargs):
+        callback = original(self, *args, **kwargs)
+        def on_batch(c, batch):
+            callback(c, batch)
+            armed[0] = True
+        return on_batch
+
+    def clock():
+        if armed[0] and not conn.in_transaction:
+            raise KeyboardInterrupt()
+        return 0.0
+
+    monkeypatch.setattr(hs._Run, '_progress', progress)
+    with pytest.raises(KeyboardInterrupt):
+        _run(conn, settings, FakeBridge(), run_kw={'max_rows': 50, 'monotonic': clock})
+    conn.close()
+    conn = connect(tmp_path / 't.db')
+    row = _resume_row(conn)
+    assert row is not None and row['prefix_end'] > row['range_start']
+    if change_epoch:
+        before = history_epoch(conn)
+        conn.execute("INSERT INTO history_revisions (kind, source, interval, symbol, bar_time, "
+                     "history_epoch, conflict_id, actor, created_at) "
+                     "VALUES ('replace_with_incoming', ?, ?, ?, ?, ?, ?, ?, ?)",
+                     ('mt5', '15m', SYMBOL, E.isoformat(), before, 1, 'test', E.isoformat()))
+        conn.commit()
+        assert history_epoch(conn) != before
+    monkeypatch.setattr(hs._Run, '_progress', original)
+    resumed = _run(conn, settings, FakeBridge()).ops[0]
+    assert resumed.resumed and resumed.status == 'ok'
+    assert resumed.unchanged == 158
+    assert _resume_row(conn) is None
+
+
+def test_multi_series_budget_includes_resumes_deferrals_and_gap_windows(tmp_path):
+    from datetime import date
+    from tests.backtest.history_sync_support import REF
+    from tests.backtest.test_history_sync import _holes, _weekdays
+    conn, settings = _seeded(tmp_path, months=2, symbols=(SYMBOL, REF))
+    first = _run(conn, settings, FakeBridge(), run_kw=_partial_kw(9))
+    assert first.ops[0].status == 'partial'
+    days = [d for i, d in enumerate(_weekdays(date(2026, 9, 14), date(2026, 11, 6))) if i % 2]
+    _holes(conn, days)
+    bridge = FakeBridge()
+    result = _run(conn, settings, bridge)
+    recent = [o for o in result.ops if o.operation == 'recent']
+    gap_requests = sum(o.requests for o in result.ops if o.operation == 'gap')
+    assert recent[0].resumed and recent[0].requests == 3
+    assert recent[1].status == 'deferred' and recent[1].requests == 0
+    assert gap_requests == 32
+    assert result.requests == len(bridge.calls) <= (2 + 2) * 2 + 32

@@ -1371,3 +1371,53 @@ def test_history_executor_url_is_excluded_from_the_settings_dump_sent_to_workers
     dumped = s.model_dump()
     assert "history_executor_url" not in dumped["datafeed"]["mt5"]
     assert canary not in json.dumps(dumped)
+
+@pytest.mark.parametrize('kind', ['scheme', 'type', 'space'])
+def test_history_executor_validation_errors_hide_input(kind):
+    import yaml
+    from agentic_fx.config import Mt5Settings, ConfigError, load_settings_text
+    canary = 'secret-' + 'canary-429'
+    bad = {'scheme': 'ftp://user:' + canary + '@host/x',
+           'type': int('829' + '374'), 'space': ' ftp://user:' + canary + '@host/x '}[kind]
+    marker = str(bad) if kind == 'type' else canary
+    with pytest.raises(ValidationError) as direct:
+        Mt5Settings.model_validate({'history_executor_url': bad})
+    assert marker not in str(direct.value)
+    with pytest.raises(ConfigError) as nested:
+        load_settings_text(yaml.safe_dump(_mt5_raw(history_executor_url=bad)))
+    for item in (nested.value, nested.value.__cause__, nested.value.__context__):
+        assert marker not in str(item)
+        assert marker[:8] not in str(item)
+
+@pytest.mark.parametrize('kind', ['field', 'other', 'model'])
+def test_secret_is_absent_from_all_settings_error_links(kind):
+    import yaml
+    from agentic_fx.config import ConfigError, load_settings_text
+    canary = 'secret' + '87'
+    raw = _mt5_raw(history_executor_url='https://user:' + canary + '@host/x')
+    if kind == 'field':
+        raw['datafeed']['mt5']['history_executor_url'] = 'ftp://user:' + canary + '@host/x'
+    elif kind == 'other':
+        raw['risk'] = 123
+    else:
+        raw = {'datafeed': {'mt5': {'history_executor_url':
+               canary}}}
+    with pytest.raises(ConfigError) as exc:
+        load_settings_text(yaml.safe_dump(raw))
+    if kind == 'model':
+        assert 'primary_source_required' in str(exc.value)
+    for item in (exc.value, exc.value.__cause__, exc.value.__context__):
+        assert canary not in str(item)
+        assert canary[:8] not in str(item)
+
+
+def test_settings_error_without_secret_keeps_original_validation_display():
+    import yaml
+    from agentic_fx.config import ConfigError, load_settings_text
+    raw = _mt5_raw()
+    raw['risk'] = 123
+    with pytest.raises(ValidationError) as expected:
+        Settings.model_validate(raw)
+    with pytest.raises(ConfigError) as actual:
+        load_settings_text(yaml.safe_dump(raw))
+    assert str(actual.value) == str(expected.value)
