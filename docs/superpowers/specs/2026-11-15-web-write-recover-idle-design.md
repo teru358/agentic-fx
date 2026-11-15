@@ -1,0 +1,147 @@
+# web-write-recover-idle-interruption — C0.2
+
+対象: idle（未 enable / disabled）の write 回復。実装・commit は含めない。
+根拠: `docs/tickets/open/web-write-recover-idle-interruption.md`、関連設計 `2026-11-08-web-plugin-improve-hub-design.md` の B1・受入 8b。
+行番号は本 worktree の調査時点。以下 `W` = `src/agentic_fx/ops_setup/web_write.py`、`S` = 同 `stages.py`、`K` = 同 `write_key.py`。
+
+## §0 何が起きているか
+
+`_switch` は stage_mode が idle なら `_recover_idle` へ渡す（W:195–200）。回復は整合済みなら目標に関係なく not_enabled（W:138–140）。停止前の ActiveState はメモリだけで、stage は書かない（W:150–159、S:512–515 は既存フィールドがあるため通らない）。
+
+| 中断点（既存 hook） | 残る実物 | 同じ目標で再実行した結果・根拠 |
+|---|---|---|
+| 停止後・整合前（after_stop / after_lock / before_keys） | web 所有 marker、afx 停止、不整合 | 整合操作へ進むが、今回観測した inactive/failed を停止前状態にしてしまう。marker は消せても afx を起こさない（W:150–171）。 |
+| 設定整合後・marker 削除前（after_config / before_unmark） | 鍵・write 整合、marker、afx 停止 | Consistent で not_enabled。marker の解消にも起動にも届かない（W:138–140、169–171）。 |
+| marker 削除後・起動前（after_unmark） | 鍵・write 整合、marker 無し、afx 停止 | 同じく not_enabled。元の稼働状態を失い、起動しない（W:138–140、170–171）。 |
+
+チケットの現象記述と相違なし。ただし W:132 の「同じコマンドの再実行で収束」は鍵・設定についてだけで、marker と起動までの回復保証にはならない。config 不在の --no-write では config 書込みを省くため、after_keys が既に整合後となる（W:142–145、163）。idle の起動には現状 start hook が無い（W:170–171）。
+
+`_quiesce_afx` は marker → stop → 停止確認 → instance lock（S:506–542）。`_unmark` は durable 削除と前後 hook（W:287–297、S:171–173）。`_guarded` は排他 lock ではなく OSError の記録境界であり、idle は `_current` 未設定かつ unrecorded のため stage に失敗を残さない（S:251–254、294–312）。
+
+## §1 動作
+
+### 記録と既存 stage の関係
+
+**推奨: 別 file `root/data/ops/web.write-recovery.json`。** OpsSetup の回復状態機械が所有する。通常の web.stage.json は未作成なら未作成、disabled なら内容を変えずに保つ。
+
+JSON v1 の必須項目:
+
+| 項目 | 値・用途 |
+|---|---|
+| version / feature / operation | 1 / web / recover_idle（通常 enable と区別） |
+| target | bool。今回収束させる write。principal は固定対応から導出し重複保存しない。 |
+| afx_before_stop | 最初に観測した ActiveState。active/activating/reloading のみ起動を戻す（S:45）。再開で上書きしない。 |
+| idle_origin | never / disabled。通常 stage と矛盾していないか照合する。 |
+
+記録が持つのは上記6項目だけ。failure / failure_detail や進捗は保存せず、失敗理由は例外・診断で返す。鍵・password・設定の複製は持たない。設定は再読込みし port 等を保持して write だけ合わせる。
+
+既存規則との照合:
+
+- read_stage は operation が enable/disable のみ、各段を固定列挙で検証する（S:79–144）。recover の追加は既存形式の拡張になる。
+- stage_mode は「無し / disable.disabled = idle」「enable.enabled = enabled」、他は unfinished（K:120–126）。stage の新 mode は全呼出側へ影響する。
+- `_unfinished` は通常の終端と write_target の有無で競合を止める（S:265–275）。disabled に write_target を載せる案も形式上は可能だが、idle の履歴と回復の進捗を混ぜ、未 enable に架空の stage を作る。
+- `_active_features` は disable の途中を有効扱いする（S:277–287）。回復を disable の途中で表すと実態と食い違う。
+- `_check_marker_owner` は feature だけを判定する（S:484–496）。別 file でもこの検査を省かず、他機能・壊れた marker は回収しない。同じ web の marker は、正常な idle stage と回復記録の照合後だけ引き継ぐ。
+
+stage に recover mode を追加する案は影響が広く、disabled に切替フィールドを流用する案は未 enable の意味を壊す。別 file の代償（全入口で追加照合）は、共通の読取専用 pending 検査で閉じる。
+
+marker に afx_before_stop と target を載せる案も不採用。marker は `_unmark` で durable 削除した後に start するため（W:169–171、287–297）、その間に中断すると復帰に必要な情報を失う。
+marker を起動後まで残す案も、起動阻止のために停止前に置く既存の役割（S:506–524）と衝突する。別 file なら marker の寿命と回復情報の寿命を分けられる。
+
+### 状態機械と再実行
+
+**不変条件:** 鍵・設定を変える間は marker と停止確認と instance lock が揃う。記録がある間は通常の setup 操作を成功させない（直接 keys 操作は入口表の例外）。記録の削除は、目標との整合・marker 無し・必要な afx の復帰をすべて確認した後だけ。
+
+判定は `check_write_key_consistency` に集約したまま、回復の遷移・完了条件は単一の回復関数へ集める。hook や CLI ごとに独自の整合判定を作らない。
+
+段を記録しないのは、実物との整合を状態機械の中心の1関数で守り、進捗記録と実物の二重管理を避けるため。
+
+新規回復は従来どおり idle の不整合時だけ開始する。setup の排他の下で、通常 stage・他機能の未完了・marker 所有者、構成と鍵の事前条件を検査し、停止前の ActiveState を採る。稼働中なら既存の停止に対する利用者確認を経て、**marker 設置や停止より先に記録を durable 保存する**。保存失敗時は停止しない。記録の書込みはこの最初の1回と目標差替え時だけ。
+
+記録がある場合は idle の Consistent → not_enabled より先に、毎回次の同じ手順を実行する。途中経過は記録しない。
+
+(a) 記録を検証する。通常 stage も検証し、enabled/unfinished や idle_origin との矛盾、他機能の未完了は変更せず拒否する。
+
+(b) 実物を観測する。鍵と write の整合（**記録の target との一致も含む**）、marker の有無・持ち主、afx の ActiveState を読む。他機能・壊れた marker は回収しない。--write の安全条件や読めない config の検査も省略しない。
+
+(c) 目標と不整合、または marker があるなら、`_quiesce_afx(reset_stage=False)` で marker・停止確認・instance lock を揃え、align_keys と設定反映で目標へ整合させる。最初の afx_before_stop を必ず渡して通常 stage の保存を起こさず、鍵 preparing は既存 align_keys で完了させる。disabled の --no-write は読取鍵を検査し、never では新規要求しない。config 不在・target=false は既存 idle の許容に従う。整合済みでも marker があればこの手順を通る。marker 無しで目標と整合済みなら変更せず次へ進む。
+
+(d) 鍵と write が記録の target に整合するという完了の確認は、instance lock を持ったまま行う。その後に lock を閉じ、`_unmark` で marker を durable 削除する。既に無ければ何もしない。(c) で変更を省いた停止中の経路も、instance lock を取得して再照合してから閉じる。lock が取れなければ非成功とし、確認のためだけに afx を停止する権限は追加しない。start 後の再開など既に daemon が稼働して lock を持つ経路では、daemon の lock 保持を確認したうえで、その排他に守られた実物を再照合する。確認できなければ記録を保持して非成功とする（回復側が lock を取り直すためには停止しない）。直接 keys 操作に対する保証境界は §4 に定める。
+
+(e) afx_before_stop が active/activating/reloading なら稼働を確認し、止まっていれば start して ActiveState=active を確かめる。記録が残る間は回復が稼働に戻すため、start 後の中断中に利用者が手動停止しても再実行で起こす。元が停止状態ならここでは何もしない。手動で起動されていても停止しない。回復は完了時に元の停止状態へ戻すための停止権限を新たに持たない（鍵・設定変更時の既存の停止手順は (c) のまま）。idle の web の enable/READY 待ちはしない。
+
+これは既存の「元が稼働なら起動を戻す、元が停止なら回復から起こさない」という規則に沿う。通常 enable は S:649–657、稼働状態の分類は S:45・422–423、idle 回復は W:150–171。enabled 切替も元も現在も停止なら何も起こさず、現在稼働なら継続する（W:300–317）。enabled 切替は web の READY 確認もするが、idle 回復には導入しない。
+
+(f) (d) の排他下での目標整合確認・marker 無し・(e) の必要な afx 復帰という完了条件をすべて満たした後だけ、記録を durable 削除し、`StageResult(web, recover, disabled)` を返す。lock 解放後に排他無しの鍵検査を追加して完了を保証したことにはしない。削除前の失敗では記録を保持して非成功とする。unlink 後に親 directory の fsync が失敗した場合は「削除の永続性が不明」として非成功を返し、記録残存は保証しない。再実行・再起動後に記録が残っていれば同じ手順で収束し、消えていれば既に整合済みなので通常の not_enabled で安全に終わる（後続の別操作がない場合）。削除直後の中断も同じ扱い。
+
+目標変更（--write 中断 → --no-write、逆も同様）は**新しい明示目標を採用**する。(a) の検証と新目標の事前検査後、target だけを durable 更新して (b) へ進む。最初の afx_before_stop と idle_origin は保持する。旧目標を一度起動してから変更しない。更新前で落ちれば旧記録、更新後で落ちれば新記録から、次の明示目標に向け同じ手順で再開する。
+
+| 中断点 | 残る状態 | 改訂後の再実行（同じ目標） |
+|---|---|---|
+| 記録保存の直後 | 記録あり、実物はまだ不整合、afx は元の状態 | (a)(b) から (c) の停止・lock・整合へ進み、(d)〜(f) で完了 |
+| 停止後・整合前（§0） | 記録・marker あり、afx 停止、不整合 | (c) を冪等に再実行。元の稼働状態は記録から戻す |
+| 設定整合後・marker 削除前（§0） | 記録・marker あり、目標と整合 | marker があるので (c) を通り、(d) で外し (e)(f) へ |
+| marker 削除後・起動前（§0） | 記録あり、marker 無し、目標と整合、afx 停止 | (c) の変更を省き、(d) で lock 下の再照合、(e) で必要な起動、(f) で削除 |
+| start の後・記録削除の前 | 記録あり、marker 無し、目標と整合、afx active | daemon の排他下で再照合し active 確認後に (f) で削除。手動停止されていれば再起動 |
+| 記録削除の後 | 記録・marker 無し、目標と整合、必要な復帰済み | 回復は完了。idle の通常判定で not_enabled（副作用無し） |
+
+記録は 0600、自 uid の通常 file、有界読取り、O_NOFOLLOW、JSON の版・必須型・列挙を厳密検証する。無い場合だけ「記録無し」。壊れた JSON、未知版、必須欠落、読取不能、symlink は `write_recovery_invalid` と path・修復案内で fail-closed。推測で afx を起こしたり記録/marker を削除しない。管理者が停止下で原本を確認・修復して再実行する。保存は既存 atomic_write、削除は remove_durably と同じ fsync 規則（units.py:87–118）。保存の rename 前の失敗と rename 後の親 directory fsync 失敗は区別する。後者は「保存の永続性が不明」として非成功を返し、marker 設置・停止・鍵や設定変更へ進まない。新規なら次回は記録あり/なし、目標差替えなら旧/新 target のどちらでも実物を再読込みして開始または再開できる。停止前状態と idle_origin は差替えで変えない。
+
+`_guarded` / `_failure` は回復中の例外を診断として返し、回復記録にも web.stage.json にも失敗を追記しない。既存 unrecorded の扱いを保ち、保存・削除の永続性不明は上記の例外として扱う。process 終了では flock だけが解放され、記録は残る。
+
+### 入口 × 状態
+
+pending 検査を共通化し、CLI の入力収集・probe・一時 file 掃除・secret/config 保存より前と、OpsSetup の状態遷移の中心で呼ぶ。既存 check_write_switch_idle / `_unfinished` へ回復記録の検査を接続し、reconfigure の独自 stage 検査にも共有する。interactive.py:349 の write 専用分岐は回復入口として通す。
+
+| 入口 | 記録無し | 正常な回復記録あり（整合済みも含む） | 壊れた/読めない記録 |
+|---|---|---|---|
+| web enable --write / --no-write | 既存の enabled 切替 / idle 不整合回復。idle 整合済みは not_enabled | 新目標で回復完了まで進む | write_recovery_invalid、変更無し |
+| web 通常 enable（対話・非対話・再開） | 既存整合検査 | write_recovery_pending、変更無し・明示フラグへ案内 | 同上 |
+| bot/notify enable・disable、web disable、reconfigure | 既存規則 | 同上。marker・記録を奪わない | 同上 |
+| init（実 wizard 全体） | 既存規則 | wizard の lease 取得直後、instance lock 取得・入力・保存・probe より前に init 全体を拒否 | 同上 |
+| keys init / enroll / rotate / revoke（直接実行） | 既存の instance lock 下で各操作 | setup lock / pending 検査には参加させず既存操作を許す。記録・marker・通常 stage は変えない。回復は次の再実行で実物を再照合 | 記録を修復・削除せず既存 keys 操作のみ |
+| status | 読取のみ | pending と目標・観測した実物の状態を表示、完了扱いしない | 診断のみ、変更無し |
+
+wizard の検査位置は `_stage0` の acquire_setup_lease 成功直後（setup/wizard.py:675–684 の間）とする。web 準備だけを飛ばす形にはしない。回復途中に init が afx の停止・起動や鍵を触ると、記録した停止前状態の意味が変わるため init 全体を止める。marker の有無には依存しない。wizard の init は handoff_and_enable（setup/wizard.py:2449）経由の enable を試す。keys init 自体は write 回復ではない（ops/keys.py:575–620 は停止中の instance lock と initialize のみ）。直接の keys 操作は既存修復手段として残し、回復入口で実物を再照合する。interactive.py:369 の keys 初期化フォールバックより先に pending を拒否する。通常の「不整合だけなら disable は警告して停止できる」（S:559–573）は維持するが、回復記録ありでは既存 write_switch_pending と同様に操作を保護する。
+
+## §2 test の表
+
+対象は `tests/ops_setup/test_web_write_switch.py` と実 wizard の関連 test。副作用の境界ごとに代表例を置き、状態依存の分岐に必要な組合せだけ追加する。全 STATES や全中断点の直積は作らない。
+
+| 追加行 | 作る状態・hook | 期待 |
+|---|---|---|
+| 副作用境界の代表 | 新規記録保存前後、停止後、lock 取得後、鍵変更後、設定変更後、marker 削除前後、start 前後、記録削除前後 | 元稼働・idle 不整合の代表で再生成した OpsSetup から再開。鍵・write の目標整合、marker 解消、必要な稼働復帰。削除後だけ通常 not_enabled |
+| 状態による分岐 | never/disabled、元稼働/停止、true/false の各分岐を覆う最小組合せ。config 不在 false、preparing の両方向、読取鍵の required 差 | stage 不変、never で読取鍵を新規要求しない。既存 STATES はこの分岐に必要な行だけ選ぶ |
+| start 後の手動停止 | 元稼働、after_recovery_start 中断 → 手動 stop → 再実行 | 記録を保持する間は start し active を確認して完了 |
+| 元停止時の手動起動 | marker 削除後に中断 → 手動 start → 同目標で再実行 | 回復から start/stop しない。active のまま完了可能 |
+| 両方向の目標差替え | true→false / false→true、保存前後の中断 | 新しい明示目標へ収束。最初の afx_before_stop / idle_origin を保持。旧目標で一旦起動しない |
+| 実 wizard 入口 | run_wizard を通す。正常 pending + marker あり/なし、記録無しの既存正常経路 | pending は lease 取得直後に init 全体を拒否。質問・保存・probe・keys・systemd 操作なし。記録無しは既存経路へ進む |
+| 直接 keys と競合 | init / enroll / rotate / revoke を回復の lock 保持中、解放後、再実行前に試す | 保持中は排他。解放後は既存規則で動作し記録不変、次回は変更済み実物を照合。元稼働の start 後は daemon の lock で拒否。元停止の後続変更は保証外として区別 |
+| 他 setup 入口と status | 入口表の通常操作を正常 pending の代表状態で実行 | setup は無変更で pending。status は読取のみ。enabled 切替・通常 enable 再開は既存 test と必要な代表回帰だけ |
+| 破損・競合 | JSON/型/版/権限/読取エラー/symlink、foreign/corrupt marker、通常 stage 矛盾 | fail-closed、記録・stage・marker・鍵・設定を保全 |
+| 保存の永続性不明 | 新規/差替えで rename 後の directory fsync 失敗 | 非成功、停止や整合操作なし。新規は記録あり/なし、差替えは旧/新記録の両方から安全に再開 |
+| 削除の永続性不明 | 完了条件を満たした後の unlink 後 directory fsync 失敗 | 非成功。記録ありなら同手順で収束、無しなら整合済み not_enabled。残存を必須にしない |
+| その他 I/O・systemd 失敗 | rename/unlink 前、marker 削除、stop/show/lock/start の代表失敗 | 非成功。記録削除前は再開可能、通常 stage 不変 |
+
+再実行ごとに新しい OpsSetup を生成する。hook 例外と実 I/O 境界の fake 失敗を区別し、鍵・設定の実物、stage、marker、記録、start/stop の呼出しを照合する。afx の最終停止は保証せず、元停止なら回復が起こさないことを検証する。記録の書込みは新規1回と目標差替え時だけ。既存の関連 test は維持する。
+
+## §3 受入
+
+- §1 の中断点表（§0 の3中断点を含む）から、整合済みであっても marker 解消と必要な afx 復帰まで完了する。
+- 目標変更でも停止前状態を失わず、web を enable せず目標へ収束する。元が停止なら回復は afx を起こさない（最終停止状態の保証ではない。関連受入8b）。元稼働なら記録が残る間は手動停止後も再実行で起こす。
+- setup の全入口で正常/異常な記録を検出し、通常 setup 操作が回復を飛び越えない。直接 keys は入口表の既存操作を許す。通常 stage と既存整合判定の意味を保つ。
+- §2 の表と既存 web_write_switch / stages / interactive / reconfigure の関連 test が通る。これは実装時の受入であり、本 C0 では test を変更・実行していない。
+
+## §4 残余
+
+旧版で既に記録無しのまま中断した状態から、元の afx 稼働状態は復元できない。自動推測はせず、marker と停止前状態を運用者が確認する。古い実行ファイルは新記録を知らないため、pending 中の downgrade は対象外。直接 keys の setup lock 参加は範囲外。鍵・write の完了確認は instance lock の保持中に行い、その後に lock を閉じ marker を外す。lock を閉じた後の直接 keys 操作は回復の後の別の利用者操作で、回復の保証外とする。元が稼働なら start 後は daemon が instance lock を持つため直接 keys 操作は走れない。元が停止なら後続操作は今と同じ扱いで、記録が残っていれば次回回復で実物を再照合する。手動 systemd 操作は §1(e) の非対称な扱いとし、元停止の手動起動を完了時に止めず、元稼働の手動停止は記録が残る間再実行で起こす。記録は再実行で進むもので、自動再起動サービスは追加しない。
+
+## §5 裁定が要る点
+
+C0 の技術判断は別 file、明示目標の差替え、共通 pending 検査、fail-closed を推奨として決める。新たな利用者裁定を必須とする点はない。回復完了のため元の afx を戻すこと、元が停止なら起こさないことは既存の意図に従う。pending 中に通常 disable を特別許可する方針へ変えるなら別途裁定が要るが、本案では既存の切替中拒否と揃える。
+
+| 日付 | 版 | 変更 | 理由 | commit |
+|---|---|---|---|---|
+| 2026-11-15 | C0 | idle 回復記録、再開順序、入口と中断 test、受入を提案 | 記録無し回復が marker と停止前状態を失うため | —（未 commit） |
+| 2026-11-15 | C0.1 | 回復の段記録を廃止し実物から毎回同じ手順で再開。中断 test を集約し marker 流用案を比較 | 整合判定を中心の1関数に保ち、実物と進捗記録の二重管理を避けるため | —（未 commit） |
+| 2026-11-15 | C0.2 | レビュー1周目の Important 4件・Minor 1件を裁定に沿って反映。手動 start/stop の非対称な保証、排他下の整合確認と直接 keys の保証境界、wizard lease 直後の init 全体拒否、保存/削除の永続性不明、分岐中心の test 表を明記 | 回復の停止権限を増やさず、実 source と保証範囲を一致させるため | —（未 commit） |
