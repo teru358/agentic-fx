@@ -1,0 +1,389 @@
+[
+ {
+  "anchor": "afx-ops/afx_ops/bot/adapter.py::BotAdapter.deliver_events",
+  "date": "2026-11-15",
+  "evidence": "bot-gateway-disconnect-is-silent",
+  "hash": "7d36b1e1c93bb8f8665c7d9ae9d574ac4eb274c87942f03f0fcb836305b154c0",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "afx-ops/afx_ops/bot/runtime.py::_poll",
+  "date": "2026-11-15",
+  "evidence": "bot-gateway-disconnect-is-silent",
+  "hash": "b58852c86cb2f7eb1efbd3b5dc1862c73c4929faf40ce436f6d6c74b99910631",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "afx-ops/afx_ops/web/render.py::render_status",
+  "date": "2026-11-15",
+  "evidence": "bot-gateway-disconnect-is-silent",
+  "hash": "a98728e988279099e62ff6dd75a72b0ed3c7ab72e815684c7fb5e10fec79a9dc",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/commands.py::Commands._dispatch#reset_kill_switch",
+  "date": "2026-11-15",
+  "evidence": "tests/test_commands_guard_notice.py",
+  "hash": "e628d267153bc1941cf7b9582adc9f6eb3c7670da54ffbf0d071d383bb5c86fa",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/commands.py::Commands._dispatch#write@kill_switch_state_uncertain",
+  "date": "2026-11-15",
+  "evidence": "tests/test_commands_guard_notice.py",
+  "hash": "9dbfd757334d3bc784737bb255f8a75aaa62ec33b6b05d266ab0fd95eca6bf2c",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/commands.py::Commands._emit_guard_notices",
+  "date": "2026-11-15",
+  "evidence": "tests/test_commands_guard_notice.py",
+  "hash": "b8a7eee164b209aa3c4dc40885be334663780617c36212927e4a602589dd4459",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/commands.py::Commands._killswitch_reconcile",
+  "date": "2026-11-15",
+  "evidence": "tests/test_commands_guard_notice.py",
+  "hash": "5b484e37c8b8fc39c64218ca4b945dc60c14931eef249bd6e534c8872ba4ccad",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/commands.py::Commands._projected_state",
+  "date": "2026-11-15",
+  "evidence": "tests/test_commands_guard_notice.py",
+  "hash": "81e29079c7863426c9bf7ba045e9ca5e08557f7f87e18d95db6111f5b30473c8",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/commands.py::Commands.dispatch",
+  "date": "2026-11-15",
+  "evidence": "tests/test_commands_guard_notice.py",
+  "hash": "e9d5abaa1736c9d121164c820891b04814712b619ac97ea89c7c42e7be72b6a8",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/client.py::Runner._op_killswitch_rebase",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_ctl_rebase.py",
+  "hash": "447832d97e84134bee199bc9acef20f7770eb3b68812a527ae3c70c782983a1a",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/client.py::Runner._op_killswitch_reset",
+  "date": "2026-11-15",
+  "evidence": "tests/test_status_acceptance.py",
+  "hash": "2a8ad9e3dd88f3e6a21884934204f79c7740d7b24819faaf1c01bea35eed2a2e",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/client.py::format_status",
+  "date": "2026-11-15",
+  "evidence": "tests/test_status_acceptance.py",
+  "hash": "29821232cdf0fd470968ed0d2717374217d6609e278f504fe66defa080f4fe32",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/events.py::EventStore.emit",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_guard_sweep.py",
+  "hash": "505d9d5db1138320bc13646661ae60adc885f4498a19a4d2d17ba1d0de1dc36c",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/events.py::EventStore.emit_best_effort",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_guard_sweep.py",
+  "hash": "104febb8b0c3dd380c2f11a6dd98aeb52fca0d25ffa882f2c70171ef45483f7f",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/events.py::kill_switch_event_states",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_guard_sweep.py",
+  "hash": "bd1ead1bb93e8f3cdde17e649666ad9fa7859b40a6f7606d02c96445f340889d",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/rebase_accounting.py::apply_rebase",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_rebase_accounting.py",
+  "hash": "c1d22dd93e40c8fc8f10e44c757cc25f6ad1285d7caf547121b1ff7e9442b864",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/rebase_service.py::evaluate_rebase",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_rebase_service.py",
+  "hash": "18e402e1a4401c0bfd99401e299c344249a565368e6de2dc8c6dbffc99ede1c3",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/service.py::GuardLaneNotHeld",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_guard_sweep.py",
+  "hash": "37dbe76d3a8e62de5995d2ef751e1d5f29ff3b792b18ddde6676855f162e1f0e",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/service.py::GuardLaneReentry",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_guard_sweep.py",
+  "hash": "c7893f6fc1bdffa83e3f56793c7ce6e08abce3d8d54361d10b82eb9cb5f64873",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/service.py::OpsService.__init__",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_guard_sweep.py",
+  "hash": "022e0f94a9d867aa125897429a187dc01b8ef669cdbc138a5baa1650a4fe34bd",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/service.py::OpsService._current_state",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_guard_sweep.py",
+  "hash": "4f3ef1d010c4f21b84795aee5538520f00f72ea7b1fe447c741e23e5440fe99f",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/service.py::OpsService._guard_notices_in_lane",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_guard_sweep.py",
+  "hash": "0b0e0ac795c0b81ff01fc588ceb6a2f7980065ea1212585f87acad44da7cbe14",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/service.py::OpsService._guard_step",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_guard_sweep.py",
+  "hash": "ac5bec286ca3f7888d54221a4e8d416924266677e005a050a0c854247de1f2a0",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/service.py::OpsService._ops_lane",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_guard_sweep.py",
+  "hash": "6a0868b84006e2ce2e477aa478e41ad2b9b0306b62c087a582383874796013cb",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/service.py::OpsService._rebase_commit",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_rebase_service.py",
+  "hash": "267b0330602f0d9e5deda8f5c70da5a14bd5a955ff9ecc0e2ce814e65c35c94d",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/service.py::OpsService._rebase_under_core",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_rebase_service.py",
+  "hash": "6f2fedb693e841187a00427dcdbc711b10ac5c4a09d6e2c5d4498fdf251d5e2a",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/service.py::OpsService._reject_lane_reentry",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_guard_sweep.py",
+  "hash": "2f005f92685b3007cc1e4bee88215c5cff82f81bcaa2316b4a958b66500bb69f",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_guard_sweep.py",
+  "hash": "849c5ec4de3b8961a9346fbadf14147bcccf4eaffa9c398ccb61581939ec00dd",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/service.py::OpsService.emit_pending_guard_notices",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_guard_sweep.py",
+  "hash": "533322958f8f146c42b963eb1c1baff9d78a4e96900e5756fecfb5151d5ae756",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/service.py::OpsService.emit_pending_notices",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_guard_sweep.py",
+  "hash": "c6ec76598e7fb5419f77883ce0b2c71e3d4abab2d768fdbfe05f0fa7720d7948",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/service.py::OpsService.rebase_kill_switch",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_rebase_service.py",
+  "hash": "0b776749f5d73ca96f6190c5477d6043682ecc6747fd21b47f57aa943668548a",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/service.py::OpsService.rebase_preview",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_rebase_service.py",
+  "hash": "b0707dde4c2766d643344727601df9134492cf4443184f78da8c6f859d7f6764",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/service.py::OpsService.reconcile_kill_switch",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_guard_sweep.py",
+  "hash": "18c9022240e43425515c24e059a146635f7550613a6eb5f6b5b3a1be13774a59",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/service.py::OpsService.reset_kill_switch",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_guard_sweep.py",
+  "hash": "cca904674a41f5e227d47643ee20d34a38940f9ec0c59c55f2e1ff3733ec033c",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/service.py::plan_kill_switch_notice",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_guard_sweep.py",
+  "hash": "4519eb85474256614e19da5f386baae456e7d961adc2c3da07ecdf9ca5ea1cc7",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/service.py::_GuardNoticeProbe.__call__",
+  "date": "2026-11-15",
+  "evidence": "tests/service/test_improve_notice_wiring.py",
+  "hash": "6698f2d6261bb9c4593edb5cc4ebea788cd45253fe93c6246734dd4685a4c4dd",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/service.py::_build_ops_service",
+  "date": "2026-11-15",
+  "evidence": "tests/service/test_improve_notice_wiring.py",
+  "hash": "1a33329cf3b0c1071500899f04a76c970c6859795145913a971952ce024dd68a",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/service.py::_build_ops_service.status_provider",
+  "date": "2026-11-15",
+  "evidence": "tests/service/test_improve_notice_wiring.py",
+  "hash": "c1e5cad44b1812310fff9039e36a3f21154ea445bef8bf928242b2e427a0f0f1",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/service.py::_sweep_improve_notices",
+  "date": "2026-11-15",
+  "evidence": "tests/service/test_improve_notice_wiring.py",
+  "hash": "5279823b1dc86433b298b46b3a700cf177428e0b2255c53fdb975cad35d0f5e8",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/service.py::build_app#emit_pending_notices",
+  "date": "2026-11-15",
+  "evidence": "tests/service/test_improve_notice_wiring.py",
+  "hash": "768a89eff13a468ced2965f3d1f2d7c282f3ea8fe9847888e8611c6df212e593",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/status.py::collect_status",
+  "date": "2026-11-15",
+  "evidence": "tests/test_status_acceptance.py",
+  "hash": "1c285e9db397eda94b45b29f5f2d5e1a7348f64afe69d754f82e67768124ede9",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/status.py::render_status",
+  "date": "2026-11-15",
+  "evidence": "tests/test_status_acceptance.py",
+  "hash": "cda4a7ae5f2204f378de61f74afd9db5f907f35f1ce0d8615e9d57044514105b",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ },
+ {
+  "anchor": "src/agentic_fx/store/state.py::StateStore.shared_guard",
+  "date": "2026-11-15",
+  "evidence": "tests/ops/test_rebase_service.py",
+  "hash": "d91d1ca1388e360f6d4310cb951b20cbee6461b4f3bcb7ae248f6f3f220175a9",
+  "method": "python-3.14:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "5f016ea825c4d14c9f0065bd0ee7d4c34d1b65ff"
+ }
+]

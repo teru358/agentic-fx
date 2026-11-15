@@ -255,3 +255,9 @@
 - 検査: `check --page kill-switch` は終了コード 0 (人が読む項目は E13 の 1 件のみ)。`tests/scripts/test_impact_map*.py` 95 本 passed。
 - evaluate (凍結表は変えない): 頁セル 凍結表 310 行は TP 310 / FN 0 / U 0 (critical 208 / 208)、機械セル critical 81 / 81、FN 0、U 0。**FP は頁セル 1 → 42、機械セル 59 → 86。増えた分はすべて HWM の追加による凍結後の追加**で、凍結表の symbol への FP の増加は無い。頁セルの内訳 (41 件): 新 resource (台帳表・endpoint 二つ・error code 二つ・log code) の被覆 25、既存 resource の HWM symbol への被覆 16 (`evaluate_rebase`・`_rebase_commit`・`rebase_preview`・`shared_guard`・`GuardedState.projected`・`apply_rebase` の state・config・snapshot の読み書き)。機械セルの新しい FP 27 は同じ新 resource の literal の索引の命中と、`activity:kill_switch_latched` の衝突。凍結表の更新は次の正解表見直しで扱う。
 - 所要時間: `affected` 約 5 秒、`check` 約 1 秒、`extract` + `evaluate` 約 2 秒、頁の更新を含めて開始から commit まで約 4〜5 分の経過時間 (`date` による)。これは操作と編集を含む経過時間であり、58 項目の意味の照合の費用としては扱わない。
+
+## T3 の照合記録 (verify --record の初回)
+
+T3 の二件の確認で source を読んで頁の記述と合っていることを確かめた 43 anchor に、`initial_record` で初回の照合を記録した (`docs/impact-map/verification/kill-switch.json`)。内訳は HWM の 8 anchor (`evaluate_rebase`・`apply_rebase`・`rebase_preview`・`rebase_kill_switch`・`_rebase_under_core`・`_rebase_commit`・`shared_guard`・`_op_killswitch_rebase`、根拠は HWM の test) と、C4 で変わった既存の宣言 35 (副 anchor を含む。根拠は commands・ops service・status の test と bot の閉鎖済みチケット)。記録後の `check --page kill-switch` は終了コード 0 で stale 0。
+
+記録しなかった C4 側の anchor: `commands.py::Commands._dispatch#_emit_guard_notices` (E13 の端点。副 anchor が 3 文に該当して曖昧のため、記録しても stale になる。T2 の人手の裁定のまま)、`service.py::build_app` (coarse の親で副 anchor `build_app#emit_pending_notices` を記録した)。C4 で変わっていない既存の宣言は、この確認で source を読み直していないので記録していない。鮮度の運用 (§6.4) は、記録した anchor について成立し、それ以外の初回基準は次の通常チケットで該当 anchor を読むときに足す。
