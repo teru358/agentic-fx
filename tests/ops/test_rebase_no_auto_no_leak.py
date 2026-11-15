@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+from types import SimpleNamespace
 
 import pytest
 
@@ -75,13 +76,56 @@ def test_startup_recovery_does_not_change_hwm_or_ledger(rig):
     assert rig.state.load().kill_switch_latched is True
 
 
-def _all_text(rig, caplog):
+@pytest.fixture
+def journal(tmp_path, monkeypatch):
+    """技術ログの実際の出力先を捕捉する。
+
+    daemon の logger は `agentic_fx` (propagate なし) で、file (logs/agentic.log) と
+    systemd の journal が拾う stderr の StreamHandler に出す。root へ流れないので caplog は
+    これを見られない。"""
+    import io
+    import sys
+
+    from agentic_fx.logging_setup import setup_technical_logging
+    stream = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", stream)
+    log_dir = tmp_path / "technical"
+    logger = setup_technical_logging(log_dir, "DEBUG", daemon=True)
+    yield SimpleNamespace(stream=stream, file=log_dir / "agentic.log", logger=logger)
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+
+
+@pytest.fixture
+def canaries(monkeypatch):
+    """実行時に組み立てる秘密 (固定の値をソースに置かない)。"""
+    import secrets
+
+    from agentic_fx.ops import keys as ops_keys
+    values = {"MT5_BRIDGE_API_KEY": "bridge-" + secrets.token_hex(12),
+              "TWELVEDATA_API_KEY": "td-" + secrets.token_hex(12)}
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    values["ops_key"] = ops_keys.new_token()
+    return list(values.values())
+
+
+def _journal_text(journal):
+    for handler in journal.logger.handlers:
+        handler.flush()
+    return journal.stream.getvalue() + "\n" + journal.file.read_text(encoding="utf-8")
+
+
+def _all_text(rig, caplog, journal=None):
     parts = [rig.env.activity_path.read_text(encoding="utf-8") if rig.env.activity_path.exists()
              else ""]
     for table, columns in (("ops_requests", "*"), ("ops_events", "*")):
         for row in rig.conn.execute(f"SELECT {columns} FROM {table}").fetchall():
             parts.append(json.dumps([str(value) for value in tuple(row)], ensure_ascii=False))
     parts.append(caplog.text)
+    if journal is not None:
+        parts.append(_journal_text(journal))
     return "\n".join(parts)
 
 
@@ -226,3 +270,54 @@ def test_executor_auto_relatch_after_reset_changes_neither_hwm_nor_ledger(rig):
     assert rig.state.load().kill_switch_latched is True  # 実際に自動で再ラッチした
     assert _gen(rig) == 2
     assert _dump(rig.conn) == before
+
+
+def test_journal_capture_sees_the_real_output_destinations(journal):
+    journal.logger.getChild("probe").warning("probe-line")
+    assert "probe-line" in journal.stream.getvalue()
+    assert "probe-line" in _journal_text(journal)
+    assert "probe-line" in journal.file.read_text(encoding="utf-8")
+
+
+def _leaks(text, view, token, canaries):
+    found = [word for word in PREVIEW_ONLY_WORDS if word != "preview_token" and word in text]
+    found += [c for c in canaries if c in text]
+    if token in text:
+        found.append("preview_token value")
+    for amount in (START, START - LOSS, LOSS, view["additional_headroom"]):
+        for form in (str(amount), f"{amount:,.0f}", f"{amount:.2f}", str(int(amount))):
+            if form in text:
+                found.append(form)
+    return found
+
+
+def test_success_leaves_no_preview_amount_or_secret_in_audit_event_activity_or_journal(
+        rig, caplog, journal, canaries):
+    caplog.set_level(logging.DEBUG)
+    view = _preview(rig)
+    token = view["preview_token"]
+    _post(rig, token)
+    rig.service.reset_kill_switch(APPROVER, _gen(rig))
+    assert _leaks(_all_text(rig, caplog, journal), view, token, canaries) == []
+
+
+def test_failure_leaves_no_preview_amount_or_secret_in_any_output(rig, caplog, journal,
+                                                                  canaries):
+    caplog.set_level(logging.DEBUG)
+    view = _preview(rig)
+    token = view["preview_token"]
+    with pytest.raises(Exception):
+        _post(rig, "f" * 64)
+    assert _leaks(_all_text(rig, caplog, journal), view, token, canaries + ["f" * 64]) == []
+
+
+@pytest.mark.parametrize("kind", ["bridge", "ops_key", "token", "word", "amount"])
+def test_the_leak_check_itself_detects_each_kind_in_the_journal(rig, caplog, journal,
+                                                               canaries, kind):
+    view = _preview(rig)
+    token = view["preview_token"]
+    planted = {"bridge": canaries[0], "ops_key": canaries[-1], "token": token,
+               "word": "cumulative_cut", "amount": f"{START - LOSS:,.0f}"}[kind]
+    assert _leaks(_all_text(rig, caplog, journal), view, token, canaries) == []
+    journal.logger.getChild("plant").error("x %s", planted)
+    assert _leaks(_all_text(rig, caplog, journal), view, token, canaries)
