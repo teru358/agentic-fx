@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 175 件。完了分は closed/。
+未完了: 176 件。完了分は closed/。
 
 ## 実装中 (5)
 
