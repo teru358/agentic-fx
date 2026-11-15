@@ -297,12 +297,15 @@ def state_exclusive_to_core(index: Index) -> list[str]:
 
 
 def unresolved_calls(index: Index) -> list[str]:
-    """保持区間の解決できない呼出しを監査用に列挙する。"""
+    """保持区間の解決できない呼出しを監査用に列挙する。
+
+    行番号は含めない: 無関係な行の増減で一覧が変わらず、呼出しの追加・変更だけが差分に出る。
+    """
     result = set()
     for func in index.funcs:
         for marker in ("core_lock", "_exclusive"):
             for form, stmts in hold_regions(func.node, marker):
                 for call in _calls(stmts):
                     if not resolve(index, func, call):
-                        result.add(f"{func.ident}:{call.lineno} {_text(call)} ({form})")
+                        result.add(f"{func.ident} {_text(call)} ({form})")
     return sorted(result)
