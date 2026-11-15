@@ -328,11 +328,13 @@ def observe_gap(conn, *, source, interval, symbol, day_utc: str, kind: str,
 
 def resolve_gap(conn, *, source, interval, symbol, day_utc, kind, resolution: str,
                 run_id: str | None, now: datetime) -> None:
-    conn.execute(
+    updated = conn.execute(
         "UPDATE history_sync_gaps SET state='resolved', resolution=?, attempts=0, "
         "no_improve_count=0, next_retry_at=NULL, last_observed_at=?, last_run_id=? "
         "WHERE source=? AND interval=? AND symbol=? AND day_utc=? AND kind=? AND state='open'",
-        (resolution, iso(now), run_id, source, interval, symbol, day_utc, kind))
+        (resolution, iso(now), run_id, source, interval, symbol, day_utc, kind)).rowcount
+    if updated:
+        clear_resume(conn, source, interval, symbol, f"gap:{day_utc}:{kind}")
 
 
 def expire_gaps(conn, *, source, interval, boundary: datetime, now: datetime) -> int:
@@ -348,6 +350,8 @@ def expire_gaps(conn, *, source, interval, boundary: datetime, now: datetime) ->
                 "resolution='holdout_passed', last_observed_at=? WHERE source=? AND "
                 "interval=? AND symbol=? AND day_utc=? AND kind=?",
                 (iso(now), source, interval, row["symbol"], row["day_utc"], row["kind"]))
+            clear_resume(conn, source, interval, row["symbol"],
+                         f"gap:{row['day_utc']}:{row['kind']}")
             expired += 1
     return expired
 
@@ -461,6 +465,11 @@ def collect_garbage(conn, *, now: datetime, retention_days: int = RETENTION_DAYS
     """詳細 (series) を 90 日で消す。run の行は集計として残し、参照されているものは
     最小 identity (tombstone) として必ず残す。未完 run・gap・系列状態・衝突から参照される run は
     series 詳細も含めて消さない。衝突は解決済みも消さない。"""
+    conn.execute(
+        "DELETE FROM history_sync_resume WHERE op_key GLOB 'gap:*' AND NOT EXISTS ("
+        "SELECT 1 FROM history_sync_gaps AS g WHERE g.source=history_sync_resume.source "
+        "AND g.interval=history_sync_resume.interval AND g.symbol=history_sync_resume.symbol "
+        "AND g.state='open' AND history_sync_resume.op_key='gap:' || g.day_utc || ':' || g.kind)")
     cutoff = iso(now - timedelta(days=retention_days))
     referenced = set()
     for sql in ("SELECT first_run_id AS r FROM history_sync_gaps UNION "

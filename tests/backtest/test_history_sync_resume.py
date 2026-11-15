@@ -340,3 +340,32 @@ def test_resumed_queue_stops_at_original_start_when_current_window_moves(tmp_pat
     assert result.ops[0].resumed and result.ops[0].status == 'ok'
     assert max(datetime.fromisoformat(span[1]) for spans in captured[0].values()
                for span in spans) == original_start
+
+
+def test_reconcile_clears_interrupted_gap_resume_before_gap_reopens(tmp_path, monkeypatch):
+    from tests.backtest.history_sync_support import seed
+    conn, settings = _seeded(tmp_path)
+    day = '2026-11-04'
+    lo, hi = _dt(2026, 11, 4, 12), _dt(2026, 11, 4, 18)
+    conn.execute('DELETE FROM ohlcv_history WHERE symbol=? AND bar_time >= ? AND bar_time < ?',
+                 (SYMBOL, lo.isoformat(), hi.isoformat()))
+    conn.commit()
+    jumper = _ArmedJumper(5)
+    first = _run(conn, settings, _ArmingBridge(jumper, day),
+                 run_kw={'max_rows': 50, 'monotonic': jumper})
+    assert next(op for op in first.ops if op.operation == 'gap').status == 'partial'
+    key = f'gap:{day}:primary_exact'
+    assert store.get_resume(conn, 'mt5', '15m', SYMBOL, key) is not None
+    seed(conn, SYMBOL, lo, hi)
+    monkeypatch.setattr(store, 'collect_garbage', lambda *_a, **_kw: {})
+    _run(conn, settings, FakeBridge())
+    row = conn.execute("SELECT state, resolution FROM history_sync_gaps WHERE symbol=? AND day_utc=? AND kind='primary_exact'",
+                       (SYMBOL, day)).fetchone()
+    assert (row['state'], row['resolution']) == ('resolved', 'rescan_clear')
+    assert store.get_resume(conn, 'mt5', '15m', SYMBOL, key) is None
+    conn.execute('DELETE FROM ohlcv_history WHERE symbol=? AND bar_time >= ? AND bar_time < ?',
+                 (SYMBOL, lo.isoformat(), hi.isoformat()))
+    conn.commit()
+    third = _run(conn, settings, FakeBridge())
+    reopened = next(op for op in third.ops if op.operation == 'gap' and op.day == day)
+    assert not reopened.resumed and reopened.status == 'ok'

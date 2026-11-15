@@ -482,3 +482,51 @@ def test_epoch_propagates_busy_when_reading_revisions():
 
     with pytest.raises(sqlite3.OperationalError, match="busy"):
         history_epoch(BusyConnection())
+
+
+def test_resolve_and_expire_clear_only_matching_resume_in_same_transaction(tmp_path):
+    conn = _conn(tmp_path)
+    a = datetime(2026, 10, 20, tzinfo=timezone.utc)
+    key = 'gap:2026-10-20:primary_exact'
+    _observe(conn, '2026-10-20')
+    for symbol, op_key in [('USDJPY', key), ('OTHER', key), ('USDJPY', 'recent')]:
+        _txn(conn, lambda c: hs.save_resume(c, source=SRC, interval=IV, symbol=symbol,
+            op_key=op_key, range_start=a, range_end=a + timedelta(days=1),
+            tail_start=a - timedelta(hours=2), prefix_end=a, now=NOW))
+    def resolve(c):
+        hs.resolve_gap(c, source=SRC, interval=IV, symbol='USDJPY', day_utc='2026-10-20',
+                       kind='primary_exact', resolution='rescan_clear', run_id='r', now=NOW)
+        assert hs.get_resume(c, SRC, IV, 'USDJPY', key) is None
+        raise RuntimeError('rollback')
+    with pytest.raises(RuntimeError, match='rollback'):
+        _txn(conn, resolve)
+    assert _gap(conn, '2026-10-20')['state'] == 'open'
+    assert hs.get_resume(conn, SRC, IV, 'USDJPY', key) is not None
+    def expire_then_rollback(c):
+        hs.expire_gaps(c, source=SRC, interval=IV, boundary=a + timedelta(days=1), now=NOW)
+        assert hs.get_resume(c, SRC, IV, 'USDJPY', key) is None
+        raise RuntimeError('rollback expiry')
+    with pytest.raises(RuntimeError, match='rollback expiry'):
+        _txn(conn, expire_then_rollback)
+    assert _gap(conn, '2026-10-20')['state'] == 'open'
+    assert hs.get_resume(conn, SRC, IV, 'USDJPY', key) is not None
+    _txn(conn, lambda c: hs.expire_gaps(c, source=SRC, interval=IV,
+                                        boundary=a + timedelta(days=1), now=NOW))
+    assert _gap(conn, '2026-10-20')['state'] == 'expired'
+    assert hs.get_resume(conn, SRC, IV, 'USDJPY', key) is None
+    assert hs.get_resume(conn, SRC, IV, 'OTHER', key) is not None
+    assert hs.get_resume(conn, SRC, IV, 'USDJPY', 'recent') is not None
+
+
+def test_gc_clears_only_gap_resume_without_matching_open_gap(tmp_path):
+    conn = _conn(tmp_path)
+    a = datetime(2026, 10, 20, tzinfo=timezone.utc)
+    _observe(conn, '2026-10-20')
+    for key in ('recent', 'gap:2026-10-20:primary_exact', 'gap:2026-10-21:primary_exact'):
+        _txn(conn, lambda c: hs.save_resume(c, source=SRC, interval=IV, symbol='USDJPY',
+            op_key=key, range_start=a, range_end=a + timedelta(days=1),
+            tail_start=a - timedelta(hours=2), prefix_end=a, now=NOW))
+    _txn(conn, lambda c: hs.collect_garbage(c, now=NOW))
+    assert hs.get_resume(conn, SRC, IV, 'USDJPY', 'gap:2026-10-21:primary_exact') is None
+    assert hs.get_resume(conn, SRC, IV, 'USDJPY', 'gap:2026-10-20:primary_exact') is not None
+    assert hs.get_resume(conn, SRC, IV, 'USDJPY', 'recent') is not None

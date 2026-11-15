@@ -767,3 +767,30 @@ def test_until_done_backs_off_insufficient_gap_once_while_other_gaps_progress(tm
     assert datetime.fromisoformat(row['next_retry_at']) == T + wait
     assert conn.execute("SELECT COUNT(*) FROM history_sync_series WHERE run_id=? AND operation='gap' AND day_utc=?",
                         (result.run_id, stuck.isoformat())).fetchone()[0] == 1
+
+
+def test_deferred_gap_is_attempted_once_per_run_even_if_it_becomes_due_again(tmp_path, monkeypatch):
+    conn, settings = _seeded(tmp_path, months=4)
+    days = list(_weekdays(date(2026, 8, 4), date(2026, 11, 6)))[::2]
+    assert len(days) > 32
+    stuck = days[0]
+    _holes(conn, days)
+    clock = Clock()
+    actual_due = store.due_gaps
+
+    def advancing_due(conn, **kwargs):
+        kwargs['now'] = T + timedelta(seconds=clock.now)
+        return actual_due(conn, **kwargs)
+
+    monkeypatch.setattr(store, 'due_gaps', advancing_due)
+    bridge = FakeBridge(drop=lambda _symbol, t: t.date() == date(2026, 8, 3) and t.hour >= 22)
+    result = _run(conn, settings, bridge, until_done=True, clock=clock)
+    assert result.subruns >= 3 and clock.now > 300
+    stuck_ops = [op for op in result.ops if op.operation == 'gap' and op.day == stuck.isoformat()]
+    assert len(stuck_ops) == 1 and stuck_ops[0].reason == 'inspection_insufficient'
+    row = conn.execute("SELECT attempts FROM history_sync_gaps WHERE day_utc=? AND kind='primary_exact'",
+                       (stuck.isoformat(),)).fetchone()
+    assert row['attempts'] == 1
+    assert conn.execute("SELECT COUNT(*) FROM history_sync_series WHERE run_id=? AND operation='gap' AND day_utc=?",
+                        (result.run_id, stuck.isoformat())).fetchone()[0] == 1
+    assert sum(op.status == 'ok' for op in result.ops if op.operation == 'gap') > 32

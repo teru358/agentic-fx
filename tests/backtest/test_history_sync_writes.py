@@ -98,3 +98,24 @@ def test_a_run_without_write_failures_is_unchanged(tmp_path):
     conn, settings = _seeded(tmp_path)
     result = _run(conn, settings)
     assert result.rc == 0 and result.required_write_failures == []
+
+
+@pytest.mark.parametrize('failure', ['gap_attempt', 'series'])
+def test_until_done_stops_after_a_gap_state_write_failure(tmp_path, monkeypatch, failure):
+    from datetime import date
+    from tests.backtest.test_history_sync import _holes
+    conn, settings = _seeded(tmp_path)
+    _holes(conn, [date(2026, 10, 20), date(2026, 10, 22)])
+    if failure == 'gap_attempt':
+        monkeypatch.setattr(store, 'record_gap_attempt', _boom)
+    else:
+        original = store.insert_series
+        def insert(c, **kwargs):
+            if kwargs['operation'] == 'gap':
+                raise RuntimeError('write failed')
+            return original(c, **kwargs)
+        monkeypatch.setattr(store, 'insert_series', insert)
+    result = _run(conn, settings, FakeBridge(), until_done=True)
+    assert result.subruns == 1 and result.rc == 1
+    assert (bool(result.required_write_failures) if failure == 'gap_attempt'
+            else result.unrecorded_series > 0)

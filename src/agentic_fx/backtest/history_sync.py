@@ -337,6 +337,7 @@ class _Run:
         self.__dict__.update(kw)
         self.op_seq = 0
         self.executed_last = 0
+        self.deferred_gaps: set[tuple[str, str, str]] = set()
 
     # -- 記録 --
     def _write(self, work) -> bool:
@@ -620,8 +621,10 @@ class _Run:
 
     # -- 古い gap --
     def can_continue(self) -> bool:
-        return self.executed_last > 0 and not any(
-            o.status in ("partial", "failed", "conflict_circuit_open") for o in self.result.ops)
+        return (self.executed_last > 0 and not self.result.required_write_failures
+                and not self.result.unrecorded_series and not any(
+                    o.status in ("partial", "failed", "conflict_circuit_open")
+                    for o in self.result.ops))
 
     def gap_phase(self) -> int:
         interval = self.dataset.base_interval
@@ -632,6 +635,9 @@ class _Run:
         used = executed = 0
         last_symbol = None
         for row in ordered:
+            gap_key = (row["symbol"], row["day_utc"], row["kind"])
+            if gap_key in self.deferred_gaps:
+                continue
             day = date.fromisoformat(row["day_utc"])
             day0 = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
             clipped = plan.clip(day0, day0 + timedelta(days=1), boundary=self.boundary,
@@ -651,6 +657,7 @@ class _Run:
                 if op.reason == REASON_REQUEST_BUDGET:
                     self.result.deferred_reasons.append(REASON_REQUEST_BUDGET)
                     break
+                self.deferred_gaps.add(gap_key)
                 self._record_gap_attempt(row, op)
                 if op.reason not in self.result.deferred_reasons:
                     self.result.deferred_reasons.append(op.reason)
