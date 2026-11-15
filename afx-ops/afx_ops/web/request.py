@@ -312,13 +312,24 @@ def _invoke(match: RouteMatch, query: dict[str, str], client, report: _Reporter)
                 functools.partial(render.render_activity, category=category,
                                   n=n if "n" in query else None))
     if method == "plugins":
-        if query:
+        if set(query) - {"tab", "sort", "dir"}:
             raise _Reject(400)
-        return _call(report, client.plugins), plugin_pages.render_plugins
+        if query.get("tab", tabs.default_tab("/plugins")) not in tabs.tab_names("/plugins"):
+            raise _Reject(400)
+        sort, direction = query.get("sort"), query.get("dir")
+        if (sort is not None and sort not in plugin_pages.SORT_COLUMNS) or (
+                direction is not None and (sort is None or direction not in plugin_pages.DIRECTIONS)):
+            raise _Reject(400)
+        return (_call(report, client.plugins),
+                functools.partial(plugin_pages.render_plugins, sort=sort, direction=direction))
     if method == "plugin":
-        if query:
+        if set(query) - {"tab"}:
             raise _Reject(400)
-        return _call(report, client.plugin, match.values["name"]), plugin_pages.render_plugin
+        tab = query.get("tab", tabs.default_tab(tabs.PLUGIN_DETAIL))
+        if tab not in tabs.tab_names(tabs.PLUGIN_DETAIL):
+            raise _Reject(400)
+        return (_call(report, client.plugin, match.values["name"]),
+                functools.partial(plugin_pages.render_plugin, tab=tab, name=match.values["name"]))
     if method == "improve_list":
         limit = _positive(query, "limit", maximum=improve_pages.MAX_LIMIT,
                           default=improve_pages.DEFAULT_LIMIT)

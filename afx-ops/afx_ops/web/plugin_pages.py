@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import html
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 
 from afx_ops import plugin_text
 from afx_ops.display_zone import zone_of
 from afx_ops.plugin_text import label
-from afx_ops.web import render
+from afx_ops.web import render, tabs
 from afx_ops.web.common import approval_link, display_time, pick, plugin_link
 
 # server DTO の新 field を表示面へ自動的に広げないための allowlist (入れ子の object ごと)。
@@ -179,8 +180,75 @@ def _list_row(raw: dict) -> list[str]:
     ]
 
 
-LIST_HEADERS = ("名前", "kind", "配備", "承認と読込", "承認待ち", "配備中の版", "途中の操作",
-                "参照する strategy", "有用性", "注意")
+@dataclass(frozen=True)
+class SortColumn:
+    """並べ替えの列。`first` は初めの向き、`value` は行から比べる値を取り出す (無い・型違いは None)。"""
+
+    first: str
+    value: Callable[[dict], object]
+
+
+def _text_value(raw: object) -> str | None:
+    return raw if type(raw) is str else None
+
+
+def _int_value(raw: object) -> int | None:
+    return raw if type(raw) is int else None
+
+
+def _usefulness_value(row: dict, name: str) -> int | None:
+    if row.get("kind") != "indicator":
+        return None
+    return _int_value(pick(row.get("usefulness"), USEFULNESS_FIELDS).get(name))
+
+
+SORT_COLUMNS: dict[str, SortColumn] = {
+    "name": SortColumn("asc", lambda row: _text_value(row.get("name"))),
+    "kind": SortColumn("asc", lambda row: _text_value(row.get("kind"))),
+    "state": SortColumn("asc", lambda row: _text_value(
+        pick(row.get("entity"), ENTITY_FIELDS).get("state"))),
+    "pending": SortColumn("desc", lambda row: _int_value(row.get("pending_count"))),
+    "submitted": SortColumn("desc", lambda row: _usefulness_value(row, "submitted")),
+    "deployed": SortColumn("desc", lambda row: _usefulness_value(row, "deployed")),
+}
+DIRECTIONS = ("asc", "desc")
+_MARKS = {"asc": "▲", "desc": "▼"}
+
+
+def sort_rows(plugins: list[dict], sort: str | None, direction: str | None) -> list[dict]:
+    """sort 列で並べ替える。同じ値は元の順のまま (desc でも反転しない)、値の無い行は向きによらず末尾。"""
+    if sort is None:
+        return plugins
+    column = SORT_COLUMNS[sort]
+    valued: list[tuple[object, dict]] = []
+    missing: list[dict] = []
+    for raw in plugins:
+        value = column.value(pick(raw, ROW_FIELDS))
+        if value is None:
+            missing.append(raw)
+        else:
+            valued.append((value, raw))
+    valued.sort(key=lambda pair: pair[0], reverse=(direction or column.first) == "desc")
+    return [raw for _, raw in valued] + missing
+
+
+def _sort_link(label_text: str, key: str, sort: str | None, direction: str | None) -> str:
+    """見出しの link。今の列なら向きを逆にし、ほかの列はその列の初めの向きにする。"""
+    column = SORT_COLUMNS[key]
+    current = (direction or column.first) if key == sort else None
+    target = column.first if current is None else DIRECTIONS[1 - DIRECTIONS.index(current)]
+    href = html.escape(f"/plugins?sort={key}&dir={target}", quote=True)
+    mark = _MARKS[current] if current else ""
+    return f'<a href="{href}">{html.escape(label_text, quote=True)}{mark}</a>'
+
+
+def _list_headers(sort: str | None, direction: str | None) -> tuple[str, ...]:
+    def link(text: str, key: str) -> str:
+        return _sort_link(text, key, sort, direction)
+
+    return (link("名前", "name"), link("kind", "kind"), link("配備", "state"), "承認と読込",
+            link("承認待ち", "pending"), "配備中の版", "途中の操作", "参照する strategy",
+            f'有用性 ({link("提出", "submitted")} / {link("配備成功", "deployed")})', "注意")
 
 
 def _sources_note(sources: object) -> str:
@@ -209,15 +277,23 @@ def _header_section(data: Mapping[str, object]) -> str:
     return "".join(parts)
 
 
-def render_plugins(data: Mapping[str, object]) -> bytes:
+def render_plugins(data: Mapping[str, object], sort: str | None = None,
+                   direction: str | None = None) -> bytes:
     tz = zone_of(data)
     listing = pick(data, LISTING_FIELDS)
     plugins = listing.get("plugins")
-    rows = [_list_row(row) for row in plugins if type(row) is dict] if type(plugins) is list else []
+    given = [row for row in plugins if type(row) is dict] if type(plugins) is list else []
+    rows = [_list_row(row) for row in sort_rows(given, sort, direction)]
     head = _header_section(data)
-    budget = render.MAX_RESPONSE_BYTES - len(render._document("Plugins", head, tz, current="/plugins"))
-    table = _table(LIST_HEADERS, rows, budget) if rows else "<p>plugin はありません</p>"
-    return render._page("Plugins", head + table, tz, current="/plugins")
+    bar = tabs.bar("/plugins", "list")
+    frame = '<div class="scroll"></div>'
+    budget = render.MAX_RESPONSE_BYTES - len(
+        render._document("Plugins", head + frame, tz, current="/plugins", tabs=bar))
+    if rows:
+        table = '<div class="scroll">' + _table(_list_headers(sort, direction), rows, budget) + "</div>"
+    else:
+        table = "<p>plugin はありません</p>"
+    return render._page("Plugins", head + table, tz, current="/plugins", tabs=bar)
 
 
 # ---------------------------------------------------------------- 詳細
@@ -340,7 +416,21 @@ def _history_section(row: dict, tz: str) -> str:
     return _section("承認の履歴", table)
 
 
-def render_plugin(data: Mapping[str, object]) -> bytes:
+# plugin 詳細のタブごとの節。キーは tabs.TABS[tabs.PLUGIN_DETAIL] の名前と一致させる
+DETAIL_TAB_SECTIONS: dict[str, Callable[[dict, dict, dict, Mapping[str, object], str], str]] = {
+    "overview": lambda row, entity, admission, data, tz: _overview(row, entity, admission, tz),
+    "approvals": lambda row, entity, admission, data, tz: (
+        _pending_section(row) + _history_section(row, tz)),
+    "deps": lambda row, entity, admission, data, tz: (
+        _dependencies_section(row) + _dependents_section(row)),
+    "usefulness": lambda row, entity, admission, data, tz: _usefulness_section(
+        row, data.get("unknown_submissions")),
+    "versions": lambda row, entity, admission, data, tz: _versions_section(row),
+}
+
+
+def render_plugin(data: Mapping[str, object], tab: str = "overview",
+                  name: str | None = None) -> bytes:
     tz = zone_of(data)
     row = pick(data.get("plugin"), ROW_FIELDS)
     entity = pick(row.get("entity"), ENTITY_FIELDS)
@@ -348,8 +438,7 @@ def render_plugin(data: Mapping[str, object]) -> bytes:
     name = row.get("name")
     shown = name if type(name) is str and render._NAME.match(name) else "-"
     nav = '<p><a href="/plugins">Plugins</a> / <a href="/approvals">Pending approvals</a></p>'
-    body = (nav + _overview(row, entity, admission, tz) + _pending_section(row)
-            + _dependencies_section(row) + _dependents_section(row)
-            + _usefulness_section(row, data.get("unknown_submissions"))
-            + _versions_section(row) + _history_section(row, tz))
-    return render._page(f"Plugin {shown}", body, tz, current="/plugins")
+    body = DETAIL_TAB_SECTIONS[tab](row, entity, admission, data, tz) or "<p>なし</p>"
+    link_name = name if name is not None else shown
+    bar = tabs.bar(tabs.PLUGIN_DETAIL, tab, at=f"/plugins/{link_name}")
+    return render._page(f"Plugin {shown}", body, tz, current="/plugins", tabs=nav + bar)

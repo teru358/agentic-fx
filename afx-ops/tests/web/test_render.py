@@ -145,8 +145,8 @@ def test_each_pending_approval_links_to_its_detail_route():
         {"id": 0, "name": "zero id"},
     ]}
     page = handle_request(Request("GET", "/approvals", {}), ReadClient(approvals=approvals)).body.decode()
-    links = re.findall(r'<a href="([^"]*)">', page.split("</nav>", 1)[1])
-    assert links == ["/approvals/7"]
+    content = re.sub(r'<nav class="tabs">.*?</nav>', "", page).split("</nav>", 1)[1]
+    assert re.findall(r'<a href="([^"]*)">', content) == ["/approvals/7"]
     assert "&lt;b&gt;p&lt;/b&gt;" in page and "<b>" not in page
     assert "<script>" not in page
 

@@ -452,7 +452,8 @@ def render_approvals(data: Mapping[str, object]) -> bytes:
     if isinstance(journals, list):
         body += "".join("<section>" + _pairs(item, JOURNAL_FIELDS, tz=tz) + "</section>"
                         for item in journals[:MAX_ITEMS] if type(item) is dict)
-    return _page("Pending approvals", body, tz, current="/plugins")
+    return _page("Pending approvals", body, tz, current="/plugins",
+                 tabs=tab_table.bar("/plugins", "approvals"))
 
 
 def _change_is_well_formed(change: Mapping[str, object]) -> bool:

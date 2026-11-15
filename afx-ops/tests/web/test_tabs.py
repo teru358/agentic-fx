@@ -115,7 +115,7 @@ def test_the_emphasis_is_kept_in_the_overview():
     ("/activity", {"tab": "NEWS"}), ("/activity", {"category": "news"}),
     ("/activity", {"category": "NEWS", "x": "1"}), ("/activity", {"n": "0"}),
     ("/activity", {"n": "501"}), ("/activity", {"n": "01"}),
-    ("/plugins", {"tab": "list"}), ("/approvals", {"tab": "x"}), ("/logs", {"tab": "x"}),
+    ("/plugins", {"tab": "nope"}), ("/approvals", {"tab": "x"}), ("/logs", {"tab": "x"}),
 ])
 @pytest.mark.parametrize("method", ["GET", "HEAD"])
 def test_a_query_outside_the_table_is_400_and_never_reaches_the_daemon(path, query, method):

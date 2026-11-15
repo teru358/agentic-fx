@@ -32,6 +32,7 @@ class Tab:
 
 ACTIVITY_CATEGORIES = ("NEWS", "TECH", "AGGREGATE", "TRADE", "IMPROVE", "APPROVAL", "SYSTEM")
 ALL = "all"
+PLUGIN_DETAIL = "/plugins/{name}"
 
 # 表の先頭が既定。帯を持たない route はここに載せない
 TABS: dict[str, tuple[Tab, ...]] = {
@@ -40,6 +41,17 @@ TABS: dict[str, tuple[Tab, ...]] = {
         Tab("bot", "Bot", Link(TAB, "bot")),
         Tab("econ", "経済指標", Link(TAB, "econ")),
         Tab("reaction", "反応統計", Link(TAB, "reaction")),
+    ),
+    "/plugins": (
+        Tab("list", "一覧", Link(TAB, "list")),
+        Tab("approvals", "承認待ち", Link(PATH, "/approvals")),
+    ),
+    PLUGIN_DETAIL: (
+        Tab("overview", "概要", Link(TAB, "overview")),
+        Tab("approvals", "承認", Link(TAB, "approvals")),
+        Tab("deps", "依存", Link(TAB, "deps")),
+        Tab("usefulness", "有用性", Link(TAB, "usefulness")),
+        Tab("versions", "版の履歴", Link(TAB, "versions")),
     ),
     "/activity": (Tab(ALL, "全件", Link(CATEGORY, None)),)
     + tuple(Tab(name, name, Link(CATEGORY, name)) for name in ACTIVITY_CATEGORIES),
@@ -73,14 +85,17 @@ def _href(path: str, item: Tab, carry: Mapping[str, int]) -> str:
 
 
 def bar(path: str, current: str, *, carry: Mapping[str, int] | None = None,
-        writable: bool = False) -> str:
-    """h1 の下に置く帯。href は path・固定表の値・検査済みの整数だけで組む。"""
+        writable: bool = False, at: str | None = None) -> str:
+    """h1 の下に置く帯。href は path・固定表の値・検査済みの整数だけで組む。
+
+    `path` は表の key。表の key と実際の path が違う route (名前を含む path) は `at` に実際の path を渡す。
+    """
     items = [item for item in TABS.get(path, ()) if writable or not item.write_only]
     if not items:
         return ""
     links = []
     for item in items:
         mark = ' aria-current="page"' if item.name == current else ""
-        links.append(f'<a href="{_href(path, item, carry or {})}"{mark}>'
+        links.append(f'<a href="{_href(at or path, item, carry or {})}"{mark}>'
                      f"{html.escape(item.label, quote=True)}</a>")
     return '<nav class="tabs">' + "".join(links) + "</nav>"
