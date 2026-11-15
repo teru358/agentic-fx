@@ -1,0 +1,1004 @@
+{
+ "header": {
+  "domain": "kill-switch",
+  "isolation": "repo 外の detached worktree、sparse checkout で impact-map の設計書・docs/impact-map・tmp を除外",
+  "revision": "0dbcb27f",
+  "role": "B",
+  "roots": [
+   "src/agentic_fx",
+   "afx-ops/afx_ops"
+  ]
+ },
+ "negative_assertions": [
+  {
+   "claim": "guard_notice_deferred と guard_notice_backfill_skipped は ops_events code として発行されない。",
+   "entry": "src/agentic_fx/ops/service.py::OpsService._finish_notices と OpsService._sweep_kill_switch",
+   "rationale": "該当箇所は warning ログであり、ops/events.py の FIELDS に両 code はない。"
+  },
+  {
+   "claim": "shell の data resume は data_feed の guard_state_changed を直接発行しない。",
+   "entry": "src/agentic_fx/commands.py::Commands._data_resume",
+   "rationale": "outage.request_resume を直接呼び、OpsService.resume_data とその _guard_event を経由しない。"
+  },
+  {
+   "claim": "通常の kill_switch_latched activity の記録箇所は Notifier.send を呼ばない。",
+   "entry": "src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open",
+   "rationale": "通常成功分岐は activity.write のみで、耐久性不明分岐は _best_effort_record を通じて通知する。"
+  }
+ ],
+ "rows": [
+  {
+   "critical": true,
+   "rationale": "口座 snapshot テーブルと時刻・ID の index を定義する。",
+   "relation": "schema",
+   "resource": "db:account_snapshots",
+   "symbol": "src/agentic_fx/store/db.py::<module>._SCHEMA"
+  },
+  {
+   "critical": true,
+   "rationale": "balance、equity、HWM 等を挿入する。",
+   "relation": "writes",
+   "resource": "db:account_snapshots",
+   "symbol": "src/agentic_fx/store/snapshots.py::add"
+  },
+  {
+   "critical": true,
+   "rationale": "最新 snapshot を時刻と ID で取得する。",
+   "relation": "reads",
+   "resource": "db:account_snapshots",
+   "symbol": "src/agentic_fx/store/snapshots.py::latest"
+  },
+  {
+   "critical": true,
+   "rationale": "指定時刻以降の最初の snapshot を取得する。",
+   "relation": "reads",
+   "resource": "db:account_snapshots",
+   "symbol": "src/agentic_fx/store/snapshots.py::first_since"
+  },
+  {
+   "critical": true,
+   "rationale": "指定時刻より前の最後の snapshot を取得する。",
+   "relation": "reads",
+   "resource": "db:account_snapshots",
+   "symbol": "src/agentic_fx/store/snapshots.py::last_before"
+  },
+  {
+   "critical": true,
+   "rationale": "口座 snapshot を記録し HWM を維持する。",
+   "relation": "writes",
+   "resource": "db:account_snapshots",
+   "symbol": "src/agentic_fx/core/accounting.py::record_snapshot"
+  },
+  {
+   "critical": true,
+   "rationale": "日次基準 snapshot と cashflow を参照する。",
+   "relation": "reads",
+   "resource": "db:account_snapshots",
+   "symbol": "src/agentic_fx/core/accounting.py::daily_start_snapshot"
+  },
+  {
+   "critical": true,
+   "rationale": "gate に渡す現在の equity と HWM を取得する。",
+   "relation": "reads",
+   "resource": "db:account_snapshots",
+   "symbol": "src/agentic_fx/core/accounting.py::current_account"
+  },
+  {
+   "critical": true,
+   "rationale": "tick の時価評価を実行し、記録失敗時は tick の継続を抑止する。",
+   "relation": "invokes -> Scheduler._mark_to_market",
+   "resource": "db:account_snapshots",
+   "symbol": "src/agentic_fx/core/scheduler.py::Scheduler._tick_body"
+  },
+  {
+   "critical": true,
+   "rationale": "時価評価から balance と equity の snapshot を記録する。",
+   "relation": "invokes -> record_snapshot",
+   "resource": "db:account_snapshots",
+   "symbol": "src/agentic_fx/core/scheduler.py::Scheduler._mark_to_market"
+  },
+  {
+   "critical": false,
+   "rationale": "ドローダウン閾値を 0 より大きく 100 以下に制約する。",
+   "relation": "schema",
+   "resource": "config:risk.drawdown_kill_pct",
+   "symbol": "src/agentic_fx/config.py::RiskSettings"
+  },
+  {
+   "critical": false,
+   "rationale": "高い閾値に警告する。",
+   "relation": "reads",
+   "resource": "config:risk.drawdown_kill_pct",
+   "symbol": "src/agentic_fx/config.py::Settings._warn_high_drawdown_kill_pct"
+  },
+  {
+   "critical": true,
+   "rationale": "gate 入力に latch 状態と口座値を保持する。",
+   "relation": "schema",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/core/risk_gate.py::GateContext"
+  },
+  {
+   "critical": true,
+   "rationale": "既存 latch を確認して新規取引を拒否する。",
+   "relation": "reads",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/core/risk_gate.py::evaluate"
+  },
+  {
+   "critical": true,
+   "rationale": "equity と HWM から算出した DD を閾値と比較する。",
+   "relation": "reads",
+   "resource": "config:risk.drawdown_kill_pct",
+   "symbol": "src/agentic_fx/core/risk_gate.py::evaluate"
+  },
+  {
+   "critical": true,
+   "rationale": "live trade loop の入口。",
+   "relation": "invokes -> TradeLoop._run_once_impl",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/loops/trade_loop.py::TradeLoop.run_once"
+  },
+  {
+   "critical": true,
+   "rationale": "通常 mission の新規注文を snapshot 経由で executor に渡す。",
+   "relation": "invokes -> Executor.open_from_snapshot",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/loops/trade_loop.py::TradeLoop._run_once_impl"
+  },
+  {
+   "critical": true,
+   "rationale": "signal mission の新規注文も同じ executor 入口に渡す。",
+   "relation": "invokes -> Executor.open_from_snapshot",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/loops/trade_loop.py::TradeLoop._run_signal_mission"
+  },
+  {
+   "critical": true,
+   "rationale": "intent 入口から新規注文処理に進む。replay も使用する。",
+   "relation": "invokes -> Executor._open",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/core/executor.py::Executor.handle_intent"
+  },
+  {
+   "critical": true,
+   "rationale": "現在の equity と HWM が取得できなければ fail closed する。",
+   "relation": "reads",
+   "resource": "db:account_snapshots",
+   "symbol": "src/agentic_fx/core/executor.py::Executor._open"
+  },
+  {
+   "critical": true,
+   "rationale": "投影された latch 状態を gate context に渡す。",
+   "relation": "reads",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/core/executor.py::Executor._open"
+  },
+  {
+   "critical": true,
+   "rationale": "commit 時に現在口座を読み直し、取得できなければ拒否する。",
+   "relation": "reads",
+   "resource": "db:account_snapshots",
+   "symbol": "src/agentic_fx/core/executor.py::Executor.open_from_snapshot"
+  },
+  {
+   "critical": true,
+   "rationale": "snapshot 経由の新規注文でも latch 状態を gate に渡す。",
+   "relation": "reads",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/core/executor.py::Executor.open_from_snapshot"
+  },
+  {
+   "critical": true,
+   "rationale": "両新規注文経路が共有する risk gate を評価する。",
+   "relation": "invokes -> evaluate",
+   "resource": "config:risk.drawdown_kill_pct",
+   "symbol": "src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open"
+  },
+  {
+   "critical": true,
+   "rationale": "DD の kill switch 判定で latch を永続化する。",
+   "relation": "writes",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open"
+  },
+  {
+   "critical": true,
+   "rationale": "新規 latch を activity に記録する。",
+   "relation": "produces",
+   "resource": "activity:kill_switch_latched",
+   "symbol": "src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open"
+  },
+  {
+   "critical": true,
+   "rationale": "保存済みだが耐久性が不明な latch を記録する。",
+   "relation": "produces",
+   "resource": "activity:kill_switch_latched_durability_uncertain",
+   "symbol": "src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open"
+  },
+  {
+   "critical": true,
+   "rationale": "耐久性不明時は activity 記録と通知を best effort で行う。",
+   "relation": "invokes -> Executor._notify",
+   "resource": "activity:kill_switch_latched_durability_uncertain",
+   "symbol": "src/agentic_fx/core/executor.py::Executor._best_effort_record"
+  },
+  {
+   "critical": true,
+   "rationale": "executor の通知を Notifier に渡す。",
+   "relation": "invokes -> Notifier.send",
+   "resource": "activity:kill_switch_latched_durability_uncertain",
+   "symbol": "src/agentic_fx/core/executor.py::Executor._notify"
+  },
+  {
+   "critical": true,
+   "rationale": "有効な webhook に通知し、失敗は warning に留める。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_latched_durability_uncertain",
+   "symbol": "src/agentic_fx/core/notifier.py::Notifier.send"
+  },
+  {
+   "critical": true,
+   "rationale": "latch の既定値を定義する。",
+   "relation": "schema",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/store/state.py::AppState"
+  },
+  {
+   "critical": true,
+   "rationale": "generation の既定値を定義する。",
+   "relation": "schema",
+   "resource": "state:app_state.kill_switch_generation",
+   "symbol": "src/agentic_fx/store/state.py::AppState"
+  },
+  {
+   "critical": true,
+   "rationale": "latch 時刻の既定値を定義する。",
+   "relation": "schema",
+   "resource": "state:app_state.kill_switch_latched_at",
+   "symbol": "src/agentic_fx/store/state.py::AppState"
+  },
+  {
+   "critical": true,
+   "rationale": "保存値の型を検証して状態を復元する。",
+   "relation": "reads",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/store/state.py::parse_state"
+  },
+  {
+   "critical": true,
+   "rationale": "generation の型を検証し復元する。",
+   "relation": "reads",
+   "resource": "state:app_state.kill_switch_generation",
+   "symbol": "src/agentic_fx/store/state.py::parse_state"
+  },
+  {
+   "critical": true,
+   "rationale": "latch 時刻の型を検証し復元する。",
+   "relation": "reads",
+   "resource": "state:app_state.kill_switch_latched_at",
+   "symbol": "src/agentic_fx/store/state.py::parse_state"
+  },
+  {
+   "critical": true,
+   "rationale": "state file に付ける reset marker の suffix。",
+   "relation": "schema",
+   "resource": "marker:reset_marker",
+   "symbol": "src/agentic_fx/store/state.py::<module>._MARKER_SUFFIX"
+  },
+  {
+   "critical": true,
+   "rationale": "state file から marker path を作る。",
+   "relation": "exposes",
+   "resource": "marker:reset_marker",
+   "symbol": "src/agentic_fx/store/state.py::StateStore._marker"
+  },
+  {
+   "critical": true,
+   "rationale": "残存 marker とその内容を取得する。",
+   "relation": "reads",
+   "resource": "marker:reset_marker",
+   "symbol": "src/agentic_fx/store/state.py::StateStore.reconcile_marker"
+  },
+  {
+   "critical": true,
+   "rationale": "marker があれば状態を latched として投影する。",
+   "relation": "reads",
+   "resource": "marker:reset_marker",
+   "symbol": "src/agentic_fx/store/state.py::StateStore.load"
+  },
+  {
+   "critical": true,
+   "rationale": "状態を排他更新する。",
+   "relation": "writes",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/store/state.py::StateStore.update"
+  },
+  {
+   "critical": true,
+   "rationale": "新規 latch の generation を増やす。",
+   "relation": "writes",
+   "resource": "state:app_state.kill_switch_generation",
+   "symbol": "src/agentic_fx/store/state.py::StateStore.update"
+  },
+  {
+   "critical": true,
+   "rationale": "latch 時刻を設定し通常の解除更新では消す。",
+   "relation": "writes",
+   "resource": "state:app_state.kill_switch_latched_at",
+   "symbol": "src/agentic_fx/store/state.py::StateStore.update"
+  },
+  {
+   "critical": true,
+   "rationale": "reset の途中状態を marker に永続化する。",
+   "relation": "writes",
+   "resource": "marker:reset_marker",
+   "symbol": "src/agentic_fx/store/state.py::StateStore._write_marker"
+  },
+  {
+   "critical": true,
+   "rationale": "reset marker を削除する。",
+   "relation": "mutates",
+   "resource": "marker:reset_marker",
+   "symbol": "src/agentic_fx/store/state.py::StateStore._remove_marker"
+  },
+  {
+   "critical": true,
+   "rationale": "generation を照合し marker を介して reset を行う。",
+   "relation": "mutates",
+   "resource": "marker:reset_marker",
+   "symbol": "src/agentic_fx/store/state.py::StateStore.reset_kill_switch"
+  },
+  {
+   "critical": true,
+   "rationale": "期待 generation に一致する latch を解除する。",
+   "relation": "writes",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/store/state.py::StateStore.reset_kill_switch"
+  },
+  {
+   "critical": true,
+   "rationale": "不確実な状態を latched として確定し marker を処理する。",
+   "relation": "mutates",
+   "resource": "marker:reset_marker",
+   "symbol": "src/agentic_fx/store/state.py::StateStore.confirm_latched"
+  },
+  {
+   "critical": true,
+   "rationale": "reconcile は latch 側に倒す。",
+   "relation": "writes",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/store/state.py::StateStore.confirm_latched"
+  },
+  {
+   "critical": true,
+   "rationale": "独立した afx status も marker を latch に投影する。",
+   "relation": "reads",
+   "resource": "marker:reset_marker",
+   "symbol": "src/agentic_fx/status.py::read_state"
+  },
+  {
+   "critical": false,
+   "rationale": "収集した状態を status に表示する。",
+   "relation": "exposes",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/status.py::render_status"
+  },
+  {
+   "critical": true,
+   "rationale": "起動時に残存 marker を確認する。",
+   "relation": "reads",
+   "resource": "marker:reset_marker",
+   "symbol": "src/agentic_fx/service.py::build_app"
+  },
+  {
+   "critical": false,
+   "rationale": "marker が残っていれば reconcile が必要な旨を記録する。",
+   "relation": "produces",
+   "resource": "activity:kill_switch_reconcile_required",
+   "symbol": "src/agentic_fx/service.py::build_app"
+  },
+  {
+   "critical": true,
+   "rationale": "listener と supervisor の開始前に未通知の遷移を回収する。",
+   "relation": "invokes -> OpsService.emit_pending_notices",
+   "resource": "event:guard_state_changed",
+   "symbol": "src/agentic_fx/service.py::build_app"
+  },
+  {
+   "critical": true,
+   "rationale": "tick ごとに kill switch の未通知遷移を回収する。",
+   "relation": "invokes -> OpsService.emit_pending_notices",
+   "resource": "event:guard_state_changed",
+   "symbol": "src/agentic_fx/service.py::_sweep_improve_notices"
+  },
+  {
+   "critical": true,
+   "rationale": "更新前後の latch を比較し replay 遷移を記録する。",
+   "relation": "reads",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/backtest/runner.py::_RecordingStateStore.update"
+  },
+  {
+   "critical": true,
+   "rationale": "確定した replay 解除遷移を公開する。",
+   "relation": "produces",
+   "resource": "metric:kill_switch_events",
+   "symbol": "src/agentic_fx/backtest/runner.py::_RecordingStateStore.publish_released"
+  },
+  {
+   "critical": true,
+   "rationale": "遷移に対応する snapshot から DD を組み立てる。",
+   "relation": "reads",
+   "resource": "db:account_snapshots",
+   "symbol": "src/agentic_fx/backtest/runner.py::_kill_switch_event"
+  },
+  {
+   "critical": true,
+   "rationale": "replay 自動解除に関連する snapshot を挿入する。",
+   "relation": "writes",
+   "resource": "db:account_snapshots",
+   "symbol": "src/agentic_fx/backtest/runner.py::_auto_release_kill_switch"
+  },
+  {
+   "critical": true,
+   "rationale": "replay latch を解除し、失敗時には再 latch の補償を試みる。",
+   "relation": "mutates",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/backtest/runner.py::_auto_release_kill_switch"
+  },
+  {
+   "critical": true,
+   "rationale": "replay の intent を同じ executor と risk gate に渡す。",
+   "relation": "invokes -> Executor.handle_intent",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/backtest/runner.py::run_replay"
+  },
+  {
+   "critical": true,
+   "rationale": "解除条件が満たされると自動解除を試みる。",
+   "relation": "invokes -> _auto_release_kill_switch",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/backtest/runner.py::run_replay"
+  },
+  {
+   "critical": true,
+   "rationale": "記録した遷移から replay artifact を組み立てる。",
+   "relation": "produces",
+   "resource": "metric:kill_switch_events",
+   "symbol": "src/agentic_fx/backtest/runner.py::run_replay"
+  },
+  {
+   "critical": true,
+   "rationale": "latched 遷移を数える。",
+   "relation": "produces",
+   "resource": "metric:kill_switch_latches",
+   "symbol": "src/agentic_fx/backtest/runner.py::run_replay"
+  },
+  {
+   "critical": true,
+   "rationale": "replay 結果の latch 数を metric に含める。",
+   "relation": "exposes",
+   "resource": "metric:kill_switch_latches",
+   "symbol": "src/agentic_fx/backtest/metrics.py::compute_metrics"
+  },
+  {
+   "critical": true,
+   "rationale": "backtest metric の key 集合に含める。",
+   "relation": "schema",
+   "resource": "metric:kill_switch_latches",
+   "symbol": "src/agentic_fx/backtest/metrics.py::<module>.METRIC_KEYS"
+  },
+  {
+   "critical": true,
+   "rationale": "採用比較の metric key を定義する。",
+   "relation": "schema",
+   "resource": "metric:kill_switch_latches",
+   "symbol": "src/agentic_fx/plugin/strategy_gate.py::<module>._COMPARE_METRIC_KEYS"
+  },
+  {
+   "critical": true,
+   "rationale": "比較対象 metric を key 集合に従って投影する。",
+   "relation": "reads",
+   "resource": "metric:kill_switch_latches",
+   "symbol": "src/agentic_fx/plugin/strategy_gate.py::_project"
+  },
+  {
+   "critical": true,
+   "rationale": "採用比較用の metric 行に latch 数を投影する。",
+   "relation": "consumes",
+   "resource": "metric:kill_switch_latches",
+   "symbol": "src/agentic_fx/ops/change.py::_metric_row"
+  },
+  {
+   "critical": true,
+   "rationale": "metric の表示文を作る。",
+   "relation": "consumes",
+   "resource": "metric:kill_switch_latches",
+   "symbol": "src/agentic_fx/metric_words.py::metric_items"
+  },
+  {
+   "critical": true,
+   "rationale": "別 package 側で metric の表示文を作る。",
+   "relation": "consumes",
+   "resource": "metric:kill_switch_latches",
+   "symbol": "afx-ops/afx_ops/metric_words.py::metric_items"
+  },
+  {
+   "critical": true,
+   "rationale": "baseline 比較表に latch 数を表示する。",
+   "relation": "consumes",
+   "resource": "metric:kill_switch_latches",
+   "symbol": "afx-ops/afx_ops/web/render.py::_baseline_section"
+  },
+  {
+   "critical": true,
+   "rationale": "shell の比較 metric 行に含める。",
+   "relation": "consumes",
+   "resource": "metric:kill_switch_latches",
+   "symbol": "src/agentic_fx/commands.py::Commands._comparison_metrics_line"
+  },
+  {
+   "critical": true,
+   "rationale": "floor report の metric key を定義する。",
+   "relation": "schema",
+   "resource": "metric:kill_switch_latches",
+   "symbol": "src/agentic_fx/loops/improve_loop.py::ImproveLoop._FLOOR_REPORT_METRIC_KEYS"
+  },
+  {
+   "critical": true,
+   "rationale": "比較用 metric を floor report に含める。",
+   "relation": "consumes",
+   "resource": "metric:kill_switch_latches",
+   "symbol": "src/agentic_fx/loops/improve_loop.py::ImproveLoop._render_floor_report_detail"
+  },
+  {
+   "critical": false,
+   "rationale": "shell reset は generation を指定して解除する。",
+   "relation": "invokes -> StateStore.reset_kill_switch",
+   "resource": "state:app_state.kill_switch_generation",
+   "symbol": "src/agentic_fx/commands.py::Commands._dispatch"
+  },
+  {
+   "critical": false,
+   "rationale": "reset の結果が不確実な状態を記録する。",
+   "relation": "produces",
+   "resource": "activity:kill_switch_state_uncertain",
+   "symbol": "src/agentic_fx/commands.py::Commands._dispatch"
+  },
+  {
+   "critical": false,
+   "rationale": "成功した shell reset を activity に記録する。",
+   "relation": "produces",
+   "resource": "activity:kill_switch_reset",
+   "symbol": "src/agentic_fx/commands.py::Commands._dispatch"
+  },
+  {
+   "critical": false,
+   "rationale": "reset activity の表示用データを組み立てる。",
+   "relation": "produces",
+   "resource": "activity:kill_switch_reset",
+   "symbol": "src/agentic_fx/core/display_time.py::kill_switch_reset"
+  },
+  {
+   "critical": false,
+   "rationale": "別 package 側の reset activity 表示定義。",
+   "relation": "duplicates",
+   "resource": "activity:kill_switch_reset",
+   "symbol": "afx-ops/afx_ops/display_time.py::kill_switch_reset"
+  },
+  {
+   "critical": true,
+   "rationale": "shell reconcile は marker を確認し latched を確定する。",
+   "relation": "invokes -> StateStore.confirm_latched",
+   "resource": "marker:reset_marker",
+   "symbol": "src/agentic_fx/commands.py::Commands._killswitch_reconcile"
+  },
+  {
+   "critical": false,
+   "rationale": "reconcile による latch 確認を記録する。",
+   "relation": "produces",
+   "resource": "activity:kill_switch_reconcile_confirmed",
+   "symbol": "src/agentic_fx/commands.py::Commands._killswitch_reconcile"
+  },
+  {
+   "critical": false,
+   "rationale": "reconcile の失敗を記録する。",
+   "relation": "produces",
+   "resource": "activity:kill_switch_reconcile_failed",
+   "symbol": "src/agentic_fx/commands.py::Commands._killswitch_reconcile"
+  },
+  {
+   "critical": false,
+   "rationale": "shell status に latch と generation、時刻を表示する。",
+   "relation": "exposes",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/commands.py::Commands._status"
+  },
+  {
+   "critical": true,
+   "rationale": "shell reset と reconcile 前後の状態を callback として通知 sweep に渡す。",
+   "relation": "invokes -> OpsService.emit_pending_guard_notices",
+   "resource": "event:guard_state_changed",
+   "symbol": "src/agentic_fx/commands.py::Commands._emit_guard_notices"
+  },
+  {
+   "critical": false,
+   "rationale": "ctl は API status から kill switch を表示する。",
+   "relation": "reads",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/ops/client.py::Runner._op_killswitch_show"
+  },
+  {
+   "critical": false,
+   "rationale": "ctl は API へ期待 generation を送る。",
+   "relation": "invokes -> OpsService.reset_kill_switch",
+   "resource": "state:app_state.kill_switch_generation",
+   "symbol": "src/agentic_fx/ops/client.py::Runner._op_killswitch_reset"
+  },
+  {
+   "critical": true,
+   "rationale": "ctl は API の reconcile を呼ぶ。",
+   "relation": "invokes -> OpsService.reconcile_kill_switch",
+   "resource": "marker:reset_marker",
+   "symbol": "src/agentic_fx/ops/client.py::Runner._op_killswitch_reconcile"
+  },
+  {
+   "critical": false,
+   "rationale": "API request の expected generation を service に渡す。",
+   "relation": "invokes -> OpsService.reset_kill_switch",
+   "resource": "state:app_state.kill_switch_generation",
+   "symbol": "src/agentic_fx/ops/api_server.py::_call"
+  },
+  {
+   "critical": true,
+   "rationale": "API request を reconcile service に渡す。",
+   "relation": "invokes -> OpsService.reconcile_kill_switch",
+   "resource": "marker:reset_marker",
+   "symbol": "src/agentic_fx/ops/api_server.py::_call"
+  },
+  {
+   "critical": false,
+   "rationale": "認可、監査、通知 sweep を伴う reset 操作。",
+   "relation": "invokes -> StateStore.reset_kill_switch",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.reset_kill_switch"
+  },
+  {
+   "critical": true,
+   "rationale": "marker がある場合に latch として確定する。",
+   "relation": "invokes -> StateStore.confirm_latched",
+   "resource": "marker:reset_marker",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.reconcile_kill_switch"
+  },
+  {
+   "critical": false,
+   "rationale": "投影状態と、marker がある場合の file 状態等を API status に載せる。",
+   "relation": "exposes",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.status"
+  },
+  {
+   "critical": false,
+   "rationale": "現在の generation を API status に載せる。",
+   "relation": "exposes",
+   "resource": "state:app_state.kill_switch_generation",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.status"
+  },
+  {
+   "critical": false,
+   "rationale": "latch 時刻を API status に載せる。",
+   "relation": "exposes",
+   "resource": "state:app_state.kill_switch_latched_at",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.status"
+  },
+  {
+   "critical": false,
+   "rationale": "読取接続で現 generation の未通知を照合する。",
+   "relation": "invokes -> plan_kill_switch_notice",
+   "resource": "event:guard_state_changed",
+   "symbol": "src/agentic_fx/service.py::_GuardNoticeProbe.__call__"
+  },
+  {
+   "critical": false,
+   "rationale": "status_provider callback が未通知の有無を status に載せる。",
+   "relation": "exposes",
+   "resource": "ops_status_field:guard_notice_pending",
+   "symbol": "src/agentic_fx/service.py::_build_ops_service"
+  },
+  {
+   "critical": false,
+   "rationale": "status_provider callback が未通知 generation を status に載せる。",
+   "relation": "exposes",
+   "resource": "ops_status_field:guard_notice_generation",
+   "symbol": "src/agentic_fx/service.py::_build_ops_service"
+  },
+  {
+   "critical": true,
+   "rationale": "generation、latch 時刻と既存 event から通知すべき状態を決める。",
+   "relation": "reads",
+   "resource": "event:guard_state_changed",
+   "symbol": "src/agentic_fx/ops/service.py::plan_kill_switch_notice"
+  },
+  {
+   "critical": true,
+   "rationale": "指定 generation の kill switch event を検索する。",
+   "relation": "reads",
+   "resource": "event:guard_state_changed",
+   "symbol": "src/agentic_fx/ops/events.py::kill_switch_event_states"
+  },
+  {
+   "critical": true,
+   "rationale": "callback から取得した状態で通知 sweep を実行する。",
+   "relation": "invokes -> OpsService._sweep_kill_switch",
+   "resource": "event:guard_state_changed",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._guard_step"
+  },
+  {
+   "critical": true,
+   "rationale": "未通知の kill switch 遷移を event に挿入する。",
+   "relation": "produces",
+   "resource": "event:guard_state_changed",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch"
+  },
+  {
+   "critical": true,
+   "rationale": "guard lane 内で通知を回収する。",
+   "relation": "invokes -> OpsService._guard_notices_in_lane",
+   "resource": "event:guard_state_changed",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.emit_pending_guard_notices"
+  },
+  {
+   "critical": true,
+   "rationale": "起動時と tick の共通 sweep に guard 通知を含める。",
+   "relation": "invokes -> OpsService._guard_notices_in_lane",
+   "resource": "event:guard_state_changed",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.emit_pending_notices"
+  },
+  {
+   "critical": true,
+   "rationale": "API data resume の要求後に data_feed の resume_requested event を発行する。",
+   "relation": "invokes -> OpsService._guard_event",
+   "resource": "event:guard_state_changed",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.resume_data"
+  },
+  {
+   "critical": true,
+   "rationale": "共通 guard event を best effort で発行する。",
+   "relation": "produces",
+   "resource": "event:guard_state_changed",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._guard_event"
+  },
+  {
+   "critical": true,
+   "rationale": "guard の種別を event fields に設定する。",
+   "relation": "writes",
+   "resource": "ops_status_field:guard_kind",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._guard_event"
+  },
+  {
+   "critical": false,
+   "rationale": "accepted を確定して副作用を行い、成功または例外を終端監査へ渡す。",
+   "relation": "invokes -> OpsService._terminal",
+   "resource": "event:ops_request_terminal",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._mutate"
+  },
+  {
+   "critical": false,
+   "rationale": "終端監査を記録した後、event に投影する。",
+   "relation": "invokes -> OpsService._project",
+   "resource": "event:ops_request_terminal",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._terminal"
+  },
+  {
+   "critical": true,
+   "rationale": "操作の終端監査を event に投影する。",
+   "relation": "produces",
+   "resource": "event:ops_request_terminal",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._project"
+  },
+  {
+   "critical": true,
+   "rationale": "起動時に accepted-only 監査を終端化し、書けた行を event に投影する。副作用は再実行しない。",
+   "relation": "produces",
+   "resource": "event:ops_request_terminal",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.recover_after_journal"
+  },
+  {
+   "critical": false,
+   "rationale": "listener 開始前の回復を呼び、失敗時は API listener を開かない。",
+   "relation": "invokes -> OpsService.recover_after_journal",
+   "resource": "event:ops_request_terminal",
+   "symbol": "src/agentic_fx/service.py::_recover_ops"
+  },
+  {
+   "critical": true,
+   "rationale": "event 発行失敗の観測を後続 health event で報告する。",
+   "relation": "produces",
+   "resource": "event:event_stream_health",
+   "symbol": "src/agentic_fx/ops/events.py::EventStore.emit_best_effort"
+  },
+  {
+   "critical": true,
+   "rationale": "guard_kind、state、generation を event fields に定義する。",
+   "relation": "schema",
+   "resource": "event:guard_state_changed",
+   "symbol": "src/agentic_fx/ops/events.py::<module>.FIELDS"
+  },
+  {
+   "critical": true,
+   "rationale": "terminal event の固定 fields を定義する。",
+   "relation": "schema",
+   "resource": "event:ops_request_terminal",
+   "symbol": "src/agentic_fx/ops/events.py::<module>.FIELDS"
+  },
+  {
+   "critical": true,
+   "rationale": "event 発行失敗数と時刻の固定 fields を定義する。",
+   "relation": "schema",
+   "resource": "event:event_stream_health",
+   "symbol": "src/agentic_fx/ops/events.py::<module>.FIELDS"
+  },
+  {
+   "critical": true,
+   "rationale": "通知側にも guard event の固定 fields を定義する。",
+   "relation": "duplicates",
+   "resource": "event:guard_state_changed",
+   "symbol": "afx-ops/afx_ops/notify/payload.py::<module>.ALLOWED_FIELDS"
+  },
+  {
+   "critical": true,
+   "rationale": "通知側にも terminal event の固定 fields を定義する。",
+   "relation": "duplicates",
+   "resource": "event:ops_request_terminal",
+   "symbol": "afx-ops/afx_ops/notify/payload.py::<module>.ALLOWED_FIELDS"
+  },
+  {
+   "critical": true,
+   "rationale": "通知側にも stream health event の固定 fields を定義する。",
+   "relation": "duplicates",
+   "resource": "event:event_stream_health",
+   "symbol": "afx-ops/afx_ops/notify/payload.py::<module>.ALLOWED_FIELDS"
+  },
+  {
+   "critical": true,
+   "rationale": "cursor 以降の event page を返す。",
+   "relation": "exposes",
+   "resource": "event:guard_state_changed",
+   "symbol": "src/agentic_fx/ops/events.py::EventStore.poll"
+  },
+  {
+   "critical": true,
+   "rationale": "認可された API consumer に event page を返す。",
+   "relation": "invokes -> EventStore.poll",
+   "resource": "event:guard_state_changed",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.events_after"
+  },
+  {
+   "critical": true,
+   "rationale": "通知 payload として event schema を検証する。",
+   "relation": "consumes",
+   "resource": "event:guard_state_changed",
+   "symbol": "afx-ops/afx_ops/notify/payload.py::encode_event"
+  },
+  {
+   "critical": true,
+   "rationale": "terminal event の schema を検証する。",
+   "relation": "consumes",
+   "resource": "event:ops_request_terminal",
+   "symbol": "afx-ops/afx_ops/notify/payload.py::encode_event"
+  },
+  {
+   "critical": true,
+   "rationale": "stream health event の schema を検証する。",
+   "relation": "consumes",
+   "resource": "event:event_stream_health",
+   "symbol": "afx-ops/afx_ops/notify/payload.py::encode_event"
+  },
+  {
+   "critical": true,
+   "rationale": "API event を poll し配送または skip 後に cursor を保存する。",
+   "relation": "consumes",
+   "resource": "event:guard_state_changed",
+   "symbol": "afx-ops/afx_ops/notify/runtime.py::_Loop._poll_once"
+  },
+  {
+   "critical": true,
+   "rationale": "bot の event poll を開始する。",
+   "relation": "invokes -> BotAdapter.deliver_events",
+   "resource": "event:guard_state_changed",
+   "symbol": "afx-ops/afx_ops/bot/adapter.py::BotAdapter.poll_once"
+  },
+  {
+   "critical": true,
+   "rationale": "event を取得し配送または skip を確定する。",
+   "relation": "consumes",
+   "resource": "event:guard_state_changed",
+   "symbol": "afx-ops/afx_ops/bot/adapter.py::BotAdapter.deliver_events"
+  },
+  {
+   "critical": true,
+   "rationale": "bot の event 配送を計画する。",
+   "relation": "invokes -> render_event",
+   "resource": "event:guard_state_changed",
+   "symbol": "afx-ops/afx_ops/gate/service.py::GateService.plan_event"
+  },
+  {
+   "critical": true,
+   "rationale": "schema 検証後に event 表示を作る。",
+   "relation": "consumes",
+   "resource": "event:guard_state_changed",
+   "symbol": "afx-ops/afx_ops/gate/render.py::render_event"
+  },
+  {
+   "critical": true,
+   "rationale": "kill switch の latched と released を表示文に変換する。",
+   "relation": "consumes",
+   "resource": "event:guard_state_changed",
+   "symbol": "afx-ops/afx_ops/gate/render.py::_event_text_for_code"
+  },
+  {
+   "critical": true,
+   "rationale": "terminal event の表示文を作る。",
+   "relation": "consumes",
+   "resource": "event:ops_request_terminal",
+   "symbol": "afx-ops/afx_ops/gate/render.py::_event_text_for_code"
+  },
+  {
+   "critical": false,
+   "rationale": "guard lane 再入の error code を定義する。",
+   "relation": "exposes",
+   "resource": "ops_error:guard_lane_reentry",
+   "symbol": "src/agentic_fx/ops/service.py::GuardLaneReentry"
+  },
+  {
+   "critical": false,
+   "rationale": "guard lane 未保持の error code を定義する。",
+   "relation": "exposes",
+   "resource": "ops_error:guard_lane_not_held",
+   "symbol": "src/agentic_fx/ops/service.py::GuardLaneNotHeld"
+  },
+  {
+   "critical": false,
+   "rationale": "状態取得不能時に error を発生させる。",
+   "relation": "exposes",
+   "resource": "ops_error:guard_state_unavailable",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._current_state"
+  },
+  {
+   "critical": false,
+   "rationale": "履歴表示用 guard version を保持する。",
+   "relation": "schema",
+   "resource": "ops_status_field:guard_version",
+   "symbol": "src/agentic_fx/status_history.py::EvaluationHistory"
+  },
+  {
+   "critical": false,
+   "rationale": "history health の GUARD_VERSION を評価履歴に格納する。",
+   "relation": "writes",
+   "resource": "ops_status_field:guard_version",
+   "symbol": "src/agentic_fx/status_history.py::collect"
+  },
+  {
+   "critical": false,
+   "rationale": "履歴表示の rules 行に guard version を表示する。",
+   "relation": "exposes",
+   "resource": "ops_status_field:guard_version",
+   "symbol": "src/agentic_fx/status_history.py::render"
+  },
+  {
+   "critical": false,
+   "rationale": "history audit report に history health の guard version を格納する。",
+   "relation": "writes",
+   "resource": "ops_status_field:guard_version",
+   "symbol": "src/agentic_fx/plugin/history_audit.py::_build_report"
+  }
+ ],
+ "unread": [
+  "bot と notify の poll から delivery までの全 callback、および指定 event code ごとの全 consumer 行は未完了。",
+  "activity 表示の経路は OpsService.activity、ctl の Runner._op_activity、独立 status の _activity、web の render_activity まで確認したが、各 activity kind ごとの逆引き行は未作成。",
+  "data_feed 停止通知の不在は producer 全体を追跡できておらず、negative assertion として確定していない。",
+  "採用比較 metric の全 consumer と callback 注入の完全な逆引きは未完了。",
+  "全行の qualified symbol を完全には再照合できていない。表は網羅的な正解表ではない。"
+ ]
+}

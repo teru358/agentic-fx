@@ -1,45 +1,25 @@
 # 影響地図
 
-基本設計とは別に、コードから読み取った現状の責務と影響関係を保守する正本。変更前に入口と副作用を探し、守る契約と既知の逸脱を確認する。生成した索引は候補であり、地図の代わりにはならない。
+領域頁は現コードの責務と影響関係を読むための手保守資料です。冒頭で入口、主要 resource、逸脱と未確認を把握し、F（観測事実）、K（承認済み契約）、D（既知の差）と手動辺の根拠を source と照合します。anchor は repository 相対 path と qualified symbol、行番号は参考です。未実装の契約と観測事実を区別します。literal 索引は候補であり、呼出し関係や無関係を証明しません。
 
-## 読み方
+## 公開規則
 
-各領域頁の冒頭20〜30行を目安に、責務、入口、主要 resource、逸脱と未確認を読む。詳細は次の三層で確認する。
+spec・チケットを含む他資料から、本番の時刻・event 行や件数・金額・閾値等の運用観測値を頁へ写さない。契約上の固定 code・仕様定数は区別し、fixture は合成する。鍵・ID・URL・口座・個人設定値・例外自由文を保存しない。必須 link を tmp/、私的 checkout、memory に向けない。公開前に指揮者が確認する。
 
-- **F（観測事実）**: 現コードの呼出し、保存、投影、障害動作。観測 revision と `path::qualified_symbol` を根拠とし、行番号は参考にする。
-- **K（守る契約）**: 承認済み設計の責務や許容する欠損窓。公開 spec の節と test を引き、未実装は明示する。
-- **D（既知の逸脱）**: F と K、文書とコードの差や構造的問題。根拠、公開 ticket、解消条件または受容境界を記す。
+## extract / evaluate
 
-## 公開と更新
+既存の Python 3 を選び、公開入力だけを指定する。出力は非公開の作業領域に置く。正解表は独立作成・裁定後に指定する。
 
-他の spec や ticket を含む資料から、運用の観測値、時刻、event 行、件数、金額、閾値を写さない。鍵、ID、URL、口座、個人設定値、例外の自由文も保存しない。契約上の固定 code や仕様定数は運用観測値と区別し、fixture は合成する。必須 link は `tmp/`、私的 checkout、ホームの memory など私的な記録に向けない。初回は指揮者が手で確認する。
+```sh
+python3 scripts/impact_map.py extract --domain kill-switch --page docs/impact-map/domains/kill-switch.md --root src/agentic_fx --root afx-ops/afx_ops --out tmp/impact-map/current
+python3 scripts/impact_map.py evaluate --domain kill-switch --index tmp/impact-map/current/index.json --oracle docs/impact-map/oracle/kill-switch-frozen.json --page docs/impact-map/domains/kill-switch.md --out tmp/impact-map/current
+```
 
-契約・責務・影響関係が変わるチケットでは、該当頁をコードと同じ commit で更新する。関係が変わらない場合は本文を改訂せず、その理由を閉鎖時に残す。
+採点には裁定済みの凍結表 (`kill-switch-frozen.json`、各行に class 欄がある) を使う。A・B の表 (`kill-switch-a.json` / `kill-switch-b.json`) は独立作成の記録で、class 欄が無いので evaluate には渡さない。出力と被覆宣言は人が source と照合する材料で、頁の意味の自動証明ではない。
 
-## 指揮者の使い方
+## 手動閉鎖の雛形
 
-設計 C0 で領域頁と source を読み、literal 索引と変更予定 symbol から入口と副作用を逆引きする。F、守る K、変える K を分け、別 package の consumer、未対応の種類、critical な未解決事項を照合する。頁改訂の要否と理由を台帳に残す。差分のない設計段階では affected を使わない。
-
-実装 brief は「守る契約: K-ID と該当行・合成 test 要件」と「禁止経路: callee・入口・例外境界と所有 spec の test」の二行を基本とする。頁差分、抽出、照合、記録、commit は指揮者が担う。
-
-閉鎖時は差分候補を全件裁き、必要な頁がコードと同じ commit にあるか確認する。地図と `tmp/` を除いた隔離 checkout と patch で独立初読を保存し、その後に頁差分を含めて整合を確認する。初回は根拠、候補、公開規則を手読みする。T2 以降は stale の再照合と verify、affected/unmapped の裁定、必要な test と例外も確認する。
-
-## 独立正解表 A/B
-
-1. opsalert C4 merge 後、同一 revision、領域境界、抽出種類と採点粒度を固定する。A/B に渡す材料は source、test、境界、五項目形式だけとする。
-2. B は repo 外の scratch に固定 revision の detached worktree を作る。初読前に `tmp/` と `docs/impact-map/` が存在しないことを列挙して確認する。頁が収載済みなら初期化時から sparse checkout で除外し、revision と除外状態を記録する。これは通常の初読材料を除く手段であり、git object の探索を防ぐ境界ではない。
-3. B に設計の過去レビュー、A の表、抽出結果、影響先リスト、親セッション履歴を渡さない。B の結果を scratch に保存し、A を見せる前に確定する。
-4. A/B はそれぞれ入口から順方向と resource の逆引きで作成する。各行は symbol（path 込み）、relation、resource、critical、rationale の五項目とし、非 literal 辺の終点を relation、証拠を rationale に記す。header に役割、revision、領域を記す。単独の再読は独立二者に数えない。
-5. 指揮者が不一致を source/test で裁き、表、裁定結果、digest を凍結する。出力を見て変更する場合は理由、旧新 digest、役割、旧 score を残して再測定する。存在しない event は positive にせず、負の主張、K 未達、禁止経路は別欄に置く。実在する迂回辺は positive に含める。
-
-現在は merge 前のため、正解表を作成・凍結していない。
-
-## 測定と保証の限界
-
-合否は「抽出規則の種類 × 領域」ごとに判定する。未測定や母数ゼロは unsupported とし、別セルの合格を流用しない。初回は literal 索引の機械セルと、手動補完を含む頁セルを別に測る。索引は候補を示すもので、動的な呼出しや意味上の依存を網羅する保証はない。source と test の確認、人手の辺、既知の逸脱を併用する。
-
-## 領域一覧
-
-| 領域 | 状態 |
-|---|---|
-| [kill switch / guard state](domains/kill-switch.md) | 試行前。雛形のみ |
+1. 予定 symbol と入口・副作用を頁と source で照合し、守る K と禁止経路を brief に渡す。
+2. 公開規則、抽出候補、F/K/D と手動辺を全件確認し、不明点を残す。契約・責務・影響関係が変わる場合は code と頁を同じ commit で更新する。
+3. 地図を除いた独立初読を保存してから頁差分を照合する。必要な root および afx-ops test を実行し、結果と未検証を記録する。
+4. 初回は独立 A/B の裁定、二セルと三分類、履歴再現、実行時間を記録する。未実装の check / affected を実行済みとしない。
