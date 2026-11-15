@@ -198,6 +198,8 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 - **F169** `src/agentic_fx/ops_setup/units.py::<module>.BOT_PERMANENT_EXIT_STATUS` — bot unit の drop-in が RestartPreventExitStatus に入れる終了コードの集合 (78 を含む)。bot unit は Restart=on-failure で、これらを除いて backoff で再起動する。drop-in は systemd の version が RestartSteps を使えるときだけ書き、満たさなければ bot の enable を拒否する。F168 の恒久・一時の区別が自動復旧に効くのはこの設置による。
 - **F170** `afx-ops/afx_ops/bot/runtime.py::_main_body` — bot の起動と常駐の本体。進捗の monitor・表示専用の health・startup (state の読込と無効化、login、起動 reconcile) を起こし、続けて gateway・poll・失敗通知を走らせて最初に終わったものを理由にする。失敗の BotFailure は終了コードに写る (F168)。health snapshot は表示専用で、その task の失敗では bot を止めない。
 - **F171** `afx-ops/afx_ops/bot/runtime.py::run` — bot の入口。loop 外の watchdog を起こし、失敗理由を固定語で出して終了コードを返す (F168)。daemon に届かないときは一時の終了、想定外の例外は固定語だけにする。health の最終 snapshot に停止の理由を残すが、これは表示であって配送の成否ではない (D09)。
+- **F172** `afx-ops/afx_ops/bot/adapter.py::BotAdapter.reconcile_startup` — login の後・gateway 接続の前に、View の登録、承認投稿の fetch・履歴照合 (_fetch・_find_posted)・出し直し・投稿を行う。一時の失敗は倍々の待ちで保留して再試行し、その間は poll も guard event の配送も始まらない (待ちの上限は startup からの poll の窓、F166)。恒久の拒否と state の失敗は BotFailure で bot を止める (F165・F168)。prepare の _load_and_invalidate も login の前に同じく state の失敗で止め得る。
+- **F173** `afx-ops/afx_ops/bot/adapter.py::BotAdapter.poll_once` — 一周は event 配送 (F29) が先で、続いて承認の同期 (sync_pending・in_flight の照合・期限切れ・View の同期) を行う。承認の同期の一時失敗の再試行は同じ周回を占め、次の配送の開始を待たせる (poll の窓で見る、F166)。承認表示の恒久拒否と bot state の失敗は BotFailure で bot 全体を止め、配送も止まる (F165・F168・F170)。interaction の応答 (_respond_within) の失敗は握り、周回にも配送にも影響しない。
 
 ## K — 守る契約
 

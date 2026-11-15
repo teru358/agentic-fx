@@ -206,7 +206,7 @@
 
 ## T3 一件目: C4 の遡及運用確認 (§6.4)
 
-**これは遡及運用確認であり、「関係を変える code と頁が同 commit で更新された」ことの実地試験ではない。** C4 の merge 時点 (0dbcb27f) の頁は雛形で、今の頁は C4 の後に書かれたものである。
+**これは遡及運用確認であり、「関係を変える code と頁が同 commit で更新された」ことの実地試験ではない。** したがって T3 は二件目の同 commit の実地試験が未達で、閉鎖していない (下の「T3 の状態」)。 C4 の merge 時点 (0dbcb27f) の頁は雛形で、今の頁は C4 の後に書かれたものである。
 
 - 手順: 0dbcb27f の使い捨て worktree (repo 外) に今の `docs/impact-map/` と `scripts/impact_map.py` を写して一時 commit し、`affected --page kill-switch --base d7025768^1 --head <一時 commit>` を回した (差分は C4 の merge の親 → merge 結果、first-parent の 5 merge)。一時 commit が足す docs と scripts は裁定から除いた。終了後に worktree を remove した。
 - 出力: 185 項目 (終了コード 0)。内訳は `unmapped_changed_unmapped_symbol` 109、`symbol_changed` 33、`literal_candidates_changed` 32、`unmapped_new_file` 8、`ambiguous_sub_anchor` 1、`coarse_parent_changed` 1、`base_declarations_partial` 1。
@@ -214,9 +214,9 @@
 
 | 分類 | 件数 | 内容 |
 |---|---|---|
-| 無関係 | 41 | 承認 UI (承認投稿の edit・fetch・履歴・interaction 応答)、表示専用の bot health (writer・status・web・ops status の行)、log の固定語化 (logsafe・cli)、設置 UI の文言、docstring のみの変更、task 生成の補助 |
-| 関連・既存の頁で足りる | 129 | 通知機構 (F09–F12・F17–F18・F21・F70・F92・E13–E16・E31–E33・E60) と、bot の cursor 保存・gateway・login・state の失敗分類 (F29・F168・K-CONSUME)、drop-in の設置手順 (F169) |
-| 頁の更新が要る (更新済み) | 14 | F29 の書き直し、F129、F130、F12 の一文、および配送の停止・再試行・自動復旧の新 F165–F171 (下記) |
+| 無関係 | 27 | web の bot health 表示 (daemon の status を描くだけの純粋な関数・固定語)、`status` / `ctl status` の bot health 行、`ops/bot_health.py` と `health.py` (別 daemon thread で書き失敗は握る。終了判断の集合に入らない)、log の固定語化 (logsafe・cli)、docstring のみの変更、task 生成の補助、設置 UI の文言、`_respond_within` (応答の失敗を握るだけで state・再試行を持たない)。各行に source で確かめた根拠を書いた |
+| 関連・既存の頁で足りる | 143 | 通知機構 (F09–F12・F17–F18・F21・F70・F92・E13–E16・E31–E33・E60)、bot の cursor 保存・state の読書き・snapshot の掃除・gateway・login の失敗分類 (F29・F168・K-CONSUME)、drop-in の設置手順 (F169)、承認表示の取得・再試行・投稿・更新 (起動 reconcile と poll 周回を占め、恒久拒否・state 失敗で bot 全体が止まるので配送に効く。F165・F168・F170・F172・F173) |
+| 頁の更新が要る (更新済み) | 14 | F29 の書き直し、F129、F130、F12 の一文、および配送の停止・再試行・自動復旧の新 F165–F171 (下記)。承認表示の再試行が配送の開始を待たせる点を F172・F173 に足した (関連の行から結んだ) |
 | 道具の情報項目 | 1 | `base_declarations_partial` (下記) |
 
 (計 185。`coarse_parent_changed` の `build_app` と `ambiguous_sub_anchor` の E13 は「関連・既存」に含め、E13 は T2 の裁定のとおり再確認した。)
@@ -236,7 +236,7 @@
 
 ## T3 二件目: HWM の運用確認 (§6.4)
 
-**この確認は、HWM が頁の無い branch で実装されたため、「関係を変える code と頁が同 commit で更新された」ことの実地試験にはならない。** 頁は HWM の merge の後に合わせた。同 commit の更新の実地試験は、次の通常の変更 (頁のある領域に触れるチケット) で行う。
+**この確認は、HWM が頁の無い branch で実装されたため、「関係を変える code と頁が同 commit で更新された」ことの実地試験にはならない。** 頁は HWM の merge の後に合わせた。同 commit の更新の実地試験は未達である (下の「T3 の状態」)。
 
 - 手順: `affected --page kill-switch --base 0dbcb27f --head HEAD` (終了コード 0)。58 項目: `unmapped_changed_unmapped_symbol` 33、`literal_candidates_changed` 13、`symbol_changed` 5、`unmapped_new_file` 3、`ambiguous_sub_anchor` 1、`coarse_parent_changed` 1、`dependency_changed` 1、`base_declarations_partial` 1。
 - HWM 以外の混入: 無い。`src/` と `afx-ops/` の差分は HWM の 12 file だけ (`ops/rebase_service.py`・`ops/rebase_accounting.py`・`ops/rebase_view.py` の新規 3 file と、`ops/service.py`・`ops/client.py`・`ops/api_server.py`・`ops/contracts.py`・`cli_surface.py`・`store/state.py`・`store/db.py`・`service.py`・`afx-ops/afx_ops/web/write.py` の変更)。影響地図の道具と記録は `scripts/`・`docs/`・`tests/` にあり候補走査から除かれる。
@@ -261,3 +261,12 @@
 T3 の二件の確認で source を読んで頁の記述と合っていることを確かめた 43 anchor に、`initial_record` で初回の照合を記録した (`docs/impact-map/verification/kill-switch.json`)。内訳は HWM の 8 anchor (`evaluate_rebase`・`apply_rebase`・`rebase_preview`・`rebase_kill_switch`・`_rebase_under_core`・`_rebase_commit`・`shared_guard`・`_op_killswitch_rebase`、根拠は HWM の test) と、C4 で変わった既存の宣言 35 (副 anchor を含む。根拠は commands・ops service・status の test と bot の閉鎖済みチケット)。記録後の `check --page kill-switch` は終了コード 0 で stale 0。
 
 記録しなかった C4 側の anchor: `commands.py::Commands._dispatch#_emit_guard_notices` (E13 の端点。副 anchor が 3 文に該当して曖昧のため、記録しても stale になる。T2 の人手の裁定のまま)、`service.py::build_app` (coarse の親で副 anchor `build_app#emit_pending_notices` を記録した)。C4 で変わっていない既存の宣言は、この確認で source を読み直していないので記録していない。鮮度の運用 (§6.4) は、記録した anchor について成立し、それ以外の初回基準は次の通常チケットで該当 anchor を読むときに足す。
+
+## T3 の状態
+
+**T3 は二件目の同 commit の実地試験 (設計 §6.4: 関係を変える code と頁が実際に同 commit で更新されたことの確認) が未達で、未閉鎖である。** HWM は頁の無い branch で実装され、頁は後から合わせたため、この確認は満たされない。次の通常チケット (kill switch 領域を触るもの) で、code と頁を同 commit で更新し、閉鎖束 (§6.4 の (a)〜(e)) を実行して確認するまで、T3 は開いたままとする。一件目 (C4 の遡及運用確認)・二件目の頁の更新・照合記録は行ったが、それは未達の条件を満たさない。
+
+## C4 の裁き直し (二回目)
+
+「無関係」41 件を source で読み直し、配送の開始・継続・停止・復旧に効くものを移した。gateway・poll の開始前の処理 (prepare の `_load_and_invalidate`、起動 reconcile の `_fetch`・`_find_posted`) と、同じ poll 周回を止め得る承認表示の処理 (`_edit`・`_send_approval`・`_update_display_locked`・`_repost_locked`) は、恒久拒否・state 失敗で bot 全体が止まり、一時失敗の再試行が配送の開始を待たせるため「関連・既存」に移した。`write_snapshot` の前処理 (`_remove_stale_temps`) も cursor の保存の失敗分類に効くので移した。結果は無関係 27 / 関連・既存 143 / 更新 14 / 情報項目 1。F172 (起動 reconcile)・F173 (poll_once) を足した。この裁き直しの経過時間は操作と編集を含む約 10 分で、全件の意味の照合の費用としては扱わない。
+
