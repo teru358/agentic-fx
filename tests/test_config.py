@@ -1329,3 +1329,45 @@ def test_friday_swing_cutoff_limit_is_derived_from_rollover_and_margin():
     assert fx_time.FRIDAY_SWING_CUTOFF_LIMIT_NY == (
         rollover - fx_time.SWING_CUTOFF_MARGIN).time()
     assert fx_time.FRIDAY_SWING_CUTOFF_LIMIT_NY.hour == 16
+
+
+# ---- datafeed.mt5.history_executor_url ------------------------------------------
+
+def _mt5_raw(**mt5):
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["datafeed"]["mt5"] = {"enabled": False, "bridge_url": "http://bridge.invalid", **mt5}
+    return raw
+
+
+def test_history_executor_url_defaults_to_none_and_never_falls_back_to_bridge_url():
+    s = load_settings(EXAMPLE)
+    assert s.datafeed.mt5.history_executor_url is None
+    assert s.datafeed.mt5.bridge_url and s.datafeed.mt5.history_executor() is None
+
+
+def test_history_executor_url_accepts_an_http_url_and_rejects_other_values():
+    mt5 = Settings.model_validate(_mt5_raw(history_executor_url="http://exec.invalid:8813")
+                                  ).datafeed.mt5
+    assert mt5.history_executor() == "http://exec.invalid:8813"
+    for bad in ("ftp://x", "exec.invalid", ""):
+        with pytest.raises(ValidationError):
+            Settings.model_validate(_mt5_raw(history_executor_url=bad))
+
+
+def test_history_executor_url_is_not_shown_in_repr_str_dump_or_json():
+    canary = "http://" + "exec-" + "canary.invalid:8813"
+    s = Settings.model_validate(_mt5_raw(history_executor_url=canary))
+    for text in (repr(s), str(s), repr(s.datafeed.mt5), s.datafeed.mt5.model_dump_json(),
+                 str(s.model_dump()), s.model_dump_json()):
+        assert canary not in text
+    assert s.datafeed.mt5.history_executor() == canary
+
+
+def test_history_executor_url_is_excluded_from_the_settings_dump_sent_to_workers():
+    import json
+    canary = "http://" + "exec-" + "canary.invalid:8813"
+    s = Settings.model_validate(_mt5_raw(history_executor_url=canary))
+    dumped = s.model_dump()
+    assert "history_executor_url" not in dumped["datafeed"]["mt5"]
+    assert canary not in json.dumps(dumped)

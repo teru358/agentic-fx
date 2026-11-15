@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import yaml
 from dotenv import load_dotenv
 from pydantic import (
-    BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError,
+    BaseModel, ConfigDict, Field, SecretStr, StrictBool, StrictInt, ValidationError,
     field_validator, model_validator,
 )
 
@@ -154,6 +154,29 @@ class SourceToggle(_Strict):
     bridge_url: str | None = None
 
 
+class Mt5Settings(SourceToggle):
+    """MT5。`history_executor_url` は履歴取得専用の別 bridge の URL (既定 null)。
+
+    URL は秘密として扱い、表示・ログ・repr・dump (worker への handshake を含む) に出さない。`bridge_url` への
+    fallback はしない: 未設定なら履歴取得の実行先は無い。"""
+    history_executor_url: SecretStr | None = Field(default=None, exclude=True)
+
+    @field_validator("history_executor_url")
+    @classmethod
+    def _http_url(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        raw = value.get_secret_value().strip()
+        if not raw.startswith(("http://", "https://")):
+            raise ValueError("datafeed.mt5.history_executor_url must be an http(s) URL")
+        return SecretStr(raw)
+
+    def history_executor(self) -> str | None:
+        """履歴取得の実行先 URL。未設定なら None (`bridge_url` で代替しない)。"""
+        url = self.history_executor_url
+        return None if url is None else url.get_secret_value()
+
+
 class OutageSettings(_Strict):
     flat_stall_max_sec: int = Field(default=1800, ge=0)
     ready_confirm_ticks: int = Field(default=3, ge=1)
@@ -162,7 +185,7 @@ class OutageSettings(_Strict):
 
 class DatafeedSettings(_Strict):
     yfinance: SourceToggle
-    mt5: SourceToggle
+    mt5: Mt5Settings
     twelvedata: SourceToggle
     primary: str
     # primary が不通のときだけ、この順に試す明示 fallback。既定は無し
@@ -488,7 +511,7 @@ class ApiSettings(_Strict):
 class HistorySyncSettings(_Strict):
     """評価用履歴の同期。省略時はこの既定で動く (旧 settings にキー行を足さない)。
 
-    `lookback_days` は手動同期の後ろ窓 (UTC 暦日数、当日を含む)。
+    `lookback_days` は手動同期の後ろ窓の長さ (日数、始端は E - lookback_days 日)。
     """
     auto_enabled: bool = True
     lookback_days: int = Field(default=7, ge=2, le=31)
