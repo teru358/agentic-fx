@@ -95,14 +95,21 @@ def rebase_figures(hwm_before: float, equity: float, threshold_pct: float) -> Re
     return figures
 
 
+def _resolve_time(value: datetime | Callable[[], datetime]) -> datetime:
+    return value() if callable(value) else value
+
+
 def apply_rebase(
-        conn: sqlite3.Connection, *, source_snapshot_id: int,
-        accepted_audit_id: int, applied_at: datetime, generation: int,
+        conn: sqlite3.Connection, *, source_snapshot_id: int | None = None,
+        accepted_audit_id: int, applied_at: datetime | Callable[[], datetime],
+        generation: int,
         latched_at: str | None, digest_version: int, preview_token: str,
-        hwm_before: float, equity: float, balance: float,
+        hwm_before: float | None = None, equity: float | None = None,
+        balance: float | None = None,
         threshold_pct: float,
-        now: datetime,
-        validate: Callable[[sqlite3.Connection], None]) -> dict[str, Any]:
+        now: datetime | Callable[[], datetime],
+        validate: Callable[[sqlite3.Connection], None],
+        check_budget: Callable[[], None] | None = None) -> dict[str, Any]:
     """Atomically insert a rebase snapshot and its ledger row.
 
     ``validate`` rechecks caller-owned broker/source/flat/freshness, generation,
@@ -117,6 +124,17 @@ def apply_rebase(
     to None. The authorizer guards against accidental writes by trusted
     validate code; it cannot prevent validate from disabling the authorizer.
 
+    When ``source_snapshot_id`` is None the source is the latest snapshot read
+    inside the BEGIN IMMEDIATE transaction (``hwm_before`` / ``equity`` /
+    ``balance`` must then also be None and come from that row), so snapshots
+    appended before the lock was taken never make the call fail. ``applied_at``
+    and ``now`` may be zero-argument callables; they are evaluated once after
+    ``validate`` returns, so a caller can hand back the instant it validated at.
+
+    ``check_budget`` is called after BEGIN IMMEDIATE, after ``validate``, after
+    each INSERT and last before COMMIT is sent; whatever it raises rolls the
+    transaction back. The budget cannot bound COMMIT itself once it started.
+
     An ``Exception`` from COMMIT becomes ``RebaseOutcomeUnknown`` (the caller
     resolves it from the ledger). A ``BaseException`` that is not an
     ``Exception`` (an interrupt) propagates unchanged. Before COMMIT completes,
@@ -126,7 +144,10 @@ def apply_rebase(
     """
     conn.execute("BEGIN IMMEDIATE")
     committed = False
+    budget = check_budget or (lambda: None)
     try:
+        budget()
+
         def read_only_authorizer(action, _arg1, _arg2, _database, _trigger):
             allowed = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ,
                        sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_RECURSIVE}
@@ -139,6 +160,20 @@ def apply_rebase(
             conn.set_authorizer(None)
         if not conn.in_transaction:
             raise RuntimeError("validate must not end the rebase transaction")
+        budget()
+        now = _resolve_time(now)
+        applied_at = _resolve_time(applied_at)
+        if source_snapshot_id is None:
+            if any(v is not None for v in (hwm_before, equity, balance)):
+                raise ValueError("source values need a source snapshot id")
+            chosen = conn.execute(
+                "SELECT * FROM account_snapshots ORDER BY ts DESC,id DESC LIMIT 1"
+            ).fetchone()
+            if chosen is None:
+                raise ValueError("source snapshot missing")
+            source_snapshot_id = chosen["id"]
+            hwm_before, equity, balance = (
+                chosen["hwm"], chosen["equity"], chosen["balance"])
         if not math.isfinite(balance) or balance <= 0:
             raise ValueError("balance must be finite and positive")
         figures = rebase_figures(hwm_before, equity, threshold_pct)
@@ -164,6 +199,7 @@ def apply_rebase(
             (source["ts"], source["balance"], source["equity"],
              source["equity"], 0.0, "manual_ks_rebase"))
         rebase_snapshot_id = cur.lastrowid
+        budget()
         ledger_cur = conn.execute(
             "INSERT INTO kill_switch_hwm_rebases "
             "(applied_at,generation,latched_at,source_snapshot_id,"
@@ -175,6 +211,7 @@ def apply_rebase(
              rebase_snapshot_id, accepted_audit_id, digest_version, preview_token,
              hwm_before, equity, equity, balance, figures.drawdown_pct, threshold_pct,
              figures.cut, figures.cut_pct, figures.additional_headroom))
+        budget()
 
         after = conn.execute(
             "SELECT * FROM account_snapshots ORDER BY ts DESC,id DESC LIMIT 1"
@@ -186,10 +223,11 @@ def apply_rebase(
             raise RuntimeError("rebase accounting postcondition failed")
         result = {"rebase_id": ledger_cur.lastrowid,
             "snapshot_id": rebase_snapshot_id,
-            "generation": generation, "latched": latched_at is not None,
+            "generation": generation,
             "cut": figures.cut, "cut_pct": figures.cut_pct,
             "drawdown_pct": figures.drawdown_pct,
             "additional_headroom": figures.additional_headroom}
+        budget()
         try:
             _commit_rebase(conn)
         except Exception as exc:

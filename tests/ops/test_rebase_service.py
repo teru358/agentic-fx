@@ -681,3 +681,117 @@ def test_success_projects_only_the_existing_ops_activity_and_terminal_event(rig)
         "SELECT fields_json FROM ops_events WHERE code='ops_request_terminal'").fetchall()]
     assert fields[-1]["endpoint_code"] == "killswitch_rebase"
     assert not any(k in json.dumps(fields) for k in ("hwm", "cut", "equity"))
+
+
+# ------------------------------------------------ 保持予算と transaction 内の時刻・source
+
+def _spy_commit(monkeypatch):
+    calls = []
+    real = accounting._commit_rebase
+    monkeypatch.setattr(accounting, "_commit_rebase",
+                        lambda conn: (calls.append(1), real(conn))[1])
+    return calls
+
+
+def test_slow_evaluation_past_the_hold_budget_does_not_commit(rig, monkeypatch):
+    from agentic_fx.ops import rebase_service
+    token = _preview(rig)["preview_token"]
+    commits = _spy_commit(monkeypatch)
+    real = rebase_service.evaluate_rebase
+
+    def slow(*args, **kwargs):
+        result = real(*args, **kwargs)
+        rig.env.mono.advance(2.0)  # 1 秒の保持予算を評価だけで使い切る
+        return result
+
+    monkeypatch.setattr(rebase_service, "evaluate_rebase", slow)
+    counts = _write_counts(rig.conn)
+    assert _post_error(rig, token) is ErrorCode.REQUEST_TIMEOUT
+    assert commits == [] and _write_counts(rig.conn) == counts
+    assert not rig.conn.in_transaction
+    assert _rebase_requests(rig.conn)[-1]["result_code"] == "request_timeout"
+
+
+def test_slow_insert_past_the_hold_budget_does_not_commit(rig, monkeypatch):
+    token = _preview(rig)["preview_token"]
+    commits = _spy_commit(monkeypatch)
+    real = accounting.daily_start_equity
+    calls = []
+
+    def slow(conn, now):
+        calls.append(1)
+        value = real(conn, now)
+        if len(calls) == 2:  # 2 行の INSERT の後の事後検査で時間がかかる
+            rig.env.mono.advance(2.0)
+        return value
+
+    monkeypatch.setattr(accounting, "daily_start_equity", slow)
+    counts = _write_counts(rig.conn)
+    assert _post_error(rig, token) is ErrorCode.REQUEST_TIMEOUT
+    assert len(calls) == 2 and commits == []
+    assert _write_counts(rig.conn) == counts and not rig.conn.in_transaction
+
+
+@pytest.mark.parametrize("moved_to, code", [
+    (datetime(2026, 11, 21, 12, 0, tzinfo=UTC), ErrorCode.MARKET_CLOSED),  # 土曜
+    (NOW + timedelta(minutes=12), ErrorCode.PREVIEW_CHANGED),  # snapshot が 10 分超
+])
+def test_time_is_taken_again_inside_the_transaction(rig, monkeypatch, moved_to, code):
+    from agentic_fx.ops import service as service_mod
+    token = _preview(rig)["preview_token"]
+    real = service_mod.apply_rebase
+
+    def late(conn, **kwargs):
+        rig.env.wall.now = moved_to  # BEGIN IMMEDIATE を待つ間に時が進んだ
+        return real(conn, **kwargs)
+
+    monkeypatch.setattr(service_mod, "apply_rebase", late)
+    counts = _write_counts(rig.conn)
+    assert _post_error(rig, token) is code
+    assert _write_counts(rig.conn) == counts
+
+
+def test_the_validated_instant_is_the_applied_at(rig, monkeypatch):
+    from agentic_fx.ops import service as service_mod
+    token = _preview(rig)["preview_token"]
+    real = service_mod.apply_rebase
+
+    def late(conn, **kwargs):
+        rig.env.wall.now = NOW + timedelta(minutes=2)
+        return real(conn, **kwargs)
+
+    monkeypatch.setattr(service_mod, "apply_rebase", late)
+    _post(rig, token)
+    assert _ledger(rig.conn)[0]["applied_at"] == (NOW + timedelta(minutes=2)).isoformat()
+
+
+def test_same_value_snapshot_right_before_begin_immediate_still_succeeds(rig, monkeypatch):
+    from agentic_fx.ops import service as service_mod
+    token = _preview(rig)["preview_token"]
+    real = service_mod.apply_rebase
+
+    def late(conn, **kwargs):
+        _snapshot(rig.conn, NOW - timedelta(seconds=20), balance=START - LOSS,
+                  equity=START - LOSS, hwm=START)
+        return real(conn, **kwargs)
+
+    monkeypatch.setattr(service_mod, "apply_rebase", late)
+    _post(rig, token)
+    newest = max(row["id"] for row in _snapshots(rig.conn) if row["source"] == "paper")
+    assert _ledger(rig.conn)[0]["source_snapshot_id"] == newest != rig.source_id
+
+
+def test_changed_value_snapshot_right_before_begin_immediate_is_rejected(rig, monkeypatch):
+    from agentic_fx.ops import service as service_mod
+    token = _preview(rig)["preview_token"]
+    real = service_mod.apply_rebase
+
+    def late(conn, **kwargs):
+        _snapshot(rig.conn, NOW - timedelta(seconds=20), balance=START - LOSS,
+                  equity=START - LOSS, hwm=START + 5.0)
+        return real(conn, **kwargs)
+
+    monkeypatch.setattr(service_mod, "apply_rebase", late)
+    assert _post_error(rig, token) is ErrorCode.PREVIEW_CHANGED
+    assert _ledger(rig.conn) == []
+    assert [r["source"] for r in _snapshots(rig.conn)].count("manual_ks_rebase") == 0

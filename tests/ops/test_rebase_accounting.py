@@ -380,3 +380,88 @@ def test_same_timestamp_rebase_is_latest_and_next_mtm_inherits_its_hwm(tmp_path)
     assert latest["cashflow"] == 0
     mtm = record_snapshot(conn, now=now, balance=899, equity=899)
     assert mtm["hwm"] == 900
+
+
+class _Budget(Exception):
+    pass
+
+
+@pytest.mark.parametrize("fail_at", [1, 2, 3, 4, 5])
+def test_budget_is_checked_up_to_the_commit_and_expiry_rolls_back(tmp_path, fail_at):
+    path = tmp_path / f"budget-{fail_at}.db"
+    conn, now, source_id, audit_id = _commit_fault_db(path)
+    calls, committed = [], []
+    real = accounting._commit_rebase
+    accounting._commit_rebase = lambda c: (committed.append(1), real(c))[1]
+
+    def budget():
+        calls.append(1)
+        if len(calls) == fail_at:
+            raise _Budget
+
+    try:
+        with pytest.raises(_Budget):
+            apply_rebase(conn, accepted_audit_id=audit_id, applied_at=now, generation=7,
+                         latched_at=None, digest_version=1, preview_token="budget",
+                         threshold_pct=5.0, now=now, validate=lambda db: None,
+                         check_budget=budget)
+    finally:
+        accounting._commit_rebase = real
+    # budget は BEGIN 直後・validate 後・2 回の INSERT 後 (commit の直前) の 5 点で見る。
+    assert len(calls) == fail_at
+    assert committed == [] and not conn.in_transaction
+    assert _counts(path) == (0, 1)
+
+
+def test_budget_is_checked_five_times_on_success(tmp_path):
+    conn, now, _source_id, audit_id = _commit_fault_db(tmp_path / "ok.db")
+    calls = []
+    apply_rebase(conn, accepted_audit_id=audit_id, applied_at=now, generation=7,
+                 latched_at=None, digest_version=1, preview_token="ok",
+                 threshold_pct=5.0, now=now, validate=lambda db: None,
+                 check_budget=lambda: calls.append(1))
+    assert len(calls) == 5
+
+
+def test_latest_snapshot_inside_the_transaction_is_the_source(tmp_path):
+    path = tmp_path / "latest.db"
+    conn, now, first_id, audit_id = _commit_fault_db(path)
+    other = sqlite3.connect(path)
+
+    def validate(db):
+        # validate の直前に同値の snapshot が入っても、最新行を選び直して通る。
+        pass
+
+    other.execute("INSERT INTO account_snapshots(ts,balance,equity,hwm) VALUES(?,900,900,1000)",
+                  ((now + timedelta(seconds=30)).isoformat(),))
+    other.commit()
+    other.close()
+    result = apply_rebase(conn, accepted_audit_id=audit_id, applied_at=now, generation=7,
+                          latched_at=None, digest_version=1, preview_token="latest",
+                          threshold_pct=5.0, now=now, validate=validate)
+    row = conn.execute("SELECT source_snapshot_id FROM kill_switch_hwm_rebases").fetchone()
+    assert row[0] != first_id and result["snapshot_id"] > row[0]
+    assert "latched" not in result
+
+
+def test_time_callables_are_resolved_after_validate(tmp_path):
+    conn, now, _source_id, audit_id = _commit_fault_db(tmp_path / "time.db")
+    cell = []
+    later = now + timedelta(seconds=3)
+    apply_rebase(conn, accepted_audit_id=audit_id, applied_at=lambda: cell[0], generation=7,
+                 latched_at=None, digest_version=1, preview_token="time",
+                 threshold_pct=5.0, now=lambda: cell[0],
+                 validate=lambda db: cell.append(later))
+    stored = conn.execute("SELECT applied_at FROM kill_switch_hwm_rebases").fetchone()[0]
+    assert stored == later.isoformat()
+
+
+def test_source_values_without_a_source_id_are_rejected(tmp_path):
+    path = tmp_path / "mixed.db"
+    conn, now, _source_id, audit_id = _commit_fault_db(path)
+    with pytest.raises(ValueError):
+        apply_rebase(conn, accepted_audit_id=audit_id, applied_at=now, generation=7,
+                     latched_at=None, digest_version=1, preview_token="mixed",
+                     hwm_before=1000.0, threshold_pct=5.0, now=now,
+                     validate=lambda db: None)
+    assert _counts(path) == (0, 1)

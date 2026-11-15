@@ -1865,7 +1865,7 @@ class OpsService:
                 guard = stack.enter_context(self._state_store.shared_guard(
                     deadline=self._foreign(hold), stop_event=self.stop_event))
                 response = self._rebase_commit(wiring, guard, accepted, expected_generation,
-                                               preview_token)
+                                               preview_token, hold)
         except Exception:
             if response is None:
                 raise
@@ -1873,42 +1873,48 @@ class OpsService:
         return response
 
     def _rebase_commit(self, wiring: RebaseWiring, guard, accepted: AcceptedRequest,
-                       expected_generation: int, preview_token: str) -> dict:
-        from agentic_fx.store import snapshots
+                       expected_generation: int, preview_token: str, hold: float) -> dict:
+        """BEGIN IMMEDIATE の中で最新 snapshot を選び、その行を検証して適用する。
+
+        ``hold`` (monotonic) は共有 flock・SQLite busy・計算・書込みに共通の期限で、
+        COMMIT を送る前までの各段で検査する。COMMIT 自体の停止は上限を保証しない。
+        市場開閉と snapshot 鮮度の判定時刻は transaction の中で取り直し、同じ値を
+        台帳の applied_at と日次基準の計算にも使う。"""
         state = guard.state
         if state is None or guard.marker_pending:
             raise OpsError(ErrorCode[rebase_service.error_code_name("state_unavailable")])
         if state.autopilot:
             raise OpsError(ErrorCode.AUTOPILOT_RESTRICTED)
-        source = snapshots.latest(self._conn)
-        if source is None:
-            raise OpsError(ErrorCode.PREVIEW_CHANGED)
-        now = self._wall_clock()
+        instant: list[datetime] = []
+
+        def check_budget() -> None:
+            if self._monotonic() >= hold:
+                raise OpsError(ErrorCode.REQUEST_TIMEOUT)
 
         def validate(conn) -> None:
+            instant[:] = [self._wall_clock()]
             evaluation = rebase_service.evaluate_rebase(
                 conn, wiring=wiring, state=state, marker_pending=guard.marker_pending,
-                expected_generation=expected_generation, settings=self._settings, now=now)
+                expected_generation=expected_generation, settings=self._settings,
+                now=instant[0])
             if evaluation.reason is not None:
                 raise OpsError(ErrorCode[rebase_service.error_code_name(evaluation.reason)])
-            if (evaluation.token != preview_token
-                    or evaluation.source_snapshot_id != source["id"]):
+            if evaluation.token != preview_token:
                 raise OpsError(ErrorCode.PREVIEW_CHANGED)
 
-        latched = state.kill_switch_latched
         try:
             result = apply_rebase(
-                self._conn, source_snapshot_id=source["id"], accepted_audit_id=accepted.audit_id,
-                applied_at=now, generation=state.kill_switch_generation,
+                self._conn, accepted_audit_id=accepted.audit_id,
+                applied_at=lambda: instant[0], generation=state.kill_switch_generation,
                 latched_at=state.kill_switch_latched_at,
                 digest_version=rebase_service.DIGEST_VERSION, preview_token=preview_token,
-                hwm_before=source["hwm"], equity=source["equity"], balance=source["balance"],
-                threshold_pct=self._settings.risk.drawdown_kill_pct, now=now, validate=validate)
+                threshold_pct=self._settings.risk.drawdown_kill_pct,
+                now=lambda: instant[0], validate=validate, check_budget=check_budget)
         except ValueError:
             raise OpsError(ErrorCode.PREVIEW_CHANGED) from None
         # 台帳の金額は応答 / 監査 terminal に載せない。latched は guard の state の値。
         return {"rebase_id": result["rebase_id"], "snapshot_id": result["snapshot_id"],
-                "generation": result["generation"], "latched": latched}
+                "generation": result["generation"], "latched": state.kill_switch_latched}
 
     def cancel_job(self, principal: Caller, job_id: str, *,
                    deadline: float | None = None, asserted_actor: str | None = None) -> dict:
