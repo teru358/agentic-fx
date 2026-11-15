@@ -88,12 +88,48 @@ def insert_run(conn, *, run_id: str, owner: str, trigger: str, source: str, inte
          lookback_days, epoch, iso(t), iso(b), iso(e), iso(started_at)))
 
 
+_STATUS_COLUMN = {
+    "ok": "runs_ok", "completed_with_gaps": "runs_with_gaps",
+    "completed_with_conflicts": "runs_with_conflicts", "conflict_circuit_open": "runs_with_conflicts",
+    "deferred": "runs_deferred", "partial": "runs_failed", "failed": "runs_failed",
+    "interrupted": "runs_failed",
+}
+
+
+def _add_daily(conn, run_id: str, *, status: str, series_total: int, series_failed: int,
+               inserted: int, unchanged: int, conflicted_new: int, conflicted_known: int,
+               requests: int) -> None:
+    """run の終了を、その run を始めた UTC 日の永続集計へ加える (run の終了と同じ transaction)。"""
+    row = conn.execute("SELECT started_at, source, interval, status FROM history_sync_runs "
+                       "WHERE id=?", (run_id,)).fetchone()
+    if row is None or row["status"] != "running":
+        return                                   # 二重に数えない
+    day = datetime.fromisoformat(row["started_at"]).astimezone(timezone.utc).date().isoformat()
+    column = _STATUS_COLUMN.get(status)
+    conn.execute(
+        "INSERT OR IGNORE INTO history_sync_daily (day_utc, source, interval) VALUES (?,?,?)",
+        (day, row["source"], row["interval"]))
+    conn.execute(
+        "UPDATE history_sync_daily SET runs=runs+1, "
+        + (f"{column}={column}+1, " if column else "")
+        + "series_total=series_total+?, series_failed=series_failed+?, inserted=inserted+?, "
+        "unchanged=unchanged+?, conflicted_new=conflicted_new+?, "
+        "conflicted_known=conflicted_known+?, requests=requests+? "
+        "WHERE day_utc=? AND source=? AND interval=?",
+        (series_total, series_failed, inserted, unchanged, conflicted_new, conflicted_known,
+         requests, day, row["source"], row["interval"]))
+
+
 def finish_run(conn, run_id: str, *, status: str, rc: int, finished_at: datetime,
                series_total: int = 0, series_failed: int = 0, inserted: int = 0,
                unchanged: int = 0, conflicted_new: int = 0, conflicted_known: int = 0,
                requests: int = 0, failure_code: str | None = None,
                deferred_reason: str | None = None, unprocessed: object = None,
                unrecorded_series: int = 0, health: str | None = None) -> None:
+    _add_daily(conn, run_id, status=status, series_total=series_total,
+               series_failed=series_failed, inserted=inserted, unchanged=unchanged,
+               conflicted_new=conflicted_new, conflicted_known=conflicted_known,
+               requests=requests)
     conn.execute(
         "UPDATE history_sync_runs SET status=?, rc=?, finished_at=?, series_total=?, "
         "series_failed=?, inserted=?, unchanged=?, conflicted_new=?, conflicted_known=?, "
@@ -114,6 +150,8 @@ def mark_interrupted(conn, *, owner_alive: Callable[[str], bool], now: datetime)
     for row in rows:
         if owner_alive(row["owner"]):
             continue
+        _add_daily(conn, row["id"], status="interrupted", series_total=0, series_failed=0,
+                   inserted=0, unchanged=0, conflicted_new=0, conflicted_known=0, requests=0)
         conn.execute("UPDATE history_sync_runs SET status='interrupted', finished_at=? "
                      "WHERE id=? AND status='running'", (iso(now), row["id"]))
         conn.execute("UPDATE history_sync_series SET status='failed', "

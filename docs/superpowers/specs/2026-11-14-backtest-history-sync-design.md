@@ -202,7 +202,7 @@ backoff正本は系列状態行とgap行であり、最新series結果ではな�
 | history_conflicts | histbugs C2.2が所有。本件DDLや独自digest/helperを作らず正本を参照 |
 | history_revisions | histbugs C2.2 §2.6を実現する明示置換の改訂印。id、kind、対象key、conflict id、実行者、時刻、理由参照。自由理由は人間専用 |
 
-first/last_run_idにFKは張らず、runのtombstoneで論理参照を保持する。runs/series詳細は90日保持し、日別run集計は永続。未完run・再開cursor・gap・系列状態・衝突/改訂から参照されるrunの最小identityは削除しない (tombstone)。first/last_run_idの参照を壊さない。衝突は解決済みも削除しない。価格・自由reasonを集計に複製しない。GCも短いadmission付きtransactionで行いtickへ譲る。
+first/last_run_idにFKは張らず、runのtombstoneで論理参照を保持する。runs/series詳細は90日保持し、日別run集計 (`history_sync_daily`: UTC日 × source × 足幅の run数・結果別・series/取得/衝突/要求の件数) は永続で、run の終了と同じ transaction で加算する。未完run・再開cursor・gap・系列状態・衝突/改訂から参照されるrunの最小identityは削除しない (tombstone)。first/last_run_idの参照を壊さない。衝突は解決済みも削除しない。価格・自由reasonを集計に複製しない。GCも短いadmission付きtransactionで行いtickへ譲る。
 
 revisionsをconflict id最大値へ畳む案は不採用。衝突idは初出順で改訂順でなく、古いidを後から置換してもepochが変わる保証にならない。独立した単調revisionが必要である。epochは正本のversion付き合成tokenとしsnapshotではない。
 
@@ -302,6 +302,7 @@ rollbackは新コードのうちにauto_enabled=falseへ変更して再起動し
 | 2026-11-15 | C5.1 | recent始端を `max(B,E-D日)` に戻し、offline recent上限をD+1からD+2窓/系列・要求上限を `(D+2)N+32` に改訂。追記・後ろ窓・尾の和集合をUTC日で数え、上限外・cursor遅れの未取得をunprocessedとして明示queue、cursor前進と同transaction | 始端が日中だと範囲だけでD+1窓となり、尾が前UTC日へ出るとD+2になって毎日数時間request_budgetになるため (sol裁定) | — (未commit) |
 | 2026-11-15 | C5.2 | 置換の由来証明を `bridge_verified_run_id` に具体化 (sync の検証済み取得のみ設定、再観測で上書き、replace tx内で再照合、手動importは段2で証明なし) | sol裁定 (b)。originラベルだけの証明は付録Eが禁止 | — (未commit) |
 | 2026-11-15 | C5.3 | 参照の疑いを、日の本数そのものでなく共通暦の開場格子に対する充足率の中央値比較に改訂 | 正常な日曜・短縮日が疑いになる誤検出を避ける (利用者裁定 2026-11-14) | — (未commit) |
+| 2026-11-15 | C5.4 | 日別run集計の永続表 `history_sync_daily` を明記 (run終了と同transactionで加算、二重に数えない) | series詳細の90日GC後も日別を復元できるようにする | — (未commit) |
 
 ## 6. 短い task 表
 

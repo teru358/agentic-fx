@@ -11,7 +11,7 @@ from agentic_fx.store import history_sync as hs
 from agentic_fx.store.db import TABLE_NAMES, connect, init_db
 
 NEW_TABLES = ("history_sync_runs", "history_sync_series", "history_sync_series_state",
-              "history_sync_gaps", "history_sync_resume", "history_revisions")
+              "history_sync_gaps", "history_sync_resume", "history_sync_daily", "history_revisions")
 NOW = datetime(2026, 11, 11, 12, 0, tzinfo=timezone.utc)
 SRC, IV = "mt5", "15m"
 
@@ -407,3 +407,67 @@ def test_a_resume_point_is_saved_replaced_and_cleared_by_operation_key(tmp_path)
     assert hs.get_resume(conn, SRC, IV, "USDJPY", "gap:2026-11-04:primary_exact") is None
     _txn(conn, lambda c: hs.clear_resume(c, SRC, IV, "USDJPY", "recent"))
     assert hs.get_resume(conn, SRC, IV, "USDJPY", "recent") is None
+
+
+# ---- 日別の run 集計 -------------------------------------------------------
+
+def _run_once(conn, run_id, status, *, started=NOW, **counts):
+    _txn(conn, lambda c: hs.insert_run(
+        c, run_id=run_id, owner="offline", trigger="manual", source=SRC, interval=IV,
+        calendar_version="v", lookback_days=2, epoch="none", t=started, b=started, e=started,
+        started_at=started))
+    _txn(conn, lambda c: hs.finish_run(c, run_id, status=status, rc=0, finished_at=started,
+                                       **counts))
+
+
+def _daily(conn):
+    return {r["day_utc"]: dict(r) for r in conn.execute("SELECT * FROM history_sync_daily")}
+
+
+def test_run_totals_are_added_per_utc_day_when_a_run_finishes(tmp_path):
+    conn = _conn(tmp_path)
+    _run_once(conn, "a", "ok", series_total=2, inserted=10, unchanged=90, requests=3)
+    _run_once(conn, "b", "partial", series_total=1, series_failed=1, inserted=5, requests=1)
+    _run_once(conn, "c", "completed_with_conflicts", conflicted_new=2, conflicted_known=1)
+    _run_once(conn, "d", "ok", started=NOW + timedelta(days=1), inserted=7)
+    day = _daily(conn)
+    first = day[NOW.date().isoformat()]
+    assert (first["runs"], first["runs_ok"], first["runs_failed"], first["runs_with_conflicts"]
+            ) == (3, 1, 1, 1)
+    assert (first["series_total"], first["series_failed"], first["inserted"], first["unchanged"],
+            first["conflicted_new"], first["conflicted_known"], first["requests"]) == (
+        3, 1, 15, 90, 2, 1, 4)
+    assert day[(NOW + timedelta(days=1)).date().isoformat()]["inserted"] == 7
+
+
+def test_finishing_a_run_twice_or_recovering_a_finished_run_does_not_double_count(tmp_path):
+    conn = _conn(tmp_path)
+    _run_once(conn, "a", "ok", inserted=4)
+    _txn(conn, lambda c: hs.finish_run(c, "a", status="ok", rc=0, finished_at=NOW, inserted=4))
+    _txn(conn, lambda c: hs.mark_interrupted(c, owner_alive=lambda _o: False, now=NOW))
+    assert _daily(conn)[NOW.date().isoformat()]["inserted"] == 4
+    assert _daily(conn)[NOW.date().isoformat()]["runs"] == 1
+
+
+def test_an_interrupted_run_is_counted_once_as_a_failed_run(tmp_path):
+    conn = _conn(tmp_path)
+    _txn(conn, lambda c: hs.insert_run(
+        c, run_id="x", owner="offline:1", trigger="manual", source=SRC, interval=IV,
+        calendar_version="v", lookback_days=2, epoch="none", t=NOW, b=NOW, e=NOW,
+        started_at=NOW))
+    _txn(conn, lambda c: hs.mark_interrupted(c, owner_alive=lambda _o: False, now=NOW))
+    row = _daily(conn)[NOW.date().isoformat()]
+    assert (row["runs"], row["runs_failed"]) == (1, 1)
+
+
+def test_the_daily_totals_survive_the_retention_gc_of_the_series_detail(tmp_path):
+    conn = _conn(tmp_path)
+    _run_once(conn, "a", "ok", series_total=1, inserted=10)
+    _txn(conn, lambda c: hs.insert_series(
+        c, run_id="a", op_seq=1, operation="recent", symbol="USDJPY", range_kind="recent",
+        range_start=NOW, range_end=NOW, day_utc=None, started_at=NOW))
+    before = _daily(conn)
+    result = _txn(conn, lambda c: hs.collect_garbage(c, now=NOW + timedelta(days=200)))
+    assert result["series_deleted"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM history_sync_series").fetchone()[0] == 0
+    assert _daily(conn) == before and before[NOW.date().isoformat()]["inserted"] == 10
