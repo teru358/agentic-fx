@@ -633,18 +633,27 @@ def affected(args):
         return fail('invalid_page')
     try:
         page = Path('docs/impact-map/domains') / (args.page + '.md')
-        def page_data(rev):
+        def page_data(rev, *, is_base=False):
+            if rev and is_base:
+                listing = git('ls-tree', '-z', rev, '--', page.as_posix())
+                if listing is None:
+                    raise OSError('page listing unavailable')
+                if not listing:
+                    return {}, set(), 'page_absent'
             data = git('show', rev + ':' + page.as_posix()) if rev else page.read_bytes()
             if data is None:
                 raise OSError('page unavailable')
             text = data.decode('utf-8')
             meta = parse_front_matter(text)
-            declarations = set(meta['anchors']) | {c['symbol'] for c in parse_covers(text)}
+            start, end = '<!-- impact-map:covers -->', '<!-- /impact-map:covers -->'
+            partial = is_base and start not in text and end not in text
+            covers = [] if partial else parse_covers(text)
+            declarations = set(meta['anchors']) | {c['symbol'] for c in covers}
             for m in re.finditer(r'^- \*\*E[0-9]+\*\* `([^`]+)` → `([^`]+)`', text, re.MULTILINE):
                 declarations.update(m.groups())
-            return meta, declarations
-        _, old_declarations = page_data(base)
-        meta, new_declarations = page_data(head)
+            return meta, declarations, 'covers_absent' if partial else None
+        _, old_declarations, partial_reason = page_data(base, is_base=True)
+        meta, new_declarations, _ = page_data(head)
         declarations = old_declarations | new_declarations
         lookup = literals(meta['resources'], meta.get('literals'))
         for anchor in declarations:
@@ -678,6 +687,8 @@ def affected(args):
             source = Path(path)
             return source.read_bytes() if source.is_file() else None
         items = set()
+        if partial_reason:
+            items.add(('base_declarations_partial', '', partial_reason, ''))
         sub_parents = {a.split('#', 1)[0] for a in declarations if '#' in a}
         for parent in sorted(sub_parents):
             path = parent.split('::', 1)[0]
@@ -746,9 +757,13 @@ def affected(args):
                 items.add(('literal_candidates_changed', symbol, resource, 'added' if (resource, symbol) in after else 'removed'))
         rows = []
         for kind, anchor, resource, change in sorted(items):
-            row = {'kind': kind, 'anchor': anchor}
-            if resource:
-                row.update(resource=resource, change=change)
+            row = {'kind': kind}
+            if kind == 'base_declarations_partial':
+                row['reason'] = resource
+            else:
+                row['anchor'] = anchor
+                if resource:
+                    row.update(resource=resource, change=change)
             rows.append(row)
         print(json.dumps({'items': rows}, sort_keys=True, separators=(',', ':')))
         return 0

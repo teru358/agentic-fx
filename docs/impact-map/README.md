@@ -52,3 +52,5 @@ python3 scripts/impact_map.py evaluate --domain kill-switch --index tmp/impact-m
 AST hash 方式 `v1` は docstring、型注釈、文字列 literal、decorator、default 値を含む AST を保持し、位置情報だけを除く。
 規則を変更しない限り方式 version は維持する。
 `affected` の `coarse_parent_changed` は副 anchor を持つ 300 行超の親全体に変更があったことを示す情報項目で、辺の変更を意味せず、終了コードを変えない。
+
+`affected` は base に頁がない場合や covers marker が両方ない旧頁の場合、利用可能な宣言で続行し `base_declarations_partial` に理由を出す。この情報項目は終了コードを変えず、壊れた頁は解析失敗として扱う。

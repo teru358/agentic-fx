@@ -112,3 +112,51 @@ def test_unregistered_symbol_in_resource_file(tmp_path):
     assert any(i['kind'] == 'unmapped_changed_unmapped_symbol' and i['anchor'] == 'app.py::emitter' for i in run(tmp_path, base, '--worktree')[1]['items'])
     src.write_text(src.read_text().replace('    emit("new_event")\n', '').replace('return 1', 'return 2'))
     assert 'unmapped_changed_unmapped_symbol' not in kinds(run(tmp_path, base, '--worktree')[1])
+
+
+def test_base_page_absent_is_partial(tmp_path):
+    setup(tmp_path)
+    page = tmp_path / 'docs/impact-map/domains/demo.md'
+    text = page.read_text()
+    page.unlink()
+    git(tmp_path, 'add', '-A')
+    git(tmp_path, 'commit', '-qm', 'no page')
+    base = git(tmp_path, 'rev-parse', 'HEAD')
+    page.write_text(text)
+    code, result = run(tmp_path, base, '--worktree')
+    assert code == 0
+    assert [i for i in result['items'] if i['kind'] == 'base_declarations_partial'] == [
+        {'kind': 'base_declarations_partial', 'reason': 'page_absent'}]
+
+
+def test_base_page_without_covers_keeps_old_declarations(tmp_path):
+    setup(tmp_path)
+    page = tmp_path / 'docs/impact-map/domains/demo.md'
+    text = page.read_text()
+    page.write_text('---\n' + json.dumps({'resources': [], 'anchors': ['app.py::g']}) + '\n---\nold page\n')
+    git(tmp_path, 'add', '.')
+    git(tmp_path, 'commit', '-qm', 'old page')
+    base = git(tmp_path, 'rev-parse', 'HEAD')
+    page.write_text(text.replace('- **E1** `app.py::f` → `app.py::g`\n', ''))
+    (tmp_path / 'app.py').write_text('VALUE = 1\ndef f(): return 1\n')
+    code, result = run(tmp_path, base, '--worktree')
+    assert code == 0
+    assert [i for i in result['items'] if i['kind'] == 'base_declarations_partial'] == [
+        {'kind': 'base_declarations_partial', 'reason': 'covers_absent'}]
+    assert any(i['kind'] == 'unmapped_removed_dependency' and i['anchor'] == 'app.py::g' for i in result['items'])
+
+
+def test_broken_base_page_remains_error(tmp_path):
+    setup(tmp_path)
+    page = tmp_path / 'docs/impact-map/domains/demo.md'
+    text = page.read_text()
+    for broken in (text.replace('"covers": []', '"covers": oops'),
+                   text.replace('<!-- /impact-map:covers -->', ''),
+                   text.replace('"id": "demo"', '"id": broken')):
+        page.write_text(broken)
+        git(tmp_path, 'add', '.')
+        git(tmp_path, 'commit', '-qm', 'broken page')
+        base = git(tmp_path, 'rev-parse', 'HEAD')
+        page.write_text(text)
+        code, result = run(tmp_path, base, '--worktree')
+        assert code == 2 and result['error'] == 'analysis_failed'
