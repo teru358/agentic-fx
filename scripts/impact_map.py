@@ -365,8 +365,17 @@ def evaluate(args):
 METHOD = f"python-{sys.version_info.major}.{sys.version_info.minor}:ast.dump(annotate_fields=True,include_attributes=False):v1"
 
 
+class AmbiguousSubAnchor(Exception):
+    pass
+
+
 def anchor_digest(anchor, data=None):
     path, symbol = anchor.split('::', 1)
+    symbol, separator, selector = symbol.partition('#')
+    if separator:
+        callee, at, literal = selector.partition('@')
+        if not callee.isidentifier() or (at and not literal):
+            raise ValueError('invalid sub-anchor')
     source = Path(path)
     if source.is_absolute() or '..' in source.parts or source.resolve().is_relative_to(Path.cwd().resolve()) is False:
         raise ValueError('invalid path')
@@ -405,6 +414,37 @@ def anchor_digest(anchor, data=None):
                 body = node.body
     except FileNotFoundError:
         pass
+    if separator and node is not None:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            node = None
+        else:
+            matches = []
+            def scan(statement):
+                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    return
+                expressions = []
+                nested = []
+                def collect(item):
+                    for child in ast.iter_child_nodes(item):
+                        if isinstance(child, ast.stmt):
+                            nested.append(child)
+                        else:
+                            expressions.append(child)
+                            collect(child)
+                collect(statement)
+                has_call = any(isinstance(n, ast.Call) and
+                               (n.func.id if isinstance(n.func, ast.Name) else n.func.attr if isinstance(n.func, ast.Attribute) else None) == callee
+                               for n in expressions)
+                has_literal = not at or any(isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value == literal for n in expressions)
+                if has_call and has_literal:
+                    matches.append(statement)
+                for child in nested:
+                    scan(child)
+            for statement in node.body:
+                scan(statement)
+            if len(matches) > 1:
+                raise AmbiguousSubAnchor(anchor)
+            node = matches[0] if matches else None
     digest = hashlib.sha256(ast.dump(node, annotate_fields=True, include_attributes=False).encode()).hexdigest() if node else None
     return node, digest
 
@@ -437,11 +477,15 @@ def evidence_exists(value):
 def verify(args):
     if not re.fullmatch(r'[A-Za-z0-9_-]+', args.page):
         raise ValueError('invalid domain')
-    node, digest = anchor_digest(args.anchor)
+    try:
+        node, digest = anchor_digest(args.anchor)
+        ambiguous = False
+    except AmbiguousSubAnchor:
+        node, digest, ambiguous = None, None, True
     record_path = Path('docs/impact-map/verification') / (args.page + '.json')
     records = json.loads(record_path.read_text()) if record_path.exists() else []
     previous = next ( (r for r in records if r['anchor'] == args.anchor), None)
-    status = 'anchor_missing' if node is None else 'missing_record' if previous is None else 'method_mismatch' if previous['method'] != METHOD else 'fresh' if previous['hash'] == digest else 'stale'
+    status = 'ambiguous_sub_anchor' if ambiguous else 'anchor_missing' if node is None else 'missing_record' if previous is None else 'method_mismatch' if previous['method'] != METHOD else 'fresh' if previous['hash'] == digest else 'stale'
     if args.record:
         if not digest or digest != args.expected_hash:
             raise ValueError('expected hash mismatch')
@@ -537,15 +581,21 @@ def check(args):
         records = []
         add('declaration', 'verification', 'invalid_record')
     hashes = {}
+    sub_parents = {anchor.split('#', 1)[0] for kind, anchor in anchors if kind != 'record' and '#' in anchor}
     for kind, anchor in sorted(set(anchors)):
         try:
             path, symbol = anchor.split('::', 1)
             if not path or not symbol or Path(path).is_absolute() or '..' in Path(path).parts:
                 raise ValueError()
             if anchor not in hashes:
-                hashes[anchor] = anchor_digest(anchor)[1]
+                node, hashes[anchor] = anchor_digest(anchor)
+                if node and '#' not in anchor and anchor not in sub_parents and node.end_lineno - node.lineno + 1 > 300:
+                    add(kind, anchor, 'coarse_symbol')
             if hashes[anchor] is None:
                 add(kind, anchor, 'anchor_missing')
+        except AmbiguousSubAnchor:
+            hashes[anchor] = None
+            add(kind, anchor, 'ambiguous_sub_anchor')
         except (ValueError, TypeError):
             add('declaration', kind, 'invalid_anchor')
         except (OSError, SyntaxError, UnicodeError, RecursionError, MemoryError):
@@ -555,11 +605,11 @@ def check(args):
         if record['method'] == METHOD and hashes.get(anchor) is not None and hashes[anchor] != record['hash']:
             add('record', anchor, 'stale')
     errors2 = {'git_unavailable', 'invalid_domain', 'invalid_front_matter', 'invalid_covers', 'invalid_ticket', 'invalid_record', 'invalid_anchor', 'unreadable_page', 'parse_error', 'method_mismatch'}
-    reasons = ('stale', 'anchor_missing', 'missing_key', 'ticket_missing', 'test_missing', 'public_rule_violation', *sorted(errors2))
+    reasons = ('stale', 'anchor_missing', 'missing_key', 'ticket_missing', 'test_missing', 'public_rule_violation', 'coarse_symbol', 'ambiguous_sub_anchor', *sorted(errors2))
     result = {'counts': {reason: sum(item[2] == reason for item in items) for reason in reasons},
               'items': [dict(kind=k, anchor=a, reason=r) for k, a, r in sorted(items)]}
     print(json.dumps(result, sort_keys=True, separators=(',', ':')))
-    return 2 if any(r in errors2 for _, _, r in items) else 1 if items else 0
+    return 2 if any(r in errors2 for _, _, r in items) else 1 if any(r not in ('coarse_symbol', 'ambiguous_sub_anchor') for _, _, r in items) else 0
 
 
 
@@ -626,11 +676,20 @@ def affected(args):
             source = Path(path)
             return source.read_bytes() if source.is_file() else None
         items = set()
+        sub_parents = {a.split('#', 1)[0] for a in declarations if '#' in a}
         for anchor in sorted(declarations):
             path = anchor.split('::', 1)[0]
             old, new = declared_data(base, path), declared_data(head, path)
-            before = anchor_digest(anchor, old)[1] if old is not None else None
-            after = anchor_digest(anchor, new)[1] if new is not None else None
+            if anchor in sub_parents:
+                nodes = [anchor_digest(anchor, data)[0] for data in (old, new) if data is not None]
+                if any(node and node.end_lineno - node.lineno + 1 > 300 for node in nodes):
+                    continue
+            try:
+                before = anchor_digest(anchor, old)[1] if old is not None else None
+                after = anchor_digest(anchor, new)[1] if new is not None else None
+            except AmbiguousSubAnchor:
+                items.add(('ambiguous_sub_anchor', anchor, '', ''))
+                continue
             if before is not None and after is None:
                 items.add(('unmapped_removed_dependency', anchor, '', ''))
             elif before != after:
@@ -671,7 +730,7 @@ def affected(args):
                 old_symbols, new_symbols = symbols(old), symbols(new)
                 for symbol in old_symbols.keys() | new_symbols.keys():
                     anchor = path + '::' + symbol
-                    if anchor not in declarations and old_symbols.get(symbol) != new_symbols.get(symbol):
+                    if anchor not in declarations and anchor not in sub_parents and old_symbols.get(symbol) != new_symbols.get(symbol):
                         items.add(('unmapped_changed_unmapped_symbol', anchor, '', ''))
             for resource, symbol in before ^ after:
                 items.add(('literal_candidates_changed', symbol, resource, 'added' if (resource, symbol) in after else 'removed'))
