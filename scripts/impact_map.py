@@ -11,6 +11,7 @@ import sys
 
 EXCLUDED = {'data', 'logs', 'plugins', 'tmp', '.venv', '.git', 'config'}
 SUFFIX_NAMESPACES = {'state', 'config'}
+FATAL = {'parse_error', 'missing_root', 'excluded_root', 'symlink_root', 'root_outside_repo', 'git_unavailable', 'invalid_include'}
 
 
 def git(*args):
@@ -52,17 +53,17 @@ def validate_root(root, repo, diagnostics, *, source_file=False):
     # Inspect the original components before normalizing away "..".
     path = Path(root)
     path = path if path.is_absolute() else Path.cwd() / path
-    current = Path(path.anchor)
-    for part in path.parts[1:]:
-        current = current / part
-        if current.is_symlink():
-            diagnostics.append({'path': relative(path), 'reason': 'symlink_root'})
-            return None
     normalized = Path(os.path.abspath(path))
     if not normalized.is_relative_to(repo):
         diagnostics.append({'path': relative(normalized), 'reason': 'root_outside_repo'})
         return None
     lexical_parts = path.relative_to(repo).parts if path.is_relative_to(repo) else normalized.relative_to(repo).parts
+    current = repo
+    for part in lexical_parts:
+        current = current / part
+        if current.is_symlink():
+            diagnostics.append({'path': relative(path), 'reason': 'symlink_root'})
+            return None
     if any(part in EXCLUDED for part in lexical_parts):
         diagnostics.append({'path': relative(normalized), 'reason': 'excluded_root'})
         return None
@@ -99,9 +100,14 @@ def candidates(root, diagnostics, tracked_set, includes, repo, seen):
             yield path, root
 
 
+def compile_patterns(lookup):
+    return {literal: re.compile(r'(?<!\w)' + re.escape(literal) + r'(?!\w)') for literal in lookup}
+
+
 class Visitor(ast.NodeVisitor):
-    def __init__(self, lookup, path, package, records):
+    def __init__(self, lookup, path, package, records, patterns=None):
         self.lookup, self.path, self.package, self.records = lookup, path, package, records
+        self.patterns = patterns if patterns is not None else compile_patterns(lookup)
         self.stack = []
         self.scopes = []
 
@@ -164,7 +170,7 @@ class Visitor(ast.NodeVisitor):
             for literal in self.lookup:
                 if node.value == literal:
                     self.add(literal, 'string_exact', node.lineno)
-                elif re.search(r'(?<!\w)' + re.escape(literal) + r'(?!\w)', node.value):
+                elif self.patterns[literal].search(node.value):
                     self.add(literal, 'string_token', node.lineno)
 
     def visit_Attribute(self, node):
@@ -180,6 +186,7 @@ class Visitor(ast.NodeVisitor):
 def extract(args):
     page = front_matter(args.page)
     lookup = literals(page['resources'], page.get('literals'))
+    patterns = compile_patterns(lookup)
     diagnostics, records = [], {}
     inputs = size = 0
     roots = sorted(set(relative(Path(r).absolute()) for r in args.root))
@@ -216,18 +223,25 @@ def extract(args):
                 inputs += 1
                 size += len(data)
                 tree = ast.parse(data, filename=rel)
-            except (SyntaxError, UnicodeDecodeError, ValueError, OSError):
+                parts = path.relative_to(base).parts
+                package = (Path(root) / parts[0]).as_posix() if len(parts) > 1 else root
+                file_records = {}
+                Visitor(lookup, rel, package, file_records, patterns).visit(tree)
+                records.update(file_records)
+            except (SyntaxError, UnicodeDecodeError, ValueError, OSError, RecursionError, MemoryError):
                 diagnostics.append({'path': rel, 'reason': 'parse_error'})
                 continue
-            parts = path.relative_to(base).parts
-            package = (Path(root) / parts[0]).as_posix() if len(parts) > 1 else root
-            Visitor(lookup, rel, package, records).visit(tree)
     rev = git('rev-parse', 'HEAD')
     header = dict(schema_version=1, revision=rev.decode().strip() if rev else None, roots=roots, inputs=inputs, bytes=size, diagnostics=sorted(diagnostics, key=lambda d: (d['path'], d['reason'])), unsupported=[])
     output = {'header': header, 'records': [records[k] for k in sorted(records)]}
+    index_path = Path(args.out) / 'index.json'
+    if any(d['reason'] in FATAL for d in diagnostics):
+        index_path.unlink(missing_ok=True)
+        print(json.dumps({'header': header, 'records': []}, sort_keys=True), file=sys.stderr)
+        return 1
     Path(args.out).mkdir(parents=True, exist_ok=True)
     (Path(args.out) / 'index.json').write_text(json.dumps(output, sort_keys=True, separators=(',', ':')) + '\n', encoding='utf-8')
-    return int(any(d['reason'] in {'parse_error', 'missing_root', 'excluded_root', 'symlink_root', 'root_outside_repo', 'git_unavailable', 'invalid_include'} for d in diagnostics))
+    return 0
 
 
 def read_covers(path):
@@ -259,6 +273,8 @@ def key(item):
 
 def evaluate(args):
     index = json.loads(Path(args.index).read_text(encoding='utf-8'))
+    if any(d['reason'] in FATAL for d in index['header']['diagnostics']):
+        raise ValueError('fatal index diagnostics')
     oracle = json.loads(Path(args.oracle).read_text(encoding='utf-8'))
     covers = read_covers(args.page)
     rows = oracle['rows']

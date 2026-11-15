@@ -1,4 +1,9 @@
 import json
+import importlib.util
+import ast
+import re
+
+import pytest
 import subprocess
 import sys
 from pathlib import Path
@@ -22,8 +27,8 @@ def run_extract(tmp_path, resources):
     page = tmp_path / 'page.md'
     page.write_text('---\n' + json.dumps({'resources': resources}) + '\n---\n')
     out = tmp_path / 'out'
-    result = subprocess.run([sys.executable, str(SCRIPT), 'extract', '--domain', 'x', '--page', str(page), '--root', 'source', '--allow-untracked-walk', '--out', str(out)], cwd=tmp_path)
-    return result, (out / 'index.json').read_bytes()
+    result = subprocess.run([sys.executable, str(SCRIPT), 'extract', '--domain', 'x', '--page', str(page), '--root', 'source', '--allow-untracked-walk', '--out', str(out)], cwd=tmp_path, capture_output=True, text=True)
+    return result, (out / 'index.json').read_bytes() if result.returncode == 0 else result.stderr.encode()
 
 
 def test_canonical_deterministic_output(tmp_path):
@@ -71,7 +76,6 @@ def test_nested_scope_and_parse_failure(tmp_path):
     result, raw = run_extract(tmp_path, ['event:target'])
     index = json.loads(raw)
     assert result.returncode != 0
-    assert {r['symbol'] for r in index['records']} == {'<module>', 'outer.inner'}
     assert index['header']['diagnostics'] == [{'path': 'source/bad.py', 'reason': 'parse_error'}]
 
 
@@ -144,13 +148,13 @@ def test_evaluate_critical_unresolved_and_manual_coverage(tmp_path):
     rows = [row('src/a.py::found', resource), row('src/a.py::manual', resource, cls='G_reach'), row('src/b.py::lost', resource), row('src/c.py::unknown', resource)]
     records = [{'resource': resource, 'path': 'src/a.py', 'symbol': 'found'}]
     covers = [{'symbol': 'src/a.py::found', 'resource': resource, 'ids': ['F01'], 'kind': 'page'}, {'symbol': 'src/a.py::manual', 'resource': resource, 'ids': ['F02'], 'kind': 'manual_edge'}]
-    diagnostics = [{'path': 'src/c.py', 'reason': 'parse_error'}]
+    diagnostics = [{'path': 'src/c.py', 'reason': 'symlink_outside_root'}]
     unresolved = [{'symbol': 'src/b.py::lost', 'resource': resource, 'cell': 'page', 'reason': 'fixture'}]
     metrics = evaluate_fixture(tmp_path, rows, records, covers, diagnostics, unresolved)
     machine, page = metrics['machine'], metrics['page']
     assert (machine['population'], machine['tp'], machine['fn'], machine['u'], machine['unscanned']) == (3, 1, 1, 1, 1)
     assert (page['population'], page['tp'], page['fn'], page['u']) == (4, 2, 1, 1)
-    assert machine['unresolved'] == [{'resource': resource, 'symbol': 'src/c.py::unknown', 'reasons': ['parse_error']}]
+    assert machine['unresolved'] == [{'resource': resource, 'symbol': 'src/c.py::unknown', 'reasons': ['symlink_outside_root']}]
     assert page['unresolved'] == [{'resource': resource, 'symbol': 'src/b.py::lost', 'reasons': ['fixture']}]
     assert machine['critical']['fn'] == 1 and machine['critical']['u'] == 1
     assert page['critical']['fn'] == 1 and page['critical']['u'] == 1
@@ -230,7 +234,7 @@ def invoke_roots(tmp_path, roots, *options, env=None):
     for root in roots:
         args += ['--root', str(root)]
     result = subprocess.run(args + list(options), cwd=tmp_path, env=env, capture_output=True, text=True)
-    return result, json.loads((out / 'index.json').read_text())
+    return result, json.loads((out / 'index.json').read_text() if result.returncode == 0 else result.stderr)
 
 
 def test_rejects_unsafe_roots_before_scanning(tmp_path):
@@ -400,3 +404,77 @@ def test_unresolved_found_and_missing_are_disjoint(tmp_path):
         assert (cell['tp'], cell['fn'], cell['u']) == (1, 1, 1)
         assert cell['population'] == cell['tp'] + cell['fn'] + cell['u']
         assert cell['critical']['population'] == sum(cell['critical'][k] for k in ('tp', 'fn', 'u'))
+
+
+def load_impact_map():
+    spec = importlib.util.spec_from_file_location('impact_map_test', SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_repo_ancestor_symlink_is_ignored(tmp_path, monkeypatch):
+    module = load_impact_map()
+    repo = tmp_path / 'repo'
+    (repo / 'source').mkdir(parents=True)
+    original = Path.is_symlink
+    monkeypatch.setattr(Path, 'is_symlink', lambda p: True if p == tmp_path else original(p))
+    diagnostics = []
+    assert module.validate_root(repo / 'source', repo, diagnostics) == repo / 'source'
+    assert not diagnostics
+
+
+def test_fatal_removes_old_index_and_evaluate_rejects(tmp_path):
+    out = tmp_path / 'safety-out'
+    out.mkdir()
+    (out / 'index.json').write_text('old')
+    result, _ = invoke_roots(tmp_path, ['missing'])
+    assert result.returncode != 0
+    assert not (out / 'index.json').exists()
+    index = tmp_path / 'index.json'
+    index.write_text(json.dumps({'header': {'diagnostics': [{'path': 'source', 'reason': 'git_unavailable'}], 'unsupported': []}, 'records': []}))
+    oracle = tmp_path / 'oracle.json'
+    oracle.write_text('{"header":{},"rows":[]}')
+    page = tmp_path / 'page.md'
+    page.write_text('<!-- impact-map:covers -->\n```json\n{"covers":[]}\n```\n<!-- /impact-map:covers -->')
+    result = subprocess.run([sys.executable, str(SCRIPT), 'evaluate', '--domain', 'x', '--index', str(index), '--oracle', str(oracle), '--page', str(page), '--out', str(out)], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert not (out / 'metrics.json').exists()
+
+
+def test_patterns_compiled_once_and_match_existing_semantics(monkeypatch):
+    module = load_impact_map()
+    lookup = {x: [x] for x in ('a', 'a.b', 'x+', '日本', '_tag')}
+    values = ['a', 'a.b', 'a.b and x+', 'prea', '日本!', '_tag_']
+    calls = []
+    original = re.compile
+    monkeypatch.setattr(module.re, 'compile', lambda pattern: (calls.append(pattern), original(pattern))[1])
+    records = {}
+    visitor = module.Visitor(lookup, 'x.py', 'x', records)
+    for value in values:
+        visitor.visit(ast.Constant(value=value, lineno=1))
+    assert len(calls) == len(lookup)
+    actual = {(r['resource'], r['match_kind']) for r in records.values()}
+    expected = {(literal, 'string_exact' if value == literal else 'string_token') for literal in lookup for value in values if value == literal or original(r'(?<!\w)' + re.escape(literal) + r'(?!\w)').search(value)}
+    assert actual == expected
+
+
+@pytest.mark.parametrize('stage', ['parse', 'visit'])
+@pytest.mark.parametrize('error', [RecursionError, MemoryError])
+def test_resource_exhaustion_is_parse_error(tmp_path, monkeypatch, capsys, stage, error):
+    module = load_impact_map()
+    (tmp_path / 'source').mkdir()
+    (tmp_path / 'source' / 'a.py').write_text("'target'")
+    page = tmp_path / 'page.md'
+    page.write_text('---\n{"resources":["event:target"]}\n---\n')
+    monkeypatch.chdir(tmp_path)
+    def fail(*args, **kwargs):
+        raise error('secret')
+    args = type('Args', (), {'page': str(page), 'root': ['source'], 'include': [], 'allow_untracked_walk': True, 'out': str(tmp_path / 'out')})()
+    with monkeypatch.context() as patch:
+        patch.setattr(module.ast if stage == 'parse' else module.Visitor, 'parse' if stage == 'parse' else 'visit', fail)
+        result = module.extract(args)
+    assert result != 0
+    diagnostic = json.loads(capsys.readouterr().err)
+    assert diagnostic['header']['diagnostics'] == [{'path': 'source/a.py', 'reason': 'parse_error'}]
+    assert not (tmp_path / 'out' / 'index.json').exists()
