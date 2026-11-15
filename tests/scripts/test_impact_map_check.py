@@ -87,3 +87,22 @@ def test_conditional_nested_symbol(tmp_path):
     (tmp_path / 'sample.py').write_text('def f():\n    return 1\n\ndef g():\n    if True:\n        def inner():\n            pass\n')
     page.write_text(page.read_text().replace('sample.py::g`', 'sample.py::g.inner`'))
     assert check(tmp_path)[0] == 0
+
+
+def test_check_class_constant_lifecycle(tmp_path):
+    page = setup(tmp_path)
+    src = tmp_path / 'sample.py'
+    src.write_text('def f(): return 1\ndef g(): pass\nclass Example:\n    VALUE: int = 1\n')
+    anchor = 'sample.py::Example.VALUE'
+    text = page.read_text().replace('"anchors": ["sample.py::f"]', '"anchors": ["sample.py::f", "' + anchor + '"]')
+    page.write_text(text)
+    assert check(tmp_path)[0] == 0
+    result = cli(tmp_path, 'verify', '--page', 'demo', '--anchor', anchor)
+    digest = json.loads(result.stdout)['current_hash']
+    assert cli(tmp_path, 'verify', '--page', 'demo', '--anchor', anchor, '--record', '--expected-hash', digest, '--reason', 'reviewed', '--evidence', 'TEST-1').returncode == 0
+    src.write_text(src.read_text().replace('VALUE: int = 1', 'VALUE: int = 2'))
+    code, result = check(tmp_path)
+    assert code == 1 and result['counts']['stale'] == 1
+    src.write_text(src.read_text().replace('VALUE: int = 2', 'pass'))
+    code, result = check(tmp_path)
+    assert code == 1 and any(item['anchor'] == anchor and item['reason'] == 'anchor_missing' for item in result['items'])

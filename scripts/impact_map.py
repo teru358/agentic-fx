@@ -380,7 +380,16 @@ def anchor_digest(anchor, data=None):
                         yield child
                     else:
                         yield from scoped_definitions(ast.iter_child_nodes(child))
-            for part in parts:
+            for index, part in enumerate(parts):
+                if index == len(parts) - 1 and isinstance(node, ast.ClassDef):
+                    assignments = []
+                    for item in body:
+                        targets = item.targets if isinstance(item, ast.Assign) else [item.target] if isinstance(item, ast.AnnAssign) else []
+                        if any(isinstance(target, ast.Name) and target.id == part for target in targets):
+                            assignments.append(item)
+                    if assignments:
+                        node = assignments[-1]
+                        break
                 matches = [n for n in scoped_definitions(body) if n.name == part]
                 if len(matches) != 1:
                     node = None

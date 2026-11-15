@@ -42,3 +42,22 @@ def test_reject_private_reason(tmp_path):
     for reason in ('bad\nvalue', 'https://example.com', '/home/name', 'tmp/file'):
         assert run(tmp_path, '--record', '--expected-hash', digest, '--reason', reason, '--evidence', 'T-1').returncode != 0
     assert not (tmp_path / 'docs/impact-map/verification/demo.json').exists()
+
+
+def test_verify_class_constant_lifecycle(tmp_path):
+    for assignment in ('VALUE = 1', 'VALUE: int = 1'):
+        source = tmp_path / 'sample.py'
+        source.write_text(f'class Outer:\n    class Inner:\n        {assignment}\n')
+        anchor = 'sample.py::Outer.Inner.VALUE'
+        def verify(*args):
+            return subprocess.run([sys.executable, str(SCRIPT), 'verify', '--page', 'demo', '--anchor', anchor, *args], cwd=tmp_path, capture_output=True, text=True)
+        first = json.loads(verify().stdout)
+        assert first['status'] == 'missing_record' and len(first['current_hash']) == 64
+        opts = ('--record', '--expected-hash', first['current_hash'], '--reason', 'reviewed', '--evidence', 'TEST-1')
+        assert verify(*opts).returncode == 0
+        assert json.loads(verify().stdout)['status'] == 'fresh'
+        source.write_text(f'\nclass Outer:\n    class Inner:\n        {assignment.replace("1", "2")}\n')
+        assert json.loads(verify().stdout)['status'] == 'stale'
+        source.write_text('class Outer:\n    class Inner:\n        pass\n')
+        assert json.loads(verify().stdout)['status'] == 'anchor_missing'
+        (tmp_path / 'docs/impact-map/verification/demo.json').unlink()
