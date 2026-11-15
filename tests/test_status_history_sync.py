@@ -20,6 +20,7 @@ pytestmark = pytest.mark.real_history_guard
 
 UTC = timezone.utc
 NOW = datetime(2026, 11, 10, 6, 2, 20, tzinfo=UTC)
+REQ_1 = "9f9f9f9f9f9f40d18444444444444444"
 SRC = REPO / "src" / "agentic_fx"
 
 
@@ -32,9 +33,15 @@ def world(tmp_path):
     conn.close()
 
 
+def _settings_with_reference():
+    settings = _settings()
+    settings.datafeed.watch_symbols = ["JP225"]
+    return settings
+
+
 def _collect(world, settings=None):
     root, conn = world
-    return sh.collect(root, settings or _settings(), conn, "Asia/Tokyo", NOW)
+    return sh.collect(root, settings or _settings_with_reference(), conn, "Asia/Tokyo", NOW)
 
 
 def _text(world, settings=None, tz="Asia/Tokyo"):
@@ -121,28 +128,28 @@ def test_a_non_mt5_dataset_is_not_applicable(world):
 
 def test_the_last_run_and_the_last_success_are_shown_separately_in_the_display_zone(world):
     root, conn = world
-    _run(conn, "run-ok", started=NOW - timedelta(hours=3), request_id="req-1", trigger="manual")
-    _run(conn, "run-bad", status="failed", rc=1, started=NOW - timedelta(hours=1),
+    _run(conn, "a1a1a1a1a1a14b2c8000000000000000", started=NOW - timedelta(hours=3), request_id=REQ_1, trigger="manual")
+    _run(conn, "c3c3c3c3c3c34d4e9111111111111111", status="failed", rc=1, started=NOW - timedelta(hours=1),
          failure="bridge_unavailable")
     sync = _collect(world).history_sync
     assert sync.state is sh.SyncState.ATTENTION
-    assert sync.last_run.run_id == "run-bad" and sync.last_success.run_id == "run-ok"
+    assert sync.last_run.run_id == "c3c3c3c3c3c34d4e9111111111111111" and sync.last_success.run_id == "a1a1a1a1a1a14b2c8000000000000000"
     text = _text(world)
     last = next(l for l in text.splitlines() if l.startswith("  last run:"))
     ok = next(l for l in text.splitlines() if l.startswith("  last success:"))
-    assert "status=failed rc=1 run=run-bad trigger=manual error=bridge_unavailable" in last
+    assert "status=failed rc=1 run=c3c3c3c3c3c34d4e9111111111111111 trigger=manual error=bridge_unavailable" in last
     assert "started 2026-11-10 14:02:20 +09:00" in last and "requests=3" in last
-    assert "run=run-ok request=req-1" in ok
+    assert f"run=a1a1a1a1a1a14b2c8000000000000000 request={REQ_1}" in ok
     assert "daemon を止めて `afx history sync` を実行" in text
 
 
 def test_series_cursors_gaps_expired_days_and_conflicts_are_counted_for_this_dataset_only(world):
     root, conn = world
-    _run(conn, "r1")
+    _run(conn, "0a0a0a0a0a0a41b2b333333333333333")
     sync_store.advance_cursor(conn, "mt5", "5m", "USDJPY", last_processed_e=NOW - timedelta(hours=2),
-                              run_id="r1", now=NOW)
+                              run_id="0a0a0a0a0a0a41b2b333333333333333", now=NOW)
     sync_store.record_series_failure(conn, "mt5", "5m", "JP225", error_code="bridge_unavailable",
-                                     run_id="r1", now=NOW)
+                                     run_id="0a0a0a0a0a0a41b2b333333333333333", now=NOW)
     sync_store.set_rr_cursor(conn, "mt5", "5m", "USDJPY", now=NOW)
     _gap(conn, "USDJPY", "2026-11-05", "primary_exact")
     _gap(conn, "USDJPY", "2026-11-06", "unprocessed")
@@ -241,14 +248,14 @@ def test_a_configured_history_executor_url_is_reported_without_its_value(world):
 def test_free_text_in_the_tables_never_reaches_the_block(world):
     root, conn = world
     canary = "cnr-" + "free text secret/https://x.invalid?k=v"
-    _run(conn, "run-1", status="failed", rc=1, failure="bridge_unavailable")
+    _run(conn, "e5e5e5e5e5e54f6aa222222222222222", status="failed", rc=1, failure="bridge_unavailable")
     conn.execute("UPDATE history_sync_runs SET failure_code=?, request_id=?, deferred_reason=?",
                  (canary, canary, canary))
-    sync_store.record_series_failure(conn, "mt5", "5m", "JP225", error_code="x", run_id="run-1", now=NOW)
+    sync_store.record_series_failure(conn, "mt5", "5m", "JP225", error_code="x", run_id="e5e5e5e5e5e54f6aa222222222222222", now=NOW)
     conn.execute("UPDATE history_sync_series_state SET last_error=?, last_health=?", (canary, canary))
     conn.commit()
     result = _collect(world)
-    assert result.history_sync.last_run.failure_code is None
+    assert result.history_sync.last_run.failure_code == "unknown"
     text = "\n".join(sh.render(result, "UTC"))
     assert "cnr-" not in text and "secret" not in text and "invalid" not in text
     assert "cnr-" not in repr(result)
@@ -267,7 +274,7 @@ def test_a_read_failure_makes_only_this_block_unavailable(world):
 
 def test_eval_window_is_a_separate_slot_that_sync_never_fills(world):
     root, conn = world
-    _run(conn, "run-1")
+    _run(conn, "e5e5e5e5e5e54f6aa222222222222222")
     result = _collect(world)
     assert result.eval_window == sh.NOT_COLLECTED
     text = "\n".join(sh.render(result, "UTC"))
@@ -279,7 +286,7 @@ def test_eval_window_is_a_separate_slot_that_sync_never_fills(world):
 
 def test_the_unknown_path_reads_only_the_allowed_tables_and_no_prices_of_conflicts(world):
     root, conn = world
-    _run(conn, "run-1")
+    _run(conn, "e5e5e5e5e5e54f6aa222222222222222")
     _conflict(conn)
     _gap(conn, "JP225", "2026-11-04", "reference_suspected", detail={"median_fill_ppm": 1})
     seen: list[tuple[str, str]] = []
