@@ -724,10 +724,9 @@ def affected(args):
         for parent in sorted(sub_parents):
             path = parent.split('::', 1)[0]
             old, new = declared_data(base, path), declared_data(head, path)
-            old_node, old_hash = anchor_digest(parent, old) if old is not None else (None, None)
-            new_node, new_hash = anchor_digest(parent, new) if new is not None else (None, None)
-            if (old_hash is not None and new_hash is not None and old_hash != new_hash and
-                    any(node and node.end_lineno - node.lineno + 1 > 300 for node in (old_node, new_node))):
+            old_hash = anchor_digest(parent, old)[1] if old is not None else None
+            new_hash = anchor_digest(parent, new)[1] if new is not None else None
+            if old_hash is not None and new_hash is not None and old_hash != new_hash:
                 items.add(('coarse_parent_changed', parent, '', ''))
         for anchor in sorted(declarations):
             path = anchor.split('::', 1)[0]
