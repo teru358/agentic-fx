@@ -19,22 +19,17 @@ def _page(title: str, body: str) -> bytes:
     return render._document(title, body, refresh=False)
 
 
-def approval_forms(approval_id: int, digest: str) -> str:
-    """承認詳細に足す「承認」「却下」の form。押しても確認画面が出るだけで、実行は 2 回目。"""
+def approval_forms(approval_id: int, digest: str, block: str = "") -> str:
+    """承認詳細の概要に足す決定の節。``block`` (決定のブロックの本文) の後に「承認」「却下」の form を置く。
+    押しても確認画面が出るだけで、実行は 2 回目。"""
     hidden = f'<input type="hidden" name="payload_sha256" value="{escape(digest)}">'
     base = f"/approvals/{int(approval_id)}"
-    return ("<section><h2>決定</h2>"
-            f'<form method="post" action="{base}/approve">{hidden}'
+    return ("<section><h2>決定</h2>" + block
+            + f'<form method="post" action="{base}/approve">{hidden}'
             '<button type="submit">承認</button></form>'
             f'<form method="post" action="{base}/reject">{hidden}'
             '<label>却下の理由 <input type="text" name="reason" maxlength="500"></label> '
             '<button type="submit">却下</button></form></section>')
-
-
-def drop_refresh(page: bytes) -> bytes:
-    """入力中の値を消さないよう、自動の読み直しを外す。"""
-    refresh = f'<meta http-equiv="refresh" content="{render.REFRESH_SECONDS}">'.encode()
-    return page.replace(refresh, b"", 1)
 
 
 def inject_forms(page: bytes, forms: str) -> bytes:
@@ -48,7 +43,7 @@ def inject_forms(page: bytes, forms: str) -> bytes:
 
 
 def improve_form_section() -> str:
-    """読む画面 (/improve) の末尾に足す、改善の実行 form。"""
+    """Improve の実行タブに置く、改善の実行 form。"""
     return ("<section><h2>改善を実行</h2><form method=\"post\" action=\"/improve/runs\">"
             "<p><label>期間 (秒、省略可) <input type=\"text\" name=\"duration_sec\" "
             "inputmode=\"numeric\" maxlength=\"5\"></label></p>"

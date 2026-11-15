@@ -1,4 +1,4 @@
-# 同梱 web の配置の整理 (web-layout-tabs) 設計 C2.1
+# 同梱 web の配置の整理 (web-layout-tabs) 設計 C2.2
 
 **チケット:** `web-layout-tabs` (中、機能)。関連: `web-plugin-improve-hub` (今の画面群を作った束)、`web-ui-charts-equity-indicators` (チャートは後)
 **状態:** C2.1 (2026-11-15)。方針は利用者が決定 (§3)、sol 1 周目 (Important 9 / Minor 1)・opus 2 周目 (Important 7 / Minor 10)・sol 3 周目 (Important 1 / Minor 1) を反映
@@ -345,6 +345,7 @@
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-11-15 | C2.2 | 実装で決めた細部を記す: Improve の履歴の取得失敗 (502 + 帯) も 30 秒ごとに読み直す (復旧で戻る)。result の第 2 key (reason_code) も dir の向きに並べる。params の差分が空のときは classification で 0 件 / 前版なし / 取得できないを分ける。追加節を 1 つも省いていないときは省略の注記を出さない | 実装 (T1〜T4) と実装レビュー 3 周 | fd63d4f6..c745257c |
 | 2026-11-15 | C2.1 | 決定のブロックの規模を項目ごとに「数値 / 取得できない / 非表示」で出す (endpoint の失敗と redacted を 0 と数えない) と 3 つの受入。仮想ページの骨格は常に refresh=True で測る | sol 3 周目 (Important 1 / Minor 1、27 件中 23 件閉、4 件は部分的でこの 2 件に集約) | — |
 | 2026-11-15 | C2 | <ul><li>決定のブロック (承認の内容 = payload_sha256、候補 (artifact)、比較の再掲、見ていないタブの規模、link、1 文) を form と一緒に出し、64 KiB は form 側で判定</li><li>form の条件に transport_ok と「clip されていない」を足す</li><li>仮想ページを「帯を含む骨格 + 全タブの節」と定義し、64 KiB 以上なら全タブを clip。受入は「同じ算法・タブに依らない」</li><li>履歴の取得失敗は、書込みが使えるとき 502 + 帯</li><li>承認詳細の変更・申告のタブは再読込しない</li><li>表の予算に見出しの link・枠・帯を数える。比べ方の細部 (bool・naive な時刻・reason_code の欠損・href の escape)</li><li>404 と 400 の順序、帯の項目の link 先、変更内容なしの dl の並び、空の群、sticky な th の背景</li><li>form の置き場所は概要 (§3 の 4、利用者の裁定)</li></ul> | opus 2 周目 (Important 7 / Minor 10) | — |
 | 2026-11-15 | C1 | <ul><li>承認詳細の「決定」と「検査」のタブをやめ、form と注意の節 (gate・再評価・土台・履歴証跡) を概要のタブに集める</li><li>比較は digest で保証されないことを明記し、概要に比較対象と 1 文を出す。候補の hash は `change.candidate_hash`</li><li>再読込は form を足せたときだけ外す (受入表)</li><li>予算は仮想の 1 ページで今の計算を 1 回行い、タブで切り出す。承認詳細はどのタブでも 2 回取得する</li><li>並べ替えの値・比べ方・初めの向き・欠損・安定性の表。有用性の見出しに link を 2 つ</li><li>improve の件数の注記を「取得した最新 L 件のうち S 件」に</li><li>route ごとの key と組合せの表、link の組み立ての規則</li><li>書込みが使える (write context と transport_ok) の区別。「実行」タブは一覧を取得せず、履歴の失敗は 502</li><li>例外の表示 (変更内容なし、終端の記録なし) の振り分け</li></ul> | sol 1 周目 (Important 9 / Minor 1) | — |

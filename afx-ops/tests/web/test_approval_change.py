@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from afx_ops.api_client import Reply
-from afx_ops.web import render
+from afx_ops.web import render, tabs
 from afx_ops.web.render import (DIFF_BUDGET_BYTES, FILE_QUOTA_BYTES, OTHER_BUDGET_BYTES,
                                 PAGE_LIMIT_BYTES, VALUE_CHARS, plan_diff)
 from afx_ops.web.request import Request, handle_request
@@ -66,15 +66,36 @@ class Client:
             else Reply(404, None, "not_found")
 
 
-def page_of(client, path="/approvals/7"):
-    response = handle_request(Request("GET", path, {}), client)
+TABS = tabs.tab_names(tabs.APPROVAL_DETAIL)
+
+
+def page_of(client, path="/approvals/7", tab=None):
+    response = handle_request(Request("GET", path, {} if tab is None else {"tab": tab}), client)
     assert response.status == 200
     return response.body
 
 
+def every_tab(client) -> str:
+    """4 タブの本文をすべて並べる (どのタブにも出ないことを確かめるとき用)。"""
+    return "\n".join(page_of(client, tab=tab).decode() for tab in TABS)
+
+
 def compose(change_data, detail=None):
     detail = detail if detail is not None else dict(DETAIL)
-    return render.compose_approval_page(detail, change_data["change"], change_data)
+    built = render.compose_approval_page(detail, change_data["change"], change_data)
+    return built
+
+
+def tab_page(built, tab, detail=None) -> bytes:
+    return built.view(detail if detail is not None else DETAIL, tab, "/approvals/7").page
+
+
+def tab_text(built, tab, detail=None) -> str:
+    return tab_page(built, tab, detail).decode()
+
+
+def all_text(built, detail=None) -> str:
+    return "\n".join(tab_text(built, tab, detail) for tab in TABS)
 
 
 def sections(body: bytes) -> list[str]:
@@ -84,16 +105,18 @@ def sections(body: bytes) -> list[str]:
 # ---------------------------------------------------------------- AC-12: 5 節
 
 def test_ac12_page_has_the_five_sections_holdout_and_web_only_rationale():
-    body = page_of(Client(change_data=make_change_data()))
-    assert sections(body) == ["概要", "params の差分", "成績", "申告 (agent の申告・未検証)",
-                              "変更 diff"]
-    text = body.decode()
-    assert "holdout USDJPY" in text and "trades=20 PF=1.18 avg_r=0.08" in text
-    assert "<h3>selection_rationale</h3><pre>R</pre>" in text
-    assert "<h3>summary</h3><pre>S</pre>" in text
-    assert "<dt>params.period</dt><dd>14 → 10</dd>" in text
-    assert "<h3>plugin.py</h3><pre>@@ -1 +1 @@\n+x = 1\n</pre>" in text
-    assert "<h3>config.yaml</h3><p>差分なし</p>" in text
+    client = Client(change_data=make_change_data())
+    by_tab = {tab: page_of(client, tab=tab) for tab in TABS}
+    assert {tab: sections(body) for tab, body in by_tab.items()} == {
+        "overview": ["概要"], "result": ["成績"], "change": ["params の差分", "変更 diff"],
+        "claims": ["申告 (agent の申告・未検証)"]}
+    result, claims, change = (by_tab[tab].decode() for tab in ("result", "claims", "change"))
+    assert "holdout USDJPY" in result and "trades=20 PF=1.18 avg_r=0.08" in result
+    assert "<h3>selection_rationale</h3><pre>R</pre>" in claims
+    assert "<h3>summary</h3><pre>S</pre>" in claims
+    assert "<dt>params.period</dt><dd>14 → 10</dd>" in change
+    assert "<h3>plugin.py</h3><pre>@@ -1 +1 @@\n+x = 1\n</pre>" in change
+    assert "<h3>config.yaml</h3><p>差分なし</p>" in change
 
 
 def test_ac12_page_calls_the_detail_then_the_change_endpoint_once_each():
@@ -104,9 +127,9 @@ def test_ac12_page_calls_the_detail_then_the_change_endpoint_once_each():
 
 def test_ac12_change_failures_still_render_the_page_with_a_fixed_text():
     for client in (Client(), Client(fail_change=True)):
-        text = page_of(client).decode()
-        assert "概要" in text and "変更 diff" in text
-        assert render.REASON_TEXT["unavailable"] in text
+        assert "概要" in page_of(client).decode()
+        change = page_of(client, tab="change").decode()
+        assert "変更 diff" in change and render.REASON_TEXT["unavailable"] in change
 
 
 def test_ac12_page_without_any_change_keeps_the_legacy_detail_and_fixed_text():
@@ -226,13 +249,15 @@ def test_ac12_markup_heavy_input_keeps_the_complete_page_under_64_kib():
                                  "flatten_omitted": 1, "reason": None})
     data = make_change_data(files, change, {"summary": bomb * 5, "selection_rationale": bomb * 5})
     built = compose(data)
-    assert len(built.page) < PAGE_LIMIT_BYTES
-    assert b"Output clipped" not in built.page
+    assert built.total_bytes < PAGE_LIMIT_BYTES and not built.clipped
     assert built.diff_bytes <= DIFF_BUDGET_BYTES
     assert built.other_bytes <= OTHER_BUDGET_BYTES
-    assert b"holdout" in built.page
-    for text in re.findall(rb"<pre>(.*?)</pre>", built.page, re.S):
-        assert b"<" not in text.replace(b"&lt;", b"")
+    assert b"holdout" in tab_page(built, "result")
+    for tab in TABS:
+        page = tab_page(built, tab)
+        assert len(page) < PAGE_LIMIT_BYTES and b"Output clipped" not in page
+        for text in re.findall(rb"<pre>(.*?)</pre>", page, re.S):
+            assert b"<" not in text.replace(b"&lt;", b"")
 
 
 def test_ac12_other_sections_shrink_params_first_then_claims():
@@ -242,18 +267,19 @@ def test_ac12_other_sections_shrink_params_first_then_claims():
     data = make_change_data(change=change, claims={"summary": "s" * 2000,
                                                     "selection_rationale": "r" * 2000})
     built = compose(data)
-    text = built.page.decode()
     assert built.other_bytes <= OTHER_BUDGET_BYTES
-    assert "件省略)" in text  # params が先に削られる
+    change = tab_text(built, "change")
+    assert "件省略)" in change  # params が先に削られる
     # 申告は params を削って収まる限り、切らずに残る
-    assert "s" * 2000 in text and "r" * 2000 in text
-    assert 0 < text.count("<dt>params.k") < 64
+    claims = tab_text(built, "claims")
+    assert "s" * 2000 in claims and "r" * 2000 in claims
+    assert 0 < change.count("<dt>params.k") < 64
 
 
 def test_ac12_page_is_under_64_kib_even_with_maximal_everything():
     entries = [entry_with_need(p, 200 * KIB) for p in ("plugin.py", "config.yaml", "test_plugin.py")]
     built = compose(make_change_data(entries))
-    assert len(built.page) < PAGE_LIMIT_BYTES and built.diff_bytes <= DIFF_BUDGET_BYTES
+    assert built.total_bytes < PAGE_LIMIT_BYTES and built.diff_bytes <= DIFF_BUDGET_BYTES
 
 
 # ---------------------------------------------------------------- AC-5 / 23a (web)
@@ -264,7 +290,7 @@ def test_ac5_web_values_are_cut_at_80_escaped_characters_without_splitting_entit
         change = make_change(params={"items": items, "omitted": 0, "invalid_keys": 0,
                                      "flatten_omitted": 0, "reason": None})
         built = compose(make_change_data(change=change))
-        return re.search(r"<dt>k</dt><dd>a → (.*?)</dd>", built.page.decode()).group(1)
+        return re.search(r"<dt>k</dt><dd>a → (.*?)</dd>", tab_text(built, "change")).group(1)
 
     for length, cut in ((VALUE_CHARS - 1, False), (VALUE_CHARS, False), (VALUE_CHARS + 1, True)):
         value = "v" * length
@@ -282,7 +308,7 @@ def test_ac5_web_cut_counts_the_escaped_form_of_the_next_character():
     change = make_change(params={"items": items, "omitted": 0, "invalid_keys": 0,
                                  "flatten_omitted": 0, "reason": None})
     out = re.search(r"<dt>k</dt><dd>a → (.*?)</dd>",
-                    compose(make_change_data(change=change)).page.decode()).group(1)
+                    tab_text(compose(make_change_data(change=change)), "change")).group(1)
     assert out == "v" * (VALUE_CHARS - 2) + "…"
 
 
@@ -292,7 +318,7 @@ def test_ac23a_web_orders_removal_escape_and_cut_so_markup_cannot_exceed_the_lim
     change = make_change(params={"items": items, "omitted": 0, "invalid_keys": 0,
                                  "flatten_omitted": 0, "reason": None})
     out = re.search(r"<dt>k</dt><dd>a → (.*?)</dd>",
-                    compose(make_change_data(change=change)).page.decode()).group(1)
+                    tab_text(compose(make_change_data(change=change)), "change")).group(1)
     assert out == "&lt;" * 19 + "z" and len(out) <= VALUE_CHARS
     assert html.unescape(out) == value
 
@@ -309,7 +335,7 @@ def test_web_strips_control_format_and_surrogate_characters_but_keeps_newlines()
     nasty = "a\x07b‮c\ud800d\x1b[31me"
     data = make_change_data(claims={"summary": nasty + "\nline2", "selection_rationale": "-"},
                             files=[file_entry("plugin.py", ["+" + nasty])])
-    text = compose(data).page.decode()
+    text = all_text(compose(data))
     assert "\x07" not in text and "‮" not in text and "\x1b" not in text
     assert "abc" in text and "\nline2" in text
 
@@ -317,10 +343,11 @@ def test_web_strips_control_format_and_surrogate_characters_but_keeps_newlines()
 # ---------------------------------------------------------------- AC-25 / 26 / 31a / 13
 
 def test_ac25_page_shows_twelve_hash_digits_and_the_computed_time():
-    text = page_of(Client(change_data=make_change_data())).decode()
+    client = Client(change_data=make_change_data())
+    text = page_of(client).decode()
     assert f"<dt>候補</dt><dd>{H_CAND[:12]}</dd>" in text
     assert f"<dt>比較対象</dt><dd>{H_BASE[:12]}</dd>" in text
-    assert H_CAND[:13] not in text
+    assert H_CAND[:13] not in every_tab(client)
     assert "<dt>計算時刻</dt><dd>2026-10-19 01:02:03 +00:00</dd>" in text
 
 
@@ -328,31 +355,33 @@ def test_ac25_page_shows_twelve_hash_digits_and_the_computed_time():
                                         ("unknown", "不明")])
 def test_ac26_classification_has_exactly_one_label(cls, label):
     data = make_change_data(change=make_change(classification=cls))
-    text = compose(data).page.decode()
-    assert f"<dt>分類</dt><dd>{label}</dd>" in text
-    assert "同一版・変更なし" not in text
+    built = compose(data)
+    assert f"<dt>分類</dt><dd>{label}</dd>" in tab_text(built, "overview")
+    assert "同一版・変更なし" not in all_text(built)
 
 
 @pytest.mark.parametrize("code", ["unavailable", "hash_mismatch", "too_large", "unsafe_source",
                                   "redacted"])
 def test_ac31a_each_reason_code_prints_only_its_fixed_text(code):
     data = make_change_data(change=make_change(reason=code, classification="unknown"), files=[])
-    text = compose(data).page.decode()
-    assert render.REASON_TEXT[code] in text
+    built = compose(data)
+    assert render.REASON_TEXT[code] in tab_text(built, "overview")
     others = {t for c, t in render.REASON_TEXT.items() if t != render.REASON_TEXT[code]}
+    text = all_text(built)
     assert not any(other in text for other in others)
 
 
 def test_ac31a_unknown_reason_code_falls_back_to_a_fixed_text_without_echo():
     data = make_change_data(change=make_change(reason="free text /etc/passwd"), files=[])
-    text = compose(data).page.decode()
-    assert render.REASON_TEXT["unsafe_source"] in text and "passwd" not in text
+    built = compose(data)
+    assert render.REASON_TEXT["unsafe_source"] in tab_text(built, "overview")
+    assert "passwd" not in all_text(built)
 
 
 def test_ac31a_redacted_file_is_hidden_alone_and_other_files_are_shown():
     files = [file_entry("plugin.py", None, "redacted"),
              file_entry("config.yaml", ["+k: v"]), file_entry("test_plugin.py", None, "unchanged")]
-    text = compose(make_change_data(files)).page.decode()
+    text = tab_text(compose(make_change_data(files)), "change")
     assert f"<h3>plugin.py</h3><p>{render.REASON_TEXT['redacted']}</p>" in text
     assert "<h3>config.yaml</h3><pre>@@ -1 +1 @@\n+k: v\n</pre>" in text
 
@@ -362,7 +391,7 @@ def test_ac31a_params_granularity_value_redaction_keeps_other_rows():
              {"key": "params.b", "old": "1", "new": "2"}]
     change = make_change(params={"items": items, "omitted": 0, "invalid_keys": 1,
                                  "flatten_omitted": 0, "reason": None})
-    text = compose(make_change_data(change=change)).page.decode()
+    text = tab_text(compose(make_change_data(change=change)), "change")
     assert "<dt>params.a</dt><dd>[redacted] → [redacted]</dd>" in text
     assert "<dt>params.b</dt><dd>1 → 2</dd>" in text
     assert "形に合わない key 1 件" in text
@@ -380,8 +409,7 @@ def test_ac13_unknown_fields_never_reach_the_page():
     data["diff"]["files"][0]["hunks"][0]["extra"] = marker
     data["change"]["params"]["items"][0]["extra"] = marker
     data["change"]["performance"]["in_sample"][0]["extra"] = marker
-    text = page_of(Client(detail, data)).decode()
-    assert marker not in text
+    assert marker not in every_tab(Client(detail, data))
 
 
 def test_ac13_the_approval_routes_are_unchanged_and_new_ones_are_appended():
@@ -404,7 +432,7 @@ def test_page_has_no_script_or_inline_style_with_hostile_values():
                                                "flatten_omitted": 0, "reason": None})
     data = make_change_data([file_entry("plugin.py", ["+" + hostile])], change,
                             {"summary": hostile, "selection_rationale": hostile})
-    text = compose(data).page.decode()
+    text = all_text(compose(data))
     assert "<script" not in text.replace("<style>", "") and "<img" not in text
     assert " style=" not in text and " onerror" not in text.replace("onerror=y", "")
 
@@ -457,22 +485,23 @@ def test_page_plans_the_diff_exactly_once(monkeypatch):
                                          ("params", {"items": "x"}), ("params", [])])
 def test_malformed_change_fields_degrade_to_one_fixed_line(field, value):
     change = make_change(**{field: value})
-    body = page_of(Client(change_data=make_change_data(change=change))).decode()
-    assert render.INVALID_CHANGE_TEXT in body
-    assert "変更 diff" not in body
+    client = Client(change_data=make_change_data(change=change))
+    assert render.INVALID_CHANGE_TEXT in page_of(client).decode()
+    assert "変更 diff" not in every_tab(client)
 
 
 def test_malformed_summary_in_detail_is_ignored_when_the_change_endpoint_is_valid():
     detail = dict(DETAIL, change={"classification": []})
-    text = page_of(Client(detail=detail, change_data=make_change_data())).decode()
-    assert render.INVALID_CHANGE_TEXT not in text and "変更 diff" in text
+    client = Client(detail=detail, change_data=make_change_data())
+    assert render.INVALID_CHANGE_TEXT not in every_tab(client)
+    assert "変更 diff" in page_of(client, tab="change").decode()
 
 
 def test_a_degraded_diff_file_says_the_computation_was_skipped():
     entry = file_entry("plugin.py", ["-a", "+b"])
     entry["diff_degraded"] = "too_many_lines"
-    text = render.compose_approval_page(DETAIL, make_change(), make_change_data([entry])).page.decode()
-    assert render.DIFF_DEGRADED_TEXT in text
+    built = render.compose_approval_page(DETAIL, make_change(), make_change_data([entry]))
+    assert render.DIFF_DEGRADED_TEXT in tab_text(built, "change")
 
 
 def test_performance_rows_show_win_rate_max_dd_and_kill_switch_for_both_scopes():

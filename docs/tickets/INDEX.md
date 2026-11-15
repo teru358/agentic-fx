@@ -3,7 +3,7 @@
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 未完了: 175 件。完了分は closed/。
 
-## 実装中 (5)
+## 実装中 (6)
 
 ### 不具合 (3)
 
@@ -13,11 +13,12 @@
 | [history-import-stops-at-first-conflict](open/history-import-stops-at-first-conflict.md) | 中 | 2026-11-13 | history import は食い違う足 1 本で partial 停止し後続を取り込まない |
 | [status-history-hidden-while-daemon-runs](open/status-history-hidden-while-daemon-runs.md) | 中 | 2026-11-13 | daemon 稼働中は評価用履歴の状態を見る面が無い |
 
-### 機能 (1)
+### 機能 (2)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [killswitch-reset-hwm-rebase](open/killswitch-reset-hwm-rebase.md) | 高 | 2026-11-13 | kill switch の手動解除で HWM を付け直す明示操作が無い |
+| [web-layout-tabs](open/web-layout-tabs.md) | 中 | 2026-11-15 | 同梱 web の各画面をタブに分け、plugin と improve の表を並べ替え可能にする |
 
 ### 保守 (1)
 
@@ -77,7 +78,7 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (152)
+## 設計待ち (151)
 
 ### 不具合 (80)
 
@@ -164,7 +165,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (43)
+### 機能 (42)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -180,7 +181,6 @@
 | [multi-input-indicator-relations](open/multi-input-indicator-relations.md) | 中 | 2026-10-31 | 多入力 indicator: 2 銘柄の生系列から関係 (相関・スプレッド・β) を指標として計算する |
 | [improve-runner-choice](open/improve-runner-choice.md) | 中 | 2026-11-08 | 改善の実行ごとに backend / model の候補を選べるようにする |
 | [web-https-for-writes](open/web-https-for-writes.md) | 中 | 2026-11-08 | 同梱 web を HTTPS で動かし LAN から書込めるようにする |
-| [web-layout-tabs](open/web-layout-tabs.md) | 中 | 2026-11-15 | 同梱 web の各画面をタブに分け、plugin と improve の表を並べ替え可能にする |
 | [improve-targeted-run](open/improve-targeted-run.md) | 低 | 2026-09-12 | 現状は `improve add <text>` + 引数なし `improve` で LLM が open から自分… |
 | [pine-script-to-plugin](open/pine-script-to-plugin.md) | 低 | 2026-09-12 | Pine script を plugin に変換する手段が無い |
 | [indicator-reference-oracle-gate](open/indicator-reference-oracle-gate.md) | 低 | 2026-09-15 | indicator の正しさを確かめる門が無い |

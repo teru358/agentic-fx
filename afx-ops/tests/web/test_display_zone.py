@@ -60,14 +60,15 @@ class Client:
         return Reply(200, self.replies["activity"], None)
 
 
-def _get(client, path):
-    response = handle_request(Request("GET", path, {}), client)
+def _get(client, path, query=None):
+    response = handle_request(Request("GET", path, query or {}), client)
     assert response.status == 200
     return response.body.decode()
 
 
 def test_every_status_time_at_every_depth_is_converted_to_the_zone_of_the_response():
-    text = _get(Client(status=_status()), "/")
+    client = Client(status=_status())
+    text = "".join(_get(client, "/", {"tab": tab}) for tab in ("overview", "bot", "econ", "reaction"))
     for shown in ("2026-11-06 19:04:05 +09:00", "2026-11-06 19:11:00 +09:00",
                   "2026-11-06 19:22:00 +09:00", "2026-11-06 19:33:00 +09:00",
                   "2026-11-06 19:44:00 +09:00"):
@@ -130,7 +131,7 @@ def test_every_page_has_the_zone_line_at_the_top(path, key):
                "activity": {"lines": [], "display_timezone": TOKYO}}
     text = _get(Client(**replies), path)
     head = text.split("</nav>", 1)[1]
-    assert re.match(r"<h1>[^<]*</h1><p>表示 tz: Asia/Tokyo \(\+09:00\)</p>", head)
+    assert re.match(r"<h1>[^<]*</h1>(<nav class=\"tabs\">.*?</nav>)?<p>表示 tz: Asia/Tokyo \(\+09:00\)</p>", head)
 
 
 def test_the_approval_pages_have_the_zone_line_and_a_converted_created_at():
@@ -158,12 +159,12 @@ def _change(computed="2026-11-06T10:06:00+00:00", summary="LLM 要約 2026-11-06
             "performance": {"in_sample": [], "holdout": []}, "summary": summary}
 
 
-def _approval_text(tz=TOKYO, **change):
+def _approval_text(tz=TOKYO, tab="overview", **change):
     change_data = {"id": 7, "change": _change(**change),
                    "claims": {"summary": "要約 2026-11-06T10:07:00Z",
                               "selection_rationale": "根拠 2026-11-06T10:08:00+00:00"},
                    "diff": {"files": [], "omitted_lines": 0}, "display_timezone": tz}
-    return _get(Client(approval=_detail(tz), change=change_data), "/approvals/7")
+    return _get(Client(approval=_detail(tz), change=change_data), "/approvals/7", {"tab": tab})
 
 
 def test_the_approval_page_converts_decided_at_and_the_hand_written_computed_time_row():
@@ -174,10 +175,10 @@ def test_the_approval_page_converts_decided_at_and_the_hand_written_computed_tim
 
 
 def test_llm_text_and_identifiers_are_not_converted():
-    text = _approval_text()
-    assert "要約 2026-11-06T10:07:00Z" in text
-    assert "根拠 2026-11-06T10:08:00+00:00" in text
-    assert "a1a1a1a1a1a1" in text
+    claims = _approval_text(tab="claims")
+    assert "要約 2026-11-06T10:07:00Z" in claims
+    assert "根拠 2026-11-06T10:08:00+00:00" in claims
+    assert "a1a1a1a1a1a1" in _approval_text()
 
 
 def test_an_unreadable_computed_time_stays_as_written_and_does_not_fail_the_page():

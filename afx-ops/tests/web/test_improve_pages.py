@@ -14,6 +14,7 @@ from afx_ops.web.request import Request, handle_request
 from afx_ops.web.routes import resolve_route
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
+DETAIL_TABS = ("overview", "agent", "result", "handoff")
 DTOS = json.loads((FIXTURES / "improve_run_summary_dtos.json").read_text())
 
 
@@ -68,9 +69,15 @@ def body_of(text: str) -> str:
     return text.split("</nav>", 1)[1]
 
 
-def detail_page(key_or_data, run_id: int = 7) -> str:
+def detail_page(key_or_data, run_id: int = 7, tab: str | None = None) -> str:
     data = dto(key_or_data, run_id) if isinstance(key_or_data, str) else key_or_data
-    return body_of(page(f"/improve/{data['id']}", Client(detail=data)))
+    return body_of(page(f"/improve/{data['id']}", Client(detail=data),
+                        {} if tab is None else {"tab": tab}))
+
+
+def all_tabs(key_or_data) -> str:
+    """4 つのタブの本文をつなげる (どのタブにも出る節の有無を、タブを問わず確かめる)。"""
+    return "".join(detail_page(key_or_data, tab=name) for name in DETAIL_TABS)
 
 
 # ---------------------------------------------------------------- route
@@ -156,43 +163,48 @@ def test_a_hostile_list_value_is_escaped_or_rendered_as_a_fixed_word():
     assert "<script" not in text and hostile not in text
 
 
+def wide_runs(count: int) -> list[dict]:
+    return [run_row(10**17 - i, plugin="p" * 64, failed_conditions=["pf"] * 5,
+                    approval_id=10**17) for i in range(count)]
+
+
 def test_a_huge_list_stays_within_the_response_limit_and_says_what_is_omitted():
-    runs = [run_row(10**17 - i, plugin="p" * 64, failed_conditions=["pf"] * 5,
-                    approval_id=10**17) for i in range(100)]
-    listing = {"runs": runs, "has_more": False}
+    listing = {"runs": wide_runs(improve_pages.ROW_LIMIT), "has_more": False}
     response = get("/improve", Client(listing=listing))
     assert response.status == 200 and len(response.body) <= render.MAX_RESPONSE_BYTES
-    forms = "<section>" + "x" * 30000 + "</section>"
-    body = improve_pages.render_improve_list(listing, forms=forms)
-    assert len(body) <= render.MAX_RESPONSE_BYTES and forms.encode() in body
-    assert "件省略" in body.decode()
+    assert "件省略" in response.body.decode() and b"Output clipped" not in response.body
 
 
 # ---------------------------------------------------------------- 詳細
 
 def test_a_submitted_run_shows_every_summary_item():
-    text = detail_page("canary_improved")
-    for fragment in ("仮説", "idea for cand", "agent の説明", "test rationale", "cand candidate",
-                     "試したもの", "床との差", "床 (閾値)", "配備中の版との比較",
-                     "上回った", "holdout で配備中の版を上回る", "USDJPY", "候補を提出",
-                     "enforce (採否に反映)", "local", '<a href="/approvals/1">#1</a>',
-                     '<a href="/plugins/cand">cand</a>'):
-        assert fragment in text, fragment
+    by_tab = {
+        "overview": ("候補を提出", "local", '<a href="/approvals/1">#1</a>'),
+        "agent": ("仮説", "idea for cand", "agent の説明", "test rationale", "cand candidate",
+                  "試したもの", '<a href="/plugins/cand">cand</a>'),
+        "result": ("床との差", "床 (閾値)", "配備中の版との比較", "上回った",
+                   "holdout で配備中の版を上回る", "USDJPY", "enforce (採否に反映)"),
+    }
+    for tab, fragments in by_tab.items():
+        text = detail_page("canary_improved", tab=tab)
+        for fragment in fragments:
+            assert fragment in text, (tab, fragment)
 
 
 def test_a_floor_miss_shows_the_failed_stage_conditions_and_the_thresholds():
-    text = detail_page("unprofitable_holdout")
+    text = detail_page("unprofitable_holdout", tab="result")
     assert "床を割った段: holdout" in text
-    assert "PF の下限" in text and "床未達" in text
+    assert "PF の下限" in text
+    assert "床未達" in detail_page("unprofitable_holdout")
 
 
 def test_a_not_improved_run_shows_the_comparison_against_the_deployed_version():
-    text = detail_page("not_improved")
+    text = detail_page("not_improved", tab="result")
     assert "配備中の版との比較" in text and "上回らない" in text
 
 
 def test_the_handoff_comes_from_the_parent_summary():
-    text = detail_page("insufficient_trades")
+    text = detail_page("insufficient_trades", tab="handoff")
     assert "次回への申し送り" in text and "strategy:未配備指標@1h@USDJPY" in text
     assert "未提出" in text
 
@@ -208,12 +220,12 @@ def test_handoff_outcomes_are_displayed(word, expected):
     data = dto("insufficient_trades")
     data["summary"]["items"]["handoff"] = {
         "family": "family", "attempts": 1, "outcomes": {word: 1}}
-    assert expected in detail_page(data)
+    assert expected in detail_page(data, tab="handoff")
 
 
 @pytest.mark.parametrize("key", sorted(k for k in DTOS if not k.startswith("_")))
 def test_every_real_dto_renders_without_a_stray_python_value(key):
-    text = detail_page(key)
+    text = all_tabs(key)
     assert "None" not in text and "{'" not in text and "[{" not in text and "Traceback" not in text
 
 
@@ -222,7 +234,7 @@ def test_a_run_without_a_summary_row_says_the_summary_is_missing_but_shows_the_s
     data["summary"] = None
     text = detail_page(data)
     assert improve_pages.NO_SUMMARY_TEXT in text and "候補を提出" in text
-    assert "仮説" not in text
+    assert "仮説" not in all_tabs(data)
 
 
 @pytest.mark.parametrize(("state", "note"), [("empty", "要約の材料がありません"),
@@ -231,14 +243,14 @@ def test_a_summary_that_is_not_ok_says_why_and_shows_no_items(state, note):
     data = dto("submitted")
     data["summary"] = {"version": 1, "state": state, "items": {"hypothesis": {"idea": "SECRET"}}}
     text = detail_page(data)
-    assert note in text and "SECRET" not in text
+    assert note in text and "SECRET" not in all_tabs(data)
 
 
 def test_a_summary_state_outside_the_known_words_is_a_generic_note():
     data = dto("submitted")
     data["summary"] = {"version": 1, "state": "weird", "items": {"hypothesis": {"idea": "X1"}}}
     text = detail_page(data)
-    assert "要約を表示できません" in text and "X1" not in text
+    assert "要約を表示できません" in text and "X1" not in all_tabs(data)
 
 
 def test_a_mission_without_a_terminal_record_says_so():
@@ -253,7 +265,7 @@ def test_the_floor_report_is_the_fallback_when_the_summary_has_no_floor():
     data["floor"] = {"stages": [{"stage": "holdout", "pairs": [
         {"pair": "USDJPY", "trades": 12, "pf": 0.8, "avg_r": -0.1, "evaluable": True,
          "conditions": ["pf"]}]}]}
-    text = detail_page(data)
+    text = detail_page(data, tab="result")
     assert "床との差 (レポートから)" in text and "USDJPY" in text and "0.8" in text
 
 
@@ -266,7 +278,7 @@ def test_agent_text_is_escaped_and_controls_are_removed():
     items["explanation"]["artifact_summary"] = hostile
     items["observation"] = hostile
     items["handoff"] = {"family": hostile, "attempts": 1, "outcomes": {"x_y": 1}}
-    text = detail_page(data)
+    text = all_tabs(data)
     assert "<img" not in text and "&lt;img src=x onerror=alert(1)&gt;" in text
     assert "\x00" not in text and "\x07" not in text and "‮" not in text
 
@@ -274,7 +286,7 @@ def test_agent_text_is_escaped_and_controls_are_removed():
 def test_long_agent_text_is_cut_with_a_mark():
     data = dto("canary_improved")
     data["summary"]["items"]["hypothesis"]["idea"] = "あ" * 5000
-    text = detail_page(data)
+    text = detail_page(data, tab="agent")
     assert "あ" * 5000 not in text and "…" in text
 
 
@@ -291,7 +303,7 @@ def test_fields_outside_the_allowlist_never_reach_the_page():
     items["tried"]["secret"] = marker
     items["floor"]["stages"][0]["pairs"][0]["secret"] = marker
     items["comparison"]["pairs"][0]["candidate"]["secret"] = marker
-    assert marker not in detail_page(data)
+    assert marker not in all_tabs(data)
 
 
 def test_unknown_words_are_shown_as_unknown_never_as_a_known_result():
@@ -316,7 +328,7 @@ def test_a_hostile_scalar_in_every_detail_slot_is_neutralised():
                                                    failed=[hostile])
     items["comparison"].update(mode=hostile, verdict=hostile, reason=hostile, metrics=[hostile])
     items["comparison"]["pairs"][0].update(pair=hostile, verdict=hostile)
-    assert "<script" not in detail_page(data)
+    assert "<script" not in all_tabs(data)
 
 
 def test_a_detail_with_the_largest_allowed_content_fits_the_response_limit():
@@ -333,9 +345,13 @@ def test_a_detail_with_the_largest_allowed_content_fits_the_response_limit():
     items["comparison"]["pairs"] = [dict(cmp_pair, pair=f"R{i}" * 10) for i in range(64)]
     items["handoff"] = {"family": "<&>" * 200, "attempts": 5,
                         "outcomes": {f"w{i}": i + 1 for i in range(20)}}
-    response = get("/improve/7", Client(detail=data))
-    assert response.status == 200 and len(response.body) <= render.MAX_RESPONSE_BYTES
-    assert b"Output clipped" not in response.body and "件省略" in response.body.decode()
+    omitted = 0
+    for tab in DETAIL_TABS:
+        response = get("/improve/7", Client(detail=data), {"tab": tab})
+        assert response.status == 200 and len(response.body) <= render.MAX_RESPONSE_BYTES
+        assert b"Output clipped" not in response.body
+        omitted += response.body.decode().count("件省略")
+    assert omitted
 
 
 # ---------------------------------------------------------------- 失敗
@@ -425,44 +441,39 @@ def test_floor_report_fills_in_when_summary_pairs_were_dropped():
     data["floor"] = {"stages": [{"stage": "holdout", "pairs": [
         {"pair": "EURUSD", "trades": 12, "pf": 0.8, "avg_r": -0.1,
          "evaluable": True, "conditions": ["pf"]}]}]}
-    text = detail_page(data)
+    text = detail_page(data, tab="result")
     assert "床を割った段" in text and "床との差 (レポートから)" in text
     assert "EURUSD" in text and "0.8" in text
 
 
+def shown_rows(body: str) -> int:
+    return body.split("<tbody>", 1)[1].split("</tbody>", 1)[0].count("<tr>")
+
+
 def test_truncated_list_note_and_link_match_visible_rows():
-    runs = [run_row(10**17 - i, plugin="p" * 64, failed_conditions=["pf"] * 5,
-                    approval_id=10**17) for i in range(100)]
-    listing = {"runs": runs, "has_more": True}
-    body = improve_pages.render_improve_list(listing, limit=100,
-                                               forms="<section>" + "x" * 30000 + "</section>").decode()
-    table = body.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
-    shown = table.count("<tr>")
-    assert 0 < shown < 100
-    assert f"最新 {shown} 件を表示" in body
-    assert f"…({100 - shown} 件省略" in body
+    listing = {"runs": wide_runs(improve_pages.ROW_LIMIT), "has_more": True}
+    body = improve_pages.render_improve_list(listing, limit=100).decode()
+    shown = shown_rows(body)
+    assert 0 < shown < improve_pages.ROW_LIMIT
+    assert f"取得した最新 {improve_pages.ROW_LIMIT} 件のうち {shown} 件を表示" in body
+    assert f"…({improve_pages.ROW_LIMIT - shown} 件省略" in body
     # 予算で表を切ったときは limit を増やしても同じ頁に入らないので、続きの link は出さず CLI へ案内する。
     assert 'href="/improve?limit=' not in body
     assert "afx ctl improve runs" in body
 
 
 def test_truncated_list_with_a_small_limit_does_not_link_back_to_the_same_rows():
-    runs = [run_row(10**17 - i, plugin="p" * 64, failed_conditions=["pf"] * 5,
-                    approval_id=10**17) for i in range(50)]
-    listing = {"runs": runs, "has_more": True}
-    body = improve_pages.render_improve_list(listing, limit=50,
-                                               forms="<section>" + "x" * 50000 + "</section>").decode()
-    table = body.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
-    shown = table.count("<tr>")
-    assert 0 < shown < 50
+    listing = {"runs": wide_runs(improve_pages.ROW_LIMIT), "has_more": True}
+    body = improve_pages.render_improve_list(listing, limit=50).decode()
+    assert 0 < shown_rows(body) < improve_pages.ROW_LIMIT
     assert 'href="/improve?limit=' not in body
 
 
 def test_reason_section_requires_parent_reason():
     data = dto("unprofitable_holdout")
     data["summary"]["items"].pop("parent_reason", None)
-    text = detail_page(data)
-    assert "床未達" in text
+    text = detail_page(data, tab="agent")
     assert "<h2>判定理由</h2>" not in text
     data["summary"]["items"]["parent_reason"] = "unprofitable"
-    assert "<h2>判定理由</h2>" in detail_page(data)
+    text = detail_page(data, tab="agent")
+    assert "<h2>判定理由</h2>" in text and "床未達" in text
