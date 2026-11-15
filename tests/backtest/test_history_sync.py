@@ -92,7 +92,7 @@ def test_recent_sync_of_a_complete_history_changes_nothing_and_advances_the_curs
     assert result.inserted == 0 and result.unchanged > 0 and result.conflicted == 0
     assert count(conn) == before
     assert result.cursors[SYMBOL] == E.isoformat()
-    # 後ろ窓は当日を含む 2 日 + 検査尾の前日窓 = D+1 = 3 要求
+    # E=11:30 の後ろ窓は 11-09 11:30 から。検査尾は同日内なので 11-09/10/11 の 3 要求
     assert result.requests == len(bridge.calls) == 3
     # 要求の開始間隔は 5 秒、待ちは仮想時計
     assert result.clock.sleeps == [5.0, 5.0]
@@ -267,7 +267,7 @@ def test_the_old_gap_budget_is_32_day_windows_per_subrun_and_until_done_finishes
     gap_ops = [o for o in first.ops if o.operation == "gap" and o.status != "deferred"]
     assert sum(o.requests for o in gap_ops) <= hs.OLD_GAP_WINDOWS
     assert len(gap_ops) >= hs.OLD_GAP_WINDOWS // 2
-    assert first.requests <= (2 + 1) * 1 + hs.OLD_GAP_WINDOWS
+    assert first.requests <= (2 + 2) * 1 + hs.OLD_GAP_WINDOWS
     assert "request_budget" in first.deferred_reasons
     assert first.result == "completed_with_gaps" and first.rc == 3
     open_after_first = first.gap_counts["open"]
@@ -687,13 +687,15 @@ def test_the_recent_operation_is_deferred_before_any_request_when_it_would_excee
         tmp_path, monkeypatch):
     conn, settings = _seeded(tmp_path)
     from agentic_fx.backtest import history_sync_plan as plan
-    # 後ろ窓が想定より長く決まってしまっても、D+1 窓の上限を超える操作は要求 0 で後送りにする
+    # 後ろ窓が想定より長く決まってしまっても、D+2 窓の上限を超える操作は要求 0 で後送りにする
     monkeypatch.setattr(plan, "lookback_start", lambda limit, days, boundary: limit - timedelta(days=6))
     bridge = FakeBridge()
     result = _run(conn, settings, bridge)
     recent = next(o for o in result.ops if o.operation == "recent")
     assert (recent.status, recent.reason, recent.requests) == ("deferred", "request_budget", 0)
-    assert bridge.calls == [] and result.cursors[SYMBOL] is None
+    # 上限外の範囲は未取得として queue に残り、要求はその gap 操作だけが出す
+    assert result.cursors[SYMBOL] is None
+    assert len(bridge.calls) == sum(o.requests for o in result.ops if o.operation == "gap") > 0
 
 
 def test_the_final_scan_stops_at_e_so_the_margin_slot_is_never_observed(tmp_path, monkeypatch):

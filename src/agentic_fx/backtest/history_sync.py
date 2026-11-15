@@ -33,6 +33,8 @@ from agentic_fx.store.ohlcv import inspection_tail_bars
 SOURCE = "mt5"
 REQUEST_SPACING_SEC = 5.0
 OLD_GAP_WINDOWS = 32
+#: recent の要求窓の上限は、後ろ窓 D 日 + 日をまたぐ検査尾の分の 2 窓
+RECENT_EXTRA_WINDOWS = 2
 MAX_SUBRUNS = 64
 SUSPECT_MEDIAN_DAYS = 20
 
@@ -482,7 +484,11 @@ class _Run:
                 unprocessed = self._unprocessed_days(symbol, max(prior, self.boundary), start)
             op = self._run_op(operation="recent", symbol=symbol, range_kind="recent",
                               start=start, end=self.limit, day=None,
-                              window_cap=self.lookback + 1)
+                              window_cap=self.lookback + RECENT_EXTRA_WINDOWS)
+            if op.status == "deferred" and op.reason == REASON_REQUEST_BUDGET:
+                # 上限外の範囲は黙って落とさず、日ごとの未取得として queue に残す。
+                first = start if prior is None else min(max(prior, self.boundary), start)
+                unprocessed = self._unprocessed_days(symbol, first, self.limit)
             self._after_op(op, advance_to=self.limit, unprocessed=unprocessed)
 
     def _unprocessed_days(self, symbol: str, start: datetime, end: datetime

@@ -231,12 +231,25 @@ def plan_prefix(last_processed_e: datetime | None, *, boundary: datetime, limit:
 
 
 def lookback_start(limit: datetime, days: int, boundary: datetime) -> datetime:
-    """手動同期の後ろ窓の始端。当日を含む UTC 暦日 `days` 日の先頭を B で切る。"""
-    day0 = datetime(limit.year, limit.month, limit.day, tzinfo=timezone.utc)
-    return max(boundary, day0 - timedelta(days=days - 1))
+    """手動同期の後ろ窓の始端。`max(B, E - days 日)` (日境界へは丸めない)。"""
+    return max(boundary, limit - timedelta(days=days))
+
+
+def request_windows(ranges: Sequence[tuple[datetime, datetime]], *,
+                    is_open: IsOpen = is_market_open) -> list[tuple[datetime, datetime]]:
+    """複数の範囲 (追記・後ろ窓・固定尾) を UTC 日で分割した要求窓の和集合。
+
+    同じ UTC 日の重なった範囲は 1 窓にまとめ、全日閉場の窓は含めない。"""
+    spans: dict[datetime, list[datetime]] = {}
+    for s, e in ranges:
+        for ws, we in fetch_windows(s, e, is_open=is_open):
+            day = datetime(ws.year, ws.month, ws.day, tzinfo=timezone.utc)
+            cur = spans.get(day)
+            spans[day] = [ws, we] if cur is None else [min(cur[0], ws), max(cur[1], we)]
+    return [(lo, hi) for _day, (lo, hi) in sorted(spans.items())]
 
 
 def request_count(ranges: Sequence[tuple[datetime, datetime]], *,
                   is_open: IsOpen = is_market_open) -> int:
-    """取得前に数える要求数 (UTC 日窓、全日閉場の窓は数えない)。尾を含む範囲を渡す。"""
-    return sum(len(fetch_windows(s, e, is_open=is_open)) for s, e in ranges)
+    """取得前に数える要求数 (UTC 日窓、全日閉場の窓は数えない、重複窓は 1 回)。尾を含む範囲を渡す。"""
+    return len(request_windows(ranges, is_open=is_open))

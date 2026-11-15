@@ -69,12 +69,14 @@ def test_fetch_windows_are_utc_days_and_fully_closed_days_are_not_requested():
     assert plan.request_count([(dt(2026, 11, 13), dt(2026, 11, 15, 23))]) == 2
 
 
-def test_lookback_start_covers_the_current_utc_day_and_is_clipped_by_b():
+def test_lookback_start_is_e_minus_d_days_clipped_by_b_without_rounding_to_a_day():
     limit = dt(2026, 11, 11, 11, 30)
     b = dt(2026, 10, 11, 12)
-    assert plan.lookback_start(limit, 2, b) == dt(2026, 11, 10)
-    assert plan.lookback_start(limit, 31, b) == dt(2026, 10, 12)
+    assert plan.lookback_start(limit, 2, b) == dt(2026, 11, 9, 11, 30)
+    assert plan.lookback_start(limit, 31, b) == b
     assert plan.lookback_start(limit, 40, b) == b
+    # 例: E=2026-11-12 18:00Z, D=7 -> 始端 2026-11-05 18:00Z
+    assert plan.lookback_start(dt(2026, 11, 12, 18), 7, b) == dt(2026, 11, 5, 18)
 
 
 # ---- 検査尾 ---------------------------------------------------------------

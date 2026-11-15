@@ -90,7 +90,7 @@ cycleはDB作業250msを上限に新batch開始を止め、100ms以上yieldし�
 
 足幅w、段1aのgrace gを使い `E=min(requested_end, floor_grid(T-g-w,w))`。Bは評価区間C2と同じ `in_sample_until(T,holdout_months)`。全自動範囲を `B,E)` にclipし、scanもEで止める。E以後の余裕1本を偽gapにしない。Bをまたぐ日もB以前の行は書かない。
 
-offlineのrecentの追記範囲は `max(B, min(last_processed_E, E-1日))` からE。初回・後ろ窓は `max(B,E-lookback_days)` からE。日窓上限を超えた未取得区間はkind=unprocessedでqueueへ保存する。
+offlineのrecentの範囲は初回・後ろ窓とも始端 `max(B,E-lookback_days)` (日境界へ丸めない) からE。cursorがこの始端より古いときの追記 `[max(B,last_processed_E), 始端)` と、recentの要求窓の上限 (D+2) を超えた未取得区間は、黙って落とさずkind=unprocessedで日ごとにqueueへ保存し、cursorはこの保存と同じtransactionでだけ進める。
 
 **3aは有界な確定prefixで追いつく。** `c=max(B,last_processed_E)` とし、開場時間を積算して進む `advance_open` を共通暦で定義する。追記範囲は `[c,F)`、`F=min(E,advance_open(c,2時間))` に取得前に固定する。c未初期化は停止中初回同期を案内しMAX(bar_time)から推測しない。E−cが24開場時間を超える場合だけ `recent_backlog_offline_required` で停止中手動へ送り、自動でcold範囲を広げない。24時間以内も受入済みwarm形状であることが前提。正当な空格子を含めFまで判定・反映完了したらcursorをFへ進め、未取得 `[F,E)` は次の予定runへ残す。応答に実欠損があればqueueへ残し、cursorを充足の証明にしない。通常1時間間隔に2開場時間まで進められるので、全取得成功のrunが続けば中断分は毎回最大1開場時間ずつ縮み、長くなり続けるall-or-deferを解消する。run内のgeneration/batch・60秒中断のprefixはhistbugs C2.2 §2.5aのままとし、未確定suffixを処理済みにしない。
 
@@ -102,11 +102,11 @@ offlineのrecentの追記範囲は `max(B, min(last_processed_E, E-1日))` か�
 
 recent/検査尾外の訂正検出時期は停止中手動次第で保証しない。既存値は自動上書きせず、主guardはDBを直接判定する。
 
-Nをその経路の対象系列数、Dをlookback_daysとする。offlineはUTC日境界でpagingする。全日閉場のUTC日は要求/予算に数えない (日曜のrecentで金・土・日を2開場日窓として扱う)。要求は単一in-flight、開始間隔5秒以上 (失敗/retryも含む)。検査尾の別要求も予算へ含め、admission前に全要求数を数える。上限外なら操作を部分確定せずdeferredにする。
+Nをその経路の対象系列数、Dをlookback_daysとする。offlineはUTC日境界でpagingする。全日閉場のUTC日は要求/予算に数えない (日曜のrecentで金・土・日を2開場日窓として扱う)。要求は単一in-flight、開始間隔5秒以上 (失敗/retryも含む)。検査尾の別要求も予算へ含め、追記・後ろ窓・固定尾の和集合をUTC日で分割して重複窓は1回だけ数え、admission前に全要求数を数える。上限外なら操作を部分確定せずdeferredにする。
 
 | run種別 | recent上限 (検査尾込み) | 古いgap上限 | bridge要求上限 |
 |---|---:|---:|---:|
-| offline手動subrun | D+1開場日窓/系列 | 全系列合計32日窓 (別日の検査尾も算入) | `(D+1)N+32` |
+| offline手動subrun | D+2開場日窓/系列 (後ろ窓D日 + 日をまたぐ検査尾の2窓) | 全系列合計32日窓 (別日の検査尾も算入) | `(D+2)N+32` |
 | 3a毎時recent/起動時の直近確認/各閉場前catchup | 追記<=2開場時間/120格子、尾<=3開場時間/180格子、各1要求 | 0 | 検査尾込み最大2要求/主系列、run合計2N |
 | 3a retry/明示ctl | dueの主系列・同じ小窓操作のみ | 0 | 上と同じ上限のdue対象分 |
 
@@ -299,6 +299,7 @@ rollbackは新コードのうちにauto_enabled=falseへ変更して再起動し
 | 2026-11-14 | C3 | I-2=A裁定済み。主pair毎時recent/金曜二段catchup、受動計測先行、A8目標を基準線後に確定、短い自己計測と毎要求占有監視・超過自動停止。3b詳細を保留し参照追加を分離、live ingest事実訂正 | 利用者確定裁定とfable推奨A。既定有効と環境差を二層で解く | — (旧版、未commit) |
 | 2026-11-14 | C4 | r3全件裁定。有界prefix/既存key固定尾、開場時間予算、自己計測lifecycle/timeout帰属/完了slot、UTC :40、header互換、共有v6、運用案内 | opus r3と利用者方向づけ、経路A維持 | — (旧版、未commit) |
 | 2026-11-14 | C5 | 取得前不足/取得後遮断優先、計測不能時の手動復旧とcursor初期化、slot none継続時の表示/復旧/実装可能性、T3正本追随条件を補足 | terra C4閉鎖確認 Important 2 / Minor 2、histbugs C2.2 §2.3との整合 | — (本改訂、未commit) |
+| 2026-11-15 | C5.1 | recent始端を `max(B,E-D日)` に戻し、offline recent上限をD+1からD+2窓/系列・要求上限を `(D+2)N+32` に改訂。追記・後ろ窓・尾の和集合をUTC日で数え、上限外・cursor遅れの未取得をunprocessedとして明示queue、cursor前進と同transaction | 始端が日中だと範囲だけでD+1窓となり、尾が前UTC日へ出るとD+2になって毎日数時間request_budgetになるため (sol裁定) | — (未commit) |
 
 ## 6. 短い task 表
 
