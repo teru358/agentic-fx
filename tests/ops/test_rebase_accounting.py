@@ -43,13 +43,12 @@ def _insert_closed_order(conn, now, pnl):
 def _apply(conn, *, source_id, audit_id, now, hwm, equity, balance,
            validate=None, applied_at=None):
     cut = hwm - equity
-    pct = cut / hwm * 100
+    pct = accounting.drawdown_pct(equity, hwm)
     return apply_rebase(
         conn, source_snapshot_id=source_id, accepted_audit_id=audit_id,
         applied_at=applied_at or now, generation=7, latched_at=None, digest_version=1,
         preview_token=f"token-{audit_id}", hwm_before=hwm, equity=equity,
-        balance=balance, drawdown_pct=pct, threshold_pct=pct, cut=cut,
-        cut_pct=pct, additional_headroom=equity * pct / 100, now=now,
+        balance=balance, threshold_pct=pct, now=now,
         validate=validate or (lambda db: None))
 
 
@@ -65,43 +64,41 @@ def test_read_rebase_totals_accepts_plain_sqlite_connection(tmp_path):
 
 
 @pytest.mark.parametrize("field,value", [
-    ("hwm_before", float("inf")),
-    ("equity", float("nan")),
-    ("balance", float("-inf")),
-    ("drawdown_pct", float("inf")),
-    ("threshold_pct", float("nan")),
-    ("cut", float("inf")),
-    ("cut_pct", float("inf")),
-    ("additional_headroom", float("inf")),
-    ("hwm_before", 1001.0),
-    ("cut", 99.0),
-    ("cut", 0.0),
-    ("cut_pct", 9.0),
-    ("drawdown_pct", 9.0),
-    ("additional_headroom", -1.0),
+    ("hwm_before", 0.0), ("hwm_before", -1.0),
+    ("equity", 1000.0), ("equity", 1100.0),
+    ("hwm_before", float("inf")), ("equity", float("nan")),
+    ("balance", float("-inf")), ("threshold_pct", float("nan")),
+    ("threshold_pct", 0.0), ("threshold_pct", -1.0),
+    ("threshold_pct", 11.0), ("hwm_before", 1001.0),
 ])
 def test_invalid_ledger_values_are_rejected_before_writes(tmp_path, field, value):
-    conn, now, source_id, audit_id = _commit_fault_db(tmp_path / f"invalid-{field}.db")
-    kwargs = {"hwm": 1000.0, "equity": 900.0, "balance": 900.0}
-    if field == "hwm_before":
-        kwargs["hwm"] = value
-    with pytest.raises((ValueError, TypeError)):
-        apply_values = {
-            "hwm_before": kwargs["hwm"], "equity": kwargs["equity"],
-            "balance": kwargs["balance"], "drawdown_pct": 10.0,
-            "threshold_pct": 10.0, "cut": 100.0,
-            "cut_pct": 10.0, "additional_headroom": 90.0,
-        }
-        apply_values[field] = value
-        if field == "hwm_before" and math.isfinite(value):
-            apply_values["cut"] = value - apply_values["equity"]
-            apply_values["cut_pct"] = apply_values["cut"] / value * 100
-        apply_rebase(
-            conn, source_snapshot_id=source_id, accepted_audit_id=audit_id,
-            applied_at=now, generation=7, latched_at=None, digest_version=1,
-            preview_token="bad-value", now=now, validate=lambda db: None,
-            **apply_values)
-    assert _counts(tmp_path / f"invalid-{field}.db") == (0, 1)
+    path = tmp_path / "invalid.db"
+    conn, now, source_id, audit_id = _commit_fault_db(path)
+    values = dict(hwm_before=1000.0, equity=900.0, balance=900.0, threshold_pct=10.0)
+    values[field] = value
+    with pytest.raises(ValueError):
+        apply_rebase(conn, source_snapshot_id=source_id, accepted_audit_id=audit_id,
+                     applied_at=now, generation=7, latched_at=None, digest_version=1,
+                     preview_token="bad-value", now=now, validate=lambda db: None, **values)
+    assert _counts(path) == (0, 1)
+    assert not conn.in_transaction
+
+
+def test_derived_figures_are_saved_and_returned_with_rounding(tmp_path):
+    conn, now, source_id, audit_id = _commit_fault_db(tmp_path / "round.db")
+    conn.execute("UPDATE account_snapshots SET hwm=0.3, equity=0.1, balance=0.1 WHERE id=?", (source_id,))
+    conn.commit()
+    result = apply_rebase(conn, source_snapshot_id=source_id, accepted_audit_id=audit_id,
+        applied_at=now, generation=7, latched_at=None, digest_version=1,
+        preview_token="round", hwm_before=0.3, equity=0.1, balance=0.1,
+        threshold_pct=10.0, now=now, validate=lambda db: None)
+    row = conn.execute("SELECT * FROM kill_switch_hwm_rebases").fetchone()
+    expected = dict(cut=0.3 - 0.1, cut_pct=100 * (0.3 - 0.1) / 0.3,
+                    drawdown_pct=accounting.drawdown_pct(0.1, 0.3), additional_headroom=0.1 * 10 / 100)
+    for key, value in expected.items():
+        assert row[key] == result[key] == value
+    figures = accounting.rebase_figures(0.3, 0.1, 10)
+    assert all(getattr(figures, key) == value for key, value in expected.items())
 
 
 def test_apply_rebase_rejects_naive_applied_at(tmp_path):
@@ -312,7 +309,7 @@ def test_an_interrupt_during_commit_propagates_unchanged(tmp_path):
     assert _counts(path) == (0, 1)
 
 
-@pytest.mark.parametrize("action", ["write", "commit", "rollback", "commit_then_begin"])
+@pytest.mark.parametrize("action", ["write", "commit", "rollback", "commit_then_begin", "direct_commit", "direct_rollback"])
 def test_a_validator_cannot_write_or_end_and_reopen_transaction(tmp_path, action):
     path = tmp_path / f"validator-{action}.db"
     conn, now, source_id, audit_id = _commit_fault_db(path)
@@ -324,6 +321,10 @@ def test_a_validator_cannot_write_or_end_and_reopen_transaction(tmp_path, action
             db.execute("COMMIT")
         elif action == "rollback":
             db.execute("ROLLBACK")
+        elif action == "direct_commit":
+            db.commit()
+        elif action == "direct_rollback":
+            db.rollback()
         else:
             db.execute("COMMIT")
             db.execute("BEGIN")
