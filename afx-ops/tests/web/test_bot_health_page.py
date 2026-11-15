@@ -30,7 +30,7 @@ def _page(health) -> str:
     data = {"mode": "paper"}
     if health is not None:
         data["bot_health"] = health
-    return handle_request(Request("GET", "/", {}), Client(data)).body.decode()
+    return handle_request(Request("GET", "/", {"tab": "bot"}), Client(data)).body.decode()
 
 
 @pytest.mark.parametrize("state", STATES)

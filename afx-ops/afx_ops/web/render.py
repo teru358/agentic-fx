@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from afx_ops import base_text, display_time, history_text, reevaluation_text
 from afx_ops.display_zone import zone_of
 from afx_ops.metric_words import metric_items
+from afx_ops.web import tabs as tab_table
 from afx_ops.web.routes import ROUTE_TABLE, resolve_route
 
 MAX_TEXT = 512
@@ -52,6 +53,10 @@ dd.danger { font-weight: 700; background: #ffebe9; }
 dd.warn { font-weight: 700; background: #fff8c5; }
 table { border-collapse: collapse; }
 th, td { border: 1px solid #d0d7de; padding: 0.25rem 0.5rem; text-align: left; }
+.tabs a { padding-bottom: 0.25rem; border-bottom: 2px solid transparent; }
+.tabs a[aria-current="page"] { border-bottom-color: #0969da; }
+.scroll { max-height: 70vh; overflow: auto; }
+.scroll th { position: sticky; top: 0; background: #fff; }
 """
 
 # nav に出す静的な route (表示順)。/approvals は /plugins から辿り、詳細は一覧の各項目から辿る
@@ -59,8 +64,14 @@ _NAV_LABELS = {"/": "Status", "/plugins": "Plugins", "/improve": "Improve", "/lo
 _STATIC_ROUTES = frozenset(route.path for route in ROUTE_TABLE if "{" not in route.path)
 if not set(_NAV_LABELS) <= _STATIC_ROUTES:
     raise RuntimeError("nav label without a route")
-_NAV = "<nav>" + "".join(f'<a href="{path}">{label}</a>'
-                         for path, label in _NAV_LABELS.items()) + "</nav>"
+
+
+def _nav(current: str | None) -> str:
+    """上部の nav。`current` は今の画面が属する項目の path。"""
+    return "<nav>" + "".join(
+        f'<a href="{path}"' + (' aria-current="page"' if path == current else "") + f">{label}</a>"
+        for path, label in _NAV_LABELS.items()) + "</nav>"
+
 # 真のとき強調する status の field と class
 _EMPHASIS = {"kill_switch": "danger", "autopilot": "warn"}
 
@@ -105,11 +116,14 @@ def _time_text(value: object, tz: str) -> str:
 
 
 def _pairs(data: object, allowed: frozenset[str], *, nested_allowed: frozenset[str] = frozenset(),
-           emphasis: Mapping[str, str] | None = None, tz: str = "UTC") -> str:
+           emphasis: Mapping[str, str] | None = None, tz: str = "UTC",
+           order: Sequence[str] | None = None) -> str:
+    """allowlist の key を dl にする。`order` を渡すとその順 (既定は key のアルファベット順)。"""
     if type(data) is not dict:
         return ""
     rows = []
-    for key in sorted(set(data) & allowed):
+    for key in (sorted(set(data) & allowed) if order is None
+                else [key for key in order if key in data and key in allowed]):
         value = data[key]
         shown = _value(value, nested_allowed, tz, key)
         if shown:
@@ -142,27 +156,56 @@ def _zone_line(tz: str | None) -> str:
     return "<p>" + html.escape(display_time.display_header(tz), quote=True) + "</p>"
 
 
-def _document(title: str, body: str, tz: str | None = None, *, refresh: bool = True) -> bytes:
+def _document(title: str, body: str, tz: str | None = None, *, refresh: bool = True,
+              current: str | None = None, tabs: str = "") -> bytes:
     reload = f'<meta http-equiv="refresh" content="{REFRESH_SECONDS}">' if refresh else ""
     return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
             + reload + '<title>'
             + html.escape(title, quote=True) + "</title><style>" + STYLE + "</style></head><body>"
-            + _NAV + "<h1>" + html.escape(title, quote=True) + "</h1>" + _zone_line(tz) + body
+            + _nav(current) + "<h1>" + html.escape(title, quote=True) + "</h1>" + tabs
+            + _zone_line(tz) + body
             + "</body></html>").encode("utf-8")
 
 
-def _page(title: str, body: str, tz: str | None = None) -> bytes:
-    document = _document(title, body, tz)
+def _page(title: str, body: str, tz: str | None = None, *, current: str | None = None,
+          tabs: str = "") -> bytes:
+    document = _document(title, body, tz, current=current, tabs=tabs)
     if len(document) <= MAX_RESPONSE_BYTES:
         return document
-    return _page(title, "<p>Output clipped</p>", tz)
+    return _page(title, "<p>Output clipped</p>", tz, current=current, tabs=tabs)
 
 
-def render_status(data: Mapping[str, object]) -> bytes:
+# Status の概要の群と、群の中の並び。allowlist (STATUS_FIELDS) と同じ集合を並べる
+STATUS_GROUPS = (
+    ("安全", ("kill_switch", "health", "autopilot")),
+    ("資金", ("equity", "balance", "pnl", "performance")),
+    ("稼働", ("mode", "mission", "data", "orders", "jobs")),
+)
+
+
+def _status_overview(data: Mapping[str, object], tz: str) -> str:
+    parts = []
+    for title, keys in STATUS_GROUPS:
+        rows = _pairs(data, STATUS_FIELDS, nested_allowed=NESTED_FIELDS, emphasis=_EMPHASIS,
+                      tz=tz, order=keys)
+        if rows:
+            parts.append(f"<section><h2>{title}</h2>{rows}</section>")
+    return "".join(parts)
+
+
+# Status のタブごとの本文。キーは tabs.TABS["/"] の名前と一致させる
+STATUS_TAB_SECTIONS = {
+    "overview": lambda data, tz: _status_overview(data, tz),
+    "bot": lambda data, tz: _bot_section(data, tz),
+    "econ": lambda data, tz: _calendar_section(data) + _econ_section(data, tz),
+    "reaction": lambda data, tz: _reaction_section(data),
+}
+
+
+def render_status(data: Mapping[str, object], tab: str = "overview") -> bytes:
     tz = zone_of(data)
-    body = _pairs(data, STATUS_FIELDS, nested_allowed=NESTED_FIELDS, emphasis=_EMPHASIS, tz=tz)
-    return _page("Status", body + _bot_section(data, tz) + _calendar_section(data)
-                 + _econ_section(data, tz) + _reaction_section(data), tz)
+    body = STATUS_TAB_SECTIONS[tab](data, tz) or "<p>なし</p>"
+    return _page("Status", body, tz, current="/", tabs=tab_table.bar("/", tab))
 
 
 # daemon の `bot_health` の語 (agentic_fx.ops.bot_health の写し。test が突き合わせる)。web は daemon API
@@ -409,7 +452,7 @@ def render_approvals(data: Mapping[str, object]) -> bytes:
     if isinstance(journals, list):
         body += "".join("<section>" + _pairs(item, JOURNAL_FIELDS, tz=tz) + "</section>"
                         for item in journals[:MAX_ITEMS] if type(item) is dict)
-    return _page("Pending approvals", body, tz)
+    return _page("Pending approvals", body, tz, current="/plugins")
 
 
 def _change_is_well_formed(change: Mapping[str, object]) -> bool:
@@ -535,9 +578,9 @@ def _unchanged_page(data: Mapping[str, object], message: str) -> bytes:
     tz = zone_of(data)
     body = (_pairs(data, DETAIL_FIELDS, nested_allowed=NESTED_FIELDS, tz=tz)
             + "<section><h2>変更内容</h2><p>" + message + "</p></section>")
-    extra = _fit_extra_sections(len(_document("Approval", "", tz)) + _bytes(body), _extra_sections(data))
-    page = _document("Approval", body + "".join(extra), tz)
-    return page if len(page) < PAGE_LIMIT_BYTES else _page("Approval", "<p>Output clipped</p>", tz)
+    extra = _fit_extra_sections(len(_document("Approval", "", tz, current="/plugins")) + _bytes(body), _extra_sections(data))
+    page = _document("Approval", body + "".join(extra), tz, current="/plugins")
+    return page if len(page) < PAGE_LIMIT_BYTES else _page("Approval", "<p>Output clipped</p>", tz, current="/plugins")
 
 
 def render_approval(data: Mapping[str, object], change_data: Mapping[str, object] | None = None) -> bytes:
@@ -882,7 +925,7 @@ def compose_approval_page(data: Mapping[str, object], change: Mapping[str, objec
     diff_html = "<section><h2>変更 diff</h2>" + diff_body + "</section>"
     frame = _bytes(diff_html) - diff_bytes
     tz = zone_of(data)
-    skeleton = len(_document("Approval", "", tz))
+    skeleton = len(_document("Approval", "", tz, current="/plugins"))
     params_total = len(_params_rows(change)[0])
 
     def build(show_params: int | None, claim_limit: int, parent: bool) -> str:
@@ -903,10 +946,10 @@ def compose_approval_page(data: Mapping[str, object], change: Mapping[str, objec
     kept = _fit_extra_sections(fixed + _bytes(others), extra_sections)
     extra_html = "".join(kept)
     body = others + (diff_html if diff_body else "")
-    page = _document("Approval", body + extra_html, tz)
+    page = _document("Approval", body + extra_html, tz, current="/plugins")
     other_bytes = len(page) - diff_bytes
     if len(page) >= PAGE_LIMIT_BYTES:
-        page = _page("Approval", "<p>Output clipped</p>", tz)
+        page = _page("Approval", "<p>Output clipped</p>", tz, current="/plugins")
     return ApprovalPage(page, diff_bytes, other_bytes, plans)
 
 
@@ -917,16 +960,19 @@ def render_log(data: Mapping[str, object]) -> bytes:
     tz = zone_of(data)
     values = ([_text(display_time.convert_log_line(line, tz)) for line in lines[-MAX_ITEMS:]]
               if isinstance(lines, list) else [])
-    return _page("Log", "<pre>" + "\n".join(item for item in values if item) + "</pre>", tz)
+    return _page("Log", "<pre>" + "\n".join(item for item in values if item) + "</pre>", tz, current="/logs")
 
 
-def render_activity(data: Mapping[str, object]) -> bytes:
+def render_activity(data: Mapping[str, object], category: str | None = None,
+                    n: int | None = None) -> bytes:
     lines = data.get("lines")
     tz = zone_of(data)
     values = ([_text(display_time.convert_activity_line(line, tz)) for line in lines[-MAX_ITEMS:]]
               if isinstance(lines, list) else [])
     body = "<pre>" + "\n".join(item for item in values if item) + "</pre>"
-    return _page("Activity", body, tz)
+    bar = tab_table.bar("/activity", category or tab_table.ALL,
+                        carry={} if n is None else {"n": n})
+    return _page("Activity", body, tz, current="/activity", tabs=bar)
 
 
 def render_error(status: int) -> bytes:

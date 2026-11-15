@@ -71,7 +71,7 @@ from afx_ops.web import headers, render  # noqa: E402
 from afx_ops.web.routes import ROUTE_TABLE  # noqa: E402
 
 # CSS を変えたらこの値も変える (CSP の hash と埋め込む CSS の取り違えを防ぐ)
-PINNED_STYLE_HASH = "sha256-LTD12P28Uy1nqEG8Ug154drZ3pH6F9EnG8flNemSejY="
+PINNED_STYLE_HASH = "sha256-ikbXKLrXYVfxPcWWcuDZtzvvyqj/k6rP5KkKwrMxPpU="
 
 
 class ReadClient:
@@ -132,7 +132,7 @@ def test_every_page_has_the_route_nav_and_a_read_only_refresh():
     for path in PAGES:
         page = handle_request(Request("GET", path, {}), ReadClient()).body.decode()
         nav = re.search(r"<nav>(.*?)</nav>", page, re.S).group(1)
-        assert re.findall(r'<a href="([^"]*)">', nav) == in_nav, path
+        assert re.findall(r'<a href="([^"]*)"(?: aria-current="page")?>', nav) == in_nav, path
         assert 'Approvals</a>' not in nav, path
         assert page.count('<meta http-equiv="refresh" content="30">') == 1, path
 
@@ -158,7 +158,7 @@ def test_kill_switch_and_autopilot_are_marked_by_class_only_when_on():
     assert '<dt class="warn">autopilot</dt><dd class="warn">' in on
     off = handle_request(Request("GET", "/", {}), ReadClient(status={
         "kill_switch": {"latched": False}, "autopilot": False})).body.decode()
-    assert "class=" not in off.split("</nav>", 1)[1]
+    assert "class=" not in off.split("</nav>")[-1]
 
 
 def test_log_and_activity_show_the_newest_lines_of_a_long_window():

@@ -60,14 +60,15 @@ class Client:
         return Reply(200, self.replies["activity"], None)
 
 
-def _get(client, path):
-    response = handle_request(Request("GET", path, {}), client)
+def _get(client, path, query=None):
+    response = handle_request(Request("GET", path, query or {}), client)
     assert response.status == 200
     return response.body.decode()
 
 
 def test_every_status_time_at_every_depth_is_converted_to_the_zone_of_the_response():
-    text = _get(Client(status=_status()), "/")
+    client = Client(status=_status())
+    text = "".join(_get(client, "/", {"tab": tab}) for tab in ("overview", "bot", "econ", "reaction"))
     for shown in ("2026-11-06 19:04:05 +09:00", "2026-11-06 19:11:00 +09:00",
                   "2026-11-06 19:22:00 +09:00", "2026-11-06 19:33:00 +09:00",
                   "2026-11-06 19:44:00 +09:00"):
@@ -130,7 +131,7 @@ def test_every_page_has_the_zone_line_at_the_top(path, key):
                "activity": {"lines": [], "display_timezone": TOKYO}}
     text = _get(Client(**replies), path)
     head = text.split("</nav>", 1)[1]
-    assert re.match(r"<h1>[^<]*</h1><p>表示 tz: Asia/Tokyo \(\+09:00\)</p>", head)
+    assert re.match(r"<h1>[^<]*</h1>(<nav class=\"tabs\">.*?</nav>)?<p>表示 tz: Asia/Tokyo \(\+09:00\)</p>", head)
 
 
 def test_the_approval_pages_have_the_zone_line_and_a_converted_created_at():

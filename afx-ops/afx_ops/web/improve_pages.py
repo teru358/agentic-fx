@@ -224,7 +224,7 @@ def render_improve_list(data: Mapping[str, object], limit: int = DEFAULT_LIMIT,
     intro = "<p>終了した改善 mission を新しい順に並べています。run の番号から要約を開けます。</p>"
     note = _more_note(len(rows), listing.get("has_more") is True, limit)
     # 書込みの form を足す余地と、枠・nav・style を引いた残りが table の予算
-    budget = (render.MAX_RESPONSE_BYTES - len(render._document("Improve", intro + note, tz))
+    budget = (render.MAX_RESPONSE_BYTES - len(render._document("Improve", intro + note, tz, current="/improve"))
               - render._bytes(forms) - 1024)
     if rows:
         table, shown = plugin_pages.table_with_count(LIST_HEADERS, rows, budget, cli=OMIT_CLI)
@@ -232,7 +232,7 @@ def render_improve_list(data: Mapping[str, object], limit: int = DEFAULT_LIMIT,
             note = _more_note(shown, True, MAX_LIMIT)
     else:
         table = "<p>終了した改善 mission はありません</p>"
-    return render._page("Improve", intro + table + note + forms, tz)
+    return render._page("Improve", intro + table + note + forms, tz, current="/improve")
 
 
 # ---------------------------------------------------------------- 詳細
@@ -436,7 +436,7 @@ def render_improve_detail(data: Mapping[str, object]) -> bytes:
     nav = '<p><a href="/improve">Improve (一覧)</a> / <a href="/plugins">Plugins</a></p>'
     if not snapshot:
         parts = [nav, _section("概要", f"<p>{NO_TERMINAL_TEXT}</p>")]
-        return render._page(f"Improve #{shown}", "".join(parts), tz)
+        return render._page(f"Improve #{shown}", "".join(parts), tz, current="/improve")
     if not summary:
         notice = _section("要約", f"<p>{NO_SUMMARY_TEXT}</p>")
     elif state != "ok":
@@ -448,4 +448,4 @@ def render_improve_detail(data: Mapping[str, object]) -> bytes:
              _observation_section(items, snapshot), _reason_section(items),
              _tried_section(items), _floor_section(items, pick(row.get("floor"), REPORT_FLOOR_FIELDS)),
              _comparison_section(items), _handoff_section(items)]
-    return render._page(f"Improve #{shown}", "".join(parts), tz)
+    return render._page(f"Improve #{shown}", "".join(parts), tz, current="/improve")

@@ -296,7 +296,7 @@ def _wait_for(condition, seconds: float = 5.0) -> bool:
 @pytest.mark.parametrize("size", [2000, 2048, 4096, 20000])
 def test_a_large_reply_ends_without_a_loop_error(monkeypatch, capsys, services, size):
     from afx_ops.web import render
-    monkeypatch.setattr(render, "render_status", lambda data: b"x" * size)
+    monkeypatch.setattr(render, "render_status", lambda data, **_: b"x" * size)
     port, thread, outcome = start(BigPageClient(), stop_after=3)
     try:
         for _ in range(3):
@@ -314,7 +314,7 @@ def test_a_large_reply_ends_without_a_loop_error(monkeypatch, capsys, services, 
 def test_repeated_large_replies_keep_the_slots_and_the_next_request_answers(
         monkeypatch, capsys, services):
     from afx_ops.web import render
-    monkeypatch.setattr(render, "render_status", lambda data: b"x" * 2500)
+    monkeypatch.setattr(render, "render_status", lambda data, **_: b"x" * 2500)
     port, thread, outcome = start(BigPageClient(), stop_after=60)
     try:
         for _ in range(50):

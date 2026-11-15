@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from urllib.parse import parse_qsl
 
 from afx_ops.api_client import ApiError, with_detail
-from afx_ops.web import auth, improve_pages, plugin_pages, render, write, write_pages
+from afx_ops.web import auth, improve_pages, plugin_pages, render, tabs, write, write_pages
 from afx_ops.web.headers import response_headers
 from afx_ops.web.routes import RouteMatch, resolve_route
 
@@ -24,8 +24,7 @@ _METHOD = re.compile(r"[A-Z]+\Z")
 _TARGET = re.compile(r"/[!-~]*\Z")
 _INTEGER = re.compile(r"[1-9][0-9]{0,2}\Z")
 _NOT_FOUND_METHODS = frozenset({"plugin", "improve_detail"})
-_ACTIVITY_CATEGORIES = frozenset({"NEWS", "TECH", "AGGREGATE", "TRADE", "IMPROVE",
-                                  "APPROVAL", "SYSTEM"})
+_ACTIVITY_CATEGORIES = frozenset(tabs.ACTIVITY_CATEGORIES)
 
 
 @dataclass(frozen=True)
@@ -284,9 +283,12 @@ def _report_bad_reply(reply: object, report: _Reporter) -> None:
 def _invoke(match: RouteMatch, query: dict[str, str], client, report: _Reporter):
     method = match.route.client_method
     if method == "status":
-        if query:
+        if set(query) - {"tab"}:
             raise _Reject(400)
-        return _call(report, client.status), render.render_status
+        tab = query.get("tab", tabs.default_tab("/"))
+        if tab not in tabs.tab_names("/"):
+            raise _Reject(400)
+        return _call(report, client.status), functools.partial(render.render_status, tab=tab)
     if method == "approvals":
         limit = _positive(query, "limit", maximum=200, default=20)
         return _call(report, client.approvals, limit=limit), render.render_approvals
@@ -306,7 +308,9 @@ def _invoke(match: RouteMatch, query: dict[str, str], client, report: _Reporter)
         category = query.get("category")
         if category is not None and category not in _ACTIVITY_CATEGORIES:
             raise _Reject(400)
-        return _call(report, client.activity, n=n, category=category), render.render_activity
+        return (_call(report, client.activity, n=n, category=category),
+                functools.partial(render.render_activity, category=category,
+                                  n=n if "n" in query else None))
     if method == "plugins":
         if query:
             raise _Reject(400)

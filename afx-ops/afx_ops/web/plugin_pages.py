@@ -215,9 +215,9 @@ def render_plugins(data: Mapping[str, object]) -> bytes:
     plugins = listing.get("plugins")
     rows = [_list_row(row) for row in plugins if type(row) is dict] if type(plugins) is list else []
     head = _header_section(data)
-    budget = render.MAX_RESPONSE_BYTES - len(render._document("Plugins", head, tz))
+    budget = render.MAX_RESPONSE_BYTES - len(render._document("Plugins", head, tz, current="/plugins"))
     table = _table(LIST_HEADERS, rows, budget) if rows else "<p>plugin はありません</p>"
-    return render._page("Plugins", head + table, tz)
+    return render._page("Plugins", head + table, tz, current="/plugins")
 
 
 # ---------------------------------------------------------------- 詳細
@@ -352,4 +352,4 @@ def render_plugin(data: Mapping[str, object]) -> bytes:
             + _dependencies_section(row) + _dependents_section(row)
             + _usefulness_section(row, data.get("unknown_submissions"))
             + _versions_section(row) + _history_section(row, tz))
-    return render._page(f"Plugin {shown}", body, tz)
+    return render._page(f"Plugin {shown}", body, tz, current="/plugins")
