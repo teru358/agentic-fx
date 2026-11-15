@@ -1,88 +1,5 @@
 ---
-{
-  "id": "kill-switch",
-  "owner_role": "conductor",
-  "resources": [
-    "state:app_state.kill_switch_latched",
-    "state:app_state.kill_switch_generation",
-    "state:app_state.kill_switch_latched_at",
-    "marker:reset_marker",
-    "event:guard_state_changed",
-    "event:ops_request_terminal",
-    "event:event_stream_health",
-    "event:guard_notice_deferred",
-    "event:guard_notice_backfill_skipped",
-    "activity:kill_switch_latched",
-    "activity:kill_switch_latched_durability_uncertain",
-    "activity:kill_switch_reset",
-    "activity:kill_switch_reconcile_required",
-    "activity:kill_switch_reconcile_confirmed",
-    "activity:kill_switch_reconcile_failed",
-    "activity:kill_switch_state_uncertain",
-    "db:account_snapshots",
-    "config:risk.drawdown_kill_pct",
-    "metric:kill_switch_latches",
-    "metric:kill_switch_events",
-    "ops:guard_lane_reentry",
-    "ops:guard_lane_not_held",
-    "ops:guard_state_unavailable",
-    "ops:guard_notice_pending",
-    "ops:guard_notice_generation",
-    "ops:guard_kind",
-    "ops:guard_version"
-  ],
-  "anchors": [
-    "src/agentic_fx/core/risk_gate.py::evaluate",
-    "src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open",
-    "src/agentic_fx/store/state.py::StateStore.load",
-    "src/agentic_fx/store/state.py::StateStore.update",
-    "src/agentic_fx/store/state.py::StateStore.reset_kill_switch",
-    "src/agentic_fx/store/state.py::StateStore.confirm_latched",
-    "src/agentic_fx/ops/service.py::OpsService.reset_kill_switch",
-    "src/agentic_fx/ops/service.py::OpsService.reconcile_kill_switch",
-    "src/agentic_fx/ops/service.py::plan_kill_switch_notice",
-    "src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch",
-    "src/agentic_fx/ops/service.py::OpsService._guard_step",
-    "src/agentic_fx/ops/service.py::OpsService.emit_pending_guard_notices",
-    "src/agentic_fx/commands.py::Commands.dispatch",
-    "src/agentic_fx/commands.py::Commands._killswitch_reconcile",
-    "src/agentic_fx/commands.py::Commands._data_resume",
-    "src/agentic_fx/ops/service.py::OpsService.resume_data",
-    "src/agentic_fx/ops/events.py::EventStore.emit_best_effort",
-    "src/agentic_fx/ops/events.py::EventStore.emit",
-    "src/agentic_fx/ops/service.py::OpsService._terminal",
-    "src/agentic_fx/service.py::build_app",
-    "src/agentic_fx/ops/service.py::OpsService.emit_pending_notices",
-    "src/agentic_fx/ops/service.py::OpsService._current_state",
-    "src/agentic_fx/core/accounting.py::record_snapshot",
-    "src/agentic_fx/core/accounting.py::current_account",
-    "src/agentic_fx/backtest/runner.py::_auto_release_kill_switch",
-    "src/agentic_fx/backtest/runner.py::run_replay",
-    "src/agentic_fx/backtest/metrics.py::compute_metrics",
-    "afx-ops/afx_ops/gate/render.py::_event_text_for_code",
-    "afx-ops/afx_ops/bot/adapter.py::BotAdapter.deliver_events",
-    "afx-ops/afx_ops/notify/payload.py::encode_event",
-    "afx-ops/afx_ops/notify/runtime.py::_Loop._poll_once",
-    "src/agentic_fx/status.py::read_state",
-    "afx-ops/afx_ops/web/render.py::render_activity",
-    "src/agentic_fx/ops/service.py::OpsService.status",
-    "src/agentic_fx/ops/events.py::<module>.FIELDS",
-    "src/agentic_fx/service.py::_build_ops_service"
-  ],
-  "related": [
-    "auto-killswitch-latch-emits-no-event",
-    "killswitch-reset-hwm-rebase",
-    "datafeed-outage-discord-notice",
-    "killswitch-latched-activity-repeats",
-    "bot-gateway-disconnect-is-silent"
-  ],
-  "tests": [
-    "tests/store/test_state.py",
-    "tests/core/test_executor.py",
-    "tests/ops/test_ac51_killswitch_api.py",
-    "tests/test_commands.py"
-  ]
-}
+{"id": "kill-switch", "owner_role": "conductor", "literals": {"marker:reset_marker": ["_MARKER_SUFFIX"]}, "resources": ["state:app_state.kill_switch_latched", "state:app_state.kill_switch_generation", "state:app_state.kill_switch_latched_at", "marker:reset_marker", "event:guard_state_changed", "event:ops_request_terminal", "event:event_stream_health", "event:guard_notice_deferred", "event:guard_notice_backfill_skipped", "activity:kill_switch_latched", "activity:kill_switch_latched_durability_uncertain", "activity:kill_switch_reset", "activity:kill_switch_reconcile_required", "activity:kill_switch_reconcile_confirmed", "activity:kill_switch_reconcile_failed", "activity:kill_switch_state_uncertain", "db:account_snapshots", "config:risk.drawdown_kill_pct", "metric:kill_switch_latches", "metric:kill_switch_events", "ops:guard_lane_reentry", "ops:guard_lane_not_held", "ops:guard_state_unavailable", "ops:guard_notice_pending", "ops:guard_notice_generation", "ops:guard_kind"], "anchors": ["src/agentic_fx/core/risk_gate.py::evaluate", "src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open", "src/agentic_fx/store/state.py::StateStore.load", "src/agentic_fx/store/state.py::StateStore.update", "src/agentic_fx/store/state.py::StateStore.reset_kill_switch", "src/agentic_fx/store/state.py::StateStore.confirm_latched", "src/agentic_fx/ops/service.py::OpsService.reset_kill_switch", "src/agentic_fx/ops/service.py::OpsService.reconcile_kill_switch", "src/agentic_fx/ops/service.py::plan_kill_switch_notice", "src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch", "src/agentic_fx/ops/service.py::OpsService._guard_step", "src/agentic_fx/ops/service.py::OpsService.emit_pending_guard_notices", "src/agentic_fx/commands.py::Commands.dispatch", "src/agentic_fx/commands.py::Commands._killswitch_reconcile", "src/agentic_fx/commands.py::Commands._data_resume", "src/agentic_fx/ops/service.py::OpsService.resume_data", "src/agentic_fx/ops/events.py::EventStore.emit_best_effort", "src/agentic_fx/ops/events.py::EventStore.emit", "src/agentic_fx/ops/service.py::OpsService._terminal", "src/agentic_fx/service.py::build_app", "src/agentic_fx/ops/service.py::OpsService.emit_pending_notices", "src/agentic_fx/ops/service.py::OpsService._current_state", "src/agentic_fx/core/accounting.py::record_snapshot", "src/agentic_fx/core/accounting.py::current_account", "src/agentic_fx/backtest/runner.py::_auto_release_kill_switch", "src/agentic_fx/backtest/runner.py::run_replay", "src/agentic_fx/backtest/metrics.py::compute_metrics", "afx-ops/afx_ops/gate/render.py::_event_text_for_code", "afx-ops/afx_ops/bot/adapter.py::BotAdapter.deliver_events", "afx-ops/afx_ops/notify/payload.py::encode_event", "afx-ops/afx_ops/notify/runtime.py::_Loop._poll_once", "src/agentic_fx/status.py::read_state", "afx-ops/afx_ops/web/render.py::render_activity", "src/agentic_fx/ops/service.py::OpsService.status", "src/agentic_fx/ops/events.py::<module>.FIELDS", "src/agentic_fx/service.py::_build_ops_service"], "related": ["auto-killswitch-latch-emits-no-event", "killswitch-reset-hwm-rebase", "datafeed-outage-discord-notice", "killswitch-latched-activity-repeats", "bot-gateway-disconnect-is-silent"], "tests": ["tests/store/test_state.py", "tests/core/test_executor.py", "tests/ops/test_ac51_killswitch_api.py", "tests/test_commands.py"]}
 ---
 # Kill switch / guard state
 
@@ -204,866 +121,866 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 <!-- impact-map:covers -->
 ```json
 {
-  "covers": [
-    {
-      "symbol": "afx-ops/afx_ops/bot/adapter.py::BotAdapter.deliver_events",
-      "resource": "event:event_stream_health",
-      "ids": [
-        "F29"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "afx-ops/afx_ops/bot/adapter.py::BotAdapter.deliver_events",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F29"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "afx-ops/afx_ops/bot/adapter.py::BotAdapter.deliver_events",
-      "resource": "event:ops_request_terminal",
-      "ids": [
-        "F29"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "afx-ops/afx_ops/gate/render.py::_event_text_for_code",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F28"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "afx-ops/afx_ops/gate/render.py::_event_text_for_code",
-      "resource": "event:ops_request_terminal",
-      "ids": [
-        "F28"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "afx-ops/afx_ops/notify/payload.py::encode_event",
-      "resource": "event:event_stream_health",
-      "ids": [
-        "F30"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "afx-ops/afx_ops/notify/payload.py::encode_event",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F30"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "afx-ops/afx_ops/notify/payload.py::encode_event",
-      "resource": "event:ops_request_terminal",
-      "ids": [
-        "F30"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "afx-ops/afx_ops/notify/runtime.py::_Loop._poll_once",
-      "resource": "event:event_stream_health",
-      "ids": [
-        "F31"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "afx-ops/afx_ops/notify/runtime.py::_Loop._poll_once",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F31"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "afx-ops/afx_ops/notify/runtime.py::_Loop._poll_once",
-      "resource": "event:ops_request_terminal",
-      "ids": [
-        "F31"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "afx-ops/afx_ops/web/render.py::render_activity",
-      "resource": "activity:kill_switch_reset",
-      "ids": [
-        "F33"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/backtest/metrics.py::compute_metrics",
-      "resource": "metric:kill_switch_latches",
-      "ids": [
-        "F27"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/backtest/runner.py::_auto_release_kill_switch",
-      "resource": "db:account_snapshots",
-      "ids": [
-        "F25"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/backtest/runner.py::_auto_release_kill_switch",
-      "resource": "state:app_state.kill_switch_latched",
-      "ids": [
-        "F25"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/backtest/runner.py::run_replay",
-      "resource": "db:account_snapshots",
-      "ids": [
-        "F26"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/backtest/runner.py::run_replay",
-      "resource": "metric:kill_switch_events",
-      "ids": [
-        "F26"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/backtest/runner.py::run_replay",
-      "resource": "metric:kill_switch_latches",
-      "ids": [
-        "F26"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/backtest/runner.py::run_replay",
-      "resource": "state:app_state.kill_switch_latched",
-      "ids": [
-        "E03"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/commands.py::Commands._data_resume",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "E07"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/commands.py::Commands._data_resume",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F15"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/commands.py::Commands._emit_guard_notices",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "E13",
-        "E14",
-        "E15"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/commands.py::Commands._killswitch_reconcile",
-      "resource": "activity:kill_switch_reconcile_confirmed",
-      "ids": [
-        "F14"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/commands.py::Commands._killswitch_reconcile",
-      "resource": "activity:kill_switch_reconcile_failed",
-      "ids": [
-        "F14"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/commands.py::Commands._killswitch_reconcile",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "E14"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/commands.py::Commands._killswitch_reconcile",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F14"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/commands.py::Commands._killswitch_reconcile",
-      "resource": "marker:reset_marker",
-      "ids": [
-        "F14"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/commands.py::Commands.dispatch",
-      "resource": "activity:kill_switch_reset",
-      "ids": [
-        "F13"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/commands.py::Commands.dispatch",
-      "resource": "activity:kill_switch_state_uncertain",
-      "ids": [
-        "F13"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/commands.py::Commands.dispatch",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "E13"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/commands.py::Commands.dispatch",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F13"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/core/accounting.py::current_account",
-      "resource": "db:account_snapshots",
-      "ids": [
-        "F24"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/core/accounting.py::record_snapshot",
-      "resource": "db:account_snapshots",
-      "ids": [
-        "F23"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open",
-      "resource": "activity:kill_switch_latched",
-      "ids": [
-        "F02"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open",
-      "resource": "activity:kill_switch_latched_durability_uncertain",
-      "ids": [
-        "F02"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open",
-      "resource": "config:risk.drawdown_kill_pct",
-      "ids": [
-        "E05",
-        "E06"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open",
-      "resource": "state:app_state.kill_switch_latched",
-      "ids": [
-        "F02"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/core/executor.py::Executor._open",
-      "resource": "config:risk.drawdown_kill_pct",
-      "ids": [
-        "E05"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/core/executor.py::Executor._open",
-      "resource": "state:app_state.kill_switch_latched",
-      "ids": [
-        "E04"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/core/executor.py::Executor.handle_intent",
-      "resource": "state:app_state.kill_switch_latched",
-      "ids": [
-        "E03",
-        "E04"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/core/executor.py::Executor.open_from_snapshot",
-      "resource": "config:risk.drawdown_kill_pct",
-      "ids": [
-        "E06"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/core/executor.py::Executor.open_from_snapshot",
-      "resource": "state:app_state.kill_switch_latched",
-      "ids": [
-        "E01",
-        "E02"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/core/risk_gate.py::evaluate",
-      "resource": "config:risk.drawdown_kill_pct",
-      "ids": [
-        "F01"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/core/risk_gate.py::evaluate",
-      "resource": "state:app_state.kill_switch_latched",
-      "ids": [
-        "F01"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/datafeed/outage.py::OutageStateMachine.request_resume",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "E07"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/loops/trade_loop.py::TradeLoop._run_once_impl",
-      "resource": "state:app_state.kill_switch_latched",
-      "ids": [
-        "E01"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/loops/trade_loop.py::TradeLoop._run_signal_mission",
-      "resource": "state:app_state.kill_switch_latched",
-      "ids": [
-        "E02"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/events.py::<module>.FIELDS",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F35"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/events.py::<module>.FIELDS",
-      "resource": "ops:guard_kind",
-      "ids": [
-        "F35"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/events.py::EventStore.emit",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F18"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/events.py::EventStore.emit_best_effort",
-      "resource": "event:event_stream_health",
-      "ids": [
-        "F17"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/events.py::EventStore.emit_best_effort",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F17"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService._current_state",
-      "resource": "ops:guard_state_unavailable",
-      "ids": [
-        "F22"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService._current_state",
-      "resource": "state:app_state.kill_switch_latched",
-      "ids": [
-        "F22"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService._guard_event",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "E09"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService._guard_step",
-      "resource": "event:guard_notice_deferred",
-      "ids": [
-        "F11"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService._guard_step",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "E10",
-        "E11",
-        "E12"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService._guard_step",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F11"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch",
-      "resource": "event:guard_notice_backfill_skipped",
-      "ids": [
-        "F10"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "E12"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F10"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch",
-      "resource": "ops:guard_lane_not_held",
-      "ids": [
-        "F10"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService._terminal",
-      "resource": "event:ops_request_terminal",
-      "ids": [
-        "F19"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService.emit_pending_guard_notices",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "E15"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService.emit_pending_guard_notices",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F12"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService.emit_pending_guard_notices",
-      "resource": "ops:guard_lane_reentry",
-      "ids": [
-        "F12"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService.emit_pending_notices",
-      "resource": "event:guard_notice_deferred",
-      "ids": [
-        "F21"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService.emit_pending_notices",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "E16"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService.emit_pending_notices",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F21"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService.reconcile_kill_switch",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "E11"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService.reconcile_kill_switch",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F08"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService.reconcile_kill_switch",
-      "resource": "marker:reset_marker",
-      "ids": [
-        "F08"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService.reset_kill_switch",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "E10"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService.reset_kill_switch",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F07"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService.reset_kill_switch",
-      "resource": "state:app_state.kill_switch_latched",
-      "ids": [
-        "F07"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService.resume_data",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "E08",
-        "E09"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService.resume_data",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F16"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService.resume_data",
-      "resource": "ops:guard_kind",
-      "ids": [
-        "F16"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService.status",
-      "resource": "marker:reset_marker",
-      "ids": [
-        "F34"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::OpsService.status",
-      "resource": "state:app_state.kill_switch_latched",
-      "ids": [
-        "F34"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::plan_kill_switch_notice",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F09"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::plan_kill_switch_notice",
-      "resource": "ops:guard_kind",
-      "ids": [
-        "F09"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::plan_kill_switch_notice",
-      "resource": "state:app_state.kill_switch_generation",
-      "ids": [
-        "F09"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::plan_kill_switch_notice",
-      "resource": "state:app_state.kill_switch_latched",
-      "ids": [
-        "F09"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/ops/service.py::plan_kill_switch_notice",
-      "resource": "state:app_state.kill_switch_latched_at",
-      "ids": [
-        "F09"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/service.py::_build_ops_service",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "E08",
-        "E17"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/service.py::_build_ops_service",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F36"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/service.py::_build_ops_service",
-      "resource": "ops:guard_notice_generation",
-      "ids": [
-        "F36"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/service.py::_build_ops_service",
-      "resource": "ops:guard_notice_pending",
-      "ids": [
-        "F36"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/service.py::build_app",
-      "resource": "activity:kill_switch_reconcile_required",
-      "ids": [
-        "F20"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/service.py::build_app",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "E16",
-        "E17"
-      ],
-      "kind": "manual_edge"
-    },
-    {
-      "symbol": "src/agentic_fx/service.py::build_app",
-      "resource": "event:guard_state_changed",
-      "ids": [
-        "F20"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/status.py::read_state",
-      "resource": "marker:reset_marker",
-      "ids": [
-        "F32"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/status.py::read_state",
-      "resource": "state:app_state.kill_switch_latched",
-      "ids": [
-        "F32"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/store/state.py::StateStore.confirm_latched",
-      "resource": "marker:reset_marker",
-      "ids": [
-        "F06"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/store/state.py::StateStore.confirm_latched",
-      "resource": "state:app_state.kill_switch_generation",
-      "ids": [
-        "F06"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/store/state.py::StateStore.confirm_latched",
-      "resource": "state:app_state.kill_switch_latched",
-      "ids": [
-        "F06"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/store/state.py::StateStore.load",
-      "resource": "marker:reset_marker",
-      "ids": [
-        "F03"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/store/state.py::StateStore.load",
-      "resource": "state:app_state.kill_switch_latched",
-      "ids": [
-        "F03"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/store/state.py::StateStore.reset_kill_switch",
-      "resource": "marker:reset_marker",
-      "ids": [
-        "F05"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/store/state.py::StateStore.reset_kill_switch",
-      "resource": "state:app_state.kill_switch_generation",
-      "ids": [
-        "F05"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/store/state.py::StateStore.reset_kill_switch",
-      "resource": "state:app_state.kill_switch_latched",
-      "ids": [
-        "F05"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/store/state.py::StateStore.reset_kill_switch",
-      "resource": "state:app_state.kill_switch_latched_at",
-      "ids": [
-        "F05"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/store/state.py::StateStore.update",
-      "resource": "state:app_state.kill_switch_generation",
-      "ids": [
-        "F04"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/store/state.py::StateStore.update",
-      "resource": "state:app_state.kill_switch_latched",
-      "ids": [
-        "F04"
-      ],
-      "kind": "page"
-    },
-    {
-      "symbol": "src/agentic_fx/store/state.py::StateStore.update",
-      "resource": "state:app_state.kill_switch_latched_at",
-      "ids": [
-        "F04"
-      ],
-      "kind": "page"
-    }
-  ]
+ "covers": [
+  {
+   "symbol": "afx-ops/afx_ops/bot/adapter.py::BotAdapter.deliver_events",
+   "resource": "event:event_stream_health",
+   "ids": [
+    "F29"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "afx-ops/afx_ops/bot/adapter.py::BotAdapter.deliver_events",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "F29"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "afx-ops/afx_ops/bot/adapter.py::BotAdapter.deliver_events",
+   "resource": "event:ops_request_terminal",
+   "ids": [
+    "F29"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "afx-ops/afx_ops/gate/render.py::_event_text_for_code",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "F28"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "afx-ops/afx_ops/gate/render.py::_event_text_for_code",
+   "resource": "event:ops_request_terminal",
+   "ids": [
+    "F28"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "afx-ops/afx_ops/notify/payload.py::encode_event",
+   "resource": "event:event_stream_health",
+   "ids": [
+    "F30"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "afx-ops/afx_ops/notify/payload.py::encode_event",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "F30"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "afx-ops/afx_ops/notify/payload.py::encode_event",
+   "resource": "event:ops_request_terminal",
+   "ids": [
+    "F30"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "afx-ops/afx_ops/notify/runtime.py::_Loop._poll_once",
+   "resource": "event:event_stream_health",
+   "ids": [
+    "F31"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "afx-ops/afx_ops/notify/runtime.py::_Loop._poll_once",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "F31"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "afx-ops/afx_ops/notify/runtime.py::_Loop._poll_once",
+   "resource": "event:ops_request_terminal",
+   "ids": [
+    "F31"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "afx-ops/afx_ops/web/render.py::render_activity",
+   "resource": "activity:kill_switch_reset",
+   "ids": [
+    "F33"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/backtest/metrics.py::compute_metrics",
+   "resource": "metric:kill_switch_latches",
+   "ids": [
+    "F27"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/backtest/runner.py::_auto_release_kill_switch",
+   "resource": "db:account_snapshots",
+   "ids": [
+    "F25"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/backtest/runner.py::_auto_release_kill_switch",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "F25"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/backtest/runner.py::run_replay",
+   "resource": "db:account_snapshots",
+   "ids": [
+    "F26"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/backtest/runner.py::run_replay",
+   "resource": "metric:kill_switch_events",
+   "ids": [
+    "F26"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/backtest/runner.py::run_replay",
+   "resource": "metric:kill_switch_latches",
+   "ids": [
+    "F26"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/backtest/runner.py::run_replay",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "E03"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/commands.py::Commands._data_resume",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "E07"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/commands.py::Commands._data_resume",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "F15"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/commands.py::Commands._emit_guard_notices",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "E13",
+    "E14",
+    "E15"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/commands.py::Commands._killswitch_reconcile",
+   "resource": "activity:kill_switch_reconcile_confirmed",
+   "ids": [
+    "F14"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/commands.py::Commands._killswitch_reconcile",
+   "resource": "activity:kill_switch_reconcile_failed",
+   "ids": [
+    "F14"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/commands.py::Commands._killswitch_reconcile",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "E14"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/commands.py::Commands._killswitch_reconcile",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "F14"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/commands.py::Commands._killswitch_reconcile",
+   "resource": "marker:reset_marker",
+   "ids": [
+    "F14"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/commands.py::Commands.dispatch",
+   "resource": "activity:kill_switch_reset",
+   "ids": [
+    "F13"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/commands.py::Commands.dispatch",
+   "resource": "activity:kill_switch_state_uncertain",
+   "ids": [
+    "F13"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/commands.py::Commands.dispatch",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "E13"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/commands.py::Commands.dispatch",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "F13"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/core/accounting.py::current_account",
+   "resource": "db:account_snapshots",
+   "ids": [
+    "F24"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/core/accounting.py::record_snapshot",
+   "resource": "db:account_snapshots",
+   "ids": [
+    "F23"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open",
+   "resource": "activity:kill_switch_latched",
+   "ids": [
+    "F02"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open",
+   "resource": "activity:kill_switch_latched_durability_uncertain",
+   "ids": [
+    "F02"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open",
+   "resource": "config:risk.drawdown_kill_pct",
+   "ids": [
+    "E05",
+    "E06"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "F02"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/core/executor.py::Executor._open",
+   "resource": "config:risk.drawdown_kill_pct",
+   "ids": [
+    "E05"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/core/executor.py::Executor._open",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "E04"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/core/executor.py::Executor.handle_intent",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "E03",
+    "E04"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/core/executor.py::Executor.open_from_snapshot",
+   "resource": "config:risk.drawdown_kill_pct",
+   "ids": [
+    "E06"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/core/executor.py::Executor.open_from_snapshot",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "E01",
+    "E02"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/core/risk_gate.py::evaluate",
+   "resource": "config:risk.drawdown_kill_pct",
+   "ids": [
+    "F01"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/core/risk_gate.py::evaluate",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "F01"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/datafeed/outage.py::OutageStateMachine.request_resume",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "E07"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/loops/trade_loop.py::TradeLoop._run_once_impl",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "E01"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/loops/trade_loop.py::TradeLoop._run_signal_mission",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "E02"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/events.py::<module>.FIELDS",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "F35"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/events.py::<module>.FIELDS",
+   "resource": "ops:guard_kind",
+   "ids": [
+    "F35"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/events.py::EventStore.emit",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "F18"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/events.py::EventStore.emit_best_effort",
+   "resource": "event:event_stream_health",
+   "ids": [
+    "F17"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/events.py::EventStore.emit_best_effort",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "F17"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._current_state",
+   "resource": "ops:guard_state_unavailable",
+   "ids": [
+    "F22"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._current_state",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "F22"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._guard_event",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "E09"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._guard_step",
+   "resource": "event:guard_notice_deferred",
+   "ids": [
+    "F11"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._guard_step",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "E10",
+    "E11",
+    "E12"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._guard_step",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "F11"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch",
+   "resource": "event:guard_notice_backfill_skipped",
+   "ids": [
+    "F10"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "E12"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "F10"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch",
+   "resource": "ops:guard_lane_not_held",
+   "ids": [
+    "F10"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._terminal",
+   "resource": "event:ops_request_terminal",
+   "ids": [
+    "F19"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.emit_pending_guard_notices",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "E15"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.emit_pending_guard_notices",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "F12"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.emit_pending_guard_notices",
+   "resource": "ops:guard_lane_reentry",
+   "ids": [
+    "F12"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.emit_pending_notices",
+   "resource": "event:guard_notice_deferred",
+   "ids": [
+    "F21"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.emit_pending_notices",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "E16"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.emit_pending_notices",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "F21"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.reconcile_kill_switch",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "E11"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.reconcile_kill_switch",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "F08"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.reconcile_kill_switch",
+   "resource": "marker:reset_marker",
+   "ids": [
+    "F08"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.reset_kill_switch",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "E10"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.reset_kill_switch",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "F07"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.reset_kill_switch",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "F07"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.resume_data",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "E08",
+    "E09"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.resume_data",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "F16"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.resume_data",
+   "resource": "ops:guard_kind",
+   "ids": [
+    "F16"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.status",
+   "resource": "marker:reset_marker",
+   "ids": [
+    "F34"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.status",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "F34"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::plan_kill_switch_notice",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "F09"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::plan_kill_switch_notice",
+   "resource": "ops:guard_kind",
+   "ids": [
+    "F09"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::plan_kill_switch_notice",
+   "resource": "state:app_state.kill_switch_generation",
+   "ids": [
+    "F09"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::plan_kill_switch_notice",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "F09"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::plan_kill_switch_notice",
+   "resource": "state:app_state.kill_switch_latched_at",
+   "ids": [
+    "F09"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/service.py::_build_ops_service",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "E08",
+    "E17"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/service.py::_build_ops_service",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "F36"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/service.py::_build_ops_service",
+   "resource": "ops:guard_notice_generation",
+   "ids": [
+    "F36"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/service.py::_build_ops_service",
+   "resource": "ops:guard_notice_pending",
+   "ids": [
+    "F36"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/service.py::build_app",
+   "resource": "activity:kill_switch_reconcile_required",
+   "ids": [
+    "F20"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/service.py::build_app",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "E16",
+    "E17"
+   ],
+   "kind": "manual_edge"
+  },
+  {
+   "symbol": "src/agentic_fx/service.py::build_app",
+   "resource": "event:guard_state_changed",
+   "ids": [
+    "F20"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/status.py::read_state",
+   "resource": "marker:reset_marker",
+   "ids": [
+    "F32"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/status.py::read_state",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "F32"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/store/state.py::StateStore.confirm_latched",
+   "resource": "marker:reset_marker",
+   "ids": [
+    "F06"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/store/state.py::StateStore.confirm_latched",
+   "resource": "state:app_state.kill_switch_generation",
+   "ids": [
+    "F06"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/store/state.py::StateStore.confirm_latched",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "F06"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/store/state.py::StateStore.load",
+   "resource": "marker:reset_marker",
+   "ids": [
+    "F03"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/store/state.py::StateStore.load",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "F03"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/store/state.py::StateStore.reset_kill_switch",
+   "resource": "marker:reset_marker",
+   "ids": [
+    "F05"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/store/state.py::StateStore.reset_kill_switch",
+   "resource": "state:app_state.kill_switch_generation",
+   "ids": [
+    "F05"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/store/state.py::StateStore.reset_kill_switch",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "F05"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/store/state.py::StateStore.reset_kill_switch",
+   "resource": "state:app_state.kill_switch_latched_at",
+   "ids": [
+    "F05"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/store/state.py::StateStore.update",
+   "resource": "state:app_state.kill_switch_generation",
+   "ids": [
+    "F04"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/store/state.py::StateStore.update",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "F04"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/store/state.py::StateStore.update",
+   "resource": "state:app_state.kill_switch_latched_at",
+   "ids": [
+    "F04"
+   ],
+   "kind": "page"
+  }
+ ]
 }
 ```
 <!-- /impact-map:covers -->
