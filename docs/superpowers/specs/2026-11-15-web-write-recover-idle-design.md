@@ -104,7 +104,7 @@ hook 例外と実 I/O の fake 失敗を区別し、鍵・設定・stage・marke
 
 ## §4 残余
 
-旧版で記録無しのまま中断した停止前状態は推測できず運用者が確認する。pending 中の downgrade と自動回復サービスは対象外。自分の instance lock 下だけ排他があり、(c) を省く観測から鍵・write の継続整合は保証しない。idle の reconfigure は整合検査前に not_enabled（reconfigure.py:55–58、161）。idle の web は unit が無いので起動せず、次の enable の `_check_web_write` が不整合を拒否する（S:548–558、737–754）。起動時検査は広げない。
+旧版で記録無しのまま中断した停止前状態は推測できず運用者が確認する。pending 中の downgrade と自動回復サービスは対象外。自分の instance lock 下だけ排他があり、(c) を省く観測から鍵・write の継続整合は保証しない。idle の reconfigure は整合検査前に not_enabled（reconfigure.py:55–58、161）。idle の web は通常 unit が無い (bot / notify が template を残す場合の手動 start は例外)ので起動せず、次の enable の `_check_web_write` が不整合を拒否する（S:548–558、737–754）。起動時検査は広げない。
 
 ## §5 変更履歴
 

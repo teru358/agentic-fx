@@ -1084,11 +1084,13 @@ def _idle_base(kind):
     return build
 
 
-def _enable_resume_base(stage):
+def _enable_resume_base(stage, point=None):
+    point = point or f"after_stage_{stage}"
+
     def build(tmp_path, monkeypatch):
         bundle = make_bundle(tmp_path, monkeypatch, enable_web=False, web_values=BASIC)
         apply_secret(bundle.root, SecretPlan("install", PW))
-        bundle.setup.hook = lambda name: (_ for _ in ()).throw(Crash(name)) if name == f"after_stage_{stage}" else None
+        bundle.setup.hook = lambda name: (_ for _ in ()).throw(Crash(name)) if name == point else None
         with pytest.raises(Crash):
             bundle.setup.enable("web")
         bundle.setup.hook = lambda _name: None
@@ -1105,12 +1107,12 @@ def _disable_resume_base(tmp_path, monkeypatch):
     return bundle
 
 
-def _switch_resume_base(target):
+def _switch_resume_base(target, step="staged"):
     def build(tmp_path, monkeypatch):
         bundle = make(tmp_path, monkeypatch)
         saved = json.loads(bundle.stage_file.read_text())
         saved.update(write_target=target, write_principal="ops-web-write" if target else "ops-web",
-                     write_step="staged", afx_before_stop="active")
+                     write_step=step, afx_before_stop="active")
         bundle.stage_file.write_text(json.dumps(saved))
         return bundle
     return build
@@ -1154,7 +1156,10 @@ ENTRIES = {
     "fresh-never-enabled": (_idle_base("never"), lambda b, t, s: _interactive(b, t, "keep", s), "gate"),
     "enabled-recheck": (_enabled_base, _enable_plain, "gate"),
     "resume-stopped": (_enable_resume_base("stopped"), _enable_plain, "gate"),
+    "resume-staged": (_enable_resume_base("staged", "before_marker"), _enable_plain, "gate"),
+    "resume-enrolled": (_enable_resume_base("enrolled"), _enable_plain, "gate"),
     "resume-installed": (_enable_resume_base("installed"), _enable_plain, "gate"),
+    "resume-started": (_enable_resume_base("started"), _enable_plain, "gate"),
     "resume-checked": (_enable_resume_base("checked"), _enable_plain, "gate"),
     "reconfigure-non-interactive": (_enabled_base, _reconf_ni, "gate"),
     "reconfigure-interactive": (_enabled_base, _reconf_ia, "gate"),
@@ -1167,8 +1172,11 @@ ENTRIES = {
     "write-idle": (_idle_base("disabled"), _switch(True), "switch_idle"),
     "no-write-idle": (_idle_base("disabled"), _switch(False), "switch_idle"),
     "write-never-enabled": (_idle_base("never"), _switch(True), "switch_idle"),
+    "no-write-never-enabled": (_idle_base("never"), _switch(False), "switch_idle"),
     "write-resume": (_switch_resume_base(True), _switch(True), "switch_resume"),
     "no-write-resume": (_switch_resume_base(False), _switch(False), "switch_resume"),
+    **{f"{name}-resume-{step}": (_switch_resume_base(target, step), _switch(target), "switch_resume")
+       for step in ("stopped", "keyed", "configured") for name, target in (("write", True), ("no-write", False))},
 }
 
 
@@ -1212,6 +1220,8 @@ def test_every_entry_keeps_the_write_and_the_write_key_consistent(tmp_path, monk
     tmp_before = sorted(p.name for p in bundle.xdg.rglob(".*.tmp"))
     rc = drive(bundle, tmp_path, state)
     want = expected(entry, state)
+    recovery = bundle.root / "data" / "ops" / "web.write-recovery.json"
+    assert not recovery.exists(), (entry, state)
     if want == "stop":
         # 止める操作は食い違いでは拒否しない。web は disabled になり、次の enable が判定で止める。
         assert rc == 0, (entry, state)
@@ -1236,6 +1246,7 @@ def test_every_entry_keeps_the_write_and_the_write_key_consistent(tmp_path, monk
     elif want == "converge":
         assert verdict == Consistent(_target_of(entry)), (entry, state, verdict)
         assert read_marker(bundle.root) is None
+        assert bundle.systemd.afx_state == "active", (entry, state)
         if mode == "enabled":
             assert "write_step" not in read_stage(bundle.root, "web")
     else:

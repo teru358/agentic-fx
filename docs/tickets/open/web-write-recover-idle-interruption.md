@@ -1,7 +1,7 @@
 ---
 id: web-write-recover-idle-interruption
 title: 有効でない web の鍵と write の回復が中断に弱い
-status: 設計待ち
+status: 実装中
 priority: 中
 kind: 不具合
 opened: 2026-11-10
@@ -10,7 +10,7 @@ related: [web-plugin-improve-hub]
 ---
 # [web-write-recover-idle-interruption] 有効でない web の鍵と write の回復が中断に弱い
 
-**状態**: 設計待ち / **優先**: 中 / **種別**: 不具合
+**状態**: 実装中 / **優先**: 中 / **種別**: 不具合
 
 ## 現象
 
@@ -25,3 +25,4 @@ afx ops web enable --write / --no-write は、web が有効でない (disabled�
 ## 経緯
 
 - 2026-11-10: 起票。
+- 2026-11-15: 状態: 実装中 — 回復記録 (data/ops/web.write-recovery.json) による再開を実装。中断点・手動操作・入口・wizard の test と変異で確認
