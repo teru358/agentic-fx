@@ -358,14 +358,14 @@ def evaluate(args):
 METHOD = f"python-{sys.version_info.major}.{sys.version_info.minor}:ast.dump(annotate_fields=True,include_attributes=False):v1"
 
 
-def anchor_digest(anchor):
+def anchor_digest(anchor, data=None):
     path, symbol = anchor.split('::', 1)
     source = Path(path)
     if source.is_absolute() or '..' in source.parts or source.resolve().is_relative_to(Path.cwd().resolve()) is False:
         raise ValueError('invalid path')
     node = None
     try:
-        tree = ast.parse(source.read_bytes(), filename=path)
+        tree = ast.parse(source.read_bytes() if data is None else data, filename=path)
         parts = symbol.split('.')
         body = tree.body
         if parts[0] == '<module>' and len(parts) == 2:
@@ -507,6 +507,100 @@ def check(args):
     return 2 if any(r in errors2 for _, _, r in items) else 1 if items else 0
 
 
+
+def affected(args):
+    def fail(reason):
+        print(json.dumps({'error': reason}, sort_keys=True))
+        return 2
+    base = git('rev-parse', '--verify', '--end-of-options', args.base + '^{commit}')
+    if not base:
+        return fail('base_unavailable')
+    base = base.decode().strip()
+    head = None
+    if not args.worktree:
+        raw = git('rev-parse', '--verify', '--end-of-options', args.head + '^{commit}')
+        if not raw:
+            return fail('head_unavailable')
+        head = raw.decode().strip()
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', args.page):
+        return fail('invalid_page')
+    try:
+        page = Path('docs/impact-map/domains') / (args.page + '.md')
+        meta = front_matter(page)
+        lookup = literals(meta['resources'], meta.get('literals'))
+        declarations = set(meta['anchors']) | {c['symbol'] for c in read_covers(page)}
+        text = page.read_text(encoding='utf-8')
+        for m in re.finditer(r'^- \*\*E[0-9]+\*\* `([^`]+)` → `([^`]+)`', text, re.MULTILINE):
+            declarations.update(m.groups())
+        for anchor in declarations:
+            path, symbol = anchor.split('::', 1)
+            if not path or not symbol or Path(path).is_absolute() or '..' in Path(path).parts:
+                raise ValueError('invalid anchor')
+        def runtime(path):
+            parts = Path(path).parts
+            return (path.endswith('.py') and not Path(path).name.startswith('.') and
+                    not any(p in EXCLUDED or p in ('tests', 'test', 'scripts', 'docs') for p in parts))
+        def listing(rev):
+            raw = git('ls-tree', '-r', '--name-only', '-z', rev) if rev else git('ls-files', '-z', '--cached', '--others', '--exclude-standard')
+            if raw is None:
+                raise OSError('listing failed')
+            return {os.fsdecode(p) for p in raw.split(b'\0') if p and runtime(os.fsdecode(p))}
+        old_files, new_files = listing(base), listing(head)
+        if head is None:
+            new_files = {p for p in new_files if Path(p).is_file() and not Path(p).is_symlink()}
+        def read(rev, path, files):
+            if path not in files:
+                return None
+            data = git('show', rev + ':' + path) if rev else Path(path).read_bytes()
+            if data is None:
+                raise OSError('source unavailable')
+            return data
+        # Declarations can name files outside the runtime scan.
+        def declared_data(rev, path):
+            if rev:
+                raw = git('cat-file', '-e', rev + ':' + path)
+                return git('show', rev + ':' + path) if raw is not None else None
+            source = Path(path)
+            return source.read_bytes() if source.is_file() else None
+        items = set()
+        for anchor in sorted(declarations):
+            path = anchor.split('::', 1)[0]
+            old, new = declared_data(base, path), declared_data(head, path)
+            before = anchor_digest(anchor, old)[1] if old is not None else None
+            after = anchor_digest(anchor, new)[1] if new is not None else None
+            if before is not None and after is None:
+                items.add(('unmapped_removed_dependency', anchor, '', ''))
+            elif before != after:
+                kind = 'dependency_changed' if '::<module>.' in anchor else 'symbol_changed'
+                items.add((kind, anchor, '', ''))
+        patterns = compile_patterns(lookup)
+        for path in sorted(old_files | new_files):
+            old, new = read(base, path, old_files), read(head, path, new_files)
+            if old is None and new is not None:
+                items.add(('unmapped_new_file', path, '', ''))
+            if old == new:
+                continue
+            def extract_set(data):
+                if data is None:
+                    return set()
+                records = {}
+                Visitor(lookup, path, '', records, patterns).visit(ast.parse(data, filename=path))
+                return {(r['resource'], r['path'] + '::' + r['symbol']) for r in records.values()}
+            before, after = extract_set(old), extract_set(new)
+            for resource, symbol in before ^ after:
+                items.add(('literal_candidates_changed', symbol, resource, 'added' if (resource, symbol) in after else 'removed'))
+        rows = []
+        for kind, anchor, resource, change in sorted(items):
+            row = {'kind': kind, 'anchor': anchor}
+            if resource:
+                row.update(resource=resource, change=change)
+            rows.append(row)
+        print(json.dumps({'items': rows}, sort_keys=True, separators=(',', ':')))
+        return 0
+    except (OSError, ValueError, KeyError, TypeError, SyntaxError, UnicodeError, RecursionError):
+        return fail('analysis_failed')
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest='command', required=True)
@@ -528,9 +622,15 @@ def main():
         ve.add_argument('--' + option)
     ck = sub.add_parser('check')
     ck.add_argument('--page', required=True)
+    af = sub.add_parser('affected')
+    af.add_argument('--page', required=True)
+    af.add_argument('--base', required=True)
+    target = af.add_mutually_exclusive_group(required=True)
+    target.add_argument('--head')
+    target.add_argument('--worktree', action='store_true')
     args = parser.parse_args()
     try:
-        return extract(args) if args.command == 'extract' else evaluate(args) if args.command == 'evaluate' else verify(args) if args.command == 'verify' else check(args)
+        return extract(args) if args.command == 'extract' else evaluate(args) if args.command == 'evaluate' else verify(args) if args.command == 'verify' else check(args) if args.command == 'check' else affected(args)
     except (OSError, ValueError, KeyError, TypeError, SyntaxError) as exc:
         print(f'invalid input: {type(exc).__name__}', file=sys.stderr)
         return 2

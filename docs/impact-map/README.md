@@ -35,3 +35,6 @@ python3 scripts/impact_map.py evaluate --domain kill-switch --index tmp/impact-m
 | 0 | 問題なし |
 | 1 | stale、根拠消失、必須項目違反 |
 | 2 | 解析・宣言・方式・履歴のエラー（1 と同時の場合も 2） |
+
+`python scripts/impact_map.py affected --page <domain> --base <rev> --head <rev>` で revision 間の候補を表示する。`--head` の代わりに `--worktree` を指定すると作業 tree と比較する。
+出力は symbol・literal 候補・依存の変化と unmapped を区別する。runtime の候補走査は Python ファイルを対象に、tests、scripts、docs と extract の除外ディレクトリを除く。履歴や解析が取得できない場合は終了コード 2 を返す。
