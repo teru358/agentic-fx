@@ -1,9 +1,9 @@
 ---
-{"id": "kill-switch", "owner_role": "conductor", "literals": {"marker:reset_marker": [".reset-in-progress"]}, "resources": ["state:app_state.kill_switch_latched", "state:app_state.kill_switch_generation", "state:app_state.kill_switch_latched_at", "marker:reset_marker", "event:guard_state_changed", "event:ops_request_terminal", "event:event_stream_health", "log:guard_notice_deferred", "log:guard_notice_backfill_skipped", "activity:kill_switch_latched", "activity:kill_switch_latched_durability_uncertain", "activity:kill_switch_reset", "activity:kill_switch_reconcile_required", "activity:kill_switch_reconcile_confirmed", "activity:kill_switch_reconcile_failed", "activity:kill_switch_state_uncertain", "db:account_snapshots", "config:risk.drawdown_kill_pct", "metric:kill_switch_latches", "metric:kill_switch_events", "ops:guard_lane_reentry", "ops:guard_lane_not_held", "ops:guard_state_unavailable", "ops:guard_notice_pending", "ops:guard_notice_generation", "ops:guard_kind"], "anchors": ["src/agentic_fx/core/risk_gate.py::evaluate", "src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open", "src/agentic_fx/store/state.py::StateStore.load", "src/agentic_fx/store/state.py::StateStore.update", "src/agentic_fx/store/state.py::StateStore.reset_kill_switch", "src/agentic_fx/store/state.py::StateStore.confirm_latched", "src/agentic_fx/ops/service.py::OpsService.reset_kill_switch", "src/agentic_fx/ops/service.py::OpsService.reconcile_kill_switch", "src/agentic_fx/ops/service.py::plan_kill_switch_notice", "src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch", "src/agentic_fx/ops/service.py::OpsService._guard_step", "src/agentic_fx/ops/service.py::OpsService.emit_pending_guard_notices", "src/agentic_fx/commands.py::Commands.dispatch", "src/agentic_fx/commands.py::Commands._dispatch#reset_kill_switch", "src/agentic_fx/commands.py::Commands._dispatch#write@kill_switch_state_uncertain", "src/agentic_fx/commands.py::Commands._killswitch_reconcile", "src/agentic_fx/commands.py::Commands._data_resume", "src/agentic_fx/ops/service.py::OpsService.resume_data", "src/agentic_fx/ops/events.py::EventStore.emit_best_effort", "src/agentic_fx/ops/events.py::EventStore.emit", "src/agentic_fx/ops/service.py::OpsService._terminal", "src/agentic_fx/service.py::build_app#_build_ops_service", "src/agentic_fx/service.py::build_app#emit_pending_notices", "src/agentic_fx/service.py::build_app#_recover_ops", "src/agentic_fx/ops/service.py::OpsService.emit_pending_notices", "src/agentic_fx/ops/service.py::OpsService._current_state", "src/agentic_fx/core/accounting.py::record_snapshot", "src/agentic_fx/core/accounting.py::current_account", "src/agentic_fx/backtest/runner.py::_auto_release_kill_switch", "src/agentic_fx/backtest/runner.py::run_replay", "src/agentic_fx/backtest/metrics.py::compute_metrics", "afx-ops/afx_ops/gate/render.py::_event_text_for_code", "afx-ops/afx_ops/bot/adapter.py::BotAdapter.deliver_events", "afx-ops/afx_ops/notify/payload.py::encode_event", "afx-ops/afx_ops/notify/runtime.py::_Loop._poll_once", "src/agentic_fx/status.py::read_state", "afx-ops/afx_ops/web/render.py::render_activity", "src/agentic_fx/ops/service.py::OpsService.status", "src/agentic_fx/ops/events.py::<module>.FIELDS", "src/agentic_fx/service.py::_build_ops_service", "src/agentic_fx/service.py::_build_ops_service.status_provider", "src/agentic_fx/backtest/runner.py::_kill_switch_event", "src/agentic_fx/store/state.py::<module>._BOOL_FIELDS", "src/agentic_fx/store/state.py::<module>._REQUIRED_KEYS"], "related": ["auto-killswitch-latch-emits-no-event", "killswitch-reset-hwm-rebase", "datafeed-outage-discord-notice", "killswitch-latched-activity-repeats", "bot-gateway-disconnect-is-silent"], "tests": ["tests/store/test_state.py", "tests/core/test_executor.py", "tests/ops/test_ac51_killswitch_api.py", "tests/test_commands.py"]}
+{"id": "kill-switch", "owner_role": "conductor", "literals": {"marker:reset_marker": [".reset-in-progress"]}, "resources": ["state:app_state.kill_switch_latched", "state:app_state.kill_switch_generation", "state:app_state.kill_switch_latched_at", "marker:reset_marker", "event:guard_state_changed", "event:ops_request_terminal", "event:event_stream_health", "log:guard_notice_deferred", "log:guard_notice_backfill_skipped", "activity:kill_switch_latched", "activity:kill_switch_latched_durability_uncertain", "activity:kill_switch_reset", "activity:kill_switch_reconcile_required", "activity:kill_switch_reconcile_confirmed", "activity:kill_switch_reconcile_failed", "activity:kill_switch_state_uncertain", "db:account_snapshots", "config:risk.drawdown_kill_pct", "metric:kill_switch_latches", "metric:kill_switch_events", "ops:guard_lane_reentry", "ops:guard_lane_not_held", "ops:guard_state_unavailable", "ops:guard_notice_pending", "ops:guard_notice_generation", "ops:guard_kind", "db:kill_switch_hwm_rebases", "ops:killswitch_rebase", "ops:killswitch_rebase_preview", "ops:preview_changed", "ops:market_closed", "log:rebase_release_failed"], "anchors": ["src/agentic_fx/core/risk_gate.py::evaluate", "src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open", "src/agentic_fx/store/state.py::StateStore.load", "src/agentic_fx/store/state.py::StateStore.update", "src/agentic_fx/store/state.py::StateStore.reset_kill_switch", "src/agentic_fx/store/state.py::StateStore.confirm_latched", "src/agentic_fx/ops/service.py::OpsService.reset_kill_switch", "src/agentic_fx/ops/service.py::OpsService.reconcile_kill_switch", "src/agentic_fx/ops/service.py::plan_kill_switch_notice", "src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch", "src/agentic_fx/ops/service.py::OpsService._guard_step", "src/agentic_fx/ops/service.py::OpsService.emit_pending_guard_notices", "src/agentic_fx/commands.py::Commands.dispatch", "src/agentic_fx/commands.py::Commands._dispatch#reset_kill_switch", "src/agentic_fx/commands.py::Commands._dispatch#write@kill_switch_state_uncertain", "src/agentic_fx/commands.py::Commands._killswitch_reconcile", "src/agentic_fx/commands.py::Commands._data_resume", "src/agentic_fx/ops/service.py::OpsService.resume_data", "src/agentic_fx/ops/events.py::EventStore.emit_best_effort", "src/agentic_fx/ops/events.py::EventStore.emit", "src/agentic_fx/ops/service.py::OpsService._terminal", "src/agentic_fx/service.py::build_app#_build_ops_service", "src/agentic_fx/service.py::build_app#emit_pending_notices", "src/agentic_fx/service.py::build_app#_recover_ops", "src/agentic_fx/ops/service.py::OpsService.emit_pending_notices", "src/agentic_fx/ops/service.py::OpsService._current_state", "src/agentic_fx/core/accounting.py::record_snapshot", "src/agentic_fx/core/accounting.py::current_account", "src/agentic_fx/backtest/runner.py::_auto_release_kill_switch", "src/agentic_fx/backtest/runner.py::run_replay", "src/agentic_fx/backtest/metrics.py::compute_metrics", "afx-ops/afx_ops/gate/render.py::_event_text_for_code", "afx-ops/afx_ops/bot/adapter.py::BotAdapter.deliver_events", "afx-ops/afx_ops/notify/payload.py::encode_event", "afx-ops/afx_ops/notify/runtime.py::_Loop._poll_once", "src/agentic_fx/status.py::read_state", "afx-ops/afx_ops/web/render.py::render_activity", "src/agentic_fx/ops/service.py::OpsService.status", "src/agentic_fx/ops/events.py::<module>.FIELDS", "src/agentic_fx/service.py::_build_ops_service", "src/agentic_fx/service.py::_build_ops_service.status_provider", "src/agentic_fx/backtest/runner.py::_kill_switch_event", "src/agentic_fx/store/state.py::<module>._BOOL_FIELDS", "src/agentic_fx/store/state.py::<module>._REQUIRED_KEYS", "src/agentic_fx/ops/rebase_service.py::evaluate_rebase", "src/agentic_fx/ops/rebase_accounting.py::apply_rebase", "src/agentic_fx/ops/service.py::OpsService.rebase_preview", "src/agentic_fx/ops/service.py::OpsService.rebase_kill_switch", "src/agentic_fx/ops/service.py::OpsService._rebase_under_core", "src/agentic_fx/ops/service.py::OpsService._rebase_commit", "src/agentic_fx/store/state.py::StateStore.shared_guard", "src/agentic_fx/ops/client.py::Runner._op_killswitch_rebase"], "related": ["auto-killswitch-latch-emits-no-event", "killswitch-reset-hwm-rebase", "datafeed-outage-discord-notice", "killswitch-latched-activity-repeats", "bot-gateway-disconnect-is-silent"], "tests": ["tests/store/test_state.py", "tests/core/test_executor.py", "tests/ops/test_ac51_killswitch_api.py", "tests/test_commands.py", "tests/ops/test_rebase_service.py", "tests/ops/test_rebase_accounting.py"]}
 ---
 # Kill switch / guard state
 
-観測 revision: `0dbcb27f`。
+観測 revision: `160f1e47` (HWM の merge。C4 の `0dbcb27f` との `src/`・`afx-ops/` の差は HWM の file だけ)。
 この頁は資金保護の latch、解除と通知の到達先を読む。
 入口は live の二経路、replay、ops API と shell である。
 DD gate は open intent の評価時に動く。
@@ -16,7 +16,7 @@ C4 sweep は event と現 state を照合する。
 shell reset/reconcile は lane 外の直接 mutation を維持する。
 shell data resume は guard event を通らない。
 ops data resume は callback 後に guard event を発行する。
-明示的 HWM rebase は承認済みだが、この revision では未実装。
+HWM の付け直しは approver だけの別操作で、通常 reset とは別に preview と POST の二 endpoint を持ち、UDS だけで受ける。
 通知 sweep は失われた全履歴の復元を保証しない。
 status の marker 投影と StateStore の全分岐一致は未確認。
 実通知、本番データと運用設定は調査していない。
@@ -45,7 +45,7 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 - **F17** `src/agentic_fx/ops/events.py::EventStore.emit_best_effort` — INSERT 失敗は rollback と失敗集計で隔離し、後の成功時に health event を試す。schema と時刻下限の検証は try の外にある。 Resource: `event:event_stream_health`, `event:guard_state_changed`.
 - **F18** `src/agentic_fx/ops/events.py::EventStore.emit` — schema 検証と INSERT・commit を行い、失敗を呼出し元へ伝える。not_before は event 時刻の下限。 terminal と stream health も同じ emit で書く。 Resource: `event:guard_state_changed`, `event:ops_request_terminal`, `event:event_stream_health`.
 - **F19** `src/agentic_fx/ops/service.py::OpsService._terminal` — mutation の監査終端に対応する terminal event を発行する。guard event とは別である。 Resource: `event:ops_request_terminal`.
-- **F20** `src/agentic_fx/service.py::build_app` — 起動時に reconcile_marker を読み、marker があれば確認要求 activity を記録し、ops service と起動時 sweep を呼ぶ。 Resource: `activity:kill_switch_reconcile_required`, `marker:reset_marker`, `event:guard_state_changed`.
+- **F20** `src/agentic_fx/service.py::build_app` — 起動時に reconcile_marker を読み、marker があれば確認要求 activity を記録し、ops service と起動時 sweep を呼ぶ。ops service の構築には core_lock と broker を渡す (F36)。 Resource: `activity:kill_switch_reconcile_required`, `marker:reset_marker`, `event:guard_state_changed`.
 - **F21** `src/agentic_fx/ops/service.py::OpsService.emit_pending_notices` — 起動時と scheduler tick で lane 内の improve と guard の通知を別々に試す。guard 側の失敗や lane 不獲得は warning log の固定 code (event ではない) で記録し、次の周期に回す。 Resource: `event:guard_state_changed`, `log:guard_notice_deferred`.
 - **F22** `src/agentic_fx/ops/service.py::OpsService._current_state` — state store が無い場合に固定 code を送出し、通常は marker 投影済み state を読む。 Resource: `ops:guard_state_unavailable`, `state:app_state.kill_switch_latched`.
 - **F23** `src/agentic_fx/core/accounting.py::record_snapshot` — live の account snapshot を INSERT する。HWM と equity は DD 入力に関係する。 Resource: `db:account_snapshots`.
@@ -61,16 +61,16 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 - **F33** `afx-ops/afx_ops/web/render.py::render_activity` — web は activity を描画する。event 配送の成功を表すものではない。 kind による選別はせず、lines の末尾を換算・escape して描く。 Resource: `activity:kill_switch_reset`, `activity:kill_switch_latched`, `activity:kill_switch_latched_durability_uncertain`, `activity:kill_switch_reconcile_required`, `activity:kill_switch_reconcile_confirmed`, `activity:kill_switch_reconcile_failed`, `activity:kill_switch_state_uncertain`.
 - **F34** `src/agentic_fx/ops/service.py::OpsService.status` — status は投影 state と marker の確認情報を返す。 kill_switch に世代と発動時刻も載せる。 Resource: `state:app_state.kill_switch_latched`, `marker:reset_marker`, `state:app_state.kill_switch_generation`, `state:app_state.kill_switch_latched_at`.
 - **F35** `src/agentic_fx/ops/events.py::<module>.FIELDS` — event 種別ごとの固定 field 表。guard は guard_kind・state・generation、terminal は endpoint_code・result_code・authenticated_principal、stream health は failure_count・first_failed_at・last_failed_at。 Resource: `event:guard_state_changed`, `event:ops_request_terminal`, `event:event_stream_health`, `ops:guard_kind`.
-- **F36** `src/agentic_fx/service.py::_build_ops_service` — OpsService に read-only pending 投影と data_resume callback を配線する。event の生成は OpsService 側で、この関数は配線だけを行う。status への pending 投影そのものは入れ子の status_provider (F92) にある。
+- **F36** `src/agentic_fx/service.py::_build_ops_service` — OpsService に read-only pending 投影と data_resume callback を配線する。event の生成は OpsService 側で、この関数は配線だけを行う。status への pending 投影そのものは入れ子の status_provider (F92) にある。HWM の付け直しの依存 (core_lock・broker・clock) は両方が揃うときだけ RebaseWiring にして注入し、揃わなければ付け直しだけが使えない (F132)。
 
 - **F37** `afx-ops/afx_ops/gate/render.py::<module>.OPS_EVENT_SPECS` — guard の既定通知を有効、terminal と stream health を無効として同じ文面関数に登録する。 Resource: `event:guard_state_changed`, `event:ops_request_terminal`, `event:event_stream_health`.
 - **F38** `afx-ops/afx_ops/gate/render.py::_event_text_for_code` — guard_kind と state により kill switch と data feed の文面を分ける。 Resource: `ops:guard_kind`.
 
 - **F39** `src/agentic_fx/store/snapshots.py::add` — account_snapshots へ ts(UTC 化)・balance・equity・hwm・cashflow・source を INSERT して commit する。source の既定は paper。 Resource: `db:account_snapshots`.
-- **F40** `src/agentic_fx/store/snapshots.py::latest` — `ORDER BY ts DESC, id DESC LIMIT 1` の最新行を返す。current_account と replay の解除判定が読む。 Resource: `db:account_snapshots`.
+- **F40** `src/agentic_fx/store/snapshots.py::latest` — `ORDER BY ts DESC, id DESC LIMIT 1` の最新行を返す。current_account、replay の解除判定、HWM 付け直しの適格判定 (F131) が読む。 Resource: `db:account_snapshots`.
 - **F41** `src/agentic_fx/store/snapshots.py::first_since` — 指定 ts 以降で最古の行を返す。日次基準の算出が使う。 Resource: `db:account_snapshots`.
 - **F42** `src/agentic_fx/store/snapshots.py::last_before` — 指定 ts より前で最新の行を返す。日初以降に行が無いときの日次基準が使う。 Resource: `db:account_snapshots`.
-- **F43** `src/agentic_fx/store/db.py::<module>._SCHEMA` — account_snapshots の列 (id, ts, balance, equity, hwm, cashflow, source) と (ts, id) 索引を定義する。 Resource: `db:account_snapshots`.
+- **F43** `src/agentic_fx/store/db.py::<module>._SCHEMA` — account_snapshots の列 (id, ts, balance, equity, hwm, cashflow, source) と (ts, id) 索引を定義する。HWM 付け直しの台帳 kill_switch_hwm_rebases の列 (source・付け直し後の snapshot・受理した audit への一意参照を含む) と、UPDATE・DELETE を拒む二つの trigger も同じ schema にある。 Resource: `db:account_snapshots`, `db:kill_switch_hwm_rebases`.
 - **F44** `src/agentic_fx/core/accounting.py::daily_start_snapshot` — 日初以降の最古行、無ければ直前行を基準とし、直前行が上限時間を超えて古ければ None (fail closed)。基準以降の cashflow を加算する。daily_start_equity 経由の日次損失の基準で、DD kill の hwm 入力ではない。 Resource: `db:account_snapshots`.
 - **F45** `src/agentic_fx/backtest/runner.py::_kill_switch_event` — entry の snapshot_id の行 (id 無しの旧呼出しは ts 以下の最新行) の equity と hwm から、hwm が正のとき drawdown_pct を計算する。同 ts の kill_switch_latched activity があれば reason をその本文に置き換え、event 一件を返す。 Resource: `db:account_snapshots`, `metric:kill_switch_events`.
 - **F46** `src/agentic_fx/backtest/runner.py::_release_is_due` — replay の解除は、呼出し側が読んだ最新 snapshot が今 tick の新規行 (id 増加、ts が now、source が paper) で、開場中かつ発動後の次の rollover を過ぎたときだけ成立する。 Resource: `db:account_snapshots`.
@@ -156,7 +156,41 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 - **F127** `src/agentic_fx/status.py::render_status` — offline status が `state:` 行に read_state の kill_switch の値を載せる。 Resource: `state:app_state.kill_switch_latched`.
 - **F128** `src/agentic_fx/store/state.py::StateStore.file_value` — marker を無視した file のままの state を共有 lock 下で返す。reconcile の表示用。 Resource: `state:app_state.kill_switch_latched`.
 - **F129** `src/agentic_fx/ops/service.py::OpsService._ops_lane` — ops lane の取得口。取得の前に同一 thread の再入を拒否し、取得後に thread-local の所有 flag を立て、解放時に下ろす。guard 専用ではなく lane を使う全 mutation の共通入口。 Resource: `ops:guard_lane_reentry`.
-- **F130** `src/agentic_fx/core/kill_switch_words.py::<module>.KILL_SWITCH_RESET_WARNING` — reset は HWM を付け直さない旨の固定文。shell の reset 成功の戻り値と ctl の reset 成功時 (`src/agentic_fx/ops/client.py::Runner._op_killswitch_reset`) が同じ文を出す。数値は含めず、API の field と event の field にも載せない。
+- **F130** `src/agentic_fx/core/kill_switch_words.py::<module>.KILL_SWITCH_RESET_WARNING` — reset は HWM を付け直さない旨の固定文。shell の reset 成功の戻り値と ctl の reset 成功時 (`src/agentic_fx/ops/client.py::Runner._op_killswitch_reset`) が同じ文を出す。ctl は成功後に、DD の状態を推測せず毎回 HWM の付け直しの案内を続ける。shell の戻り値は固定警告だけで、付け直しの案内も入口も無い。数値は含めず、API の field と event の field にも載せない。
+- **F131** `src/agentic_fx/ops/rebase_service.py::evaluate_rebase` — 付け直しの適格性の唯一の判定で、preview と POST の commit 時の再検査が同じ関数を通る。依存の配線、PaperBroker の型、state と marker、世代の一致と 1 以上、開場、最新 snapshot の鮮度 (未来時刻と 10 分超は拒否) と source (paper のみ)、cashflow 0、全 order が終端 (flat)、broker の再評価と snapshot の値の一致、DD が閾値以上、日次基準の評価可否を順に検査し、最初の不適格を固定 reason として返す。適格なら state・snapshot・閾値・starting_balance・ledger の件数と累積から digest token を作る。DB は読むだけで、ledger の読取は read_rebase_totals (F135) を通る。 Resource: `state:app_state.kill_switch_generation`, `state:app_state.kill_switch_latched`, `state:app_state.kill_switch_latched_at`, `config:risk.drawdown_kill_pct`, `db:account_snapshots`.
+- **F132** `src/agentic_fx/ops/rebase_service.py::RebaseWiring` — 付け直しだけが使う依存 (core_lock・broker・clock) の束。未注入なら付け直しだけが unavailable で、daemon の他の機能と SL/TP 監視は止めない。
+- **F133** `src/agentic_fx/ops/rebase_service.py::error_code_name` — 不適格の reason を POST の固定 error code に写す。依存・broker 非対応は unavailable、state は invalid_state、世代は generation_mismatch、閉場は market_closed、他はすべて preview_changed。 Resource: `ops:market_closed`, `ops:preview_changed`.
+- **F134** `src/agentic_fx/ops/rebase_accounting.py::apply_rebase` — BEGIN IMMEDIATE を保持して validate callback で再検査し (読取だけを許す authorizer、transaction を終える操作は拒否)、最新 snapshot を source として、同 ts・同値で hwm=equity・source=manual_ks_rebase の snapshot と ledger の行を一つの transaction で INSERT する。latest が新行・equity=hwm・日次基準が前後で同じという事後条件を満たさなければ両方 rollback する。COMMIT の例外は RebaseOutcomeUnknown にして呼出し元へ解決を任せる。state は書かない。 Resource: `db:account_snapshots`, `db:kill_switch_hwm_rebases`.
+- **F135** `src/agentic_fx/ops/rebase_accounting.py::read_rebase_totals` — ledger の SUM(cut)・SUM(cut_pct)・COUNT・最終 id を読む。累積は保存せず毎回全件から取り、開いた transaction があればその中で読む。 Resource: `db:kill_switch_hwm_rebases`.
+- **F136** `src/agentic_fx/ops/rebase_accounting.py::rebase_figures` — 切下げ幅・率・DD・追加の損失余地を導き、非有限・非正の値と DD が閾値未満を ValueError にする。表示側は再計算せずこの値の写しを使う (F138)。
+- **F137** `src/agentic_fx/ops/rebase_accounting.py::paper_equity` — ops 接続と設定と clock で PaperBroker.equity() を評価する。式を複写せず、core の接続を流用しない。適格判定が snapshot の値との一致を見る (F131)。
+- **F138** `src/agentic_fx/ops/rebase_view.py::preview_lines` — preview の DTO を端末の行に写す。金額・率・回数は server が計算した値だけを出し、ここでは計算しない。DTO は信用しない入力として、数値は有限なものだけ、文字列は無害化して出す。ラッチを解除しないことと他の gate が変わらないことを毎回表示する。
+- **F139** `src/agentic_fx/ops/rebase_view.py::confirm_sentence` — 確認の直前の一文。今回と累積の切下げ幅・率と今回後の回数を DTO から埋め、`rebase <世代>` の入力を求める。
+- **F140** `src/agentic_fx/ops/service.py::OpsService.rebase_preview` — 事前表示。入口の scope ではなく service の先頭で approver を直接検査し (shell は scope を素通りするため)、autopilot 中は拒否する。ops lane の中で state を通常の load で読み、読取 transaction の中で evaluate_rebase を呼んで DTO を返す。DB も state も変えず、受理行も作らず、core lock を取らない。 Resource: `ops:killswitch_rebase_preview`, `state:app_state.kill_switch_generation`.
+- **F141** `src/agentic_fx/ops/service.py::OpsService.rebase_kill_switch` — approver を先頭で直接検査し、世代 (0 以上の int) と preview token (64 桁の 16 進) を検査して _mutate に渡す。非 idempotent で、受理行→副作用→終端行の順を _mutate が守る。autopilot 中は endpoint の制限で拒否する。依存が揃わなければ unavailable (_rebase_wiring)。 Resource: `ops:killswitch_rebase`.
+- **F142** `src/agentic_fx/ops/service.py::OpsService._rebase_under_core` — ops lane → core lock → state の共有 flock → BEGIN IMMEDIATE の順に保持して適用する。core の取得待ちは要求の期限、取得後は共有 flock・SQLite の待ち・計算・書込みに共通の短い予算を置く。保持区間では state の公開 load・排他 flock・guard sweep を呼ばない。成功後の解放時の通常例外は固定 code の warning に隔離し、成立済みの結果を変えない。 Resource: `log:rebase_release_failed`.
+- **F143** `src/agentic_fx/ops/service.py::OpsService._rebase_commit` — 共有 flock の guard が読んだ state と marker、autopilot を再検査し、validate で evaluate_rebase を同じ時刻で呼ぶ。不適格は固定 code (detail に reason) にし、token の不一致は preview_changed にする。apply_rebase に渡し、応答は rebase_id・snapshot_id・世代・latched だけで金額は載せない。state は書かない。 Resource: `ops:preview_changed`, `state:app_state.kill_switch_generation`, `state:app_state.kill_switch_latched`, `state:app_state.kill_switch_latched_at`, `config:risk.drawdown_kill_pct`.
+- **F144** `src/agentic_fx/ops/service.py::OpsService._rebase_wiring` — RebaseWiring・state store・settings が揃うときだけ返し、一つでも欠ければ None にする。
+- **F145** `src/agentic_fx/ops/service.py::OpsService._rebase_preview_state` — preview 用に state と marker を読む。lock の待ち timeout と取消しは伝え、state が読めない場合は (None, 無し) にして適格判定が state_unavailable にする。
+- **F146** `src/agentic_fx/ops/service.py::OpsService._mutate` — mutation の共通の受理・終端の枠。RebaseOutcomeUnknown (COMMIT の結果不明) は PolicyProjectionUnknown と同じく outcome_unknown の終端として返し、OpsError の detail は終端応答にも載せる。
+- **F147** `src/agentic_fx/ops/service.py::OpsService.__init__` — 付け直しの依存を既定 None で受け、_rebase に保持する。
+- **F148** `src/agentic_fx/ops/service.py::<module>.ENDPOINTS` — endpoint 表。付け直しの preview (GET) と POST を Scope.LOCAL_GUARD で登録し、POST は非 idempotent で autopilot 中を拒否する。local_guard の route は UDS の listener だけで受ける (F164)。 Resource: `ops:killswitch_rebase`, `ops:killswitch_rebase_preview`.
+- **F149** `src/agentic_fx/ops/api_server.py::_call` — route 名 killswitch_rebase_preview は query の expected_generation だけ、killswitch_rebase は body の expected_generation と preview_token だけを service に渡す。 Resource: `ops:killswitch_rebase`, `ops:killswitch_rebase_preview`.
+- **F150** `src/agentic_fx/ops/api_server.py::build_routes` — endpoint 表から route を作り、表の件数が定数と一致しなければ起動を止める (表と route が別々に変わらないための固定)。
+- **F151** `src/agentic_fx/ops/api_server.py::ApiServer._process` — OpsError を固定 code の応答にし、detail があれば応答にも載せる。
+- **F152** `src/agentic_fx/ops/contracts.py::ErrorCode` — 固定 error code の列挙。付け直しが preview_changed と market_closed を追加する。OpsError は例外文を code に限り、任意の detail だけを別に持つ。 Resource: `ops:preview_changed`, `ops:market_closed`.
+- **F153** `afx-ops/afx_ops/web/write.py::<module>.KNOWN_DAEMON_CODES` — web が daemon の応答 code を分類する許可集合で、preview_changed と market_closed を含む。web に付け直しの route も呼出しも無く、code の分類だけである。 Resource: `ops:preview_changed`, `ops:market_closed`.
+- **F154** `src/agentic_fx/cli_surface.py::<module>._BASE_COMMANDS` — コマンド表。ctl killswitch rebase を approver 必須・local_guard・daemon 必須で登録する。shell_usage と shell の欄を持たず、legacy shell に入口が無い。reset の表の行は別で、付け直しを含まない。 Resource: `ops:killswitch_rebase`.
+- **F155** `src/agentic_fx/ops/client.py::Runner._op_killswitch_rebase` — preview を読み、端末で `rebase <世代>` の完全一致だけを受けて POST する。値が変わったら preview と確認を取り直す (回数に上限)。同じ token を送り直すのは、取り直した preview が同じ token で無変更と分かった timeout の後だけで、成功・結果不明は再送しない。 Resource: `ops:killswitch_rebase`, `ops:killswitch_rebase_preview`.
+- **F156** `src/agentic_fx/ops/client.py::Runner._rebase_done` — 成功表示。rebase_id・snapshot_id・世代を写し、ラッチ中なら新規停止が続くことと別に reset が要ることを、解除済みなら DD 条件の解消と他の gate の通過は約束しないことを出す。
+- **F157** `src/agentic_fx/ops/client.py::parse` — `killswitch rebase <世代>` を killswitch_rebase の Op にする。引数は世代一つに限る。 Resource: `ops:killswitch_rebase`.
+- **F158** `src/agentic_fx/ops/client.py::<module>._APPROVER_OPS` — approver 必須の Op の集合。killswitch_rebase を含み、確認の対象にもなる。 Resource: `ops:killswitch_rebase`.
+- **F159** `src/agentic_fx/ops/client.py::Terminal.show` — 確認と同じ端末にだけ書く。preview の本文を stdout へ出さない。ask の exact は空白とタブをそのまま返し、完全一致の入力に使う。
+- **F160** `src/agentic_fx/ops/client.py::<module>._ERROR_TEXT` — 固定 error code の利用者向け文言。preview_changed と market_closed を持つ。 Resource: `ops:preview_changed`, `ops:market_closed`.
+- **F161** `src/agentic_fx/store/state.py::StateStore.shared_guard` — 共有 flock を with の終わりまで保持し、その間に読んだ state と marker の有無を返す。保持中に state writer・reset・reconcile・排他 flock・公開 load を呼んではならない。付け直しが state を読むだけで書かないための入口。 Resource: `state:app_state.kill_switch_latched`, `state:app_state.kill_switch_generation`, `state:app_state.kill_switch_latched_at`, `marker:reset_marker`.
+- **F162** `src/agentic_fx/store/state.py::GuardedState.projected` — 保持中に読んだ state を、marker があればラッチ中として投影する (load と同じ意味)。現在の src に呼出し元は無く、付け直しの適格判定は raw の state と marker の有無を別々に受ける。 Resource: `state:app_state.kill_switch_latched`.
+- **F163** `src/agentic_fx/store/db.py::<module>.TABLE_NAMES` — schema と完全一致を検査する表名の集合。付け直しの台帳を含む。 Resource: `db:kill_switch_hwm_rebases`.
+- **F164** `src/agentic_fx/ops/api_server.py::_match` — route の照合。scope が local_guard の route は transport が uds のときだけ照合し、TCP の listener からは到達できない。付け直しの二 endpoint もこの境界の内側にある。
 
 ## K — 守る契約
 
@@ -172,8 +206,8 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 - **K-VIEW**: pending と対象世代は短命 read-only 接続の観測で、取引判断に使わない。web は status/activity を表示し、event 配送成功と混同しない（F20、F32–F34、F36）。
 - **K-CONSUME**: bot と notify は各 cursor を持ち送信後に保存する。送信後保存前の crash による重複は許容する。C4 の無進捗・恒久 4xx の終了と回復例外は同設計 §5.2 に従う（F28–F31）。
 - **K-REPLAY**: replay の理由、artifact、比較 metric と解除時補償を保つ。backtest から手動 rebase module・ledger・source を参照しない（F25–F27、HWM §2.4–2.5）。
-- **K-RESET-UI**: shell と ctl は reset 成功時に固定警告を表示する。ctl の rebase 案内は HWM 実装の契約であり、この revision では未実装（F13、F130、K-REBASE）。
-- **K-REBASE**: 承認済み・未実装（branch で実装中）。独立した approver の明示操作で、PaperBroker、注文状態、新鮮 snapshot、DD、世代、autopilot、閉場を検査する。HWM のみ変更し latch・世代・時刻を保持、値 CAS と ledger/snapshot の原子性を守る。通常 reset や shell/bot/web に入口を加えない。詳細と認可境界は HWM 設計 §1–2、§4–5 を正本とする（F23–F24 は既存入力の根拠）。
+- **K-RESET-UI**: shell と ctl は reset 成功時に固定警告を表示する。ctl は成功後に HWM の付け直しの案内を毎回出し (DD の状態は推測しない)、shell は固定警告だけで付け直しの案内も入口も持たない（F13、F130、K-REBASE）。
+- **K-REBASE**: 実装済み。独立した approver の明示操作 (`ctl killswitch rebase <世代>` と端末での `rebase <世代>` の完全一致) だけで入り、service の先頭で approver を直接検査する (F140–F141、F155)。PaperBroker、注文状態 (全 order が終端)、新鮮な snapshot、DD、世代、autopilot、閉場を検査する (F131、F143)。HWM のみ変更し、latch・世代・発動時刻を保持して state を書かない (F134、F143、F161)。値 CAS は preview の digest を commit 時に再構成して比較し、ledger と snapshot を一つの transaction で書く (F131、F134)。通常 reset、shell、bot、web、notify に入口を加えない (F13、F153–F154)。実口座 broker 向けの硬い累積上限は無い (D10)。詳細と認可境界は HWM 設計 §1–2、§4–5 を正本とする（F23–F24 は既存入力の根拠、`tests/ops/test_rebase_service.py`、`tests/ops/test_rebase_accounting.py`）。
 
 ## D — 既知の逸脱と残余リスク
 
@@ -184,8 +218,10 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 - **D05**（F17–F18）events module の広い best-effort 説明に対し、emit は例外を伝え、emit_best_effort も事前検証例外を伝える。文書修正の所有 ticket は未確定。
 - **D06**（F32、K-VIEW）独立 status と StateStore の marker path 解決は異なる。親 directory・lock 不在・例外・既定値・symlink の組合せを合成 fixture で比較するまで同一と断定しない。
 - **D07**（F01–F02、K-LATCH）DD 理由文字列は暗黙 protocol。producer/consumer の挙動 test が必要で、型付き理由への変更は別途扱う。
-- **D08**（F23–F24、K-REBASE）live rebase の入口・ledger・排他・CAS は未着地。[HWM ticket](../../tickets/open/killswitch-reset-hwm-rebase.md) の実装と受入で更新する。
+- **D08**（F23–F24、K-REBASE）解消済み。live rebase の入口・ledger・排他・CAS は着地した (F131–F163)。[HWM ticket](../../tickets/open/killswitch-reset-hwm-rebase.md) は受入が済むまで開いており、受入の結果は頁へ戻す。
 - **D09**（F28–F31、K-CONSUME）配送と status は独立し、実通知の成功は未確認。bot health の運用確認は [関連 ticket](../../tickets/closed/bot-gateway-disconnect-is-silent.md) を参照。
+- **D10**（F131、F134、K-REBASE）付け直しに累積の切下げ上限・回数上限・HWM の下限は無く、累積は ledger の表示と警告 (現在の閾値の 3 倍超) だけで扱う。PaperBroker の本件に限る設計裁定であり、実口座 broker を導入するときは硬い上限が必須要件となり、満たすまで実口座の付け直しを有効にしない。
+- **D11**（F134、F142、F146、K-REBASE）COMMIT 自体の停止は時間の上限を保証せず、COMMIT の例外は結果不明 (outcome_unknown) として自動では再送しない。成立の確認は status と ledger で人が行う。
 
 ## 手で保守する辺
 
@@ -255,12 +291,25 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 - **E63** `src/agentic_fx/service.py::build_app#_recover_ops` → `src/agentic_fx/service.py::_recover_ops`; resource `event:ops_request_terminal`。plugin 切替 journal の reconcile の後に呼ぶ。F20。
 - **E64** `src/agentic_fx/commands.py::Commands._baseline_comparison_lines` → `src/agentic_fx/commands.py::Commands._comparison_metrics_line`; resource `metric:kill_switch_latches`。保存済み snapshot の候補と配備中の版の指標を 1 行ずつ描く。F111。
 - **E65** `src/agentic_fx/status.py::collect_status` → `src/agentic_fx/status.py::read_state`; resource `state:app_state.kill_switch_latched`。offline status が kill_switch を read_state から得る。読めなければ unavailable。F32。
+- **E66** `src/agentic_fx/ops/client.py::Runner._op_killswitch_rebase` → `src/agentic_fx/ops/api_server.py::_call`; resource `ops:killswitch_rebase`, `ops:killswitch_rebase_preview`。afx ctl が preview の GET と確認後の POST で到達する。別 process で UDS の HTTP を介し、直接の呼出しではない。F149、F155、K-REBASE。
+- **E67** `src/agentic_fx/ops/api_server.py::_call` → `src/agentic_fx/ops/service.py::OpsService.rebase_preview`; resource `ops:killswitch_rebase_preview`。preview の route を expected_generation 付きで呼ぶ。F140、F149。
+- **E68** `src/agentic_fx/ops/api_server.py::_call` → `src/agentic_fx/ops/service.py::OpsService.rebase_kill_switch`; resource `ops:killswitch_rebase`。POST の route を expected_generation と preview_token 付きで呼ぶ。F141、F149。
+- **E69** `src/agentic_fx/ops/service.py::OpsService.rebase_kill_switch` → `src/agentic_fx/ops/service.py::OpsService._mutate`; resource `ops:killswitch_rebase`。受理行→副作用→終端行の枠に action を渡す。F141、F146。
+- **E70** `src/agentic_fx/ops/service.py::OpsService.rebase_kill_switch` → `src/agentic_fx/ops/service.py::OpsService._rebase_under_core`; resource `ops:killswitch_rebase`。_mutate が action の closure として呼ぶ。直接の呼出しではない。F141、F142。
+- **E71** `src/agentic_fx/ops/service.py::OpsService._rebase_under_core` → `src/agentic_fx/store/state.py::StateStore.shared_guard`; resource `state:app_state.kill_switch_latched`, `state:app_state.kill_switch_generation`。core lock の後に共有 flock を取り、state を読むだけで保持する。F142、F161。
+- **E72** `src/agentic_fx/ops/service.py::OpsService._rebase_under_core` → `src/agentic_fx/ops/service.py::OpsService._rebase_commit`; resource `state:app_state.kill_switch_generation`。全ての lock を保持したまま commit 段へ進む。F142、F143。
+- **E73** `src/agentic_fx/ops/service.py::OpsService._rebase_commit` → `src/agentic_fx/ops/rebase_accounting.py::apply_rebase`; resource `db:account_snapshots`, `db:kill_switch_hwm_rebases`。snapshot と ledger を一つの transaction で書く原子的な書込み。F134、F143。
+- **E74** `src/agentic_fx/ops/service.py::OpsService._rebase_commit` → `src/agentic_fx/ops/rebase_service.py::evaluate_rebase`; resource `state:app_state.kill_switch_generation`, `config:risk.drawdown_kill_pct`。apply_rebase が BEGIN IMMEDIATE の中で呼ぶ validate callback として渡し、commit 時の再検査にする。直接の呼出しではない。F131、F143。
+- **E75** `src/agentic_fx/ops/service.py::OpsService.rebase_preview` → `src/agentic_fx/ops/rebase_service.py::evaluate_rebase`; resource `state:app_state.kill_switch_generation`, `config:risk.drawdown_kill_pct`。preview も同じ判定を読取 transaction の中で呼ぶ。入口ごとに検査を複写しない。F131、F140。
+- **E76** `src/agentic_fx/ops/rebase_service.py::evaluate_rebase` → `src/agentic_fx/ops/rebase_accounting.py::read_rebase_totals`; resource `db:kill_switch_hwm_rebases`。ledger の件数と累積を token と表示の元にする。F131、F135。
+- **E77** `src/agentic_fx/ops/rebase_service.py::evaluate_rebase` → `src/agentic_fx/ops/rebase_accounting.py::paper_equity`; resource なし。broker の再評価と snapshot の値の一致を見る。F131、F137。
+- **E78** `src/agentic_fx/service.py::_build_ops_service` → `src/agentic_fx/ops/service.py::OpsService.__init__`; resource なし。core_lock と broker が揃うときだけ RebaseWiring を注入する。F36、F132、F147。
 
 ## 影響先と検証記録
 
 変更時は gate の理由文字列、store の marker/raw、ops と shell の入口、event schema、bot/notify の cursor、status/activity、replay artifact と比較 metric を別々に照合する。literal 索引は callback や引数伝播を証明しない。`ops:guard_version` は宣言された literal だが、guard event schema の version と結び付くことは未確認である。
 
-基準 `0dbcb27f` と作業 tree の `src/`・`afx-ops/` 差分が空であることを確認した。source の読取による下書きであり、test、独立 oracle、実通知は未実施。頁セルは凍結表の critical 行を被覆宣言で全件対応づけたが、宣言は存在の照合で意味の証明ではなく、F39 以降は source 読取りのみで test を実行していない。status と StateStore の全分岐比較、reset crash 統合 test の網羅は未確認。
+基準 `160f1e47` と作業 tree の `src/`・`afx-ops/` 差分が空であることを確認した (C4 の `0dbcb27f` からこの基準までの差は HWM の file だけ)。source の読取による下書きであり、test、独立 oracle、実通知は未実施。頁セルは凍結表の critical 行を被覆宣言で全件対応づけたが、宣言は存在の照合で意味の証明ではなく、F39 以降と HWM の F131–F163 は source 読取りのみで test を実行していない。status と StateStore の全分岐比較、reset crash 統合 test の網羅は未確認。
 
 <!-- impact-map:covers -->
 ```json
@@ -2856,6 +2905,334 @@ status の marker 投影と StateStore の全分岐一致は未確認。
    "resource": "metric:kill_switch_latches",
    "ids": [
     "F114"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/rebase_service.py::evaluate_rebase",
+   "resource": "state:app_state.kill_switch_generation",
+   "ids": [
+    "F131"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/rebase_service.py::evaluate_rebase",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "F131"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/rebase_service.py::evaluate_rebase",
+   "resource": "state:app_state.kill_switch_latched_at",
+   "ids": [
+    "F131"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/rebase_service.py::evaluate_rebase",
+   "resource": "config:risk.drawdown_kill_pct",
+   "ids": [
+    "F131"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/rebase_service.py::evaluate_rebase",
+   "resource": "db:account_snapshots",
+   "ids": [
+    "F131"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/rebase_service.py::error_code_name",
+   "resource": "ops:market_closed",
+   "ids": [
+    "F133"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/rebase_service.py::error_code_name",
+   "resource": "ops:preview_changed",
+   "ids": [
+    "F133"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/rebase_accounting.py::apply_rebase",
+   "resource": "db:account_snapshots",
+   "ids": [
+    "F134"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/rebase_accounting.py::apply_rebase",
+   "resource": "db:kill_switch_hwm_rebases",
+   "ids": [
+    "F134"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/rebase_accounting.py::read_rebase_totals",
+   "resource": "db:kill_switch_hwm_rebases",
+   "ids": [
+    "F135"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.rebase_preview",
+   "resource": "ops:killswitch_rebase_preview",
+   "ids": [
+    "F140"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.rebase_preview",
+   "resource": "state:app_state.kill_switch_generation",
+   "ids": [
+    "F140"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.rebase_kill_switch",
+   "resource": "ops:killswitch_rebase",
+   "ids": [
+    "F141"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._rebase_under_core",
+   "resource": "log:rebase_release_failed",
+   "ids": [
+    "F142"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._rebase_commit",
+   "resource": "ops:preview_changed",
+   "ids": [
+    "F143"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._rebase_commit",
+   "resource": "state:app_state.kill_switch_generation",
+   "ids": [
+    "F143"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._rebase_commit",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "F143"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._rebase_commit",
+   "resource": "state:app_state.kill_switch_latched_at",
+   "ids": [
+    "F143"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._rebase_commit",
+   "resource": "config:risk.drawdown_kill_pct",
+   "ids": [
+    "F143"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::<module>.ENDPOINTS",
+   "resource": "ops:killswitch_rebase",
+   "ids": [
+    "F148"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/service.py::<module>.ENDPOINTS",
+   "resource": "ops:killswitch_rebase_preview",
+   "ids": [
+    "F148"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/api_server.py::_call",
+   "resource": "ops:killswitch_rebase",
+   "ids": [
+    "F149"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/api_server.py::_call",
+   "resource": "ops:killswitch_rebase_preview",
+   "ids": [
+    "F149"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/contracts.py::ErrorCode",
+   "resource": "ops:preview_changed",
+   "ids": [
+    "F152"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/contracts.py::ErrorCode",
+   "resource": "ops:market_closed",
+   "ids": [
+    "F152"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "afx-ops/afx_ops/web/write.py::<module>.KNOWN_DAEMON_CODES",
+   "resource": "ops:preview_changed",
+   "ids": [
+    "F153"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "afx-ops/afx_ops/web/write.py::<module>.KNOWN_DAEMON_CODES",
+   "resource": "ops:market_closed",
+   "ids": [
+    "F153"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/cli_surface.py::<module>._BASE_COMMANDS",
+   "resource": "ops:killswitch_rebase",
+   "ids": [
+    "F154"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/client.py::Runner._op_killswitch_rebase",
+   "resource": "ops:killswitch_rebase",
+   "ids": [
+    "F155"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/client.py::Runner._op_killswitch_rebase",
+   "resource": "ops:killswitch_rebase_preview",
+   "ids": [
+    "F155"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/client.py::parse",
+   "resource": "ops:killswitch_rebase",
+   "ids": [
+    "F157"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/client.py::<module>._APPROVER_OPS",
+   "resource": "ops:killswitch_rebase",
+   "ids": [
+    "F158"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/client.py::<module>._ERROR_TEXT",
+   "resource": "ops:preview_changed",
+   "ids": [
+    "F160"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/ops/client.py::<module>._ERROR_TEXT",
+   "resource": "ops:market_closed",
+   "ids": [
+    "F160"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/store/state.py::StateStore.shared_guard",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "F161"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/store/state.py::StateStore.shared_guard",
+   "resource": "state:app_state.kill_switch_generation",
+   "ids": [
+    "F161"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/store/state.py::StateStore.shared_guard",
+   "resource": "state:app_state.kill_switch_latched_at",
+   "ids": [
+    "F161"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/store/state.py::StateStore.shared_guard",
+   "resource": "marker:reset_marker",
+   "ids": [
+    "F161"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/store/state.py::GuardedState.projected",
+   "resource": "state:app_state.kill_switch_latched",
+   "ids": [
+    "F162"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/store/db.py::<module>.TABLE_NAMES",
+   "resource": "db:kill_switch_hwm_rebases",
+   "ids": [
+    "F163"
+   ],
+   "kind": "page"
+  },
+  {
+   "symbol": "src/agentic_fx/store/db.py::<module>._SCHEMA",
+   "resource": "db:kill_switch_hwm_rebases",
+   "ids": [
+    "F43"
    ],
    "kind": "page"
   }
