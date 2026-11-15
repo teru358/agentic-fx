@@ -54,6 +54,7 @@ class SeriesSpec:
     requested_end: datetime
     effective_end: datetime
     fetch: Callable[[], list[tuple]]
+    insert_from: datetime | None = None   # これより前の足は比較・監査だけに使い、新規挿入しない
 
 
 @dataclass(frozen=True)
@@ -298,6 +299,10 @@ def _classify_and_apply(conn, spec, op, rows, *, origin, run_id, seen_at, monoto
     verified_run_id = (run_id if origin == "sync" and spec.source == "mt5"
                        and inspection_tail_bars is not None else None)
     entries = list(classification.entries)
+    if spec.insert_from is not None:
+        cutoff = spec.insert_from
+        entries = [e for e in entries
+                   if not (e.kind == "new" and datetime.fromisoformat(e.bar_time) < cutoff)]
     totals = dict(inserted=0, unchanged=0, new=0, known=0)
     last_committed = None
     failure = error_type = None

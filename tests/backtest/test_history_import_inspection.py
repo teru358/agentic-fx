@@ -142,3 +142,21 @@ def test_summarize_ranks_deferred_below_conflicts_and_above_ok_and_keeps_rc_zero
     assert hi.summarize([mk("failed"), mk("deferred")]).result == "failed"
     assert hi.summarize([mk("conflict_circuit_open"), mk("deferred")]).rc == 4
     assert hi.summarize([mk("ok")]).result == "ok"
+
+
+def test_rows_before_insert_from_are_compared_and_audited_but_never_inserted(tmp_path):
+    conn = conn_at(tmp_path)
+    ohlcv.import_history_bars(
+        conn, [_row(i) for i in range(10) if i != 3], source="mt5")   # 3 は既存行の無い足
+    rows = [_row(i, close=(150.0 if i == 5 else 148.1)) for i in range(14)]
+    end = START + W * 14
+    spec = hi.SeriesSpec("mt5", "15m", "USDJPY", START, end, end, lambda: list(rows),
+                         insert_from=START + W * 8)
+    out = hi.run_series(conn, spec, now=lambda: SEEN, inspection_tail_bars=K)
+    assert (out.status, out.unchanged, out.conflicted_new) == ("completed_with_conflicts", 8, 1)
+    assert out.inserted == 4 and out.n_overlap == 9 and out.n_test == 9
+    assert conn.execute("SELECT 1 FROM ohlcv_history WHERE bar_time=?",
+                        (_t(3),)).fetchone() is None
+    assert [r[0] for r in conn.execute("SELECT bar_time FROM history_conflicts")] == [_t(5)]
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv_history WHERE bar_time >= ?",
+                        (_t(10),)).fetchone()[0] == 4

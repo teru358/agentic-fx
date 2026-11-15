@@ -270,6 +270,7 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
                grace: timedelta = DEFAULT_GRACE, skip_window=None,
                utc_day_windows: bool = False,
                exclude_range: tuple[datetime, datetime] | None = None,
+               insert_from: datetime | None = None,
                **run_kw) -> SeriesOutcome:
     """MT5 bridge から足を 1 日窓でページングして全取得し、遮断判定のうえ取り込む。
 
@@ -287,6 +288,8 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
             要求しない。既定は従来どおり start から 1 日ずつ全窓を要求する。
         exclude_range: 確定済みの区間 [開始, 終了)。全体がこの区間に入る窓は要求せず、取得した行の
             うちこの区間のものは分類・分母に入れない (中断した同期の再開用)。
+        insert_from: これより前の足は検査尾として既存行との比較・衝突監査だけに使い、既存行の
+            無い足は新規挿入しない。
         run_kw: `history_import.run_series` へ渡す (origin / run_id / admission 等)。
 
     終端: 保存するのは ``start <= t < E`` かつ ``t + 幅 + grace <= T`` の足だけ。
@@ -357,7 +360,7 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
                 if not (exclude_range[0] <= datetime.fromisoformat(r[2]) < exclude_range[1])]
 
     spec = SeriesSpec("mt5", interval, symbol, start, requested_end,
-                      max(start, end), fetch_rows)
+                      max(start, end), fetch_rows, insert_from)
     if start >= end:
         return empty_outcome(spec)
     return run_series(conn, spec, now=lambda: now, **run_kw)

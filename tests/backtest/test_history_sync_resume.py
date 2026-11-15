@@ -97,7 +97,8 @@ def test_a_failed_resume_does_not_start_the_normal_recent_of_the_same_run(tmp_pa
 def test_a_resume_passed_by_b_is_dropped_and_the_operation_starts_fresh(tmp_path):
     conn, settings, _b, _first = _partial_run(tmp_path)
     store.write_txn(conn, lambda c: c.execute(
-        "UPDATE history_sync_resume SET tail_start=?", (_dt(2026, 9, 1).isoformat(),)),
+        "UPDATE history_sync_resume SET range_start=?, tail_start=?",
+        (_dt(2026, 9, 1).isoformat(), _dt(2026, 9, 1).isoformat())),
         sleep=lambda _s: None)
     result = _run(conn, settings, FakeBridge())
     assert not result.ops[0].resumed and result.ops[0].status == "ok"

@@ -88,15 +88,15 @@ cycleはDB作業250msを上限に新batch開始を止め、100ms以上yieldし�
 
 ### 2.3 範囲・scan・数値予算
 
-足幅w、段1aのgrace gを使い `E=min(requested_end, floor_grid(T-g-w,w))`。Bは評価区間C2と同じ `in_sample_until(T,holdout_months)`。全自動範囲を `B,E)` にclipし、scanもEで止める。E以後の余裕1本を偽gapにしない。Bをまたぐ日もB以前の行は書かない。
+足幅w、段1aのgrace gを使い `E=min(requested_end, floor_grid(T-g-w,w))`。Bは評価区間C2と同じ `in_sample_until(T,holdout_months)`。全自動範囲を `B,E)` にclipし、scanもEで止める。E以後の余裕1本を偽gapにしない。Bをまたぐ日もB以前の行は書かない。追記・修復の対象とscanは `[B,E)` で、後述の比較専用の検査尾だけがBより前に伸びる例外である。
 
 offlineのrecentの範囲は初回・後ろ窓とも始端 `max(B,E-lookback_days)` (日境界へ丸めない) からE。cursorがこの始端より古いときの追記 `[max(B,last_processed_E), 始端)` と、recentの要求窓の上限 (D+2) を超えた未取得区間は、黙って落とさずkind=unprocessedで日ごとにqueueへ保存し、cursorはこの保存と同じtransactionでだけ進める。
 
 **3aは有界な確定prefixで追いつく。** `c=max(B,last_processed_E)` とし、開場時間を積算して進む `advance_open` を共通暦で定義する。追記範囲は `[c,F)`、`F=min(E,advance_open(c,2時間))` に取得前に固定する。c未初期化は停止中初回同期を案内しMAX(bar_time)から推測しない。E−cが24開場時間を超える場合だけ `recent_backlog_offline_required` で停止中手動へ送り、自動でcold範囲を広げない。24時間以内も受入済みwarm形状であることが前提。正当な空格子を含めFまで判定・反映完了したらcursorをFへ進め、未取得 `[F,E)` は次の予定runへ残す。応答に実欠損があればqueueへ残し、cursorを充足の証明にしない。通常1時間間隔に2開場時間まで進められるので、全取得成功のrunが続けば中断分は毎回最大1開場時間ずつ縮み、長くなり続けるall-or-deferを解消する。run内のgeneration/batch・60秒中断のprefixはhistbugs C2.2 §2.5aのままとし、未確定suffixを処理済みにしない。
 
-**検査尾は事前に既存keyから選ぶ。** anchor=c、基本尾は直前2開場時間。DBの同系列・epochの[B,c)内にある暦/no-bars有効な既存keyを取得前に読み、基本尾にK本なければ古いkeyを近い順に追加し、K本を覆う連続区間を固定する。`K=ceil(2時間/w)` (120/24/8) は正本のまま、尾の探索/取得幅は最大3開場時間、native格子最大180本とする。基本尾内にK本あれば拡張しない。要求前に既存key不足が分かればinspection_insufficientで要求0・当該generationの履歴/監査0・cursor維持。全窓の応答検証後は同じmutation lease下で遮断条件を先に判定し、該当すれば実重複/分母不足でもconflict_circuit_openを優先する。遮断に当たらない実重複/分母不足だけinspection_insufficientとし、いずれも当該generationの履歴/監査0・cursor維持。結果を見た拡張や正常行追加は禁止する。取得後は同じmutation leaseで正本の実重複・N_test・C_new/C_knownを再検証する。
+**検査尾は事前に既存keyから選ぶ。** anchor=c、基本尾は直前2開場時間。DBの同系列・epochの、anchorより前にある (Bより前を含む) 暦/no-bars有効な既存keyを取得前に読み、基本尾にK本なければ古いkeyを近い順に追加し、K本を覆う連続区間を固定する。`K=ceil(2時間/w)` (120/24/8) は正本のまま、尾の探索/取得幅は最大3開場時間、native格子最大180本とする。基本尾内にK本あれば拡張しない。要求前に既存key不足が分かればinspection_insufficientで要求0・当該generationの履歴/監査0・cursor維持。全窓の応答検証後は同じmutation lease下で遮断条件を先に判定し、該当すれば実重複/分母不足でもconflict_circuit_openを優先する。遮断に当たらない実重複/分母不足だけinspection_insufficientとし、いずれも当該generationの履歴/監査0・cursor維持。結果を見た拡張や正常行追加は禁止する。取得後は同じmutation leaseで正本の実重複・N_test・C_new/C_knownを再検証する。
 
-追記と尾の2要求を同じ操作/generationにまとめ、重複keyを除く。尾1本の欠けは上限内の古い既存keyで事前補完できる。欠け合計が1開場時間を超える等で固定尾を作れない場合は明示的に停止中手動へ案内し、検査量を緩めない。尾は追記対象でなくても同じ比較・監査契約を使う。中断した同じ操作のsuffix再開では、元の検査区間を維持し確定prefixの新規行を遮断分母へ再投入しない (§2.5a)。完走した操作の次に始める独立した毎時recentは新anchorに対して上記の固定尾を事前選択する。両者を混同してprefix新規行を再開時の検査本数へ足さない。
+追記と尾の2要求を同じ操作/generationにまとめ、重複keyを除く。始端がBのとき (lookbackがBまで届く場合・clipされたBの日のgap) も尾はBより前の既存keyから選ぶ。尾は既存行との比較・衝突監査だけに使い、尾の範囲に既存行が無い足は応答にあっても新規挿入しない (Bより前の履歴を増やさない)。尾の既存行は他の取得行と同じくunchanged/conflictとして遮断の分母と監査に入れる。尾1本の欠けは上限内の古い既存keyで事前補完できる。欠け合計が1開場時間を超える等で固定尾を作れない場合は明示的に停止中手動へ案内し、検査量を緩めない。尾は追記対象でなくても同じ比較・監査契約を使う。中断した同じ操作のsuffix再開では、元の検査区間を維持し確定prefixの新規行を遮断分母へ再投入しない (§2.5a)。完走した操作の次に始める独立した毎時recentは新anchorに対して上記の固定尾を事前選択する。両者を混同してprefix新規行を再開時の検査本数へ足さない。
 
 1要求の時間幅は壁時計でなく共通暦の開場時間とnative格子数で制限する。閉場をまたぐ連続HTTP区間を許し、閉場片を追加要求にしない。no-barsは重複に数えず、容量の格子上限を緩めるためにも使わない。金曜尾から日曜開場後まででもこの定義で数える。閉場をまたぐ要求の実際の占有・warm性はT5/A8で再受入し、足数だけから性能を推測しない。C3の120本/2h上限は尾の欠けと両立しないため**最大180格子/3開場時間に改訂**し、受入前に旧容量認定を流用しない。
 
@@ -303,6 +303,7 @@ rollbackは新コードのうちにauto_enabled=falseへ変更して再起動し
 | 2026-11-15 | C5.2 | 置換の由来証明を `bridge_verified_run_id` に具体化 (sync の検証済み取得のみ設定、再観測で上書き、replace tx内で再照合、手動importは段2で証明なし) | sol裁定 (b)。originラベルだけの証明は付録Eが禁止 | — (未commit) |
 | 2026-11-15 | C5.3 | 参照の疑いを、日の本数そのものでなく共通暦の開場格子に対する充足率の中央値比較に改訂 | 正常な日曜・短縮日が疑いになる誤検出を避ける (利用者裁定 2026-11-14) | — (未commit) |
 | 2026-11-15 | C5.4 | 日別run集計の永続表 `history_sync_daily` を明記 (run終了と同transactionで加算、二重に数えない) | series詳細の90日GC後も日別を復元できるようにする | — (未commit) |
+| 2026-11-15 | C5.5 | 検査尾の候補を `[B,c)` に限る制限を撤廃し、始端がBのときもBより前の既存keyから尾を選ぶ。尾は比較・監査だけに使い、尾の欠落足は挿入しない | `max(B,E-D日)` と `[B,c)` 制限が両立せず、lookbackがBに届く設定と境界日のgapが進めなかった | — (未commit) |
 
 ## 6. 短い task 表
 

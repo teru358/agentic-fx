@@ -386,7 +386,7 @@ class _Run:
                                    is_open=self.is_open)
         except plan.PlanError:
             return []
-        return present_times(self.conn, self.dataset, symbol, max(lo, self.boundary), anchor)
+        return present_times(self.conn, self.dataset, symbol, lo, anchor)
 
     def _load_resume(self, symbol: str, op_key: str):
         """有効な再開点 (元の範囲・固定尾・確定 prefix) を返す。B が追い越した再開点は捨てる。"""
@@ -397,7 +397,7 @@ class _Run:
         e0 = datetime.fromisoformat(row["range_end"])
         ts = datetime.fromisoformat(row["tail_start"])
         p = datetime.fromisoformat(row["prefix_end"])
-        if ts < self.boundary or a < self.boundary or e0 > self.limit or not ts <= a <= p:
+        if a < self.boundary or e0 > self.limit or not ts <= a <= p:
             return ("stale",)
         return (a, e0, ts, min(p, e0))
 
@@ -433,9 +433,9 @@ class _Run:
         else:
             tail = plan.select_tail(self._existing_before(symbol, start), start,
                                     width=self.width, is_open=self.is_open,
-                                    excluded_dates=excluded, boundary=self.boundary)
+                                    excluded_dates=excluded)
             if tail.ok:
-                request_start = max(tail.tail.start, self.boundary)
+                request_start = tail.tail.start
                 windows = plan.request_count([(request_start, end)], is_open=self.is_open)
         if tail.ok and window_cap is not None and cap_used + windows > window_cap:
             tail = plan.TailResult(None, REASON_REQUEST_BUDGET)
@@ -465,7 +465,7 @@ class _Run:
             inspection_tail_bars=self.tail_k,
             on_batch=self._progress(series_id, symbol, op_key, start, end, request_start,
                                     prior_end),
-            exclude_range=exclude_range, **self.run_kw)
+            exclude_range=exclude_range, insert_from=start, **self.run_kw)
         op.requests = self.gate.count - before
         op.outcome = outcome
         op.status = outcome.status
@@ -473,7 +473,7 @@ class _Run:
         op.inserted, op.unchanged = outcome.inserted, outcome.unchanged
         if self._reconciled and op.inserted:
             if symbol in self.primary:
-                day = max(request_start, self.boundary).date()
+                day = start.date()
                 last = min(end, self.limit).date()
                 days = self._changed_primary_days.setdefault(symbol, set())
                 while day <= last:
