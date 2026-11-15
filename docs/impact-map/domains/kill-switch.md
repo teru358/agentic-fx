@@ -191,6 +191,13 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 - **F162** `src/agentic_fx/store/state.py::GuardedState.projected` — 保持中に読んだ state を、marker があればラッチ中として投影する (load と同じ意味)。現在の src に呼出し元は無く、付け直しの適格判定は raw の state と marker の有無を別々に受ける。 Resource: `state:app_state.kill_switch_latched`.
 - **F163** `src/agentic_fx/store/db.py::<module>.TABLE_NAMES` — schema と完全一致を検査する表名の集合。付け直しの台帳を含む。 Resource: `db:kill_switch_hwm_rebases`.
 - **F164** `src/agentic_fx/ops/api_server.py::_match` — route の照合。scope が local_guard の route は transport が uds のときだけ照合し、TCP の listener からは到達できない。付け直しの二 endpoint もこの境界の内側にある。
+- **F165** `afx-ops/afx_ops/bot/rest.py::classify` — Discord REST の失敗を恒久か一時かに分ける。共有の配送先の拒否 code (channel が無い・見えない・投稿できない) は status によらず恒久、401・403・404 と 429 以外の 4xx も恒久。408 と JSON code を持たない 403 (前段の一時の拒否) と判別できない失敗は一時。配送 (F29) は恒久なら cursor を進めず bot を止め、一時なら次の周回で再送する。投稿の消失 (404 かつ code 10008) と message 固有の不正本文 (400 かつ code 50035) は呼出し側が先に別扱いにする。
+- **F166** `afx-ops/afx_ops/bot/progress.py::ProgressTracker.expired` — 配送・gateway・poll 周回の各無進捗を monotonic 時計で窓 (10 分) と比べ、超えた経路の固定理由を返すだけで、終了は呼ぶ側が行う。配送の窓は先頭 event の最初の send の直前 (delivery_begin) から、cursor の保存まで済む (delivery_committed、追っている event 以後まで進んだときだけ解除) まで。poll の窓は一周の開始 (poll_begin) から完了 (poll_end) まで。guard event を含む配送が進まない状態を、無言のまま続けないための判定。
+- **F167** `afx-ops/afx_ops/bot/runtime.py::_monitor` — loop 上で周期的に F166 の期限を見て、期限切れなら BotFailure(reason) を送出する。send などの await が戻らなくても判定できる。起動の判断は startup と monitor で決め、起動後は gateway・poll・失敗通知と並べて最初に終わったものが bot を止める。
+- **F168** `afx-ops/afx_ops/bot/exits.py::rc_for_reason` — bot の失敗理由を終了コードに写す。恒久 (token・state の内容・payload・event・high watermark の後退・Discord の配送拒否など) は 78、それ以外と表に無い理由は一時の 79 で、一時は backoff の再起動で回復し得る。state の読み書きは I/O の失敗 (一時) と内容の不正 (恒久) を型で分ける (gate/state.py の StateIOError・snapshot.py の SnapshotIOError)。loop の停止 (watchdog) は 80、停止処理の超過は 79 で、どちらも再起動対象。
+- **F169** `src/agentic_fx/ops_setup/units.py::<module>.BOT_PERMANENT_EXIT_STATUS` — bot unit の drop-in が RestartPreventExitStatus に入れる終了コードの集合 (78 を含む)。bot unit は Restart=on-failure で、これらを除いて backoff で再起動する。drop-in は systemd の version が RestartSteps を使えるときだけ書き、満たさなければ bot の enable を拒否する。F168 の恒久・一時の区別が自動復旧に効くのはこの設置による。
+- **F170** `afx-ops/afx_ops/bot/runtime.py::_main_body` — bot の起動と常駐の本体。進捗の monitor・表示専用の health・startup (state の読込と無効化、login、起動 reconcile) を起こし、続けて gateway・poll・失敗通知を走らせて最初に終わったものを理由にする。失敗の BotFailure は終了コードに写る (F168)。health snapshot は表示専用で、その task の失敗では bot を止めない。
+- **F171** `afx-ops/afx_ops/bot/runtime.py::run` — bot の入口。loop 外の watchdog を起こし、失敗理由を固定語で出して終了コードを返す (F168)。daemon に届かないときは一時の終了、想定外の例外は固定語だけにする。health の最終 snapshot に停止の理由を残すが、これは表示であって配送の成否ではない (D09)。
 
 ## K — 守る契約
 
@@ -204,7 +211,7 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 - **K-START**: 起動時 marker を安全側に投影し確認を求める。監査回復の terminal は guard 回復の代用ではない。起動と tick の sweep を行う（F20–F21）。
 - **K-LANE**: lane の同一 thread 再入は待たず拒否し、所有なしの sweep も拒否する（F10、F12）。
 - **K-VIEW**: pending と対象世代は短命 read-only 接続の観測で、取引判断に使わない。web は status/activity を表示し、event 配送成功と混同しない（F20、F32–F34、F36）。
-- **K-CONSUME**: bot と notify は各 cursor を持ち送信後に保存する。送信後保存前の crash による重複は許容する。C4 の無進捗・恒久 4xx の終了と回復例外は同設計 §5.2 に従う（F28–F31）。
+- **K-CONSUME**: bot と notify は各 cursor を持ち送信後に保存する。送信後保存前の crash による重複は許容する。C4 の無進捗・恒久 4xx の終了と回復例外は同設計 §5.2 に従う。恒久は再起動せず、一時は backoff で再起動する（F28–F31、F165–F171）。
 - **K-REPLAY**: replay の理由、artifact、比較 metric と解除時補償を保つ。backtest から手動 rebase module・ledger・source を参照しない（F25–F27、HWM §2.4–2.5）。
 - **K-RESET-UI**: shell と ctl は reset 成功時に固定警告を表示する。ctl は成功後に HWM の付け直しの案内を毎回出し (DD の状態は推測しない)、shell は固定警告だけで付け直しの案内も入口も持たない（F13、F130、K-REBASE）。
 - **K-REBASE**: 実装済み。独立した approver の明示操作 (`ctl killswitch rebase <世代>` と端末での `rebase <世代>` の完全一致) だけで入り、service の先頭で approver を直接検査する (F140–F141、F155)。PaperBroker、注文状態 (全 order が終端)、新鮮な snapshot、DD、世代、autopilot、閉場を検査する (F131、F143)。HWM のみ変更し、latch・世代・発動時刻を保持して state を書かない (F134、F143、F161)。値 CAS は preview の digest を commit 時に再構成して比較し、ledger と snapshot を一つの transaction で書く (F131、F134)。通常 reset、shell、bot、web、notify に入口を加えない (F13、F153–F154)。実口座 broker 向けの硬い累積上限は無い (D10)。詳細と認可境界は HWM 設計 §1–2、§4–5 を正本とする（F23–F24 は既存入力の根拠、`tests/ops/test_rebase_service.py`、`tests/ops/test_rebase_accounting.py`）。
