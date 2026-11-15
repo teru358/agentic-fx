@@ -458,3 +458,37 @@ def test_pty_accepts_crlf_confirmation(tmp_path):
     finally:
         os.close(master)
         terminal.close()
+
+
+def test_lost_post_response_uses_rebase_unknown_guidance(tmp_path):
+    def lost(method, path):
+        raise client._ResponseLost()
+    api, _, runner = _runner(tmp_path, [_status(), _preview(), lost])
+    with pytest.raises(client.ClientError) as caught:
+        runner._op_killswitch_rebase(3, terminal=_Typed('rebase 3'))
+    assert caught.value.message == client._REBASE_UNKNOWN
+    assert len(api.posts()) == 1
+
+
+@pytest.mark.parametrize('code', ['request_timeout', 'database_busy'])
+def test_repeated_timeouts_report_unapplied(tmp_path, code):
+    replies = [_status()] + sum(([_preview(), client.Reply(409, None, code)] for _ in range(client._REBASE_MAX_ROUNDS)), [])
+    api, _, runner = _runner(tmp_path, replies)
+    with pytest.raises(client.ClientError) as caught:
+        runner._op_killswitch_rebase(3, terminal=_Typed(*(['rebase 3'] * client._REBASE_MAX_ROUNDS)))
+    assert '時間切れが続' in caught.value.message
+    assert '適用されていません' in caught.value.message
+
+
+def test_reset_guidance_uses_input_generation_when_reply_missing(tmp_path):
+    _, out, runner = _runner(tmp_path, [_ok({'kill_switch': {'latched': True}}), _ok({})])
+    runner._op_killswitch_reset(3, terminal=_Typed('reset'))
+    assert 'killswitch rebase 3`' in out.getvalue()
+
+
+def test_status_failure_uses_utc_and_continues_rebase(tmp_path):
+    api, _, runner = _runner(tmp_path, [client.Reply(503, None, 'database_busy'), _preview(), _ok({'generation': 3})])
+    terminal = _Typed('rebase 3')
+    assert runner._op_killswitch_rebase(3, terminal=terminal) == 0
+    assert '2026-11-13 01:00:00 +00:00' in ''.join(terminal.shown)
+    assert len(api.posts()) == 1

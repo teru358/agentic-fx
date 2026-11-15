@@ -1789,8 +1789,8 @@ class Runner:
                                   "印が残っています)。`afx ctl --as approver killswitch "
                                   "reconcile` で確認してください")
             raise _fail(reply)
-        generation = _ident(reply.data.get("generation"))
-        self.say(f"kill switch ラッチを解除しました (gen={generation})")
+        shown_generation = _ident(reply.data.get("generation"))
+        self.say(f"kill switch ラッチを解除しました (gen={shown_generation})")
         self.say(KILL_SWITCH_RESET_WARNING)
         # DD の状態は推測せず、毎回同じ案内を出す。
         self.say(f"HWM を付け直すには `afx ctl --as approver killswitch rebase {generation}` を"
@@ -1803,7 +1803,10 @@ class Runner:
         金額は再計算せず DTO の値を写す。値が変わったときは preview を取り直して確認も
         取り直す。同じ token を送り直すのは、取り直した preview の token が同じ (= 台帳も
         HWM も動いていない) と分かった無変更の timeout の後だけ。成功・不明は再送しない。"""
-        tz = _tz_of(self._get("/v1/status"))
+        try:
+            tz = _tz_of(self._get("/v1/status"))
+        except ClientError:
+            tz = _tz_of({})
         sent_token: str | None = None
         for _ in range(_REBASE_MAX_ROUNDS):
             data = self._get(_REBASE_PREVIEW, expected_generation=generation)
@@ -1824,8 +1827,11 @@ class Runner:
                 raise ClientError(RC_FAILED, "端末での確認に失敗しました") from None
             if answer != f"rebase {generation}":
                 raise ClientError(RC_FAILED, MESSAGES["cancelled"])
-            reply = self._post("/v1/killswitch/rebase",
-                               {"expected_generation": generation, "preview_token": token})
+            try:
+                reply = self._post("/v1/killswitch/rebase",
+                                   {"expected_generation": generation, "preview_token": token})
+            except _ResponseLost:
+                raise ClientError(RC_FAILED, _REBASE_UNKNOWN) from None
             if reply.data is not None:
                 return self._rebase_done(reply.data, generation)
             if reply.code == "preview_changed":
@@ -1842,6 +1848,8 @@ class Runner:
             if reply.code == "invalid_state":
                 raise ClientError(RC_FAILED, rebase_view.REASON_TEXT["state_unavailable"])
             raise _fail(reply)
+        if sent_token is not None:
+            raise ClientError(RC_FAILED, "時間切れが続きました。付け直しは適用されていません。")
         raise ClientError(RC_FAILED, "確認のあいだに状況が変わり続けています。"
                           "時間をおいてもう一度実行してください")
 
