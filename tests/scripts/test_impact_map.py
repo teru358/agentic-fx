@@ -102,3 +102,81 @@ def test_missing_root_is_not_success(tmp_path):
     result, raw = run_extract(tmp_path, ['event:target'])
     assert result.returncode != 0
     assert json.loads(raw)['header']['diagnostics'] == [{'path': 'source', 'reason': 'missing_root'}]
+
+
+def evaluate_fixture(tmp_path, rows, records=(), covers=(), diagnostics=(), unresolved=()):
+    index = tmp_path / 'index.json'
+    index.write_text(json.dumps({'header': {'diagnostics': list(diagnostics), 'unsupported': []}, 'records': list(records)}))
+    oracle = tmp_path / 'oracle.json'
+    oracle.write_text(json.dumps({'header': {'unresolved': list(unresolved)}, 'rows': rows}))
+    page = tmp_path / 'page.md'
+    page.write_text('---\n{"resources":[]}\n---\n<!-- impact-map:covers -->\n```json\n' + json.dumps({'covers': list(covers)}) + '\n```\n<!-- /impact-map:covers -->\n')
+    out = tmp_path / 'out'
+    result = subprocess.run([sys.executable, str(SCRIPT), 'evaluate', '--domain', 'x', '--index', str(index), '--oracle', str(oracle), '--page', str(page), '--out', str(out)], cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    raw = (out / 'metrics.json').read_bytes()
+    assert raw == (json.dumps(json.loads(raw), sort_keys=True, separators=(',', ':')) + '\n').encode()
+    return json.loads(raw)
+
+
+def row(symbol, resource, critical=True, cls='G_lit'):
+    return {'symbol': symbol, 'resource': resource, 'critical': critical, 'class': cls, 'relation': 'reads', 'rationale': 'fixture'}
+
+
+def test_evaluate_counts_ambiguous_candidates_as_fp(tmp_path):
+    state, activity = 'state:app_state.kill_switch_latched', 'activity:kill_switch_latched'
+    records = [{'resource': r, 'path': 'src/a.py', 'symbol': s} for r in (state, activity) for s in ('a', 'b')]
+    metrics = evaluate_fixture(tmp_path, [row('src/a.py::a', state)], records)
+    cell = metrics['machine']
+    assert (cell['population'], cell['tp'], cell['fp'], cell['fn']) == (1, 1, 3, 0)
+    assert len(cell['false_positives']) == 3
+
+
+def test_evaluate_empty_population_is_unsupported(tmp_path):
+    metrics = evaluate_fixture(tmp_path, [])
+    assert metrics['machine']['unsupported'] and metrics['page']['unsupported']
+    assert not metrics['pass_candidate']
+
+
+def test_evaluate_critical_unresolved_and_manual_coverage(tmp_path):
+    resource = 'event:x'
+    rows = [row('src/a.py::found', resource), row('src/a.py::manual', resource, cls='G_reach'), row('src/b.py::lost', resource), row('src/c.py::unknown', resource)]
+    records = [{'resource': resource, 'path': 'src/a.py', 'symbol': 'found'}]
+    covers = [{'symbol': 'src/a.py::found', 'resource': resource, 'ids': ['F01'], 'kind': 'page'}, {'symbol': 'src/a.py::manual', 'resource': resource, 'ids': ['F02'], 'kind': 'manual_edge'}]
+    diagnostics = [{'path': 'src/c.py', 'reason': 'parse_error'}]
+    unresolved = [{'symbol': 'src/b.py::lost', 'resource': resource, 'cell': 'page', 'reason': 'fixture'}]
+    metrics = evaluate_fixture(tmp_path, rows, records, covers, diagnostics, unresolved)
+    machine, page = metrics['machine'], metrics['page']
+    assert (machine['population'], machine['tp'], machine['fn'], machine['u'], machine['unscanned']) == (3, 1, 2, 1, 1)
+    assert (page['population'], page['tp'], page['fn'], page['u']) == (4, 2, 2, 1)
+    assert machine['unresolved'] == [{'resource': resource, 'symbol': 'src/c.py::unknown', 'reasons': ['parse_error']}]
+    assert page['unresolved'] == [{'resource': resource, 'symbol': 'src/b.py::lost', 'reasons': ['fixture']}]
+    assert machine['critical']['fn'] == 2 and machine['critical']['u'] == 1
+    assert page['critical']['fn'] == 2 and page['critical']['u'] == 1
+    assert not metrics['pass_candidate'] and metrics['needs_human_review']
+    classification = {r['symbol']: r for r in metrics['rows']}
+    assert classification['src/a.py::found']['classification'] == 'index_found'
+    assert classification['src/a.py::found']['covers'][0]['ids'] == ['F01']
+    assert classification['src/a.py::manual']['classification'] == 'page_manual'
+    assert classification['src/b.py::lost']['classification'] == 'both_missed'
+
+
+def test_evaluate_candidate_and_deduplication(tmp_path):
+    resource = 'event:x'
+    record = {'resource': resource, 'path': 'src/a.py', 'symbol': 'f'}
+    cover = {'symbol': 'src/a.py::f', 'resource': resource, 'ids': ['F01'], 'kind': 'page'}
+    metrics = evaluate_fixture(tmp_path, [row('src/a.py::f', resource), row('src/a.py::f', resource)], [record, record], [cover])
+    assert metrics['pass_candidate']
+    assert metrics['machine']['population'] == 1 and metrics['machine']['tp'] == 1
+    assert metrics['page']['tp'] == 1 and metrics['needs_human_review']
+
+
+def test_evaluate_rejects_missing_evidence(tmp_path):
+    index = tmp_path / 'index.json'
+    index.write_text('{"header":{"diagnostics":[],"unsupported":[]},"records":[]}')
+    oracle = tmp_path / 'oracle.json'
+    oracle.write_text('{"header":{},"rows":[]}')
+    page = tmp_path / 'page.md'
+    page.write_text('<!-- impact-map:covers -->\n```json\n{"covers":[{"symbol":"a.py::f","resource":"event:x","ids":[],"kind":"page"}]}\n```\n<!-- /impact-map:covers -->')
+    result = subprocess.run([sys.executable, str(SCRIPT), 'evaluate', '--domain', 'x', '--index', str(index), '--oracle', str(oracle), '--page', str(page), '--out', str(tmp_path / 'out')], cwd=tmp_path)
+    assert result.returncode != 0

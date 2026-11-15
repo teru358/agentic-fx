@@ -4,6 +4,7 @@ import argparse
 import ast
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -133,6 +134,104 @@ def extract(args):
     return int(any(d['reason'] in {'parse_error', 'missing_root'} for d in diagnostics))
 
 
+def read_covers(path):
+    text = Path(path).read_text(encoding='utf-8')
+    start, end = '<!-- impact-map:covers -->', '<!-- /impact-map:covers -->'
+    if text.count(start) != 1 or text.count(end) != 1:
+        raise ValueError('invalid covers markers')
+    if text.index(end) < text.index(start):
+        raise ValueError('invalid covers markers')
+    body = text.split(start, 1)[1].split(end, 1)[0]
+    match = re.fullmatch(r'\s*```json\s*\n(.*?)\n```\s*', body, re.DOTALL)
+    if not match:
+        raise ValueError('invalid covers block')
+    covers = json.loads(match.group(1))['covers']
+    for cover in covers:
+        if (cover['kind'] not in ('page', 'manual_edge') or not cover['ids']
+                or not isinstance(cover['ids'], list) or not all(isinstance(i, str) and i for i in cover['ids'])):
+            raise ValueError('invalid cover')
+        key(cover)
+    return covers
+
+
+def key(item):
+    resource, symbol = item['resource'], item['symbol']
+    if not isinstance(resource, str) or not isinstance(symbol, str) or not resource or '::' not in symbol:
+        raise ValueError('invalid key')
+    return resource, symbol
+
+
+def evaluate(args):
+    index = json.loads(Path(args.index).read_text(encoding='utf-8'))
+    oracle = json.loads(Path(args.oracle).read_text(encoding='utf-8'))
+    covers = read_covers(args.page)
+    rows = oracle['rows']
+    for row in rows:
+        key(row)
+        if row['class'] not in ('G_lit', 'G_reach') or type(row['critical']) is not bool:
+            raise ValueError('invalid row')
+        row['relation'], row['rationale']
+    index_keys = {(r['resource'], r['path'] + '::' + r['symbol']) for r in index['records']}
+    cover_map = {}
+    for cover in covers:
+        cover_map.setdefault(key(cover), []).append(cover)
+    for values in cover_map.values():
+        values.sort(key=lambda c: (c['kind'], tuple(c['ids'])))
+    diagnostics = index['header']['diagnostics']
+    unsupported = index['header']['unsupported']
+    unresolved = oracle['header'].get('unresolved', [])
+    for item in unresolved:
+        key(item)
+        if item['cell'] not in ('machine', 'page') or not item['reason']:
+            raise ValueError('invalid unresolved')
+    unresolved_by_cell = {cell: {key(u) for u in unresolved if u['cell'] == cell} for cell in ('machine', 'page')}
+    def unscanned(k):
+        path = k[1].split('::', 1)[0]
+        return any(d['reason'] in ('parse_error', 'missing_root', 'symlink_outside_root') and
+                   (path == d['path'] or path.startswith(d['path'].rstrip('/') + '/')) for d in diagnostics)
+    def cell(name, subset, candidates):
+        expected = {key(r) for r in subset}
+        critical = {key(r) for r in subset if r['critical']}
+        found, missed = expected & candidates, expected - candidates
+        unscanned_keys = {k for k in expected if unscanned(k)} if name == 'machine' else set()
+        unknown = (unresolved_by_cell[name] & expected) | unscanned_keys
+        false_positives = candidates - expected
+        def counts(scope):
+            return {'population': len(expected & scope), 'tp': len(found & scope),
+                    'fn': len(missed & scope), 'u': len(unknown & scope),
+                    'unscanned': len(unscanned_keys & scope)}
+        result = counts(expected)
+        result['false_negatives'] = [{'resource': r, 'symbol': s} for r, s in sorted(missed)]
+        result['unresolved'] = []
+        for resource, symbol in sorted(unknown):
+            reasons = sorted({u['reason'] for u in unresolved if u['cell'] == name and key(u) == (resource, symbol)})
+            path = symbol.split('::', 1)[0]
+            if name == 'machine':
+                reasons += sorted({d['reason'] for d in diagnostics if d['reason'] in ('parse_error', 'missing_root', 'symlink_outside_root') and (path == d['path'] or path.startswith(d['path'].rstrip('/') + '/'))})
+            result['unresolved'].append({'resource': resource, 'symbol': symbol, 'reasons': sorted(set(reasons))})
+        result['fp'] = len(false_positives)
+        result['false_positives'] = [{'resource': r, 'symbol': s} for r, s in sorted(false_positives)]
+        result['critical'] = counts(critical)
+        result['critical']['fp'] = None
+        result['unsupported'] = not expected or (name == 'machine' and bool(unsupported))
+        result['precision'] = len(found) / len(candidates) if candidates else None
+        result['recall'] = len(found) / len(expected) if expected else None
+        return result
+    machine = cell('machine', [r for r in rows if r['class'] == 'G_lit'], index_keys)
+    page = cell('page', rows, set(cover_map))
+    classifications = []
+    for row in sorted(rows, key=lambda r: (key(r), r['class'], r['relation'], r['rationale'])):
+        k = key(row)
+        classification = 'index_found' if k in index_keys else 'page_manual' if k in cover_map else 'both_missed'
+        classifications.append({**row, 'classification': classification, 'covers': cover_map.get(k, [])})
+    passed = all(not c['unsupported'] and c['critical']['fn'] == 0 and c['critical']['u'] == 0 for c in (machine, page))
+    result = {'domain': args.domain, 'machine': machine, 'page': page, 'rows': classifications,
+              'needs_human_review': True, 'pass_candidate': passed}
+    Path(args.out).mkdir(parents=True, exist_ok=True)
+    (Path(args.out) / 'metrics.json').write_text(json.dumps(result, sort_keys=True, separators=(',', ':')) + '\n', encoding='utf-8')
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest='command', required=True)
@@ -141,9 +240,12 @@ def main():
     ex.add_argument('--page', required=True)
     ex.add_argument('--root', action='append', required=True)
     ex.add_argument('--out', required=True)
+    ev = sub.add_parser('evaluate')
+    for option in ('domain', 'index', 'oracle', 'page', 'out'):
+        ev.add_argument('--' + option, required=True)
     args = parser.parse_args()
     try:
-        return extract(args)
+        return extract(args) if args.command == 'extract' else evaluate(args)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         print(f'invalid input: {type(exc).__name__}', file=sys.stderr)
         return 2
