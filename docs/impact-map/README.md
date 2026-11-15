@@ -12,10 +12,10 @@ spec・チケットを含む他資料から、本番の時刻・event 行や件�
 
 ```sh
 python3 scripts/impact_map.py extract --domain kill-switch --page docs/impact-map/domains/kill-switch.md --root . --out tmp/impact-map/current
-python3 scripts/impact_map.py evaluate --domain kill-switch --index tmp/impact-map/current/index.json --oracle docs/impact-map/oracle/kill-switch-a.json --page docs/impact-map/domains/kill-switch.md --out tmp/impact-map/current
+python3 scripts/impact_map.py evaluate --domain kill-switch --index tmp/impact-map/current/index.json --oracle docs/impact-map/oracle/kill-switch-frozen.json --page docs/impact-map/domains/kill-switch.md --out tmp/impact-map/current
 ```
 
-B も別途 `--oracle` に指定して評価する。出力と被覆宣言は人が source と照合する材料で、頁の意味の自動証明ではない。
+採点には裁定済みの凍結表 (`kill-switch-frozen.json`、各行に class 欄がある) を使う。A・B の表 (`kill-switch-a.json` / `kill-switch-b.json`) は独立作成の記録で、class 欄が無いので evaluate には渡さない。出力と被覆宣言は人が source と照合する材料で、頁の意味の自動証明ではない。
 
 ## 手動閉鎖の雛形
 
