@@ -338,6 +338,10 @@ class _Run:
         self.op_seq = 0
         self.executed_last = 0
         self.deferred_gaps: set[tuple[str, str, str]] = set()
+        self._reconciled = False
+        self._changed_primary_days: dict[str, set[date]] = {}
+        self._reference_cache: dict[str, dict[date, tuple[int, int | None]]] = {}
+        self._dirty_references: set[str] = set()
 
     # -- 記録 --
     def _write(self, work) -> bool:
@@ -467,6 +471,19 @@ class _Run:
         op.status = outcome.status
         op.reason = outcome.failure or outcome.deferred_reason
         op.inserted, op.unchanged = outcome.inserted, outcome.unchanged
+        if self._reconciled and op.inserted:
+            if symbol in self.primary:
+                day = max(request_start, self.boundary).date()
+                last = min(end, self.limit).date()
+                days = self._changed_primary_days.setdefault(symbol, set())
+                while day <= last:
+                    days.add(day)
+                    day += timedelta(days=1)
+                self._reference_cache.clear()
+                self._dirty_references.update(self.references)
+            elif symbol in self.references:
+                self._reference_cache.pop(symbol, None)
+                self._dirty_references.add(symbol)
         op.conflicted_new, op.conflicted_known = outcome.conflicted_new, outcome.conflicted_known
         self._finish_series(series_id, op)
         op.resume_action = self._resume_action(op, outcome, resume, resume_stale,
@@ -695,9 +712,7 @@ class _Run:
         day = date.fromisoformat(day_s)
         day0 = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
         if kind == "reference_suspected":
-            suspects = reference_suspects(
-                self.conn, self.dataset, symbol, self.primary, boundary=self.boundary,
-                now=self.now, no_bars=self.no_bars, is_open=self.is_open)
+            suspects = self._reference_suspects(symbol)
             # 疑いの本数は「その日の足の数」で 0 もあり得るので、解消は疑いが外れたときだけ。
             after = 0 if day not in suspects else None
         else:
@@ -722,6 +737,13 @@ class _Run:
         self._write_required(f"gap_attempt:{symbol}", work)
 
     # -- 後処理 --
+    def _reference_suspects(self, symbol: str) -> dict[date, tuple[int, int | None]]:
+        if symbol not in self._reference_cache:
+            self._reference_cache[symbol] = reference_suspects(
+                self.conn, self.dataset, symbol, self.primary, boundary=self.boundary,
+                now=self.now, no_bars=self.no_bars, is_open=self.is_open)
+        return self._reference_cache[symbol]
+
     def reconcile(self) -> None:
         """DB を読み直して gap queue を実態に合わせる (主 pair は guard と同じ判定)。"""
         interval = self.dataset.base_interval
@@ -734,9 +756,7 @@ class _Run:
                     now=self.now, grace=self.grace, no_bars=self.no_bars,
                     is_open=self.is_open), self.width)
             for symbol in self.references:
-                found_refs[symbol] = reference_suspects(
-                    self.conn, self.dataset, symbol, self.primary, boundary=self.boundary,
-                    now=self.now, no_bars=self.no_bars, is_open=self.is_open)
+                found_refs[symbol] = self._reference_suspects(symbol)
 
         def work(c):
             for symbol, days in found_primary.items():
@@ -745,9 +765,11 @@ class _Run:
             for symbol, days in found_refs.items():
                 self._reconcile_kind(c, symbol, "reference_suspected", days)
         self._write_required("reconcile", work)
+        self._reconciled = True
 
     def _reconcile_kind(self, c, symbol: str, kind: str,
-                        observed: dict[date, tuple[int, int | None]]) -> None:
+                        observed: dict[date, tuple[int, int | None]],
+                        only_days: set[date] | None = None) -> None:
         interval = self.dataset.base_interval
         seen = set()
         for day, (count, median_ppm) in sorted(observed.items()):
@@ -763,14 +785,37 @@ class _Run:
                 "SELECT day_utc FROM history_sync_gaps WHERE source=? AND interval=? AND "
                 "symbol=? AND kind=? AND state='open'", (SOURCE, interval, symbol,
                                                          kind)).fetchall():
-            if row["day_utc"] not in seen:
+            if row["day_utc"] not in seen and (only_days is None
+                    or date.fromisoformat(row["day_utc"]) in only_days):
                 store.resolve_gap(c, source=SOURCE, interval=interval, symbol=symbol,
                                   day_utc=row["day_utc"], kind=kind, resolution="rescan_clear",
                                   run_id=self.run_id, now=self.now)
 
     def finalize(self) -> None:
         interval = self.dataset.base_interval
-        self.reconcile()
+        changed: dict[str, dict[date, tuple[int, int | None]]] = {}
+        for symbol, days in self._changed_primary_days.items():
+            observed = {}
+            for day in sorted(days):
+                day0 = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+                start, end = max(day0, self.boundary), min(day0 + timedelta(days=1), self.limit)
+                if start >= end:
+                    continue
+                missing = primary_day_missing(
+                    self.conn, self.dataset, symbol, start=start, end=end, now=self.now,
+                    grace=self.grace, no_bars=self.no_bars, is_open=self.is_open)
+                observed.update({d: (n, None) for d, n in guard_relevant(missing, self.width).items()})
+            changed[symbol] = observed
+        references = {symbol: self._reference_suspects(symbol)
+                      for symbol in self._dirty_references}
+        if changed or references:
+            def work(c):
+                for symbol, days in changed.items():
+                    self._reconcile_kind(c, symbol, "primary_exact", days,
+                                         only_days=self._changed_primary_days[symbol])
+                for symbol, days in references.items():
+                    self._reconcile_kind(c, symbol, "reference_suspected", days)
+            self._write_required("reconcile", work)
         result = self.result
         result.gap_counts = store.count_gaps(self.conn, source=SOURCE, interval=interval)
         result.primary_open_gaps = self.conn.execute(

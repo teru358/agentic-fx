@@ -794,3 +794,87 @@ def test_deferred_gap_is_attempted_once_per_run_even_if_it_becomes_due_again(tmp
     assert conn.execute("SELECT COUNT(*) FROM history_sync_series WHERE run_id=? AND operation='gap' AND day_utc=?",
                         (result.run_id, stuck.isoformat())).fetchone()[0] == 1
     assert sum(op.status == 'ok' for op in result.ops if op.operation == 'gap') > 32
+
+
+@pytest.mark.parametrize('insert_bars', [False, True])
+def test_sync_scans_holdout_once_and_matches_full_rescan_after_gap_work(tmp_path, monkeypatch, insert_bars):
+    conn, settings = _seeded(tmp_path, symbols=(SYMBOL, REF))
+    day = date(2026, 10, 20)
+    lo, hi = _day_bounds(day)
+    for symbol in (SYMBOL, REF):
+        conn.execute('DELETE FROM ohlcv_history WHERE symbol=? AND bar_time>=? AND bar_time<?',
+                     (symbol, lo.isoformat(), hi.isoformat()))
+    conn.commit()
+    full_calls, ref_calls = [], []
+    primary_fn, reference_fn = hs.primary_day_missing, hs.reference_suspects
+    def primary_spy(*args, **kwargs):
+        if kwargs['start'] == B1 and kwargs['end'] == E:
+            full_calls.append(args[2])
+        return primary_fn(*args, **kwargs)
+    def reference_spy(*args, **kwargs):
+        ref_calls.append(args[2])
+        return reference_fn(*args, **kwargs)
+    monkeypatch.setattr(hs, 'primary_day_missing', primary_spy)
+    monkeypatch.setattr(hs, 'reference_suspects', reference_spy)
+    bridge = FakeBridge(drop=lambda symbol, t: t.date() == day and (not insert_bars or symbol == REF))
+    result = _run(conn, settings, bridge)
+    assert full_calls == [SYMBOL]
+    if not insert_bars:
+        assert ref_calls == [REF]
+    else:
+        assert any(op.symbol == SYMBOL and op.inserted for op in result.ops)
+    missing = primary_fn(conn, settings.backtest.dataset(), SYMBOL, start=B1, end=E, now=T,
+                         grace=timedelta(seconds=settings.datafeed.closed_bar_grace_sec),
+                         no_bars=hs.EMPTY_NO_BARS)
+    suspected = reference_fn(conn, settings.backtest.dataset(), REF, [SYMBOL], boundary=B1,
+                             now=T, no_bars=hs.EMPTY_NO_BARS)
+    rows = conn.execute("SELECT symbol,day_utc,kind FROM history_sync_gaps WHERE state='open' "
+                        "AND kind IN ('primary_exact','reference_suspected')").fetchall()
+    actual = {(r['symbol'], r['day_utc'], r['kind']) for r in rows}
+    expected = {(SYMBOL, d.isoformat(), 'primary_exact') for d in hs.guard_relevant(missing, WIDTH)}
+    expected |= {(REF, d.isoformat(), 'reference_suspected') for d in suspected}
+    assert actual == expected
+
+
+def test_reference_suspect_cache_is_invalidated_after_reference_insert(tmp_path, monkeypatch):
+    conn, settings = _seeded(tmp_path, symbols=(SYMBOL, REF))
+    day = date(2026, 10, 28)
+    lo, hi = _day_bounds(day)
+    conn.execute('DELETE FROM ohlcv_history WHERE symbol=? AND bar_time>=? AND bar_time<?',
+                 (REF, lo.isoformat(), hi.isoformat()))
+    conn.commit()
+    counts = []
+    original = hs.reference_suspects
+    def spy(*args, **kwargs):
+        result = original(*args, **kwargs)
+        counts.append(day in result)
+        return result
+    monkeypatch.setattr(hs, 'reference_suspects', spy)
+    result = _run(conn, settings, FakeBridge())
+    assert any(op.symbol == REF and op.operation == 'gap' and op.inserted for op in result.ops)
+    assert counts == [True, False]
+    row = conn.execute("SELECT state FROM history_sync_gaps WHERE symbol=? AND day_utc=? "
+                       "AND kind='reference_suspected'", (REF, day.isoformat())).fetchone()
+    assert row['state'] == 'resolved'
+
+
+def test_multiple_reference_gap_attempts_share_suspect_scan_without_inserts(tmp_path, monkeypatch):
+    conn, settings = _seeded(tmp_path, symbols=(SYMBOL, REF))
+    days = {date(2026, 10, 20), date(2026, 10, 22)}
+    for day in days:
+        lo, hi = _day_bounds(day)
+        conn.execute('DELETE FROM ohlcv_history WHERE symbol=? AND bar_time>=? AND bar_time<?',
+                     (REF, lo.isoformat(), hi.isoformat()))
+    conn.commit()
+    calls = []
+    original = hs.reference_suspects
+    def spy(*args, **kwargs):
+        calls.append(args[2])
+        return original(*args, **kwargs)
+    monkeypatch.setattr(hs, 'reference_suspects', spy)
+    result = _run(conn, settings, FakeBridge(drop=lambda symbol, t: symbol == REF and t.date() in days))
+    attempts = [op for op in result.ops if op.symbol == REF and op.operation == 'gap']
+    assert len(attempts) == 2 and all(op.status == 'ok' and op.inserted == 0 for op in attempts)
+    assert calls == [REF]
+    assert conn.execute("SELECT COUNT(*) FROM history_sync_gaps WHERE symbol=? AND kind='reference_suspected' "
+                        "AND state='open' AND attempts=1", (REF,)).fetchone()[0] == 2
