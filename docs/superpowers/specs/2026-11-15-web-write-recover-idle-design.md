@@ -1,4 +1,4 @@
-# web-write-recover-idle-interruption — C0.3
+# web-write-recover-idle-interruption — C0.4
 
 対象: idle（未 enable / disabled）の write 回復。実装・commit は含めない。
 根拠: `docs/tickets/open/web-write-recover-idle-interruption.md`、関連設計 `2026-11-08-web-plugin-improve-hub-design.md` の B1・受入 8b。
@@ -50,7 +50,7 @@ marker を起動後まで残す案も、起動阻止のために停止前に置�
 
 ### 状態機械と再実行
 
-回復記録が保証するのは、止める前の afx の状態の復元（元停止なら起こさない）と web 所有 marker の解消だけである。鍵・write の継続的な整合そのものは保証しない。安全性は既存の fail-closed 検査が担う。enable は `_check_web_write` → `check_write_key_consistency` で不整合を拒否する（S:548–558、576–583、K:72–117）。web 起動は `afx-ops/afx_ops/isolation/startup.py:881–899、1030` の `read_api_token` で write に対応する principal の state・digest を検査し、他方の鍵にフォールバックしない。起動時検査と setup の整合検査は同じ関数ではない。
+回復記録が保証するのは、止める前の afx の状態の復元（元停止なら起こさない）と web 所有 marker の解消だけである。鍵・write の継続的な整合そのものは保証しない。安全性は既存の fail-closed 検査が担う。enable は `_check_web_write` → `check_write_key_consistency` で不整合を拒否する（S:548–558、576–583、K:72–117）。web 起動は `afx-ops/afx_ops/isolation/startup.py:881–899、1030` の `read_api_token` で write に対応する principal の state・digest を検査し、他方の鍵にフォールバックしない。write=false では読取 principal だけを検査するため、書込み鍵 active の残存不整合があっても起動し得る。起動時検査と setup の整合検査は同じ関数ではない。起動時検査の拡張は範囲外とする（§4）。
 
 **不変条件:** 鍵・設定を変える間は marker と停止確認と instance lock が揃う。記録がある間は通常の setup 操作を成功させない（直接 keys 操作は入口表の例外）。記録の削除は、目標との整合・marker 無し・必要な afx の復帰をすべて確認した後だけ。
 
@@ -66,7 +66,7 @@ marker を起動後まで残す案も、起動阻止のために停止前に置�
 
 (b) 実物を観測する。鍵と write の整合（**記録の target との一致も含む**）、marker の有無・持ち主、afx の ActiveState を読む。他機能・壊れた marker は回収しない。--write の安全条件や読めない config の検査も省略しない。
 
-(c) 目標と不整合、または marker があるなら整合作業へ進む。直前に afx を再観測し、停止が必要で元が稼働（afx_before_stop が `_AFX_RUNNING`）なら既存の confirm を経る。拒否は setup_aborted、非端末は setup_input_required（interactive.py:292–295）として変更せず記録を残す。元の操作と同じ停止権限であり、再開だから確認を省かない。元が停止で、現在は手動起動され稼働しているなら、**止めずに非成功** `write_recovery_afx_running` と「afx を止めてから同じコマンドを再実行する」を返し、記録を残す。marker のみの解消でもこの停止規則を適用する。
+(c) 目標と不整合、または marker があるなら整合作業へ進む。直前に afx を再観測し、停止が必要で元が稼働（afx_before_stop が `_AFX_RUNNING`）なら既存の confirm を経る。拒否は setup_aborted、非端末は setup_input_required（interactive.py:292–295）として変更せず記録を残す。元の操作と同じ停止権限であり、再開だから確認を省かない。元が停止で、現在は手動起動され稼働しているなら、**止めずに非成功** `write_recovery_afx_running` を返し、記録を残す。固定 reason の detail に「`systemctl --user stop <unit>` で止め、`systemctl --user is-active <unit>` の出力が `inactive` であることを確かめてから、同じ `afx ops web enable --write` / `--no-write` を再実行する」と案内する。`<unit>` は `setup.paths.afx_unit` から作り（units.py:43、停止先も S:523）、既定名を固定しない。is-active の終了コードだけでは停止確認としない。marker のみの解消でもこの停止規則を適用する。
 
 停止可能なら `_quiesce_afx(reset_stage=False)` で marker・停止確認・自分の instance lock を揃え、align_keys と設定反映で目標へ整合させる。最初の afx_before_stop を必ず渡して通常 stage の保存を起こさず、鍵 preparing は既存 align_keys で完了させる。disabled の --no-write は読取鍵を検査し、never では新規要求しない。config 不在・target=false は既存 idle の許容に従う。整合済みでも marker があればこの手順を通る。marker 無しで目標と整合済みなら変更せず次へ進む。
 
@@ -125,11 +125,13 @@ wizard の検査位置は `_stage0` の acquire_setup_lease 成功直後（setup
 | start 後の手動停止 | 元稼働、after_recovery_start 中断 → 手動 stop → 再実行 | 記録を保持する間は start し active を確認して完了 |
 | 元停止時の手動起動 | marker 削除後に中断 → 手動 start → 同目標で再実行 | 回復から start/stop しない。active のまま完了可能 |
 | (b) と (d) の間の鍵変更 | (b) は整合・marker 無し、(d) 前に直接 keys で変更 | (c) へ1回戻り整合。再度の不整合は非成功・記録保持、loop しない |
-| 元停止・手動起動中に不整合 | 元停止の記録、現在 active、(b) または (d) で不整合 | stop なし、write_recovery_afx_running と停止後の再実行案内、記録保持 |
+| 元停止・手動起動中に不整合 | 元停止の記録、現在 active、(b) または (d) で不整合 | stop なし、write_recovery_afx_running の detail に setup.paths.afx_unit 由来の stop / is-active inactive 確認と同じ明示 write コマンドの再実行案内、記録保持 |
+| 元停止・marker と自動再起動ありの案内から収束 | 元停止の記録・web marker あり、手動起動後に自動再起動設定がある unit（既定以外の setup.paths.afx_unit）で非成功 | detail の案内どおり user unit を stop し、is-active の出力 inactive を確認して同じ --write / --no-write を再実行。両目標で整合・marker 解消・記録削除まで収束し、回復から start しない |
 | 元稼働で不整合 | 元稼働の記録、現在 active、再照合で不整合 | confirm 後 stop・lock・整合・復帰。拒否/非端末では停止せず setup_aborted / setup_input_required。lock 下の整合後も不整合なら write_recovery_inconsistent・記録保持 |
 | 両方向の目標差替え | true→false / false→true、保存前後の中断 | 新しい明示目標へ収束。最初の afx_before_stop / idle_origin を保持。旧目標で一旦起動しない |
 | 実 wizard 入口 | run_wizard を通す。正常 pending + marker あり/なし、記録無しの既存正常経路 | pending は lease 取得直後に init 全体を拒否。質問・保存・probe・keys・systemd 操作なし。記録無しは既存経路へ進む |
-| 直接 keys と競合 | init / enroll / rotate / revoke を回復の lock 保持中、解放後、再実行前に試す | 保持中は排他。解放後は既存規則で動作し記録不変、次回は変更済み実物を照合。稼働中再開の観測中に daemon 停止→直接 keys 変更を挟む。検出時は上記1回の再試行、未検出の残存不整合は次の web 起動・enable の既存検査で拒否することを確認 |
+| 直接 keys と競合 | init / enroll / rotate / revoke を回復の lock 保持中、解放後、再実行前に試す | 保持中は排他。解放後は既存規則で動作し記録不変、次回は変更済み実物を照合。稼働中再開の観測中に daemon 停止→直接 keys 変更を挟む。検出時は上記1回の再試行、未検出の残存不整合は次の enable（フラグなし・--write・--no-write）/ reconfigure の整合検査が止めることを確認 |
+| write=false・書込み鍵 active の残存 | target=false の整合観測後、daemon 停止と直接 keys 操作で書込み鍵を active にし、回復が変更を見逃して記録削除。読取鍵は正常 | 次の enable（フラグなし・--write・--no-write）/ reconfigure の整合検査が止める。明示 write は既存の回復経路へ進む。web 起動の拒否は期待せず、読取 principal の検査を通って起動し得る。write=false の web は書込み鍵 file を読まない |
 | 他 setup 入口と status | 入口表の通常操作を正常 pending の代表状態で実行 | setup は無変更で pending。status は読取のみ。enabled 切替・通常 enable 再開は既存 test と必要な代表回帰だけ |
 | 破損・競合 | JSON/型/版/権限/読取エラー/symlink、余分な項目・重複キー・未知ActiveState・4096 byte超過、foreign/corrupt marker、通常 stage 矛盾 | fail-closed、記録・stage・marker・鍵・設定を保全 |
 | 保存の永続性不明 | 新規/差替えで rename 後の directory fsync 失敗 | 非成功、停止や整合操作なし。新規は記録あり/なし、差替えは旧/新記録の両方から安全に再開 |
@@ -147,7 +149,7 @@ wizard の検査位置は `_stage0` の acquire_setup_lease 成功直後（setup
 
 ## §4 残余
 
-旧版で既に記録無しのまま中断した状態から、元の afx 稼働状態は復元できない。自動推測はせず、marker と停止前状態を運用者が確認する。古い実行ファイルは新記録を知らないため、pending 中の downgrade は対象外。直接 keys の setup lock 参加は範囲外。回復記録の保証は止める前の afx の状態の復元と web marker の解消であり、鍵・write の整合自体は既存 fail-closed 検査が担う（enable: S:548–558、576–583 / K:72–117、web 起動: afx-ops/afx_ops/isolation/startup.py:881–899、1030 の state・digest 検査と principal 固定）。自分の instance lock 下での照合はその期間だけ排他がある。稼働中再開は lock を取らずに観測し、daemon の継続的な lock 保持を仮定しない。整合・marker 無し・元稼働なら必要な稼働を確認して記録を消せる。daemon の停止と直接 keys 変更が観測に重なり、不整合を見逃したまま完了する可能性は残る。被害の上限は、afx 復帰・marker 解消後にも鍵・write の不整合が残り、次の web 起動・enable が既存検査で止まり修復が必要になること。回復成功を web の書込み可能性や継続整合の保証として扱わない（idle の web は enable しない）。検出できた不整合は §1(d) の1回の再試行で扱う。手動 systemd 操作は §1(e) の非対称な扱いとし、元停止の手動起動を完了時に止めず、元稼働の手動停止は記録が残る間再実行で起こす。記録は再実行で進むもので、自動再起動サービスは追加しない。
+旧版で既に記録無しのまま中断した状態から、元の afx 稼働状態は復元できない。自動推測はせず、marker と停止前状態を運用者が確認する。古い実行ファイルは新記録を知らないため、pending 中の downgrade は対象外。直接 keys の setup lock 参加は範囲外。回復記録の保証は止める前の afx の状態の復元と web marker の解消であり、鍵・write の整合自体は既存 fail-closed 検査が担う（enable: S:548–558、576–583 / K:72–117、web 起動: afx-ops/afx_ops/isolation/startup.py:881–899、1030 の state・digest 検査と principal 固定）。自分の instance lock 下での照合はその期間だけ排他がある。稼働中再開は lock を取らずに観測し、daemon の継続的な lock 保持を仮定しない。整合・marker 無し・元稼働なら必要な稼働を確認して記録を消せる。daemon の停止と直接 keys 変更が観測に重なり、不整合を見逃したまま完了する可能性は残る。被害の上限は、afx 復帰・marker 解消後にも鍵・write の不整合が残り、次の `afx ops web enable`（フラグなし・`--write`・`--no-write`）/ reconfigure の整合検査が止め、修復が必要になること（明示 write は既存回復経路へ進む）。例えば `write=false` で書込み鍵が active の場合、web 起動は読取 principal だけを検査するので起動し得る（afx-ops/afx_ops/isolation/startup.py:190–204、881–899、1030）。これは回復が無いときに同じ直接 `afx keys` 操作を行った場合と同じ状態で、回復が新しく作る危険ではない。書込み鍵 file は secret dir（API 鍵専用の `~/.config/agentic-fx/api/<instance_id>/`、0700。feature の secret dir とは別）内に置かれる（src/agentic_fx/ops/keys.py:3、51–62、115）。web は write が無効ならこの書込み鍵 file を読まず、読取鍵だけを使う（startup.py:199–204、881–899、1030）。起動時検査を全不整合へ広げる変更は範囲外とする。回復成功を web の書込み可能性や継続整合の保証として扱わない（idle の web は enable しない）。検出できた不整合は §1(d) の1回の再試行で扱う。手動 systemd 操作は §1(e) の非対称な扱いとし、元停止の手動起動を完了時に止めず、元稼働の手動停止は記録が残る間再実行で起こす。記録は再実行で進むもので、自動再起動サービスは追加しない。
 
 ## §5 裁定が要る点
 
@@ -159,3 +161,4 @@ C0 の技術判断は別 file、明示目標の差替え、共通 pending 検査
 | 2026-11-15 | C0.1 | 回復の段記録を廃止し実物から毎回同じ手順で再開。中断 test を集約し marker 流用案を比較 | 整合判定を中心の1関数に保ち、実物と進捗記録の二重管理を避けるため | —（未 commit） |
 | 2026-11-15 | C0.2 | レビュー1周目の Important 4件・Minor 1件を裁定に沿って反映。手動 start/stop の非対称な保証、排他下の整合確認と直接 keys の保証境界、wizard lease 直後の init 全体拒否、保存/削除の永続性不明、分岐中心の test 表を明記 | 回復の停止権限を増やさず、実 source と保証範囲を一致させるため | —（未 commit） |
 | 2026-11-15 | C0.3 | レビュー2周目の裁定を反映。稼働中の排他保証を撤回し既存 fail-closed との責任分界を明記。再照合不整合の1回再試行・停止権限・固定 reason、record 配置と入口順序・厳密な読取規則、試験3行を追加 | 観測と排他を区別し、手動起動を止めない規則と再開分岐を一意にするため | —（未 commit） |
+| 2026-11-15 | C0.4 | レビュー3周目 Important 2件の裁定を反映。残存不整合は次の enable / reconfigure の整合検査が止め、write=false では web が起動し得る保証境界と source を明記。元停止・手動稼働の detail に unit 停止・inactive 確認・同じ明示目標の再実行を指定し、残存不整合と marker・自動再起動ありの収束試験を追加 | 起動時検査は拡張せず実装の保証に合わせ、案内に従う再実行を収束させるため | —（未 commit） |
