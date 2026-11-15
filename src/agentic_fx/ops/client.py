@@ -1816,9 +1816,12 @@ class Runner:
                 raise ClientError(RC_FAILED, text)
             if sent_token is not None and token != sent_token:
                 raise ClientError(RC_FAILED, _REBASE_MOVED)
-            terminal.show("".join(line + "\n" for line in rebase_view.preview_lines(
-                data, generation, lambda value: _when(value, tz))))
-            answer = terminal.ask(rebase_view.confirm_sentence(data, generation), exact=True)
+            try:
+                terminal.show("".join(line + "\n" for line in rebase_view.preview_lines(
+                    data, generation, lambda value: _when(value, tz))))
+                answer = terminal.ask(rebase_view.confirm_sentence(data, generation), exact=True)
+            except OSError:
+                raise ClientError(RC_FAILED, "端末での確認に失敗しました") from None
             if answer != f"rebase {generation}":
                 raise ClientError(RC_FAILED, MESSAGES["cancelled"])
             reply = self._post("/v1/killswitch/rebase",

@@ -192,14 +192,72 @@ def test_status_and_event_sources_know_no_rebase_field():
 # 自動で解除する経路は replay の `_auto_release_kill_switch` だけで、replay 専用の DB と
 # state に対して `replay_ks_rebase` の snapshot を足す。手動の台帳は触らない。
 
-def test_only_reset_and_replay_write_an_unlatched_state_in_src():
-    import re
+def _latch_writers(source):
+    import ast
+    tree = ast.parse(source)
+    writers = set()
+    class Scan(ast.NodeVisitor):
+        scope = []
+        def visit_ClassDef(self, node):
+            self.scope.append(node.name)
+            self.generic_visit(node)
+            self.scope.pop()
+        def visit_FunctionDef(self, node):
+            self.scope.append(node.name)
+            self.generic_visit(node)
+            self.scope.pop()
+        visit_AsyncFunctionDef = visit_FunctionDef
+        def record(self):
+            writers.add(".".join(self.scope) or "<module>")
+        def visit_Call(self, node):
+            for kw in node.keywords:
+                if kw.arg == "kill_switch_latched":
+                    self.record()
+                elif kw.arg is None and isinstance(kw.value, ast.Dict):
+                    if any(isinstance(k, ast.Constant) and k.value == "kill_switch_latched" for k in kw.value.keys):
+                        self.record()
+            self.generic_visit(node)
+        def visit_Attribute(self, node):
+            if isinstance(node.ctx, ast.Store) and node.attr == "kill_switch_latched":
+                self.record()
+            self.generic_visit(node)
+        def visit_Subscript(self, node):
+            if isinstance(node.ctx, ast.Store) and isinstance(node.slice, ast.Constant) and node.slice.value == "kill_switch_latched":
+                self.record()
+            self.generic_visit(node)
+    Scan().visit(tree)
+    return writers
+
+
+def test_latch_writer_scan_detects_new_functions_and_write_forms():
+    source = """
+def other(value):
+    update(kill_switch_latched=value)
+    update(**{"kill_switch_latched": False})
+    state.kill_switch_latched = value
+    state["kill_switch_latched"] = value
+"""
+    assert _latch_writers(source) == {"other"}
+    for statement in source.splitlines()[2:]:
+        assert _latch_writers("def other(value):\n" + statement + "\n") == {"other"}
+
+
+def test_only_known_functions_write_latch_in_src():
     from pathlib import Path
     src = Path(__file__).resolve().parents[2] / "src" / "agentic_fx"
-    pattern = re.compile(r"kill_switch_latched\s*=\s*False")
-    writers = sorted(str(path.relative_to(src)) for path in src.rglob("*.py")
-                     if pattern.search(path.read_text(encoding="utf-8")))
-    assert writers == ["backtest/runner.py", "store/state.py"]
+    writers = sorted(f"{path.relative_to(src)}:{name}" for path in src.rglob("*.py")
+                     for name in _latch_writers(path.read_text(encoding="utf-8")))
+    assert writers == [
+        "backtest/runner.py:_auto_release_kill_switch",
+        "core/executor.py:Executor._evaluate_and_execute_open",
+        "core/executor.py:Executor._open",
+        "core/executor.py:Executor.open_from_snapshot",
+        "store/state.py:GuardedState.projected",
+        "store/state.py:StateStore.confirm_latched",
+        "store/state.py:StateStore.load",
+        "store/state.py:StateStore.reset_kill_switch",
+        "store/state.py:parse_state",
+    ]
 
 
 def test_replay_auto_release_changes_neither_the_live_hwm_nor_the_manual_ledger(rig, tmp_path):

@@ -427,3 +427,34 @@ def test_terminal_ask_exact_keeps_whitespace_and_only_drops_the_newline(typed, e
     finally:
         os.close(master)
         terminal.close()
+
+
+def test_terminal_write_failure_cancels_rebase(tmp_path, monkeypatch):
+    import os
+    api, out, runner = _runner(tmp_path, [_status(), _preview()])
+    terminal = client.Terminal(123)
+    def fail(*args):
+        raise OSError("disconnected")
+    monkeypatch.setattr(os, "write", fail)
+    with pytest.raises(client.ClientError) as caught:
+        runner._op_killswitch_rebase(3, terminal=terminal)
+    assert caught.value.rc != 0
+    assert api.posts() == []
+    assert "rebase_id" not in out.getvalue()
+
+
+def test_pty_accepts_crlf_confirmation(tmp_path):
+    import os
+    import termios
+    master, terminal = _pty_terminal()
+    try:
+        attrs = termios.tcgetattr(terminal._fd)
+        attrs[0] &= ~termios.ICRNL
+        termios.tcsetattr(terminal._fd, termios.TCSANOW, attrs)
+        api, out, runner = _runner(tmp_path, [_status(), _preview(), _ok({"rebase_id": 1, "snapshot_id": 2, "generation": 3, "latched": True})])
+        os.write(master, b"rebase 3\r\n")
+        assert runner._op_killswitch_rebase(3, terminal=terminal) == 0
+        assert len(api.posts()) == 1
+    finally:
+        os.close(master)
+        terminal.close()
