@@ -128,3 +128,14 @@ def test_the_old_cursor_append_beyond_the_cap_is_queued_explicitly(tmp_path):
     # 後ろ窓は 11-09 11:30 から。cursor 11-02 12:00 からそこまでは日ごとの未取得として残り、解消される
     assert days[0] == "2026-11-02" and "2026-11-08" in days
     assert result.cursors[SYMBOL] == limit.isoformat()
+
+
+def test_a_complete_reference_with_normal_sundays_raises_no_suspect_in_a_real_run(tmp_path):
+    from tests.backtest.history_sync_support import REF
+    from tests.backtest.test_history_sync import B1, E, _seeded
+    conn, settings = _seeded(tmp_path, symbols=(SYMBOL, REF))
+    result = _run(conn, settings, FakeBridge())
+    assert result.new_reference_suspects == 0
+    assert (result.result, result.rc) == ("ok", 0)
+    assert not conn.execute("SELECT 1 FROM history_sync_gaps WHERE kind='reference_suspected'"
+                            ).fetchone()

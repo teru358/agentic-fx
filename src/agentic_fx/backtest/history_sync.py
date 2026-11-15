@@ -15,6 +15,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+from fractions import Fraction
 from typing import Callable
 
 from agentic_fx.backtest import history_sync_plan as plan
@@ -225,24 +226,42 @@ def _day_counts(conn, dataset: HistoryDataset, symbol: str, start: datetime,
     return out
 
 
+def _open_slot_count(day: date, width: timedelta, is_open) -> int:
+    day0 = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+    return len(plan.open_slots(day0, day0 + timedelta(days=1), width=width, is_open=is_open))
+
+
 def reference_suspects(conn, dataset: HistoryDataset, reference: str,
                        primaries: list[str], *, boundary: datetime, now: datetime,
-                       no_bars: NoBarsList) -> dict[date, tuple[int, int | None]]:
-    """参照の疑い日 → (その日の本数, 直前 20 有足日の中央値の 2 倍 (比較不能なら None))。
+                       no_bars: NoBarsList, is_open=is_market_open
+                       ) -> dict[date, tuple[int, int | None]]:
+    """参照の疑い日 → (その日の本数, 直前 20 有足日の充足率の中央値 (百万分率、比較不能なら None))。
 
-    主 pair のどれかに足がある完了 UTC 日で、参照が 0 本、または直前 20 有足日の中央値の
-    50% 未満。20 有足日に満たなければ 0 本だけを疑う。50% ちょうどは対象外 (有理数で比較)。
-    商品固有の休場は欠損と断定できないので、ここは「疑い」に留める。"""
+    充足率 = その日の本数 / 共通暦のその日の開場格子数。主 pair のどれかに足がある完了 UTC 日で、
+    参照が 0 本、または充足率が直前 20 有足日の中央値の 50% 未満。20 有足日に満たなければ 0 本だけを
+    疑う。50% ちょうどは対象外 (有理数で比較)。開場格子が 0 の日は対象にも基準にも入れない。
+    正常な日曜・短縮日は暦の開場本数で割るので疑わない。商品固有の休場は欠損と断定できないので、
+    ここは「疑い」に留める。"""
     horizon = boundary - timedelta(days=90)
     ref_counts = _day_counts(conn, dataset, reference, horizon, now)
     excluded = no_bars.dates_for(dataset.source, dataset.base_interval, reference)
     primary_days: set[date] = set()
     for symbol in primaries:
         primary_days |= set(_day_counts(conn, dataset, symbol, boundary, now))
+    slots: dict[date, int] = {}
+
+    def open_slots(day: date) -> int:
+        if day not in slots:
+            slots[day] = _open_slot_count(day, dataset.width, is_open)
+        return slots[day]
+
+    def fill(day: date) -> Fraction:
+        return Fraction(ref_counts[day], open_slots(day))
+
     out: dict[date, tuple[int, int | None]] = {}
-    prior_days = sorted(d for d in ref_counts if ref_counts[d] > 0)
+    prior_days = sorted(d for d in ref_counts if ref_counts[d] > 0 and open_slots(d) > 0)
     for day in sorted(primary_days):
-        if day >= now.date() or day < boundary.date() or day in excluded:
+        if day >= now.date() or day < boundary.date() or day in excluded or not open_slots(day):
             continue
         count = ref_counts.get(day, 0)
         history = [d for d in prior_days if d < day][-SUSPECT_MEDIAN_DAYS:]
@@ -251,11 +270,11 @@ def reference_suspects(conn, dataset: HistoryDataset, reference: str,
             continue
         if len(history) < SUSPECT_MEDIAN_DAYS:
             continue
-        values = sorted(ref_counts[d] for d in history)
-        # 偶数個の中央値は中央 2 値の平均。2 倍して整数にする。
-        twice_median = values[len(values) // 2 - 1] + values[len(values) // 2]
-        if 4 * count < twice_median:
-            out[day] = (count, twice_median)
+        values = sorted(fill(d) for d in history)
+        # 偶数個の中央値は中央 2 値の平均 (有理数)。
+        median = (values[len(values) // 2 - 1] + values[len(values) // 2]) / 2
+        if fill(day) * 2 < median:
+            out[day] = (count, int(median * 1_000_000))
     return out
 
 
@@ -634,7 +653,7 @@ class _Run:
         if kind == "reference_suspected":
             suspects = reference_suspects(
                 self.conn, self.dataset, symbol, self.primary, boundary=self.boundary,
-                now=self.now, no_bars=self.no_bars)
+                now=self.now, no_bars=self.no_bars, is_open=self.is_open)
             # 疑いの本数は「その日の足の数」で 0 もあり得るので、解消は疑いが外れたときだけ。
             after = 0 if day not in suspects else None
         else:
@@ -673,7 +692,7 @@ class _Run:
             for symbol in self.references:
                 found_refs[symbol] = reference_suspects(
                     self.conn, self.dataset, symbol, self.primary, boundary=self.boundary,
-                    now=self.now, no_bars=self.no_bars)
+                    now=self.now, no_bars=self.no_bars, is_open=self.is_open)
 
         def work(c):
             for symbol, days in found_primary.items():
@@ -687,9 +706,9 @@ class _Run:
                         observed: dict[date, tuple[int, int | None]]) -> None:
         interval = self.dataset.base_interval
         seen = set()
-        for day, (count, twice_median) in sorted(observed.items()):
+        for day, (count, median_ppm) in sorted(observed.items()):
             seen.add(day.isoformat())
-            detail = None if twice_median is None else {"twice_median": twice_median}
+            detail = None if median_ppm is None else {"median_fill_ppm": median_ppm}
             outcome = store.observe_gap(
                 c, source=SOURCE, interval=interval, symbol=symbol, day_utc=day.isoformat(),
                 kind=kind, missing_count=count, detail=detail, run_id=self.run_id,

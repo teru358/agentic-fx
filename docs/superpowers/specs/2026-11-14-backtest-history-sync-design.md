@@ -181,7 +181,7 @@ holdout全scanは起動時・日次・明示rescan・no-bars/holdout_months/data
 
 queue keyは `(source, interval, symbol, day_utc, kind)`、kindはprimary_exact/reference_suspected/unprocessed。unprocessedは未取得区間一覧を日ごとの行に持ち、参照の半分以上ある部分日も消さない。未処理範囲の完走とDB再検査後に通常gap/疑いへ移すかresolvedとする。連続区間をkeyにせず表示時だけ連続日をまとめる。主pairはno-barsを除いた `[B,E)` の欠損を観測するが、自動queueはguardのgap判定に効く日 (現行の60分超/充足条件) に限定する。60分以下の欠けをすべて常設queueへ積まない。小欠損はローカルの日次scanと停止中手動取得で再観測し情報表示する。queue登録は3aでの古いgap取得の許可を意味しない。実装前の人間専用DB分布測定は別途必要・未実施であり、閾値変更は受入前に固定する。DB再読取で全expectedが揃ったときだけresolved。HTTP成功や空/部分応答で閉じない。
 
-参照は主pairに足のある完了UTC日で0本、または直前20有足日中央値の50%未満をsuspectedとする。20日不足なら0本だけ。50%ちょうどは対象外。中央値比較は整数/有理数で境界を固定する。条件が外れたDB再読取だけでresolved。商品固有休場を欠損と断定せず採用guardに入れない。acknowledged状態とack操作は作らない。
+参照は主pairに足のある完了UTC日で0本、または**共通暦のその日の開場格子数に対する充足率**が直前20有足日の充足率の中央値の50%未満をsuspectedとする (開場格子0の日は対象にも基準にも入れない。正常な日曜・短縮日は疑わず、商品固有の休場は疑いに残る)。20日不足なら0本だけ。50%ちょうどは対象外。中央値比較は整数/有理数で境界を固定する。条件が外れたDB再読取だけでresolved。商品固有休場を欠損と断定せず採用guardに入れない。acknowledged状態とack操作は作らない。
 
 主/参照とも欠損数や疑いが改善しない取得3回で24h、さらに3回で7日へ延長する。改善すれば通常周期へ戻し、成功解消ならattemptsを0にする。no-bars変更は主expectedとqueueを再評価する。選定はdue行の銘柄round-robin、古い日優先でcursorを永続し、埋まらない先頭日が予算を独占しない。
 
@@ -301,6 +301,7 @@ rollbackは新コードのうちにauto_enabled=falseへ変更して再起動し
 | 2026-11-14 | C5 | 取得前不足/取得後遮断優先、計測不能時の手動復旧とcursor初期化、slot none継続時の表示/復旧/実装可能性、T3正本追随条件を補足 | terra C4閉鎖確認 Important 2 / Minor 2、histbugs C2.2 §2.3との整合 | — (本改訂、未commit) |
 | 2026-11-15 | C5.1 | recent始端を `max(B,E-D日)` に戻し、offline recent上限をD+1からD+2窓/系列・要求上限を `(D+2)N+32` に改訂。追記・後ろ窓・尾の和集合をUTC日で数え、上限外・cursor遅れの未取得をunprocessedとして明示queue、cursor前進と同transaction | 始端が日中だと範囲だけでD+1窓となり、尾が前UTC日へ出るとD+2になって毎日数時間request_budgetになるため (sol裁定) | — (未commit) |
 | 2026-11-15 | C5.2 | 置換の由来証明を `bridge_verified_run_id` に具体化 (sync の検証済み取得のみ設定、再観測で上書き、replace tx内で再照合、手動importは段2で証明なし) | sol裁定 (b)。originラベルだけの証明は付録Eが禁止 | — (未commit) |
+| 2026-11-15 | C5.3 | 参照の疑いを、日の本数そのものでなく共通暦の開場格子に対する充足率の中央値比較に改訂 | 正常な日曜・短縮日が疑いになる誤検出を避ける (利用者裁定 2026-11-14) | — (未commit) |
 
 ## 6. 短い task 表
 

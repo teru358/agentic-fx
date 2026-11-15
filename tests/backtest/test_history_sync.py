@@ -44,12 +44,6 @@ def _day_bounds(day):
             datetime(day.year, day.month, day.day, tzinfo=UTC) + timedelta(days=1))
 
 
-def _sunday_no_bars(*symbols):
-    """日曜は 22:00 以降の 2 時間だけの日で、参照の本数が中央値の半分未満に見える。"""
-    return NoBarsList(tuple(NoBarsEntry("mt5", "15m", s, date(2026, 11, 8), "sunday", "human", T)
-                            for s in symbols), "d")
-
-
 def _weekdays(start, stop):
     d = start
     while d < stop:
@@ -372,14 +366,25 @@ def _suspects(conn, *, now=datetime(2026, 11, 20, 12, tzinfo=UTC), no_bars=hs.EM
         now=now, no_bars=no_bars)
 
 
-def _suspect_fixture(tmp_path, target, *, prior=20, prior_count=96):
+def _prior_weekdays(target, n):
+    """月〜木 (共通暦で 96 格子が全部開場の日) を、target の前から n 日。"""
+    out, d = [], target - timedelta(days=1)
+    while len(out) < n:
+        if d.weekday() < 4:
+            out.append(d)
+        d -= timedelta(days=1)
+    return sorted(out)
+
+
+TUESDAY = date(2026, 10, 27)
+SUNDAY = date(2026, 11, 8)
+
+
+def _suspect_fixture(tmp_path, target, *, prior=20, prior_count=96, target_day=TUESDAY):
     conn = conn_at(tmp_path)
-    first = date(2026, 10, 1)
-    for i in range(prior):
-        day = first + timedelta(days=i)
+    for day in _prior_weekdays(target_day, prior):
         _insert_day(conn, REF, day, prior_count)
         _insert_day(conn, SYMBOL, day, 96)
-    target_day = first + timedelta(days=prior)
     _insert_day(conn, SYMBOL, target_day, 96)
     if target:
         _insert_day(conn, REF, target_day, target)
@@ -402,16 +407,41 @@ def test_with_fewer_than_twenty_known_days_only_a_zero_day_is_suspected(tmp_path
     assert day2 in _suspects(conn2)
 
 
-def test_the_median_of_an_even_window_is_the_mean_of_the_two_middle_values(tmp_path):
+def test_a_normal_sunday_is_judged_by_the_fill_of_its_open_slots_not_by_the_count(tmp_path):
+    # 日曜は 22:00 以降の 8 格子だけが開場。全格子に足があれば充足率 100% で疑わない
+    conn, day = _suspect_fixture(tmp_path, 8, target_day=SUNDAY)
+    assert day not in _suspects(conn)
+    # 開場 8 格子の半分 (4 本) は 50% ちょうどで対象外、3 本は疑い、0 本も疑い
+    for count, suspected in ((4, False), (3, True), (0, True)):
+        (tmp_path / f"s{count}").mkdir()
+        conn2, day2 = _suspect_fixture(tmp_path / f"s{count}", count, target_day=SUNDAY)
+        assert (day2 in _suspects(conn2)) is suspected, count
+
+
+def test_a_product_specific_closure_on_an_open_calendar_day_is_still_suspected(tmp_path):
+    # 共通暦では開場の平日に、その商品だけ足が無い (休場) -> 疑いに残る
+    conn, day = _suspect_fixture(tmp_path, 0)
+    assert day in _suspects(conn)
+    (tmp_path / "p").mkdir()
+    conn2, day2 = _suspect_fixture(tmp_path / "p", 20)       # 20/96 は半分に満たない
+    assert day2 in _suspects(conn2)
+
+
+def test_a_full_calendar_closure_day_is_neither_a_suspect_nor_part_of_the_baseline(tmp_path):
+    conn, day = _suspect_fixture(tmp_path, 96)
+    saturday = date(2026, 10, 24)
+    _insert_day(conn, SYMBOL, saturday, 96)           # 土曜は全日閉場 (開場格子 0)
+    assert saturday not in _suspects(conn)
+
+
+def test_the_median_of_an_even_window_is_the_mean_of_the_two_middle_fills(tmp_path):
     conn = conn_at(tmp_path)
-    first = date(2026, 10, 1)
-    for i in range(20):                             # 10 日が 40 本、10 日が 60 本 → 中央値 50
-        day = first + timedelta(days=i)
+    target = TUESDAY
+    for i, day in enumerate(_prior_weekdays(target, 20)):   # 10 日が 40 本、10 日が 60 本 → 中央値 50
         _insert_day(conn, REF, day, 40 if i < 10 else 60)
         _insert_day(conn, SYMBOL, day, 96)
-    target = first + timedelta(days=20)
     _insert_day(conn, SYMBOL, target, 96)
-    _insert_day(conn, REF, target, 25)              # 25 = 50% ちょうど → 対象外
+    _insert_day(conn, REF, target, 25)              # 25/96 は 50/96 の半分未満ではない (ちょうど半分より上)
     assert target not in _suspects(conn)
     conn.execute("DELETE FROM ohlcv_history WHERE symbol=? AND bar_time LIKE ?",
                  (REF, f"{target.isoformat()}%"))
@@ -442,18 +472,16 @@ def test_a_newly_suspected_reference_makes_the_run_completed_with_gaps_once_only
     settings = make_settings(watch=[REF])
     seed(conn, SYMBOL, B1, E)
     seed(conn, REF, B1, E, skip=lambda t: t.date() == date(2026, 10, 28))
-    # 応答も当日を返さない (本当に休場)。日曜は 22:00 以降の 2 時間だけの日なので no-bars に載せる
-    sundays = NoBarsList(tuple(NoBarsEntry("mt5", "15m", REF, d, "sunday", "human", T)
-                               for d in (date(2026, 11, 8),)), "d")
+    # 応答も当日を返さない (本当に休場)。正常な日曜 (開場 8 格子が全部ある) は疑いにならない
     bridge = FakeBridge(drop=lambda s, t: s == REF and t.date() == date(2026, 10, 28))
-    first = _run(conn, settings, bridge, no_bars=sundays)
+    first = _run(conn, settings, bridge)
     assert (first.result, first.rc) == ("completed_with_gaps", 3)
     assert first.new_reference_suspects == 1 and first.primary_open_gaps == 0
     row = conn.execute("SELECT * FROM history_sync_gaps WHERE symbol=?", (REF,)).fetchone()
     assert (row["kind"], row["state"], row["day_utc"]) == (
         "reference_suspected", "open", "2026-10-28")
     second = _run(conn, settings, FakeBridge(drop=lambda s, t: s == REF and t.date()
-                                             == date(2026, 10, 28)), no_bars=sundays)
+                                             == date(2026, 10, 28)))
     assert second.new_reference_suspects == 0
     assert (second.result, second.rc) == ("ok", 0)             # 既知の疑いだけでは rc=3 にしない
 
@@ -572,7 +600,7 @@ def test_one_failed_series_does_not_roll_back_the_others_and_is_the_technical_fa
             if self.calls[-1][0] == REF:
                 payload["bars"][-1]["close"] = "not-a-number"        # 最終窓の応答が不正
             return payload
-    result = _run(conn, settings, Corrupt(), no_bars=_sunday_no_bars(REF, "US500"))
+    result = _run(conn, settings, Corrupt())
     by_symbol = {o.symbol: o for o in result.ops if o.operation == "recent"}
     assert by_symbol[REF].status == "failed" and by_symbol[REF].reason == "invalid_response"
     assert by_symbol[SYMBOL].status == by_symbol["US500"].status == "ok"
@@ -615,7 +643,7 @@ def test_old_gap_budget_is_shared_round_robin_across_symbols_and_the_cursor_is_p
                 conn.execute("DELETE FROM ohlcv_history WHERE symbol=? AND bar_time >= ? "
                              "AND bar_time < ?", (symbol, lo.isoformat(), hi.isoformat()))
     conn.commit()
-    result = _run(conn, settings, no_bars=_sunday_no_bars(REF))
+    result = _run(conn, settings)
     gap_ops = [o for o in result.ops if o.operation == "gap" and o.status != "deferred"]
     symbols = [o.symbol for o in gap_ops]
     # 一方の銘柄が予算を独占しない: 古い日から順に、銘柄を交互に選ぶ
