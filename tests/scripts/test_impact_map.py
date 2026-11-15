@@ -148,12 +148,12 @@ def test_evaluate_critical_unresolved_and_manual_coverage(tmp_path):
     unresolved = [{'symbol': 'src/b.py::lost', 'resource': resource, 'cell': 'page', 'reason': 'fixture'}]
     metrics = evaluate_fixture(tmp_path, rows, records, covers, diagnostics, unresolved)
     machine, page = metrics['machine'], metrics['page']
-    assert (machine['population'], machine['tp'], machine['fn'], machine['u'], machine['unscanned']) == (3, 1, 2, 1, 1)
-    assert (page['population'], page['tp'], page['fn'], page['u']) == (4, 2, 2, 1)
+    assert (machine['population'], machine['tp'], machine['fn'], machine['u'], machine['unscanned']) == (3, 1, 1, 1, 1)
+    assert (page['population'], page['tp'], page['fn'], page['u']) == (4, 2, 1, 1)
     assert machine['unresolved'] == [{'resource': resource, 'symbol': 'src/c.py::unknown', 'reasons': ['parse_error']}]
     assert page['unresolved'] == [{'resource': resource, 'symbol': 'src/b.py::lost', 'reasons': ['fixture']}]
-    assert machine['critical']['fn'] == 2 and machine['critical']['u'] == 1
-    assert page['critical']['fn'] == 2 and page['critical']['u'] == 1
+    assert machine['critical']['fn'] == 1 and machine['critical']['u'] == 1
+    assert page['critical']['fn'] == 1 and page['critical']['u'] == 1
     assert not metrics['pass_candidate'] and metrics['needs_human_review']
     classification = {r['symbol']: r for r in metrics['rows']}
     assert classification['src/a.py::found']['classification'] == 'index_found'
@@ -374,3 +374,29 @@ def test_overlapping_roots_do_not_duplicate_untracked_diagnostics_or_includes(tm
     assert index['header']['inputs'] == 1
     assert index['header']['diagnostics'] == [{'path': 'source/sub/other.py', 'reason': 'untracked_runtime'}]
     assert [(r['path'], r['symbol']) for r in index['records']] == [('source/sub/new.py', 'new')]
+
+
+def test_assignment_targets_are_scanned_without_slice_symbols(tmp_path):
+    root = tmp_path / 'source'
+    root.mkdir()
+    (root / 'a.py').write_text('CFG["state:foo"] = 1\ncfg.kill_switch = True\nd[k] = "state:foo"\nclass C:\n cfg.kill_switch = True\n CFG["state:foo"] = 1\n')
+    _, raw = run_extract(tmp_path, ['event:state:foo', 'state:x.kill_switch'])
+    records = {(r['symbol'], r['match_kind']) for r in json.loads(raw)['records']}
+    assert ('<module>.CFG', 'string_exact') in records
+    assert ('<module>', 'attribute') in records
+    assert ('C', 'attribute') in records
+    assert ('C', 'string_exact') in records
+    assert ('<module>.k', 'string_exact') not in records
+
+
+def test_unresolved_found_and_missing_are_disjoint(tmp_path):
+    resource = 'event:x'
+    rows = [row('src/a.py::' + s, resource) for s in ('found', 'unknown', 'missed')]
+    records = [{'resource': resource, 'path': 'src/a.py', 'symbol': 'found'}]
+    unresolved = [{'resource': resource, 'symbol': 'src/a.py::' + s, 'cell': cell, 'reason': 'fixture'} for cell in ('machine', 'page') for s in ('found', 'unknown')]
+    covers = [{'resource': resource, 'symbol': 'src/a.py::found', 'ids': ['F01'], 'kind': 'page'}]
+    metrics = evaluate_fixture(tmp_path, rows, records, covers, unresolved=unresolved)
+    for cell in (metrics['machine'], metrics['page']):
+        assert (cell['tp'], cell['fn'], cell['u']) == (1, 1, 1)
+        assert cell['population'] == cell['tp'] + cell['fn'] + cell['u']
+        assert cell['critical']['population'] == sum(cell['critical'][k] for k in ('tp', 'fn', 'u'))

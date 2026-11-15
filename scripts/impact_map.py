@@ -117,16 +117,26 @@ class Visitor(ast.NodeVisitor):
     visit_ClassDef = scope
 
     def visit_Assign(self, node):
-        names = [n.id for target in node.targets for n in ast.walk(target) if isinstance(n, ast.Name)]
         direct_class = self.scopes and isinstance(self.scopes[-1], ast.ClassDef)
-        if (not self.stack or direct_class) and names:
-            for name in names:
-                prefix = ['<module>', name] if not self.stack else [name]
-                self.stack.extend(prefix)
-                self.visit(node.value)
-                del self.stack[-len(prefix):]
-        else:
+        if self.stack and not direct_class:
             self.generic_visit(node)
+            return
+        for target in node.targets:
+            base = target
+            while isinstance(base, (ast.Subscript, ast.Attribute)):
+                base = base.value
+            name = base.id if isinstance(base, ast.Name) else None
+            if isinstance(target, ast.Name):
+                prefix = ['<module>', name] if not self.stack else [name]
+            elif not self.stack and name and name.isupper():
+                prefix = ['<module>', name]
+            else:
+                prefix = []
+            self.stack.extend(prefix)
+            self.visit(target)
+            self.visit(node.value)
+            if prefix:
+                del self.stack[-len(prefix):]
 
     def visit_AnnAssign(self, node):
         direct_class = self.scopes and isinstance(self.scopes[-1], ast.ClassDef)
@@ -287,9 +297,9 @@ def evaluate(args):
         else:
             found = expected & candidates
             matched_candidates = found
-        missed = expected - found
         unscanned_keys = {k for k in expected if unscanned(k)} if name == 'machine' else set()
-        unknown = (unresolved_by_cell[name] & expected) | unscanned_keys
+        unknown = ((unresolved_by_cell[name] & expected) | unscanned_keys) - found
+        missed = expected - found - unknown
         false_positives = candidates - matched_candidates
         def counts(scope):
             return {'population': len(expected & scope), 'tp': len(found & scope),
