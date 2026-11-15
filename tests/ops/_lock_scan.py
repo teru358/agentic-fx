@@ -4,7 +4,7 @@
 保持区間から呼ぶ関数を同じ package 内で名前解決して推移的にたどる。
 
 解決は静的で近似する。`self.m()` は同じ class、裸の名前は同じ module と import 元、
-他の object への `x.m()` は同名の関数すべて (一般的な名前は除く)。OpsService の
+他の object への `x.m()` は束縛または同名の関数から近似する。OpsService の
 メソッドへは受け手の名前 (OPS_RECEIVERS) か OpsService 内の `self` からだけ到達とみなす。
 """
 from __future__ import annotations
@@ -47,7 +47,7 @@ class Func:
 class Index:
     funcs: list[Func] = field(default_factory=list)
     by_name: dict[str, list[Func]] = field(default_factory=dict)
-    imports: dict[str, dict[str, str]] = field(default_factory=dict)  # path -> 名前 -> module
+    imports: dict[str, dict[str, tuple[str, str]]] = field(default_factory=dict)  # path -> 名前 -> module
 
     def add_source(self, path: str, source: str) -> None:
         tree = ast.parse(source)
@@ -55,7 +55,7 @@ class Index:
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module:
                 for alias in node.names:
-                    self.imports[path][alias.asname or alias.name] = node.module
+                    self.imports[path][alias.asname or alias.name] = (node.module, alias.name)
 
         def visit(body, prefix: str, cls: str | None) -> None:
             for node in body:
@@ -181,6 +181,9 @@ def hold_regions(func: ast.AST, marker: str) -> list[tuple[str, list[ast.stmt]]]
                     if _is_release(later, marker, aliases):
                         break
                     rest.append(later)
+                if isinstance(stmt, ast.If):
+                    branch = stmt.orelse if isinstance(stmt.test, ast.UnaryOp) and isinstance(stmt.test.op, ast.Not) else stmt.body
+                    regions.append(("acquire", list(branch)))
                 regions.append(("acquire", rest))
     return regions
 
@@ -203,10 +206,11 @@ def resolve(index: Index, caller: Func, call: ast.Call) -> list[Func]:
         same_file = [f for f in index.by_name.get(func.id, []) if f.path == caller.path]
         if same_file:
             return same_file
-        module = index.imports.get(caller.path, {}).get(func.id)
-        if module is not None:
+        imported = index.imports.get(caller.path, {}).get(func.id)
+        if imported is not None:
+            module, original = imported
             tail = module.split(".")[-1]
-            return [f for f in index.by_name.get(func.id, [])
+            return [f for f in index.by_name.get(original, [])
                     if Path(f.path).stem == tail and f.cls is None]
         return []
     if isinstance(func, ast.Attribute):
@@ -217,6 +221,16 @@ def resolve(index: Index, caller: Func, call: ast.Call) -> list[Func]:
             return same or [f for f in candidates if f.path == caller.path]
         if receiver in OPS_RECEIVERS:
             return [f for f in candidates if f.cls == OPS_CLASS]
+        if isinstance(func.value, ast.Name):
+            for node in ast.walk(caller.node):
+                if (isinstance(node, (ast.Assign, ast.AnnAssign))
+                        and isinstance(node.value, ast.Call)
+                        and isinstance(node.value.func, ast.Name)):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    if any(isinstance(t, ast.Name) and t.id == receiver for t in targets):
+                        bound = [f for f in candidates if f.cls == node.value.func.id]
+                        if bound:
+                            return bound
         if name in GENERIC:
             return []
         return [f for f in candidates if f.cls != OPS_CLASS]
@@ -280,3 +294,15 @@ def state_exclusive_to_core(index: Index) -> list[str]:
                 if target.ident in acquirers:
                     hits.append(f"{func.ident}:{line} -> {target.ident} ({form})")
     return sorted(set(hits))
+
+
+def unresolved_calls(index: Index) -> list[str]:
+    """保持区間の解決できない呼出しを監査用に列挙する。"""
+    result = set()
+    for func in index.funcs:
+        for marker in ("core_lock", "_exclusive"):
+            for form, stmts in hold_regions(func.node, marker):
+                for call in _calls(stmts):
+                    if not resolve(index, func, call):
+                        result.add(f"{func.ident}:{call.lineno} {_text(call)} ({form})")
+    return sorted(result)

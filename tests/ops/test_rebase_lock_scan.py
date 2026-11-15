@@ -102,7 +102,7 @@ def test_core_to_ops_follows_an_imported_function_across_files():
     holder = ("from pkg.helper import reach\n"
               "def f(self):\n    with self._core_lock:\n        reach(self)\n")
     index = _synthetic(holder, helper)
-    index.imports["synthetic0.py"]["reach"] = "pkg.synthetic1"
+    index.imports["synthetic0.py"]["reach"] = ("pkg.synthetic1", "reach")
     assert scan.core_to_ops(index) != []
 
 
@@ -186,3 +186,119 @@ def test_preview_never_takes_the_core_lock():
     source = (SRC / "ops" / "service.py").read_text(encoding="utf-8")
     assert "core_lock" not in ast.unparse(_function(source, "rebase_preview"))
     assert "core_lock" not in ast.unparse(_function(source, "_rebase_preview_state"))
+
+
+def test_acquire_success_branch_is_scanned():
+    source = "def f(self):\n    if self._core_lock.acquire():\n        self.ops.status()\n"
+    assert scan.core_to_ops(_synthetic(source))
+
+
+def test_aliased_import_resolves_original_name():
+    index = scan.Index()
+    index.add_source("caller.py", "from pkg.helper import reach as alias\ndef f(self):\n    with self._core_lock:\n        alias(self)\n")
+    index.add_source("helper.py", "def reach(x):\n    with x._ops_lock:\n        pass\n")
+    assert scan.core_to_ops(index)
+
+
+def test_bound_worker_run_is_scanned():
+    source = "class Worker:\n    def run(self):\n        with self._ops_lock:\n            pass\ndef f(self):\n    worker = Worker()\n    with self._core_lock:\n        worker.run()\n"
+    assert scan.core_to_ops(_synthetic(source))
+
+
+def test_unresolved_calls_are_audited():
+    index = _synthetic("def f(self, worker):\n    with self._core_lock:\n        worker.run()\n")
+    assert scan.unresolved_calls(index) == ["synthetic0.py:f:3 worker.run() (with)"]
+
+
+UNRESOLVED_CALLS = [
+    'loops/reflection_cycle.py:ReflectionCycle._consume_attempt:98 self.clock.now() (with)',
+    'loops/reflection_cycle.py:ReflectionCycle._reflect_one:160 self.clock.now() (with)',
+    "loops/reflection_cycle.py:ReflectionCycle._reflect_one:163 self.conn.execute('SELECT payload_json FROM trade_intents WHERE id=?', (row['intent_id'],)) (with)",
+    "loops/reflection_cycle.py:ReflectionCycle._reflect_one:163 self.conn.execute('SELECT payload_json FROM trade_intents WHERE id=?', (row['intent_id'],)).fetchone() (with)",
+    "loops/reflection_cycle.py:ReflectionCycle._reflect_one:166 json.loads(ir['payload_json']) (with)",
+    "loops/reflection_cycle.py:ReflectionCycle._reflect_one:169 json.dumps({'order': {k: row[k] for k in ('id', 'pair', 'direction', 'horizon', 'quantity', 'avg_fill_price', 'close_price', 'realized_pnl', 'close_reason')}, 'entry_reasoning': _entry_reasoning(intent)}, ensure_ascii=False, indent=1) (with)",
+    'loops/reflection_cycle.py:ReflectionCycle._reflect_one:176 Mission(prompt=prompt, tools=[], output_schema=_SCHEMA, max_turns=2, timeout_sec=self.settings.llama_swap.timeout_sec) (with)',
+    "loops/reflection_cycle.py:ReflectionCycle._reflect_one:181 missions.start(self.conn, 'reflection', self.settings.runner.trade.backend, self.settings.runner.trade.model, now) (with)",
+    "loops/reflection_cycle.py:ReflectionCycle._reflect_one:293 reflection_attempts.clear(self.conn, row['id']) (with)",
+    "loops/reflection_cycle.py:ReflectionCycle._reflect_one:323 MissionResult('failed', None, []) (with)",
+    'loops/reflection_cycle.py:ReflectionCycle.run_pending:119 self.conn.execute("SELECT o.* FROM orders o LEFT JOIN reflections r ON r.order_id=o.id LEFT JOIN reflection_attempts a ON a.order_id=o.id WHERE o.status=\'closed\' AND r.order_id IS NULL AND (a.attempts IS NULL OR a.attempts < :max) ORDER BY o.id LIMIT :limit", {\'max\': self.settings.reflection.max_attempts, \'limit\': max_items}) (with)',
+    'loops/reflection_cycle.py:ReflectionCycle.run_pending:119 self.conn.execute("SELECT o.* FROM orders o LEFT JOIN reflections r ON r.order_id=o.id LEFT JOIN reflection_attempts a ON a.order_id=o.id WHERE o.status=\'closed\' AND r.order_id IS NULL AND (a.attempts IS NULL OR a.attempts < :max) ORDER BY o.id LIMIT :limit", {\'max\': self.settings.reflection.max_attempts, \'limit\': max_items}).fetchall() (with)',
+    'loops/trade_loop.py:TradeLoop._ask_once_impl:925 self.clock.now() (with)',
+    'loops/trade_loop.py:TradeLoop._ask_once_impl:929 Mission(prompt=prompt, tools=_ASK_TOOLS, output_schema=ANSWER_SCHEMA, max_turns=self.settings.llama_swap.max_turns, timeout_sec=self.settings.llama_swap.timeout_sec) (with)',
+    "loops/trade_loop.py:TradeLoop._ask_once_impl:934 missions.start(self.conn, 'ask', self.settings.runner.trade.backend, self.settings.runner.trade.model, now) (with)",
+    "loops/trade_loop.py:TradeLoop._ask_once_impl:975 MissionResult('failed', None, []) (with)",
+    'loops/trade_loop.py:TradeLoop._notify_gate_reject_streak:787 alert_state.get(self.conn, alert_state.GATE_REJECT_STREAK_KEY) (with)',
+    'loops/trade_loop.py:TradeLoop._notify_gate_reject_streak:795 alert_state.set(self.conn, alert_state.GATE_REJECT_STREAK_KEY, str(streak_id), now=self.clock.now()) (with)',
+    'loops/trade_loop.py:TradeLoop._notify_gate_reject_streak:797 self.clock.now() (with)',
+    'loops/trade_loop.py:TradeLoop._notify_gate_reject_streak:797 str(streak_id) (with)',
+    "loops/trade_loop.py:TradeLoop._run_once_impl:214 missions.start(self.conn, 'trade', self.settings.runner.trade.backend, self.settings.runner.trade.model, now, trigger=trigger) (with)",
+    'loops/trade_loop.py:TradeLoop._run_once_impl:317 self.clock.now() (with)',
+    'loops/trade_loop.py:TradeLoop._run_once_impl:320 tuple((event.id for event in view.active)) (with)',
+    'loops/trade_loop.py:TradeLoop._run_once_impl:328 isinstance(snapshot_error, (NotTradableSymbol, ExposureNotTradableSymbol)) (with)',
+    'loops/trade_loop.py:TradeLoop._run_once_impl:331 isinstance(snapshot_error, ExposureNotTradableSymbol) (with)',
+    "loops/trade_loop.py:TradeLoop._run_once_impl:336 self.activity.write(Category.TRADE, 'gate_rejected', reason, ref_id=str(iid)) (with)",
+    'loops/trade_loop.py:TradeLoop._run_once_impl:337 str(iid) (with)',
+    "loops/trade_loop.py:TradeLoop._run_once_impl:361 self.activity.write(Category.TRADE, 'gate_rejected', reasons[0], ref_id=str(iid)) (with)",
+    'loops/trade_loop.py:TradeLoop._run_once_impl:362 str(iid) (with)',
+    "loops/trade_loop.py:TradeLoop._run_once_impl:372 self.activity.write(Category.TRADE, 'gate_rejected', reasons[0], ref_id=str(iid)) (with)",
+    'loops/trade_loop.py:TradeLoop._run_once_impl:373 str(iid) (with)',
+    "loops/trade_loop.py:TradeLoop._run_once_impl:390 _log.exception('executor intent handling raised') (with)",
+    "loops/trade_loop.py:TradeLoop._run_once_impl:394 self.activity.write(Category.AGGREGATE, 'intent_execution_failed', safe_error_text(e) + self._market_tool_calls_suffix(result), ref_id=str(mid)) (with)",
+    'loops/trade_loop.py:TradeLoop._run_once_impl:398 str(mid) (with)',
+    "loops/trade_loop.py:TradeLoop._run_once_impl:403 deferred.append(f'[agentic-fx] 注文処理失敗: {safe_error_text(e)}') (with)",
+    "loops/trade_loop.py:TradeLoop._run_once_impl:440 MissionResult('failed', None, []) (with)",
+    "loops/trade_loop.py:TradeLoop._run_signal_mission:454 missions.start(self.conn, 'trade', self.settings.runner.trade.backend, self.settings.runner.trade.model, now, trigger='signal') (with)",
+    'loops/trade_loop.py:TradeLoop._run_signal_mission:473 Mission(prompt=prompt, tools=list(SIGNAL_DECISION_TOOLS), output_schema=DECISION_SCHEMA, max_turns=self.settings.llama_swap.max_turns, timeout_sec=self.settings.llama_swap.timeout_sec) (with)',
+    'loops/trade_loop.py:TradeLoop._run_signal_mission:474 list(SIGNAL_DECISION_TOOLS) (with)',
+    "loops/trade_loop.py:TradeLoop._run_signal_mission:507 self.activity.write(Category.AGGREGATE, 'signal_decision_invalid', parsed.detail, ref_id=str(claimed['id'])) (with)",
+    "loops/trade_loop.py:TradeLoop._run_signal_mission:509 str(claimed['id']) (with)",
+    'loops/trade_loop.py:TradeLoop._run_signal_mission:581 self.clock.now() (with)',
+    'loops/trade_loop.py:TradeLoop._run_signal_mission:585 datetime.fromisoformat(fresh_until) (with)',
+    'loops/trade_loop.py:TradeLoop._run_signal_mission:600 self.executor.state_fn() (with)',
+    "loops/trade_loop.py:TradeLoop._run_signal_mission:619 MissionResult('failed', {'detail': 'invalid_reject_code'}, result.transcript) (with)",
+    "loops/trade_loop.py:TradeLoop._run_signal_mission:624 self.activity.write(Category.AGGREGATE, 'signal_decision_invalid', 'invalid_reject_code', ref_id=str(signal_id)) (with)",
+    'loops/trade_loop.py:TradeLoop._run_signal_mission:626 str(signal_id) (with)',
+    'loops/trade_loop.py:TradeLoop._run_signal_mission:630 isinstance(parsed, Accept) (with)',
+    "loops/trade_loop.py:TradeLoop._run_signal_mission:640 self.activity.write(Category.AGGREGATE, 'signal_filtered_econ_window', signal_decisions.SYSTEM_REJECT_CODE, ref_id=str(signal_id)) (with)",
+    'loops/trade_loop.py:TradeLoop._run_signal_mission:643 str(signal_id) (with)',
+    'loops/trade_loop.py:TradeLoop._run_signal_mission:646 isinstance(parsed, Accept) (with)',
+    "loops/trade_loop.py:TradeLoop._run_signal_mission:654 self.activity.write(Category.AGGREGATE, 'signal_accepted', 'accept', ref_id=str(signal_id)) (with)",
+    'loops/trade_loop.py:TradeLoop._run_signal_mission:656 str(signal_id) (with)',
+    "loops/trade_loop.py:TradeLoop._run_signal_mission:668 self.activity.write(Category.AGGREGATE, 'intent_execution_failed', reason, ref_id=str(mid)) (with)",
+    'loops/trade_loop.py:TradeLoop._run_signal_mission:670 str(mid) (with)',
+    "loops/trade_loop.py:TradeLoop._run_signal_mission:671 deferred_notifications.append(f'[agentic-fx] 注文処理失敗: {reason}') (with)",
+    "loops/trade_loop.py:TradeLoop._run_signal_mission:682 self.activity.write(Category.AGGREGATE, 'signal_rejected_by_llm', reject_code, ref_id=str(signal_id)) (with)",
+    'loops/trade_loop.py:TradeLoop._run_signal_mission:684 str(signal_id) (with)',
+    "loops/trade_loop.py:TradeLoop._run_signal_mission:710 MissionResult('failed', None, []) (with)",
+    'ops/service.py:OpsService._rebase_under_core:1863 min(deadline, self._monotonic() + self._REBASE_HOLD_SECONDS) (acquire)',
+    'ops/service.py:OpsService._rebase_under_core:1863 self._monotonic() (acquire)',
+    'ops/service.py:OpsService._rebase_under_core:1864 stack.enter_context(self._conn.waiting_until(hold)) (acquire)',
+    'ops/service.py:OpsService._rebase_under_core:1865 stack.enter_context(self._state_store.shared_guard(deadline=self._foreign(hold), stop_event=self.stop_event)) (acquire)',
+    'service.py:_scheduler_tick_body:2514 app.ingest.commit(app.conn_core) (with)',
+    "service.py:_scheduler_tick_body:2516 _log.warning('ingest commit failed: %s', safe_error_text(exc)) (with)",
+    "service.py:_scheduler_tick_body:2520 app.activity.write(Category.SYSTEM, 'ingest_commit_failed', safe_error_text(exc)) (with)",
+    "service.py:_scheduler_tick_body:2523 _log.exception('failed to record ingest commit failure') (with)",
+    "service.py:_scheduler_tick_body:2528 _log.warning('outage observe failed: %s', safe_error_text(exc)) (with)",
+    "service.py:_scheduler_tick_body:2530 app.activity.write(Category.SYSTEM, 'outage_observe_failed', safe_error_text(exc)) (with)",
+    "service.py:_scheduler_tick_body:2533 _log.exception('failed to record outage observe failure') (with)",
+    'store/state.py:StateStore.confirm_latched:466 replace(current, kill_switch_latched=True, kill_switch_generation=current.kill_switch_generation + 1, kill_switch_latched_at=self._clock.now().astimezone(timezone.utc).isoformat()) (with)',
+    'store/state.py:StateStore.confirm_latched:469 self._clock.now() (with)',
+    'store/state.py:StateStore.confirm_latched:469 self._clock.now().astimezone(timezone.utc) (with)',
+    'store/state.py:StateStore.confirm_latched:469 self._clock.now().astimezone(timezone.utc).isoformat() (with)',
+    "store/state.py:StateStore.reset_kill_switch:429 StateUncertain('a previous reset did not finish; run `killswitch reconcile`') (with)",
+    'store/state.py:StateStore.reset_kill_switch:433 NotLatched() (with)',
+    'store/state.py:StateStore.reset_kill_switch:435 GenerationMismatch(current.kill_switch_generation, current.kill_switch_latched_at) (with)',
+    'store/state.py:StateStore.reset_kill_switch:437 replace(current, kill_switch_latched=False) (with)',
+    "store/state.py:StateStore.reset_kill_switch:443 ResetNotApplied('kill switch reset did not finish; marker kept') (with)",
+    "store/state.py:StateStore.reset_kill_switch:448 ResetNotApplied('kill switch reset did not finish; marker kept') (with)",
+    "store/state.py:StateStore.update:362 changes.get('kill_switch_latched') (with)",
+    "store/state.py:StateStore.update:364 changes.get('kill_switch_latched') (with)",
+    'store/state.py:StateStore.update:370 self._clock.now() (with)',
+    'store/state.py:StateStore.update:370 self._clock.now().astimezone(timezone.utc) (with)',
+    'store/state.py:StateStore.update:370 self._clock.now().astimezone(timezone.utc).isoformat() (with)',
+    'store/state.py:StateStore.update:372 replace(current, **changes) (with)',
+]
+
+
+def test_unresolved_calls_in_real_hold_regions_are_pinned(index):
+    assert scan.unresolved_calls(index) == UNRESOLVED_CALLS
