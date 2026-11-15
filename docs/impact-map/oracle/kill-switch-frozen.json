@@ -186,13 +186,38 @@
    }
   }
  ],
- "residual_unread": [
-  "afx-ops の API client (client.events) と events_page.parse_page、api_server の /v1/events route の中継 symbol は読んでいない (行は未作成、non-critical と見ているが未確認)",
-  "採用ハーネスの上流 (evaluate_strategy_adoption_gate の caller = 承認フロー、ImproveLoop._persist_ledger_rows / _persist_gate_rows → save_harness_run、improve_loop.py:2705/3220) は caller を特定しただけで行にしていない",
-  "取引判断の上流 (supervisor の cron/signal mission 投入 → _trade_fn) は _trade_fn までしか辿っていない",
-  "activity kind ごとの表示経路 (ctl Runner._op_activity、status._activity、web render_activity) は kill_switch_reset 以外の kind に展開していない",
-  "web の status 表示 (STATUS_FIELDS の kill_switch、_EMPHASIS) と daemon splash (service.py::build_splash、kill_switch_latched と reconcile_marker を表示) は non-critical の漏れとして行にしていない",
-  "a_unread / b_unread のうち bot・notify の全 callback と表示 consumer の全件、Executor の defer_notifications 経路での latch 通知の送出時機は未確認"
+ "residual_unread": [],
+ "residual_unread_resolved": [
+  {
+   "reason": "対象3 event の中継であり領域内。API route は非 critical、bot/notify の取得・page 検証は consumer の構成部分なので critical。guard_notice_deferred/backfill_skipped は warning log であり、この中継の event 行には展開しない。",
+   "unread": "afx-ops の API client (client.events) と events_page.parse_page、api_server の /v1/events route の中継 symbol は読んでいない (行は未作成、non-critical と見ているが未確認)",
+   "verdict": "add"
+  },
+  {
+   "reason": "採用比較に使う metric の実行入口・callback・永続化経路なので追加する。kill_switch_events は replay artifact の list であり、ここで保存されるスカラー metrics と同一視しない。",
+   "unread": "採用ハーネスの上流 (evaluate_strategy_adoption_gate の caller = 承認フロー、ImproveLoop._persist_ledger_rows / _persist_gate_rows → save_harness_run、improve_loop.py:2705/3220) は caller を特定しただけで行にしていない",
+   "verdict": "add"
+  },
+  {
+   "reason": "cron/signal は共通の投入経路から _trade_fn、TradeLoop、executor の latch 判定に到達する。live の全入口を含める定義により critical。ask/reflection の分岐や supervisor の heartbeat 実装はこの辺の対象外。",
+   "unread": "取引判断の上流 (supervisor の cron/signal mission 投入 → _trade_fn) は _trade_fn までしか辿っていない",
+   "verdict": "add"
+  },
+  {
+   "reason": "全7 kind が汎用表示の入力になり得る。status は最新1行だけなので常時表示を保証する辺ではない。凍結表にある render_activity と OpsService.activity の kill_switch_reset 行は重複追加しない。",
+   "unread": "activity kind ごとの表示経路 (ctl Runner._op_activity、status._activity、web render_activity) は kill_switch_reset 以外の kind に展開していない",
+   "verdict": "add"
+  },
+  {
+   "reason": "表示自体も領域内。latch と設定値の表示は非 critical。ただし brief の『writer と marker』を適用し、marker の直接参照行は critical とする。",
+   "unread": "web の status 表示 (STATUS_FIELDS の kill_switch、_EMPHASIS) と daemon splash (service.py::build_splash、kill_switch_latched と reconcile_marker を表示) は non-critical の漏れとして行にしていない",
+   "verdict": "add"
+  },
+  {
+   "reason": "既存表の deliver_events、_poll_once、plan_event、render_event、encode_event に加え、page wrapper・最終本文・注入送信 callback の辺がある。bot の GateView/_GateButton、_click_handler、on_interaction/on_component は承認 interaction と表示世代の処理で、kill-switch generation/reset の callback ではない。通常の kill_switch_latched 分岐は executor.py:663-666 の activity.write のみで Notifier 通知を作らない。耐久性不明分岐だけが _best_effort_record→_notify を通る。defer_notifications 自体は送信せず、通常 mission は commit-post、signal mission は finally で送る。scheduler の遅延通知も service.py:2529-2545 の finally で排出されるが、通常 latch 通知が存在するという根拠にはならない。",
+   "unread": "a_unread / b_unread のうち bot・notify の全 callback と表示 consumer の全件、Executor の defer_notifications 経路での latch 通知の送出時機は未確認",
+   "verdict": "add"
+  }
  ],
  "rows": [
   {
@@ -2183,6 +2208,663 @@
    "relation": "invokes -> afx-ops/afx_ops/notify/runtime.py::_Loop._poll_once",
    "resource": "event:guard_state_changed",
    "symbol": "afx-ops/afx_ops/notify/runtime.py::_Loop.run"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "487-488: bot の event 取得入口。code を選別せず /v1/events を取得する。",
+   "relation": "consumes",
+   "resource": "event:guard_state_changed",
+   "symbol": "afx-ops/afx_ops/api_client.py::BotClient.events"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "487-488: 同じ event page に含めて bot に中継する。",
+   "relation": "consumes",
+   "resource": "event:ops_request_terminal",
+   "symbol": "afx-ops/afx_ops/api_client.py::BotClient.events"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "487-488: 同じ event page に含めて bot に中継する。",
+   "relation": "consumes",
+   "resource": "event:event_stream_health",
+   "symbol": "afx-ops/afx_ops/api_client.py::BotClient.events"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "610-611: notify の event 取得入口。code を選別せず取得する。",
+   "relation": "consumes",
+   "resource": "event:guard_state_changed",
+   "symbol": "afx-ops/afx_ops/api_client.py::NotifyClient.events"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "610-611: 同じ event page に含めて notify に中継する。",
+   "relation": "consumes",
+   "resource": "event:ops_request_terminal",
+   "symbol": "afx-ops/afx_ops/api_client.py::NotifyClient.events"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "610-611: 同じ event page に含めて notify に中継する。",
+   "relation": "consumes",
+   "resource": "event:event_stream_health",
+   "symbol": "afx-ops/afx_ops/api_client.py::NotifyClient.events"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "7-32: bot/notify 共通。応答形・event id を検証し、読める event を整列して配送側へ返す。",
+   "relation": "consumes",
+   "resource": "event:guard_state_changed",
+   "symbol": "afx-ops/afx_ops/events_page.py::parse_page"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "7-32: code 非依存の共通 parser を通る。",
+   "relation": "consumes",
+   "resource": "event:ops_request_terminal",
+   "symbol": "afx-ops/afx_ops/events_page.py::parse_page"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "7-32: code 非依存の共通 parser を通る。",
+   "relation": "consumes",
+   "resource": "event:event_stream_health",
+   "symbol": "afx-ops/afx_ops/events_page.py::parse_page"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "362-367: events route の after/limit を検証して service に渡す API 中継。",
+   "relation": "invokes -> src/agentic_fx/ops/service.py::OpsService.events_after",
+   "resource": "event:guard_state_changed",
+   "symbol": "src/agentic_fx/ops/api_server.py::_call"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "362-367: 同じ取得 route で公開する。",
+   "relation": "invokes -> src/agentic_fx/ops/service.py::OpsService.events_after",
+   "resource": "event:ops_request_terminal",
+   "symbol": "src/agentic_fx/ops/api_server.py::_call"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "362-367: 同じ取得 route で公開する。",
+   "relation": "invokes -> src/agentic_fx/ops/service.py::OpsService.events_after",
+   "resource": "event:event_stream_health",
+   "symbol": "src/agentic_fx/ops/api_server.py::_call"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "289,354-374: strategy 分岐で採用ハーネスを実行し、record_fn と sink に結果行を中継する。",
+   "relation": "invokes -> src/agentic_fx/plugin/strategy_gate.py::evaluate_strategy_adoption_gate",
+   "resource": "metric:kill_switch_latches",
+   "symbol": "src/agentic_fx/plugin/approval.py::run_kind_gate"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "365-368: ハーネスの metrics を含む row を rows と注入 record_fn に渡す callback。",
+   "relation": "consumes",
+   "resource": "metric:kill_switch_latches",
+   "symbol": "src/agentic_fx/plugin/approval.py::run_kind_gate._sink"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "2396-2418: 改善候補の採用ゲートを呼び、record_fn/evaluation_sink/compare_mode を中継する。",
+   "relation": "invokes -> src/agentic_fx/plugin/strategy_gate.py::evaluate_strategy_adoption_gate",
+   "resource": "metric:kill_switch_latches",
+   "symbol": "src/agentic_fx/loops/improve_loop.py::ImproveLoop._run_strategy_gate"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "3282-3286: 配備済み strategy の再評価入口。record_fn=rows.append でハーネス結果を収集する。",
+   "relation": "invokes -> src/agentic_fx/plugin/strategy_gate.py::evaluate_strategy_adoption_gate",
+   "resource": "metric:kill_switch_latches",
+   "symbol": "src/agentic_fx/plugin/switch.py::_evaluate_deployed"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "2686-2708: accepted な run_backtest の result_summary から行引数を射影し、ハーネス metrics を保存する。",
+   "relation": "invokes -> src/agentic_fx/store/backtest_runs.py::save_harness_run",
+   "resource": "metric:kill_switch_latches",
+   "symbol": "src/agentic_fx/loops/improve_loop.py::ImproveLoop._persist_ledger_rows"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "3210-3222: gate_rows を mission_outcome 付きで save_harness_run に渡す。",
+   "relation": "invokes -> src/agentic_fx/store/backtest_runs.py::save_harness_run",
+   "resource": "metric:kill_switch_latches",
+   "symbol": "src/agentic_fx/loops/improve_loop.py::ImproveLoop._persist_gate_rows"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "361-371: _trade_mission_due の cron/signal 理由と decision_bars を callback に渡し、live mission を投入する。",
+   "relation": "invokes -> src/agentic_fx/service.py::build_app.on_trade_mission",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/core/scheduler.py::Scheduler._tick_body"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "1713-1720: signal_max_id を固定し、kind=trade と trigger を supervisor に投入する。",
+   "relation": "invokes -> src/agentic_fx/core/supervisor.py::MissionSupervisor.try_submit",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/service.py::build_app.on_trade_mission"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "99-116: 受理した trade job を queue に入れ、_run に非同期で引き渡す。",
+   "relation": "invokes -> src/agentic_fx/core/supervisor.py::MissionSupervisor._run",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/core/supervisor.py::MissionSupervisor.try_submit"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "queue から kind/kwargs/future を取り出し、_dispatch(kind, kwargs) を実行する。参考: 160-212。",
+   "relation": "invokes -> src/agentic_fx/core/supervisor.py::MissionSupervisor._dispatch",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/core/supervisor.py::MissionSupervisor._run"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "242-249: kind=trade で trigger と追加引数を注入 trade_fn に渡す。_trade_fn は service.py:1634-1641 で TradeLoop.run_once を呼ぶ。",
+   "relation": "invokes -> src/agentic_fx/service.py::build_app._trade_fn",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/core/supervisor.py::MissionSupervisor._dispatch"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "1317-1323: /v1/activity の lines を convert_activity_line で表示。kind による除外なし。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_latched",
+   "symbol": "src/agentic_fx/ops/client.py::Runner._op_activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "1317-1323: 同じ汎用 lines 表示。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_latched_durability_uncertain",
+   "symbol": "src/agentic_fx/ops/client.py::Runner._op_activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "1317-1323: 同じ汎用 lines 表示。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_reset",
+   "symbol": "src/agentic_fx/ops/client.py::Runner._op_activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "1317-1323: 同じ汎用 lines 表示。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_reconcile_required",
+   "symbol": "src/agentic_fx/ops/client.py::Runner._op_activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "1317-1323: 同じ汎用 lines 表示。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_reconcile_confirmed",
+   "symbol": "src/agentic_fx/ops/client.py::Runner._op_activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "1317-1323: 同じ汎用 lines 表示。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_reconcile_failed",
+   "symbol": "src/agentic_fx/ops/client.py::Runner._op_activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "1317-1323: 同じ汎用 lines 表示。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_state_uncertain",
+   "symbol": "src/agentic_fx/ops/client.py::Runner._op_activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "365-376: activity.log の末尾1行から時刻・category・kind を表示する。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_latched",
+   "symbol": "src/agentic_fx/status.py::_activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "365-376: 当該 kind が末尾行なら表示する。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_latched_durability_uncertain",
+   "symbol": "src/agentic_fx/status.py::_activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "365-376: 当該 kind が末尾行なら表示する。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_reset",
+   "symbol": "src/agentic_fx/status.py::_activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "365-376: 当該 kind が末尾行なら表示する。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_reconcile_required",
+   "symbol": "src/agentic_fx/status.py::_activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "365-376: 当該 kind が末尾行なら表示する。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_reconcile_confirmed",
+   "symbol": "src/agentic_fx/status.py::_activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "365-376: 当該 kind が末尾行なら表示する。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_reconcile_failed",
+   "symbol": "src/agentic_fx/status.py::_activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "365-376: 当該 kind が末尾行なら表示する。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_state_uncertain",
+   "symbol": "src/agentic_fx/status.py::_activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "923-930: lines の末尾 MAX_ITEMS 件を時刻変換・escape して表示する。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_latched",
+   "symbol": "afx-ops/afx_ops/web/render.py::render_activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "923-930: kind 非依存の lines 表示。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_latched_durability_uncertain",
+   "symbol": "afx-ops/afx_ops/web/render.py::render_activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "923-930: kind 非依存の lines 表示。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_reconcile_required",
+   "symbol": "afx-ops/afx_ops/web/render.py::render_activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "923-930: kind 非依存の lines 表示。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_reconcile_confirmed",
+   "symbol": "afx-ops/afx_ops/web/render.py::render_activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "923-930: kind 非依存の lines 表示。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_reconcile_failed",
+   "symbol": "afx-ops/afx_ops/web/render.py::render_activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "923-930: kind 非依存の lines 表示。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_state_uncertain",
+   "symbol": "afx-ops/afx_ops/web/render.py::render_activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "activity_filter と tail で取得する汎用 activity API。kind 専用の選別はない。",
+   "relation": "exposes",
+   "resource": "activity:kill_switch_latched",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "同じ汎用 activity API。",
+   "relation": "exposes",
+   "resource": "activity:kill_switch_latched_durability_uncertain",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "同じ汎用 activity API。",
+   "relation": "exposes",
+   "resource": "activity:kill_switch_reconcile_required",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "同じ汎用 activity API。",
+   "relation": "exposes",
+   "resource": "activity:kill_switch_reconcile_confirmed",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "同じ汎用 activity API。",
+   "relation": "exposes",
+   "resource": "activity:kill_switch_reconcile_failed",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "同じ汎用 activity API。",
+   "relation": "exposes",
+   "resource": "activity:kill_switch_state_uncertain",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.activity"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "68-69: API の kill_switch 投影を表示対象 field に含める。",
+   "relation": "schema",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "afx-ops/afx_ops/web/render.py::<module>.STATUS_FIELDS"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "65: kill_switch field を danger 表示に指定する。",
+   "relation": "schema",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "afx-ops/afx_ops/web/render.py::<module>._EMPHASIS"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "161-165: STATUS_FIELDS と _EMPHASIS を _pairs に渡して status を描画する。",
+   "relation": "exposes",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "afx-ops/afx_ops/web/render.py::render_status"
+  },
+  {
+   "class": "G_lit",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "2402-2410: state.load の kill_switch_latched を LATCHED/ok に表示する。",
+   "relation": "exposes",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/service.py::build_splash"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "2411: state.reconcile_marker() の有無で reconcile 表示行を加える。marker を直接参照する辺。",
+   "relation": "reads",
+   "resource": "marker:reset_marker",
+   "symbol": "src/agentic_fx/service.py::build_splash"
+  },
+  {
+   "class": "G_lit",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "2417: DD kill の設定値を splash に表示する。",
+   "relation": "exposes",
+   "resource": "config:risk.drawdown_kill_pct",
+   "symbol": "src/agentic_fx/service.py::build_splash"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "1099-1100: BotFailure を注入して共通 parser に渡す。",
+   "relation": "invokes -> afx-ops/afx_ops/events_page.py::parse_page",
+   "resource": "event:guard_state_changed",
+   "symbol": "afx-ops/afx_ops/bot/adapter.py::_page"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "1099-1100: 同じ page wrapper を通る。",
+   "relation": "invokes -> afx-ops/afx_ops/events_page.py::parse_page",
+   "resource": "event:ops_request_terminal",
+   "symbol": "afx-ops/afx_ops/bot/adapter.py::_page"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "1099-1100: 同じ page wrapper を通る。",
+   "relation": "invokes -> afx-ops/afx_ops/events_page.py::parse_page",
+   "resource": "event:event_stream_health",
+   "symbol": "afx-ops/afx_ops/bot/adapter.py::_page"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "218-219: _Failure を注入して共通 parser に渡す。",
+   "relation": "invokes -> afx-ops/afx_ops/events_page.py::parse_page",
+   "resource": "event:guard_state_changed",
+   "symbol": "afx-ops/afx_ops/notify/runtime.py::_page"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "218-219: 同じ page wrapper を通る。",
+   "relation": "invokes -> afx-ops/afx_ops/events_page.py::parse_page",
+   "resource": "event:ops_request_terminal",
+   "symbol": "afx-ops/afx_ops/notify/runtime.py::_page"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "218-219: 同じ page wrapper を通る。",
+   "relation": "invokes -> afx-ops/afx_ops/events_page.py::parse_page",
+   "resource": "event:event_stream_health",
+   "symbol": "afx-ops/afx_ops/notify/runtime.py::_page"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "175-178,873: plan の mentions/content を結合し、2000字超過なら mention を除いて Discord 本文を返す。",
+   "relation": "consumes",
+   "resource": "event:guard_state_changed",
+   "symbol": "afx-ops/afx_ops/bot/adapter.py::_event_content"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "175-178,873: 同じ通知本文の最終射影を通る。",
+   "relation": "consumes",
+   "resource": "event:ops_request_terminal",
+   "symbol": "afx-ops/afx_ops/bot/adapter.py::_event_content"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "175-178,873: 同じ通知本文の最終射影を通る。",
+   "relation": "consumes",
+   "resource": "event:event_stream_health",
+   "symbol": "afx-ops/afx_ops/bot/adapter.py::_event_content"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "176,200-212: encode 済み body を retry(attempt) 経由で注入 send に送る。",
+   "relation": "consumes",
+   "resource": "event:guard_state_changed",
+   "symbol": "afx-ops/afx_ops/notify/runtime.py::_Loop._deliver"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "176,200-212: 同じ webhook 配送経路を通る。",
+   "relation": "consumes",
+   "resource": "event:ops_request_terminal",
+   "symbol": "afx-ops/afx_ops/notify/runtime.py::_Loop._deliver"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "176,200-212: 同じ webhook 配送経路を通る。",
+   "relation": "consumes",
+   "resource": "event:event_stream_health",
+   "symbol": "afx-ops/afx_ops/notify/runtime.py::_Loop._deliver"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "201-207: retry に注入される callback が self._send(target, body) を実行する。",
+   "relation": "consumes",
+   "resource": "event:guard_state_changed",
+   "symbol": "afx-ops/afx_ops/notify/runtime.py::_Loop._deliver.attempt"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "201-207: 同じ送信 callback を通る。",
+   "relation": "consumes",
+   "resource": "event:ops_request_terminal",
+   "symbol": "afx-ops/afx_ops/notify/runtime.py::_Loop._deliver.attempt"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "residual",
+   "rationale": "201-207: 同じ送信 callback を通る。",
+   "relation": "consumes",
+   "resource": "event:event_stream_health",
+   "symbol": "afx-ops/afx_ops/notify/runtime.py::_Loop._deliver.attempt"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "258-300: _best_effort_record が記録する同 kind の通知文を _notify 経由で pending に収容する。activity 行自体の配送ではなく、対応する通知文の遅延経路。finally は遅延先を None に戻し、送信しない。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_latched_durability_uncertain",
+   "symbol": "src/agentic_fx/core/executor.py::Executor.defer_notifications"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "308,412-420: commit-core の defer_notifications を抜けた後、core_lock 非保持で対応する通知文を Notifier.send に送る。",
+   "relation": "exposes",
+   "resource": "activity:kill_switch_latched_durability_uncertain",
+   "symbol": "src/agentic_fx/loops/trade_loop.py::TradeLoop._run_once_impl"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "residual",
+   "rationale": "579-580,690-695: 遅延 list を保持し、外側 finally で対応する通知文を送るため途中 return でも排出する。",
+   "relation": "exposes",
+   "resource": "activity:kill_switch_latched_durability_uncertain",
+   "symbol": "src/agentic_fx/loops/trade_loop.py::TradeLoop._run_signal_mission"
   }
  ]
 }

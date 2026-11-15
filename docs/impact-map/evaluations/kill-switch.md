@@ -123,3 +123,8 @@
 - FP の仕分け時間 (§4.3 の記録要件) を計測していない。
 
 また頁セルは初回測定の後の手動補完で達したもの (補完前 97 / 161 の FN)、機械セルは抽出器を設計の形に合わせる是正 (run2 → run5) と正解表の訂正 1 件を経たもの。速度の反復は T2。
+
+## 正解表の追加 (1 周目のレビューの後、residual_unread の裁定)
+
+- 凍結表の `residual_unread` 6 件を、A・B と別の裁定者 (codex sol) が source で裁き、6 件とも `add` (unresolved 0)。指揮者が 3 件を抜取り照合 (BotClient.events・build_splash の marker 参照・MissionSupervisor._dispatch) して採用。追加 73 行 (critical 36)、凍結表は 294 行 (critical 197)。各件の裁定理由は凍結表の `residual_unread_resolved` に残した。
+- 出力を見た後の正解表の変更なので記録する (§4.1 (4))。役割: 裁定者 codex sol、確定は指揮者。frozen sha256: `b929322136ed…` → `cde1d229a985…`。追加前の点は上の final 測定の表。
