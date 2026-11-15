@@ -471,3 +471,14 @@ def test_the_daily_totals_survive_the_retention_gc_of_the_series_detail(tmp_path
     assert result["series_deleted"] == 1
     assert conn.execute("SELECT COUNT(*) FROM history_sync_series").fetchone()[0] == 0
     assert _daily(conn) == before and before[NOW.date().isoformat()]["inserted"] == 10
+
+
+def test_epoch_propagates_busy_when_reading_revisions():
+    class BusyConnection:
+        def execute(self, sql):
+            if "history_revisions" in sql:
+                raise sqlite3.OperationalError("database is busy")
+            return sqlite3.connect(":memory:").execute("SELECT NULL WHERE 0")
+
+    with pytest.raises(sqlite3.OperationalError, match="busy"):
+        history_epoch(BusyConnection())

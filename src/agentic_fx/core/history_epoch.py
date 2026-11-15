@@ -13,7 +13,9 @@ def history_epoch(conn: sqlite3.Connection) -> str:
     token = str(row[0]) if row else "none"
     try:
         revision = conn.execute("SELECT MAX(id) FROM history_revisions").fetchone()[0]
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        if str(exc) != "no such table: history_revisions":
+            raise
         revision = None
     if revision is None:
         return token
