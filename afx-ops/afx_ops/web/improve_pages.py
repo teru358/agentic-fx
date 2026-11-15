@@ -7,11 +7,11 @@ from __future__ import annotations
 
 import html
 from collections.abc import Mapping
+from datetime import datetime, timezone
 
 from afx_ops.display_zone import zone_of
 from afx_ops.plugin_text import label
-from afx_ops.web import render
-from afx_ops.web import plugin_pages
+from afx_ops.web import plugin_pages, render, tabs
 from afx_ops.web.common import approval_link, display_time, pick, plugin_link
 from afx_ops.web.routes import resolve_route
 
@@ -179,7 +179,55 @@ def _result_text(result: object, reason: object) -> str:
 
 # ---------------------------------------------------------------- 一覧
 
-LIST_HEADERS = ("run", "開始", "終了", "起動", "結果", "対象", "床を割った箇所", "承認")
+def _time_value(raw: object) -> datetime | None:
+    """時刻を UTC に換算して返す。offset の無い値・読めない値は None。"""
+    if type(raw) is not str:
+        return None
+    try:
+        moment = datetime.fromisoformat(raw)
+        if moment.utcoffset() is None:
+            return None
+        return moment.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _int_value(raw: object) -> int | None:
+    return raw if type(raw) is int else None
+
+
+def _text_value(raw: object) -> str | None:
+    return raw if type(raw) is str else None
+
+
+SORT_COLUMNS: dict[str, plugin_pages.SortColumn] = {
+    "run": plugin_pages.SortColumn("desc", lambda row: _int_value(row.get("id"))),
+    "started": plugin_pages.SortColumn("desc", lambda row: _time_value(row.get("started_at"))),
+    "finished": plugin_pages.SortColumn("desc", lambda row: _time_value(row.get("finished_at"))),
+    "trigger": plugin_pages.SortColumn("asc", lambda row: _text_value(row.get("trigger"))),
+    "result": plugin_pages.SortColumn("asc", lambda row: _text_value(row.get("result_code")),
+                                      then=lambda row: _text_value(row.get("reason_code"))),
+    "target": plugin_pages.SortColumn("asc", lambda row: _text_value(row.get("plugin"))),
+}
+SORT_LABEL = {"run": "run", "started": "開始", "finished": "終了", "trigger": "起動",
+              "result": "結果", "target": "対象"}
+DIRECTION_TEXT = {"asc": "昇順", "desc": "降順"}
+DIRECTIONS = plugin_pages.DIRECTIONS
+
+
+def sort_runs(runs: list[dict], sort: str | None, direction: str | None) -> list[dict]:
+    return plugin_pages.sort_items(runs, SORT_COLUMNS, sort, direction,
+                                   lambda raw: pick(raw, RUN_FIELDS))
+
+
+def _list_headers(sort: str | None, direction: str | None,
+                  carry: tuple[tuple[str, str], ...]) -> tuple[str, ...]:
+    def link(key: str) -> str:
+        return plugin_pages.sort_link(SORT_LABEL[key], key, sort, direction,
+                                      columns=SORT_COLUMNS, path="/improve", carry=carry)
+
+    return (link("run"), link("started"), link("finished"), link("trigger"), link("result"),
+            link("target"), "床を割った箇所", "承認")
 
 
 def _floor_cell(row: dict) -> str:
@@ -204,35 +252,72 @@ def _list_row(raw: dict, tz: str) -> list[str]:
             approval_link(row.get("approval_id"))]
 
 
-def _more_note(shown: int, has_more: bool, limit: int) -> str:
+def _older_href(larger: int, sort: str | None, direction: str | None) -> str:
+    query = [f"limit={larger}"]
+    if sort is not None:
+        query += [f"sort={sort}", f"dir={direction or SORT_COLUMNS[sort].first}"]
+    return html.escape("/improve?" + "&".join(query), quote=True)
+
+
+def _more_note(fetched: int, shown: int, has_more: bool, limit: int, sort: str | None,
+               direction: str | None) -> str:
     if not has_more:
         return ""
+    head = f"取得した最新 {fetched} 件のうち {shown} 件を表示。"
     if limit < MAX_LIMIT:
         larger = min(MAX_LIMIT, max(limit + 1, limit * 2))
-        return (f'<p>最新 {shown} 件を表示。<a href="/improve?limit={larger}">'
+        return (f'<p>{head}<a href="{_older_href(larger, sort, direction)}">'
                 f"さらに古い run を表示 ({larger} 件まで)</a></p>")
-    return f"<p>最新 {shown} 件を表示。これより古い run は afx ctl improve runs で確認してください</p>"
+    return f"<p>{head}これより古い run は afx ctl improve runs で確認してください</p>"
+
+
+def _intro(fetched: int, sort: str | None, direction: str | None) -> str:
+    if sort is None:
+        return "<p>終了した改善 mission を新しい順に並べています。run の番号から要約を開けます。</p>"
+    effective = direction or SORT_COLUMNS[sort].first
+    return (f"<p>取得した最新 {fetched} 件を {SORT_LABEL[sort]} の {DIRECTION_TEXT[effective]} "
+            "で並べています。run の番号から要約を開けます。</p>")
 
 
 def render_improve_list(data: Mapping[str, object], limit: int = DEFAULT_LIMIT,
-                        forms: str = "") -> bytes:
+                        sort: str | None = None, direction: str | None = None,
+                        writable: bool = False) -> bytes:
     tz = zone_of(data)
     listing = pick(data, LIST_FIELDS)
     runs = listing.get("runs")
-    rows = [_list_row(row, tz) for row in runs[:ROW_LIMIT] if type(row) is dict] \
-        if type(runs) is list else []
-    intro = "<p>終了した改善 mission を新しい順に並べています。run の番号から要約を開けます。</p>"
-    note = _more_note(len(rows), listing.get("has_more") is True, limit)
-    # 書込みの form を足す余地と、枠・nav・style を引いた残りが table の予算
-    budget = (render.MAX_RESPONSE_BYTES - len(render._document("Improve", intro + note, tz, current="/improve"))
-              - render._bytes(forms) - 1024)
+    given = [row for row in runs[:ROW_LIMIT] if type(row) is dict] if type(runs) is list else []
+    rows = [_list_row(row, tz) for row in sort_runs(given, sort, direction)]
+    has_more = listing.get("has_more") is True
+    intro = _intro(len(rows), sort, direction)
+    note = _more_note(len(rows), len(rows), has_more, limit, sort, direction)
+    bar = tabs.bar("/improve", "runs", writable=writable)
+    carry = (("limit", str(limit)),) if limit != DEFAULT_LIMIT else ()
+    # 枠・帯・説明・注記を引いた残りが table の予算。1024 byte の余白を残す
+    frame = '<div class="scroll"></div>'
+    budget = (render.MAX_RESPONSE_BYTES
+              - len(render._document("Improve", intro + frame + note, tz, current="/improve", tabs=bar))
+              - 1024)
     if rows:
-        table, shown = plugin_pages.table_with_count(LIST_HEADERS, rows, budget, cli=OMIT_CLI)
+        table, shown = plugin_pages.table_with_count(
+            _list_headers(sort, direction, carry), rows, budget, cli=OMIT_CLI)
+        table = '<div class="scroll">' + table + "</div>"
         if shown < len(rows):
-            note = _more_note(shown, True, MAX_LIMIT)
+            note = _more_note(len(rows), shown, True, MAX_LIMIT, sort, direction)
     else:
         table = "<p>終了した改善 mission はありません</p>"
-    return render._page("Improve", intro + table + note + forms, tz, current="/improve")
+    return render._page("Improve", intro + table + note, tz, current="/improve", tabs=bar)
+
+
+def render_improve_run(form: str) -> bytes:
+    """実行タブ。form だけを描き、daemon の値は使わない (tz の行も再読込も無い)。"""
+    bar = tabs.bar("/improve", "run", writable=True)
+    return render._document("Improve", form, refresh=False, current="/improve", tabs=bar)
+
+
+def render_improve_unavailable() -> bytes:
+    """書込みが使えるときの、一覧を取得できなかったページ。帯から実行タブへ辿れる。"""
+    bar = tabs.bar("/improve", "runs", writable=True)
+    return render._document("Improve", "<p>一覧を取得できません</p>", current="/improve", tabs=bar)
 
 
 # ---------------------------------------------------------------- 詳細
@@ -423,7 +508,8 @@ def _handoff_section(items: dict) -> str:
     return _section("次回への申し送り (系統の試行結果)", body)
 
 
-def render_improve_detail(data: Mapping[str, object]) -> bytes:
+def render_improve_detail(data: Mapping[str, object], tab: str = "overview",
+                          run_id: int | None = None) -> bytes:
     tz = zone_of(data)
     row = pick(data, DETAIL_FIELDS)
     snapshot = pick(row.get("snapshot"), SNAPSHOT_FIELDS)
@@ -431,21 +517,27 @@ def render_improve_detail(data: Mapping[str, object]) -> bytes:
     summary = pick(row.get("summary"), SUMMARY_FIELDS)
     state = summary.get("state")
     items = pick(summary.get("items"), ITEM_FIELDS) if state == "ok" else {}
-    run_id = row.get("id")
-    shown = run_id if type(run_id) is int and run_id >= 1 else "-"
+    own = row.get("id")
+    shown = own if type(own) is int and own >= 1 else "-"
     nav = '<p><a href="/improve">Improve (一覧)</a> / <a href="/plugins">Plugins</a></p>'
+    bar = tabs.bar(tabs.IMPROVE_DETAIL, tab, at=f"/improve/{run_id if run_id is not None else shown}")
     if not snapshot:
-        parts = [nav, _section("概要", f"<p>{NO_TERMINAL_TEXT}</p>")]
-        return render._page(f"Improve #{shown}", "".join(parts), tz, current="/improve")
-    if not summary:
-        notice = _section("要約", f"<p>{NO_SUMMARY_TEXT}</p>")
-    elif state != "ok":
-        notice = _section("要約", f"<p>{html.escape(SUMMARY_NOTES.get(state, '要約を表示できません'))}</p>")
+        sections = {"overview": _section("概要", f"<p>{NO_TERMINAL_TEXT}</p>")}
     else:
-        notice = ""
-    parts = [nav, _overview(row, snapshot, approval), notice,
-             _hypothesis_section(items), _explanation_section(items),
-             _observation_section(items, snapshot), _reason_section(items),
-             _tried_section(items), _floor_section(items, pick(row.get("floor"), REPORT_FLOOR_FIELDS)),
-             _comparison_section(items), _handoff_section(items)]
-    return render._page(f"Improve #{shown}", "".join(parts), tz, current="/improve")
+        if not summary:
+            notice = _section("要約", f"<p>{NO_SUMMARY_TEXT}</p>")
+        elif state != "ok":
+            notice = _section("要約", f"<p>{html.escape(SUMMARY_NOTES.get(state, '要約を表示できません'))}</p>")
+        else:
+            notice = ""
+        sections = {
+            "overview": _overview(row, snapshot, approval) + notice,
+            "agent": (_hypothesis_section(items) + _explanation_section(items)
+                      + _observation_section(items, snapshot) + _reason_section(items)
+                      + _tried_section(items)),
+            "result": (_floor_section(items, pick(row.get("floor"), REPORT_FLOOR_FIELDS))
+                       + _comparison_section(items)),
+            "handoff": _handoff_section(items),
+        }
+    body = sections.get(tab) or "<p>なし</p>"
+    return render._page(f"Improve #{shown}", body, tz, current="/improve", tabs=nav + bar)

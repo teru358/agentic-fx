@@ -280,7 +280,8 @@ def _report_bad_reply(reply: object, report: _Reporter) -> None:
     report(detail)
 
 
-def _invoke(match: RouteMatch, query: dict[str, str], client, report: _Reporter):
+def _invoke(match: RouteMatch, query: dict[str, str], client, report: _Reporter,
+            writable: bool = False):
     method = match.route.client_method
     if method == "status":
         if set(query) - {"tab"}:
@@ -331,15 +332,45 @@ def _invoke(match: RouteMatch, query: dict[str, str], client, report: _Reporter)
         return (_call(report, client.plugin, match.values["name"]),
                 functools.partial(plugin_pages.render_plugin, tab=tab, name=match.values["name"]))
     if method == "improve_list":
-        limit = _positive(query, "limit", maximum=improve_pages.MAX_LIMIT,
-                          default=improve_pages.DEFAULT_LIMIT)
-        return (_call(report, client.improve_list, limit=limit),
-                functools.partial(improve_pages.render_improve_list, limit=limit))
+        return _improve_list(query, client, report, writable)
     if method == "improve_detail":
-        if query:
+        if set(query) - {"tab"}:
             raise _Reject(400)
-        return _call(report, client.improve_detail, match.values["id"]), improve_pages.render_improve_detail
+        tab = query.get("tab", tabs.default_tab(tabs.IMPROVE_DETAIL))
+        if tab not in tabs.tab_names(tabs.IMPROVE_DETAIL):
+            raise _Reject(400)
+        return (_call(report, client.improve_detail, match.values["id"]),
+                functools.partial(improve_pages.render_improve_detail, tab=tab,
+                                  run_id=match.values["id"]))
     raise _Reject(404)
+
+
+def _improve_list(query: dict[str, str], client, report: _Reporter, writable: bool):
+    """/improve の query の検査 (key → 値と組合せ → 書込み専用タブ) と、タブごとの振り分け。
+
+    実行タブは form だけを描くので、daemon を呼ばない (reply は None)。
+    """
+    if set(query) - {"tab", "limit", "sort", "dir"}:
+        raise _Reject(400)
+    tab = query.get("tab", tabs.default_tab("/improve"))
+    if tab not in tabs.tab_names("/improve", writable=True):
+        raise _Reject(400)
+    if tab == "run" and set(query) & {"limit", "sort", "dir"}:
+        raise _Reject(400)
+    limit = _positive({key: value for key, value in query.items() if key == "limit"}, "limit",
+                      maximum=improve_pages.MAX_LIMIT, default=improve_pages.DEFAULT_LIMIT)
+    sort, direction = query.get("sort"), query.get("dir")
+    if (sort is not None and sort not in improve_pages.SORT_COLUMNS) or (
+            direction is not None and (sort is None or direction not in improve_pages.DIRECTIONS)):
+        raise _Reject(400)
+    if tab not in tabs.tab_names("/improve", writable=writable):
+        raise _Reject(404)
+    if tab == "run":
+        return None, functools.partial(improve_pages.render_improve_run,
+                                       write_pages.improve_form_section())
+    return (_call(report, client.improve_list, limit=limit),
+            functools.partial(improve_pages.render_improve_list, limit=limit, sort=sort,
+                              direction=direction, writable=writable))
 
 
 def _validate_request(request: Request) -> None:
@@ -430,6 +461,8 @@ def handle_request(request: Request | bytes, client, *,
         raise ValueError("write requires host and auth")
     head = _is_head(request)
     writable = write_context is not None
+    # 書込み専用のタブを出せるのは、書込みが有効で、経路が書込みを許すときだけ
+    writable_tabs = writable and write_context.transport_ok
     try:
         if isinstance(request, bytes):
             if authorization is None:
@@ -468,7 +501,9 @@ def handle_request(request: Request | bytes, client, *,
             raise _Reject(400)
         report = _Reporter(match.route.client_method, report_upstream)
         try:
-            reply, renderer = _invoke(match, request.query, client, report)
+            reply, renderer = _invoke(match, request.query, client, report, writable_tabs)
+            if reply is None:
+                return _response(200, renderer(), head=head, writable=writable)
             if (match.route.client_method in _NOT_FOUND_METHODS and getattr(reply, "status", None) == 404
                     and getattr(reply, "code", None) == "not_found"):
                 return _error(404, head=head, writable=writable)
@@ -481,15 +516,11 @@ def handle_request(request: Request | bytes, client, *,
                 report("shape=invalid")
                 raise
         except _Upstream:
-            if writable and match.route.client_method == "improve_list" and write_context.transport_ok:
-                body = render._page("Improve", "<p>一覧を取得できません</p>" + write_pages.improve_form_section())
-                return _response(200, write_pages.drop_refresh(body), head=head, writable=writable)
+            if writable_tabs and match.route.client_method == "improve_list":
+                return _response(502, improve_pages.render_improve_unavailable(), head=head,
+                                 writable=writable)
             raise
-        if writable and match.route.client_method == "improve_list" and write_context.transport_ok:
-            body = renderer(reply.data, forms=write_pages.improve_form_section())
-            body = write_pages.drop_refresh(body)
-        else:
-            body = renderer(reply.data)
+        body = renderer(reply.data)
         if writable and match.route.client_method == "approval":
             body = _with_decision_forms(body, reply.data)
         return _response(200, body, head=head, writable=writable)

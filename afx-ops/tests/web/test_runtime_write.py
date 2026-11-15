@@ -110,7 +110,7 @@ def test_write_true_serves_decision_forms_and_a_confirmed_approval_reaches_the_c
     assert _calls(served.client, "approve") == []
     done = served.ask("POST", "/confirm", {"token": token_of(first)})
     assert done.status == 200 and JOB.encode() in done.body
-    form = served.ask("GET", "/improve")
+    form = served.ask("GET", "/improve?tab=run")
     assert form.status == 200 and b'action="/improve/runs"' in form.body
     served.finish()
     assert _calls(served.client, "approve") == [("approve", "web:afx", 7, DIGEST)]
@@ -131,7 +131,7 @@ def test_write_false_keeps_the_read_only_adapter():
     approve = served.ask("POST", "/approvals/7/approve", {"payload_sha256": DIGEST})
     reject = served.ask("POST", "/approvals/7/reject", {})
     improve = served.ask("POST", "/improve/runs", {"duration_sec": "600"})
-    form = served.ask("GET", "/improve")
+    form = served.ask("GET", "/improve?tab=run")
     job_view = served.ask("GET", "/jobs/" + JOB)
     job_cancel = served.ask("POST", "/jobs/" + JOB + "/cancel", {})
     served.finish()
@@ -139,7 +139,7 @@ def test_write_false_keeps_the_read_only_adapter():
     # 承認詳細は読めるが form は無く、書込みの route は 405 / 404 で、client は 1 回も書かない
     assert detail.status == 200 and b"<form" not in detail.body
     assert (approve.status, reject.status, improve.status) == (404, 404, 404)
-    assert form.status == 200 and b"<form" not in form.body
+    assert form.status == 404 and b"<form" not in form.body
     assert _calls(served.client, "approve", "reject", "improve_run", "job", "cancel_job") == []
 
 
@@ -147,9 +147,9 @@ def test_write_true_on_a_non_loopback_bind_never_writes():
     # 起動時の検査が先に止めるが、runtime も経路が loopback でなければ書込みを 403 にする
     served = Served(write=True, connections=2, bind="192.0.2.10")
     post = served.ask("POST", "/approvals/7/approve", {"payload_sha256": DIGEST})
-    form = served.ask("GET", "/improve")
+    form = served.ask("GET", "/improve?tab=run")
     served.finish()
-    assert post.status == 403 and form.status == 200 and b"<form" not in form.body
+    assert post.status == 403 and form.status == 404 and b"<form" not in form.body
     assert _calls(served.client, "approve", "reject", "improve_run") == []
 
 

@@ -33,6 +33,7 @@ class Tab:
 ACTIVITY_CATEGORIES = ("NEWS", "TECH", "AGGREGATE", "TRADE", "IMPROVE", "APPROVAL", "SYSTEM")
 ALL = "all"
 PLUGIN_DETAIL = "/plugins/{name}"
+IMPROVE_DETAIL = "/improve/{id}"
 
 # 表の先頭が既定。帯を持たない route はここに載せない
 TABS: dict[str, tuple[Tab, ...]] = {
@@ -52,6 +53,16 @@ TABS: dict[str, tuple[Tab, ...]] = {
         Tab("deps", "依存", Link(TAB, "deps")),
         Tab("usefulness", "有用性", Link(TAB, "usefulness")),
         Tab("versions", "版の履歴", Link(TAB, "versions")),
+    ),
+    "/improve": (
+        Tab("runs", "履歴", Link(TAB, "runs")),
+        Tab("run", "実行", Link(TAB, "run"), write_only=True),
+    ),
+    IMPROVE_DETAIL: (
+        Tab("overview", "概要", Link(TAB, "overview")),
+        Tab("agent", "agent", Link(TAB, "agent")),
+        Tab("result", "成績", Link(TAB, "result")),
+        Tab("handoff", "申し送り", Link(TAB, "handoff")),
     ),
     "/activity": (Tab(ALL, "全件", Link(CATEGORY, None)),)
     + tuple(Tab(name, name, Link(CATEGORY, name)) for name in ACTIVITY_CATEGORIES),

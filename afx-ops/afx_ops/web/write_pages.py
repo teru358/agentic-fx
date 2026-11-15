@@ -31,12 +31,6 @@ def approval_forms(approval_id: int, digest: str) -> str:
             '<button type="submit">却下</button></form></section>')
 
 
-def drop_refresh(page: bytes) -> bytes:
-    """入力中の値を消さないよう、自動の読み直しを外す。"""
-    refresh = f'<meta http-equiv="refresh" content="{render.REFRESH_SECONDS}">'.encode()
-    return page.replace(refresh, b"", 1)
-
-
 def inject_forms(page: bytes, forms: str) -> bytes:
     """承認詳細の末尾に form を足し、自動の読み直しを外す。上限を超えるなら足さない。"""
     refresh = f'<meta http-equiv="refresh" content="{render.REFRESH_SECONDS}">'.encode()
@@ -48,7 +42,7 @@ def inject_forms(page: bytes, forms: str) -> bytes:
 
 
 def improve_form_section() -> str:
-    """読む画面 (/improve) の末尾に足す、改善の実行 form。"""
+    """Improve の実行タブに置く、改善の実行 form。"""
     return ("<section><h2>改善を実行</h2><form method=\"post\" action=\"/improve/runs\">"
             "<p><label>期間 (秒、省略可) <input type=\"text\" name=\"duration_sec\" "
             "inputmode=\"numeric\" maxlength=\"5\"></label></p>"

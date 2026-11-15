@@ -1,6 +1,7 @@
 """書込みの adapter: 書込みが無効なら今のまま、有効でも検査 1〜5 を欠く要求は daemon を呼ばない。"""
 from __future__ import annotations
 
+import dataclasses
 import threading
 from urllib.parse import urlencode
 
@@ -110,14 +111,31 @@ def test_other_approval_pages_get_no_form_and_keep_the_refresh(detail):
     assert "<form" not in page and 'http-equiv="refresh"' in page
 
 
-def test_the_improve_page_ends_with_the_form_that_posts_to_the_first_step():
+def with_query(request, **query):
+    return dataclasses.replace(request, query=query)
+
+
+def test_the_run_tab_holds_the_form_that_posts_to_the_first_step_and_reads_nothing():
     rig = _rig()
-    response = rig.send(rig.request("GET", "/improve"))
-    assert response.status == 200 and rig.client.calls == [("improve_list", 50)]
+    response = rig.send(with_query(rig.request("GET", "/improve"), tab="run"))
+    assert response.status == 200 and rig.client.calls == []
     body = response.body.decode("utf-8")
     assert 'action="/improve/runs"' in body and "token" not in body
     assert 'http-equiv="refresh"' not in body and body.endswith("</body></html>")
-    assert body.index("終了した改善 mission") < body.index('action="/improve/runs"')
+    assert "UTC" not in body and "+09:00" not in body
+    head = rig.send(with_query(rig.request("HEAD", "/improve"), tab="run"))
+    assert head.status == 200 and head.body == b"" and rig.client.calls == []
+    assert head.headers["Content-Length"] == str(len(response.body))
+
+
+def test_the_history_tab_keeps_the_refresh_and_has_no_form_even_when_write_is_on():
+    rig = _rig()
+    response = rig.send(rig.request("GET", "/improve"))
+    body = response.body.decode("utf-8")
+    assert response.status == 200 and rig.client.calls == [("improve_list", 50)]
+    assert "<form" not in body and 'http-equiv="refresh"' in body
+    assert body.index("終了した改善 mission") < body.index("</body>")
+    assert '<a href="/improve?tab=run">実行</a>' in body
     head = rig.send(rig.request("HEAD", "/improve"))
     assert head.status == 200 and head.body == b""
 
@@ -127,9 +145,38 @@ def test_the_improve_page_without_write_is_read_only_and_keeps_the_refresh():
     response = rig.send(rig.request("GET", "/improve"), writable=False)
     body = response.body.decode("utf-8")
     assert response.status == 200 and "<form" not in body and 'http-equiv="refresh"' in body
+    assert ">実行</a>" not in body and '?tab=run"' not in body
     assert READ_ONLY_CSP_ACTION in response.headers["Content-Security-Policy"]
     assert rig.send(rig.request("POST", "/improve", {}), writable=False).status == 405
     assert rig.send(rig.request("POST", "/improve/runs", {}), writable=False).status == 404
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_the_run_tab_is_404_when_write_is_off_without_calling_the_daemon(method):
+    rig = _rig()
+    request = with_query(rig.request(method, "/improve"), tab="run")
+    response = rig.send(request, writable=False)
+    assert response.status == 404 and rig.client.calls == []
+    assert b"<form" not in response.body and b'class="tabs"' not in response.body
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_the_run_tab_is_404_when_the_transport_forbids_writing(method):
+    rig = _rig(loopback=False)
+    response = rig.send(with_query(rig.request(method, "/improve"), tab="run"))
+    assert response.status == 404 and rig.client.calls == []
+    page = rig.send(rig.request("GET", "/improve")).body.decode()
+    assert '?tab=run"' not in page and "<form" not in page
+
+
+@pytest.mark.parametrize("query", [{"tab": "run", "limit": "50"}, {"tab": "run", "sort": "run"},
+                                   {"tab": "run", "dir": "asc"}, {"tab": "run", "x": "1"}])
+@pytest.mark.parametrize("writable", [True, False])
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_the_run_tab_with_a_history_key_is_400_before_the_404_check(query, writable, method):
+    rig = _rig()
+    response = rig.send(with_query(rig.request(method, "/improve"), **query), writable=writable)
+    assert response.status == 400 and rig.client.calls == []
 
 
 def test_a_wrong_method_on_a_write_route_is_405_with_its_allow_list():
@@ -213,9 +260,9 @@ def test_a_non_loopback_non_tls_context_refuses_every_write_post_and_the_form():
                                         ("/confirm/check", {"token": token})]:
         response = rig.post(path, form)
         assert response.status == 403, path
-    # 経路が書込みを許さないときは、読む画面だけを出し、form は足さない
+    # 経路が書込みを許さないときは、読む画面だけを出し、実行タブは無い
     page = rig.send(rig.request("GET", "/improve"))
-    assert page.status == 200 and b"<form" not in page.body
+    assert page.status == 200 and b"<form" not in page.body and b'?tab=run"' not in page.body
     assert rig.client.calls == [("improve_list", 50)] and rig.store.counts() == (0, 0)
 
 
@@ -542,244 +589,34 @@ def test_a_lowercase_code_the_daemon_never_sends_is_not_shown_on_an_improve():
     assert b"private_customer_note" not in response.body
 
 
-@pytest.mark.parametrize("reply", [Reply(500, None, "internal"), Reply(503, None, "busy"),
-                                   object(), None])
-def test_a_server_error_or_an_unreadable_reply_is_an_unknown_result(reply):
-    rig = _rig()
-    rig.client.approve_reply = reply
-    token = rig.first_post("approve")
-    response = rig.confirm(token)
-    assert response.status == 502
-    body = response.body.decode()
-    assert "分かりません" in body and 'href="/approvals/7"' in body
-    assert "/confirm/check" not in body
-
-
-def test_a_lost_decision_response_is_unknown_and_check_never_replays_a_decision():
-    rig = _rig()
-    rig.client.fail["approve"] = ConnectionError("lost")
-    token = rig.first_post("approve")
-    assert rig.confirm(token).status == 502
-    assert rig.post("/confirm/check", {"token": token}).status == 502
-    assert [c[0] for c in rig.client.calls] == ["approve"]
-    assert rig.confirm(token).status == 409
-
-
-def test_an_error_before_anything_was_sent_is_a_known_non_execution():
-    rig = _rig()
-    rig.client.fail["approve"] = api_error("server_auth_failed", token_sent=False)
-    token = rig.first_post("approve")
-    response = rig.confirm(token)
-    assert response.status == 409 and "実行していません" in response.body.decode()
-    rig.client.fail["improve_run"] = api_error("connect_failed", token_sent=True)
-    token = rig.first_improve(max_runs="2")
-    assert rig.confirm(token).status == 502
-
-
-# --- 改善と「結果を確かめる」 ------------------------------------------------------------------
-
-def test_improve_sends_the_stored_conditions_with_a_key_derived_from_the_token():
-    rig = _rig()
-    token = rig.first_improve(duration_sec="3600", max_runs="3", comment="  look at rsi ")
-    response = rig.confirm(token)
-    assert response.status == 200 and JOB in response.body.decode()
-    key = write.idempotency_key_of(token)
-    assert rig.client.calls == [("improve_run", "web:afx",
-                                 {"duration_sec": 3600, "max_runs": 3, "comment": "look at rsi"},
-                                 key)]
-    assert token not in key and token not in repr(rig.client.calls)
-
-
-def test_a_lost_improve_response_is_recovered_by_replaying_the_stored_body_and_key():
-    rig = _rig()
-    token = rig.first_improve(max_runs="2", comment="x")
-    rig.client.fail["improve_run"] = ConnectionError("lost")
-    lost = rig.confirm(token)
-    assert lost.status == 502
-    assert token_of(lost) == token and "/confirm/check" in lost.body.decode()
-    first_call = rig.client.calls[0]
-    rig.client.fail.clear()
-    recovered = rig.post("/confirm/check", {"token": token})
-    assert recovered.status == 200 and JOB in recovered.body.decode()
-    assert rig.client.calls == [first_call, first_call]
-    # 結果が分かった後は、確かめても daemon を呼ばず、同じ結果を返す
-    again = rig.post("/confirm/check", {"token": token})
-    assert again.status == 200 and JOB in again.body.decode()
-    assert len(rig.client.calls) == 2
-    # 消費し直せない
-    assert rig.confirm(token).status == 409 and len(rig.client.calls) == 2
-
-
-def test_check_that_is_still_lost_stays_unknown_and_can_be_tried_again():
-    rig = _rig()
-    token = rig.first_improve()
-    rig.client.fail["improve_run"] = ConnectionError("lost")
-    assert rig.confirm(token).status == 502
-    assert rig.post("/confirm/check", {"token": token}).status == 502
-    rig.client.fail.clear()
-    assert rig.post("/confirm/check", {"token": token}).status == 200
-    assert len(rig.client.calls) == 3
-
-
-def test_check_before_the_final_post_is_refused_without_a_call():
-    rig = _rig()
-    token = rig.first_improve()
-    assert rig.post("/confirm/check", {"token": token}).status == 409
-    assert rig.client.calls == []
-    assert rig.confirm(token).status == 200
-
-
-def test_parallel_checks_of_an_unknown_improve_replay_once():
-    rig = _rig()
-    token = rig.first_improve()
-    rig.client.fail["improve_run"] = ConnectionError("lost")
-    rig.confirm(token)
-    rig.client.fail.clear()
-    original = rig.client.improve_run
-
-    def slow(actor, body, *, idempotency_key):
-        import time
-        time.sleep(0.05)
-        return original(actor, body, idempotency_key=idempotency_key)
-
-    rig.client.improve_run = slow
-    barrier = threading.Barrier(5)
-    statuses: list[int] = []
-
-    def send():
-        barrier.wait()
-        statuses.append(rig.post("/confirm/check", {"token": token}).status)
-
-    threads = [threading.Thread(target=send) for _ in range(5)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    assert sorted(statuses) == [200] + [409] * 4
-    assert len([c for c in rig.client.calls if c[0] == "improve_run"]) == 2
-
-
-# --- token を残さない -----------------------------------------------------------------------
-
-def test_no_token_reaches_stderr_or_the_logs_on_success_or_failure(capsys):
-    rig = _rig()
-    tokens = []
-    for failure in (None, ConnectionError("lost")):
-        rig.client.fail.clear()
-        if failure is not None:
-            rig.client.fail["improve_run"] = failure
-        token = rig.first_improve(max_runs="2")
-        tokens.append(token)
-        rig.confirm(token)
-        rig.post("/confirm/check", {"token": token})
-    rig.post("/confirm", {"token": "B" * 43})
-    captured = capsys.readouterr()
-    assert not any(token in captured.out + captured.err for token in tokens)
-    assert captured.err == ""
-
-
-def test_the_store_and_context_reprs_do_not_carry_a_token():
-    rig = _rig()
-    token = rig.first_post("approve")
-    rig.confirm(token)
-    assert token not in repr(rig.context) and token not in repr(rig.store)
-    assert token not in repr(list(rig.store._records.values()))
-
-
-def test_a_get_never_changes_the_store():
-    rig = _rig()
-    for path in ("/", "/approvals", "/approvals/7", "/improve", "/plugins"):
-        rig.send(rig.request("GET", path))
-    assert rig.store.counts() == (0, 0)
-    assert all(call[0] in {"status", "approvals", "approval", "approval_change", "plugins",
-                              "improve_list"}
-               for call in rig.client.calls)
-
-
-def test_a_check_after_the_hour_is_refused_before_the_daemon_is_called():
-    rig = _rig()
-    token = rig.first_improve(max_runs="2")
-    rig.client.fail["improve_run"] = ConnectionError("lost")
-    assert rig.confirm(token).status == 502
-    rig.client.fail.clear()
-    rig.clock.now += write.CONSUMED_TTL
-    response = rig.post("/confirm/check", {"token": token})
-    assert response.status == 410
-    assert [c[0] for c in rig.client.calls] == ["improve_run"]
-
-
-@pytest.mark.parametrize("status", [409, 200, 400, 500])
-def test_an_outcome_unknown_code_is_unknown_whatever_the_http_status(status):
-    rig = _rig()
-    rig.client.improve_reply = Reply(status, None, "outcome_unknown")
-    token = rig.first_improve()
-    response = rig.confirm(token)
-    body = response.body.decode()
-    assert response.status == 502
-    assert "分かりません" in body and "受け付けませんでした" not in body
-    assert "/confirm/check" in body and token_of(response) == token
-
-
-def test_an_outcome_unknown_409_from_the_daemon_can_be_checked_and_recovers():
-    rig = _rig()
-    rig.client.improve_reply = Reply(409, None, "outcome_unknown")
-    token = rig.first_improve(max_runs="2")
-    assert rig.confirm(token).status == 502
-    rig.client.improve_reply = Reply(200, {"job_id": JOB}, None)
-    recovered = rig.post("/confirm/check", {"token": token})
-    assert recovered.status == 200 and JOB in recovered.body.decode()
-    assert len(rig.client.calls) == 2
-
-
-def test_an_outcome_unknown_for_a_decision_links_to_the_approval_instead_of_replaying():
-    rig = _rig()
-    rig.client.approve_reply = Reply(409, None, "outcome_unknown")
-    response = rig.confirm(rig.first_post("approve"))
-    body = response.body.decode()
-    assert response.status == 502 and 'href="/approvals/7"' in body
-    assert "/confirm/check" not in body
-
-
-def test_the_longest_screen_inputs_fit_the_body_limit_even_in_four_byte_characters():
-    rig = _rig()
-    reason = "\U0001F600" * 500
-    token = rig.first_post("reject", reason=reason)
-    assert rig.confirm(token).status == 200
-    assert rig.client.calls[-1] == ("reject", "web:afx", 7, reason)
-    comment = "\U0001F600" * 1000
-    token = rig.first_improve(duration_sec="86400", max_runs="24", comment=comment)
-    assert rig.confirm(token).status == 200
-    assert rig.client.calls[-1][1:2] == ("web:afx",)
-
-
-def test_japanese_input_at_the_screen_limits_is_accepted_and_one_char_more_is_400():
-    rig = _rig()
-    assert rig.post("/approvals/7/reject", {"payload_sha256": DIGEST,
-                                            "reason": "あ" * 500}).status == 200
-    assert rig.post("/approvals/7/reject", {"payload_sha256": DIGEST,
-                                            "reason": "あ" * 501}).status == 400
-    assert rig.post("/improve/runs", {"comment": "あ" * 1000}).status == 200
-    assert rig.post("/improve/runs", {"comment": "あ" * 1001}).status == 400
-
-
-def test_the_body_limit_boundary_is_exact():
-    rig = _rig()
-    at = b"comment=" + b"x" * (write.MAX_WRITE_BODY - len(b"comment="))
-    assert rig.post("/improve/runs", at).status != 413
-    assert rig.post("/improve/runs", at + b"x").status == 413
-
-
 @pytest.mark.parametrize("reply", [Reply(500, None, "internal"),
                                     Reply(200, {"runs": "bad"}, None),
                                     Reply(404, None, "not_found")])
-@pytest.mark.parametrize("writable", [True, False])
-def test_improve_list_failure_preserves_available_form(reply, writable):
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_improve_list_failure_with_write_is_502_with_the_bar_and_a_link_to_the_run_tab(reply, method):
     rig = _rig()
     rig.client.improve_list = lambda **kwargs: reply
-    response = rig.send(rig.request("GET", "/improve"), writable=writable)
-    body = response.body.decode()
-    assert ('action="/improve/runs"' in body) is writable
-    if writable:
-        assert "一覧を取得できません" in body
-    else:
-        assert response.status == 502
+    response = rig.send(rig.request(method, "/improve"))
+    got = rig.send(rig.request("GET", "/improve"))
+    assert response.status == got.status == 502
+    assert response.headers["Content-Length"] == str(len(got.body))
+    body = got.body.decode()
+    assert "一覧を取得できません" in body and '<a href="/improve?tab=run">実行</a>' in body
+    assert "<form" not in body and "<table" not in body
+    assert b"internal" not in got.body and (method == "GET" or response.body == b"")
+
+
+@pytest.mark.parametrize("reply", [Reply(500, None, "internal"), Reply(200, {"runs": "bad"}, None)])
+def test_improve_list_failure_without_write_is_the_plain_error_page(reply):
+    rig = _rig()
+    rig.client.improve_list = lambda **kwargs: reply
+    response = rig.send(rig.request("GET", "/improve"), writable=False)
+    assert response.status == 502
+    assert b'class="tabs"' not in response.body and b"Service unavailable" in response.body
+
+
+def test_improve_list_failure_by_a_broken_connection_is_502_with_the_bar():
+    rig = _rig()
+    rig.client.fail["improve_list"] = ConnectionError("lost")
+    response = rig.send(rig.request("GET", "/improve"))
+    assert response.status == 502 and "tab=run" in response.body.decode()

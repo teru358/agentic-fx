@@ -182,10 +182,14 @@ def _list_row(raw: dict) -> list[str]:
 
 @dataclass(frozen=True)
 class SortColumn:
-    """並べ替えの列。`first` は初めの向き、`value` は行から比べる値を取り出す (無い・型違いは None)。"""
+    """並べ替えの列。`first` は初めの向き、`value` は行から比べる値を取り出す (無い・型違いは None)。
+
+    `then` を持つ列は、同じ値の中を第 2 の値で並べる (第 2 の値が無い行は、その中の末尾)。
+    """
 
     first: str
     value: Callable[[dict], object]
+    then: Callable[[dict], object] | None = None
 
 
 def _text_value(raw: object) -> str | None:
@@ -215,36 +219,56 @@ DIRECTIONS = ("asc", "desc")
 _MARKS = {"asc": "▲", "desc": "▼"}
 
 
-def sort_rows(plugins: list[dict], sort: str | None, direction: str | None) -> list[dict]:
-    """sort 列で並べ替える。同じ値は元の順のまま (desc でも反転しない)、値の無い行は向きによらず末尾。"""
+def sort_items(items: list[dict], columns: Mapping[str, SortColumn], sort: str | None,
+               direction: str | None, project: Callable[[dict], dict]) -> list[dict]:
+    """sort 列で並べ替える。同じ値は元の順のまま (desc でも反転しない)、値の無い行は向きによらず末尾。
+
+    `project` は行から、列が読む field だけの dict を作る。
+    """
     if sort is None:
-        return plugins
-    column = SORT_COLUMNS[sort]
+        return items
+    column = columns[sort]
+    reverse = (direction or column.first) == "desc"
     valued: list[tuple[object, dict]] = []
     missing: list[dict] = []
-    for raw in plugins:
-        value = column.value(pick(raw, ROW_FIELDS))
+    for raw in items:
+        value = column.value(project(raw))
         if value is None:
             missing.append(raw)
         else:
             valued.append((value, raw))
-    valued.sort(key=lambda pair: pair[0], reverse=(direction or column.first) == "desc")
+    if column.then is not None:
+        # 第 2 の値で先に並べ (安定)、第 1 の値の安定 sort で同じ値の中の順を保つ
+        keyed = [(column.then(project(raw)), (value, raw)) for value, raw in valued]
+        second = sorted([item for item in keyed if item[0] is not None],
+                        key=lambda item: item[0], reverse=reverse)
+        valued = [pair for _, pair in second] + [pair for key, pair in keyed if key is None]
+    valued.sort(key=lambda pair: pair[0], reverse=reverse)
     return [raw for _, raw in valued] + missing
 
 
-def _sort_link(label_text: str, key: str, sort: str | None, direction: str | None) -> str:
-    """見出しの link。今の列なら向きを逆にし、ほかの列はその列の初めの向きにする。"""
-    column = SORT_COLUMNS[key]
+def sort_rows(plugins: list[dict], sort: str | None, direction: str | None) -> list[dict]:
+    return sort_items(plugins, SORT_COLUMNS, sort, direction, lambda raw: pick(raw, ROW_FIELDS))
+
+
+def sort_link(label_text: str, key: str, sort: str | None, direction: str | None, *,
+              columns: Mapping[str, SortColumn] = SORT_COLUMNS, path: str = "/plugins",
+              carry: tuple[tuple[str, str], ...] = ()) -> str:
+    """見出しの link。今の列なら向きを逆にし、ほかの列はその列の初めの向きにする。
+
+    `carry` は引き継ぐ (key, 検査済みの値) の組で、sort と dir の後ろに付ける。
+    """
+    column = columns[key]
     current = (direction or column.first) if key == sort else None
     target = column.first if current is None else DIRECTIONS[1 - DIRECTIONS.index(current)]
-    href = html.escape(f"/plugins?sort={key}&dir={target}", quote=True)
+    query = "&".join([f"sort={key}", f"dir={target}"] + [f"{name}={value}" for name, value in carry])
     mark = _MARKS[current] if current else ""
-    return f'<a href="{href}">{html.escape(label_text, quote=True)}{mark}</a>'
+    return f'<a href="{html.escape(f"{path}?{query}", quote=True)}">{html.escape(label_text, quote=True)}{mark}</a>'
 
 
 def _list_headers(sort: str | None, direction: str | None) -> tuple[str, ...]:
     def link(text: str, key: str) -> str:
-        return _sort_link(text, key, sort, direction)
+        return sort_link(text, key, sort, direction)
 
     return (link("名前", "name"), link("kind", "kind"), link("配備", "state"), "承認と読込",
             link("承認待ち", "pending"), "配備中の版", "途中の操作", "参照する strategy",
