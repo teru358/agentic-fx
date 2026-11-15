@@ -363,3 +363,13 @@ def test_the_sort_columns_are_a_fixed_table():
     assert {key: column.first for key, column in plugin_pages.SORT_COLUMNS.items()} == {
         "name": "asc", "kind": "asc", "state": "asc", "pending": "desc", "submitted": "desc",
         "deployed": "desc"}
+
+
+@pytest.mark.parametrize("reply_name", ["other", "Bad-Name"])
+def test_the_detail_bar_links_to_the_requested_plugin_whatever_name_the_daemon_returns(reply_name):
+    detail = copy.deepcopy(sample("plugin_rsi"))
+    detail["plugin"]["name"] = reply_name
+    client = Client(details={"rsi": detail})
+    page = get("/plugins/rsi", {"tab": "deps"}, client)[0].body.decode()
+    hrefs = re.findall(r'<a href="([^"]*)"', bar_of(page))
+    assert hrefs and all(href.startswith("/plugins/rsi?tab=") for href in hrefs)

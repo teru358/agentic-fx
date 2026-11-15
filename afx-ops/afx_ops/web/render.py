@@ -989,6 +989,10 @@ def _scale_params(change: Mapping[str, object], total: int) -> str:
         if type(count) is int and count > 0:
             notes.append(f"{label} {count} 件")
     if total == 0 and not notes:
+        if change.get("classification") == "updated":
+            return "params の差分 0 件"
+        if change.get("classification") == "new":
+            return "params の差分: 前版なし"
         return "params の差分: 取得できない"
     return f"params の差分 {total} 件" + (" (" + "、".join(notes) + ")" if notes else "")
 

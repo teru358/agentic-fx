@@ -459,10 +459,11 @@ def render_plugin(data: Mapping[str, object], tab: str = "overview",
     row = pick(data.get("plugin"), ROW_FIELDS)
     entity = pick(row.get("entity"), ENTITY_FIELDS)
     admission = pick(row.get("admission"), ADMISSION_FIELDS)
+    route_name = name
     name = row.get("name")
     shown = name if type(name) is str and render._NAME.match(name) else "-"
     nav = '<p><a href="/plugins">Plugins</a> / <a href="/approvals">Pending approvals</a></p>'
     body = DETAIL_TAB_SECTIONS[tab](row, entity, admission, data, tz) or "<p>なし</p>"
-    link_name = name if name is not None else shown
+    link_name = route_name if type(route_name) is str and render._NAME.match(route_name) else shown
     bar = tabs.bar(tabs.PLUGIN_DETAIL, tab, at=f"/plugins/{link_name}")
     return render._page(f"Plugin {shown}", body, tz, current="/plugins", tabs=nav + bar)
