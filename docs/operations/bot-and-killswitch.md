@@ -58,7 +58,7 @@ bot は state dir の `gateway.snapshot` に最新の状態を置き、daemon �
 DD が閾値以上のままなら、次の新規判断で kill switch が再びラッチします。
 ```
 
-- reset は HWM を付け直しません。DD が閾値以上のままなら、次の新規判断で再びラッチし、新しい世代の通知が出ます。固定文に数値は付かず、API の応答や event にも DD の数値は載りません。HWM を付け直す操作は別チケット (`killswitch-reset-hwm-rebase`) で扱います。
+- reset は HWM を付け直しません。DD が閾値以上のままなら、次の新規判断で再びラッチし、新しい世代の通知が出ます。固定文に数値は付かず、API の応答や event にも DD の数値は載りません。HWM を付け直す操作は別の `afx ctl --as approver killswitch rebase <世代>` です。`afx ctl` の reset の成功後は毎回この案内が出ます (DD は推測しません。shell の reset は固定文だけです)。詳細は [操作 API](ops-api-2026-10-09.md) の「kill switch の HWM 付け直し」です。
 - bot や notify を止めても、kill switch の state と世代は変わりません。status、web、journal で確認できます。
 
 ## 5. rollback

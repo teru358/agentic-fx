@@ -336,6 +336,7 @@ TradeIntent は発注前に全ルールを通過しなければならない。1 
 - **broker 送信は DB トランザクションと原子化できない**前提で 2 段階に分ける: 再検証合格後、①**送信前に client_order_id (冪等キー) を永続化** (`submitting`) ②broker へ 1 回だけ送信。応答タイムアウト・結果不明・DB 保存失敗は**再送せず `submit_unknown`** とし、注文履歴・建玉の照合 (reconcile) で解決する。reconcile は再起動時に加えて**稼働中も定期実行** (毎分) し、**未解決の submit_unknown がある間は同一 intent の再送と新規発注を停止**する
 - **保護注文の確認 (SL/TP 添付失敗対策)**: broker が注文本体を受理しても SL/TP 設定だけ失敗・不明になり得る (MT5 は注文と建玉が別 ID)。約定後は注文・建玉・SL/TP を照合し、**保護の確認が取れるまで `open` にしない** (`protection_pending`)。SL 設定の失敗・欠落は即時再設定をリトライし、リトライ失敗時は**決定論的に緊急クローズ + 通知** — SL なしの実ポジションを存在させない
 - **自動発注への段階移行 (最終目標)**: 手動承認での成績実績を確認した上で、対話シェルの `autopilot on` (確認プロンプト付き、**API には載せない**) で承認ゲートを外し、risk gate 通過後に自動発注する。`autopilot off` でいつでも手動承認に戻せる。切替は activity ログに記録し Discord に必ず通知する。**config 編集では切替できない** (状態は `data/state/` 管理、§3)。自動発注時も risk gate・kill switch・日次損失上限は全件通過必須
+- **実口座 broker の導入前提 (kill switch の HWM 付け直し、2026-11-14 裁定)**: 実口座 broker の導入前提として、HWM rebase の硬い累積損失上限と上限到達時の正規の復旧出口、入出金の正本、broker 側 exposure、通貨精度の設計・検証を必須とする。完了するまで実口座の rebase は有効化しない。PaperBroker 限定の上限なし・累積警告は代用にならない。現行 paper.starting_balance の変更は cashflow 履歴に残らず、ledger は入出金調整済み総損失を証明しない。設計の正は [kill switch 解除後の HWM 付け直し設計](2026-11-14-killswitch-hwm-rebase-design.md) (§1.2、§5.1)
 
 ## 6. 戦略改善 loop
 
@@ -929,3 +930,4 @@ activity のカテゴリ (処理の流れ「収集 → 分析 → 統合判断 �
 |---|---|---|---|---|
 | 2026-10-14 | 運用追補 | 初期設定ウィザード、direct exec user unit、起動ガードの運用記述を更新 | 初回設定の運用責任を明確化 | |
 | 2026-10-25 | 運用追補 | ニュース源: 基本ニュースソースの同梱・agent 追加時の `news_source` approval・`POST /news`・対話シェルの `news add` を廃止の注記つきに改め、人間の `afx news` と `afx init` の副段へ一本化 | 2026-09-07 の agent 経路廃止と 2026-10-25 の同梱廃止の裁定に合わせる | |
+| 2026-11-15 | 追補 | §5 Executor 節に、実口座 broker 導入前提 (HWM rebase の硬い累積損失上限・復旧出口・入出金の正本・broker 側 exposure・通貨精度、starting_balance 履歴の制約) を追記し、kill switch の HWM 付け直し設計を参照 | HWM 付け直し設計 C2.1 §5.1 の義務 | |

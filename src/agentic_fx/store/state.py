@@ -82,6 +82,20 @@ class AppState:
     kill_switch_latched_at: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class GuardedState:
+    """:meth:`StateStore.shared_guard` が保持中に読んだ値。"""
+    state: "AppState | None"
+    marker_pending: bool
+
+    @property
+    def projected(self) -> "AppState | None":
+        """marker があればラッチ中として投影した state (`load` と同じ意味)。"""
+        if self.state is None or not self.marker_pending:
+            return self.state
+        return replace(self.state, kill_switch_latched=True)
+
+
 _BOOL_FIELDS = ("initialized", "autopilot", "kill_switch_latched")
 _REQUIRED_KEYS = ("initialized", "mode", "autopilot", "kill_switch_latched")
 
@@ -251,6 +265,23 @@ class StateStore:
         if pending:
             return replace(state, kill_switch_latched=True)
         return state
+
+    @contextmanager
+    def shared_guard(self, *, deadline: float | None = None,
+                     stop_event: threading.Event | None = None):
+        """共有 flock を with の終わりまで保持し、保持中に読んだ state と marker を返す。
+
+        state が読めないとき ``state`` は None。保持中に state writer / reset /
+        reconcile / `autopilot_at_start` (排他 flock) / 公開 `load` を呼んではならない。
+        値は返された :class:`GuardedState` から使う。
+        """
+        with self._shared(deadline=deadline, stop_event=stop_event):
+            try:
+                state: AppState | None = self._load_unlocked()
+            except (StateError, ValueError, OSError):
+                state = None
+            pending = self.reconcile_marker() is not None
+            yield GuardedState(state=state, marker_pending=pending)
 
     def autopilot_at_start(self, *, deadline: float | None = None,
                            stop_event: threading.Event | None = None) -> bool:

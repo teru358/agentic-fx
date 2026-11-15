@@ -124,6 +124,7 @@ EXPECTED = (
     ('ctl killswitch reset', G.RECOVERY, "CTL", 'afx ctl killswitch reset', 'killswitch reset', "READ", False, False, 'status.read', 'status', True, None),
     ('ctl killswitch reset', G.RECOVERY, "CTL", 'afx ctl killswitch reset <generation>', 'killswitch reset <世代>', "CHANGE", True, True, 'local_guard', 'killswitch_reset', True, None),
     ('ctl killswitch reconcile', G.RECOVERY, "CTL", 'afx ctl killswitch reconcile [confirm]', 'killswitch reconcile [confirm]', "CHANGE", True, True, 'local_guard', 'killswitch_reconcile', True, None),
+    ('ctl killswitch rebase', G.RECOVERY, "CTL", 'afx ctl killswitch rebase <generation>', None, "CHANGE", True, True, 'local_guard', 'killswitch_rebase', True, None),
     ('ctl data resume', G.RECOVERY, "CTL", 'afx ctl data resume [--acknowledge]', 'data resume [--acknowledge]', "CHANGE", True, True, 'local_guard', 'data_resume', True, None),
     ('stop', None, "CTL", 'afx stop', 'stop', "CHANGE", False, False, None, None, False, None),
 )

@@ -27,6 +27,8 @@ class ErrorCode(StrEnum):
     DECISION_IN_PROGRESS = "decision_in_progress"
     GENERATION_MISMATCH = "generation_mismatch"
     NOT_LATCHED = "not_latched"
+    PREVIEW_CHANGED = "preview_changed"
+    MARKET_CLOSED = "market_closed"
     DATABASE_BUSY = "database_busy"
     UNAVAILABLE = "unavailable"
     INTERNAL = "internal"
@@ -38,9 +40,10 @@ _MESSAGES = {code: code.value.replace("_", " ") for code in ErrorCode}
 class OpsError(Exception):
     """固定 code の失敗。例外文は code だけで、内部の詳細を載せない。"""
 
-    def __init__(self, code: ErrorCode) -> None:
+    def __init__(self, code: ErrorCode, *, detail: str | None = None) -> None:
         super().__init__(code.value)
         self.code = code
+        self.detail = detail
 
     def __repr__(self) -> str:
         return f"OpsError({self.code.value})"

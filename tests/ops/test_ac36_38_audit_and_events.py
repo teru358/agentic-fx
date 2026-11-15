@@ -1,16 +1,19 @@
-"""AC-36: 変更系 17 本の append-only 監査と自由文の不保存。
+"""AC-36: 変更系 18 本の append-only 監査と自由文の不保存。
 AC-38: event の固定 schema、cursor 再配送、best-effort 生成。"""
 from __future__ import annotations
 
 import concurrent.futures
 import sqlite3
+import threading
 
 import pytest
 
 from agentic_fx.ops import ErrorCode, OpsError
 from agentic_fx.ops.audit import AuditStore
 from agentic_fx.ops.events import EventCursor, EventPage, EventSchemaError, EventStore
+from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.ops import service as service_module
+from agentic_fx.ops.rebase_service import RebaseWiring
 from agentic_fx.ops.service import ENDPOINTS
 from agentic_fx.policy_projection import insert_policy
 from agentic_fx.store import backlog
@@ -46,7 +49,7 @@ def test_ac38_equal_high_watermark_is_not_a_rewind():
 
 
 def _drive_all_mutations(env, service):
-    """17 本の変更 endpoint をそれぞれ 1 回ずつ呼び、呼んだ code を返す。"""
+    """18 本の変更 endpoint をそれぞれ 1 回ずつ呼び、呼んだ code を返す。"""
     called = []
 
     def run(code, call):
@@ -73,6 +76,7 @@ def _drive_all_mutations(env, service):
     run("retry", lambda: service.retry(APPROVER, retry_id, digest_of(env, retry_id)))
     run("killswitch_reset", lambda: service.reset_kill_switch(APPROVER, generation))
     run("killswitch_reconcile", lambda: service.reconcile_kill_switch(APPROVER))
+    run("killswitch_rebase", lambda: service.rebase_kill_switch(APPROVER, generation, "0" * 64))
     run("reflection_retry", lambda: service.retry_reflection(
         OPERATOR, "k-ref", order_id, expected_attempts=0, expected_last_attempt_at=None))
     run("improve", lambda: service.improve(OPERATOR, "k-imp"))
@@ -96,7 +100,7 @@ def test_ac36_every_mutating_endpoint_leaves_accepted_and_one_terminal(ops_env):
                               improve_supervisor=_Improve())
     called = _drive_all_mutations(ops_env, service)
     mutating = sorted(code for code, e in ENDPOINTS.items() if e.mutating)
-    assert sorted(called) == mutating and len(mutating) == 17
+    assert sorted(called) == mutating and len(mutating) == 18
     rows = ops_env.ops_rows()
     accepted = {r["id"]: r for r in rows if r["phase"] == "accepted"}
     terminals = [r for r in rows if r["phase"] != "accepted"]
@@ -351,6 +355,10 @@ class _SeamState:
         self.hook("killswitch_reset")
         return self.inner.reset_kill_switch(*args, **kwargs)
 
+    def shared_guard(self, **kwargs):
+        self.hook("killswitch_rebase")
+        return self.inner.shared_guard(**kwargs)
+
     def reconcile_marker(self):
         return {"requested_generation": 1}
 
@@ -408,7 +416,10 @@ def _seamed_call(env, monkeypatch, code):
         return {"ok": 1}
 
     service = env.service(ask_submitter=ask_submitter, improve_supervisor=_Improve(),
-                          data_resume=data_resume, state_store=_SeamState(env.state, seams))
+                          data_resume=data_resume, state_store=_SeamState(env.state, seams),
+                          rebase=RebaseWiring(core_lock=threading.RLock(),
+                                              broker=PaperBroker(env.conn, env.settings, None),
+                                              clock=None))
     # 決定は approve / retry が approve_candidate、reject が reject_candidate を通る。
     for name, seam in (("approve_candidate", None), ("reject_candidate", "reject")):
         original = getattr(switch, name)
@@ -454,6 +465,8 @@ def _seamed_call(env, monkeypatch, code):
         "reject": lambda: service.reject(APPROVER, approval_id, "x"),
         "killswitch_reset": lambda: service.reset_kill_switch(APPROVER, generation),
         "killswitch_reconcile": lambda: service.reconcile_kill_switch(APPROVER),
+        "killswitch_rebase": lambda: service.rebase_kill_switch(
+            APPROVER, generation, "0" * 64),
         "reflection_retry": lambda: service.retry_reflection(
             OPERATOR, "k", order_id, expected_attempts=1,
             expected_last_attempt_at="2026-10-05T00:00:00+00:00"),

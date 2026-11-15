@@ -133,6 +133,8 @@ def _every_endpoint(service):
         "retry": lambda p: service.retry(p, 9999, "0" * 64),
         "killswitch_reset": lambda p: service.reset_kill_switch(p, 0),
         "killswitch_reconcile": lambda p: service.reconcile_kill_switch(p),
+        "killswitch_rebase_preview": lambda p: service.rebase_preview(p, 0),
+        "killswitch_rebase": lambda p: service.rebase_kill_switch(p, 0, "0" * 64),
         "reflection_retry": lambda p: service.retry_reflection(
             p, f"k-ref-{p}", 9999, expected_attempts=0, expected_last_attempt_at=None),
         "improve": lambda p: service.improve(p, f"k-imp-{p}"),
@@ -147,6 +149,9 @@ def _every_endpoint(service):
         "policy_reconcile": lambda p: service.reconcile_policy(p, f"k-pol-rec-{p}"),
         "job_cancel": lambda p: service.cancel_job(p, "missing"),
     }
+
+
+_APPROVER_ONLY_BY_CALLER = frozenset({"killswitch_rebase_preview", "killswitch_rebase"})
 
 
 def test_every_endpoint_admits_exactly_the_principals_holding_its_scope(ops_env):
@@ -186,6 +191,12 @@ def test_authorization_follows_the_endpoint_table(ops_env, monkeypatch, scope):
     for code in ENDPOINTS:
         monkeypatch.setitem(ENDPOINTS, code, dataclasses.replace(ENDPOINTS[code], scope=scope))
     for code, call in calls.items():
+        if code in _APPROVER_ONLY_BY_CALLER:
+            # service の先頭で approver を直接検査するので、scope 表を書き換えても operator は通らない。
+            with pytest.raises(OpsError) as raised:
+                call(OPERATOR)
+            assert raised.value.code is ErrorCode.FORBIDDEN, code
+            continue
         try:
             call(OPERATOR)
             outcome = None
