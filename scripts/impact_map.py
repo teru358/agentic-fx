@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Extract literal candidates from Python source without importing it."""
 import hashlib
+import fcntl
 import copy
 from datetime import datetime, timezone
 import argparse
@@ -500,13 +501,26 @@ def evidence_exists(value):
 def verify(args):
     if not re.fullmatch(r'[A-Za-z0-9_-]+', args.page):
         raise ValueError('invalid domain')
+    directory = Path('docs/impact-map/verification')
+    if args.record:
+        directory.mkdir(parents=True, exist_ok=True)
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            return _verify(args, directory)
+        finally:
+            os.close(fd)
+    return _verify(args, directory)
+
+
+def _verify(args, directory):
+    record_path = directory / (args.page + '.json')
+    records = json.loads(record_path.read_text()) if record_path.exists() else []
     try:
         node, digest = anchor_digest(args.anchor)
         ambiguous = False
     except AmbiguousSubAnchor:
         node, digest, ambiguous = None, None, True
-    record_path = Path('docs/impact-map/verification') / (args.page + '.json')
-    records = json.loads(record_path.read_text()) if record_path.exists() else []
     previous = next ( (r for r in records if r['anchor'] == args.anchor), None)
     status = 'ambiguous_sub_anchor' if ambiguous else 'anchor_missing' if node is None else 'missing_record' if previous is None else 'method_mismatch' if previous['method'] != METHOD else 'fresh' if previous['hash'] == digest else 'stale'
     if args.record:
@@ -518,7 +532,6 @@ def verify(args):
         entry = dict(anchor=args.anchor, hash=digest, method=METHOD, date=datetime.now(timezone.utc).date().isoformat(), evidence=args.evidence, source_sha=revision.decode().strip() if revision else None, reason=args.reason)
         records = [r for r in records if r['anchor'] != args.anchor] + [entry]
         records.sort(key=lambda r: r['anchor'])
-        record_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = None
         try:
             with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=record_path.parent, delete=False) as stream:

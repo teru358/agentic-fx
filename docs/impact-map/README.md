@@ -33,6 +33,7 @@ python3 scripts/impact_map.py evaluate --domain kill-switch --index tmp/impact-m
 `python scripts/impact_map.py verify --page <domain> --anchor <path::symbol>` で照合状態を表示する。
 記録するには表示された hash を `--record --expected-hash <hash> --reason <公開可能な理由> --evidence <testまたはticket ID>` と共に指定する。
 照合記録は anchor 順の canonical JSON（キー順固定、インデント1、末尾改行）で保存し、一時ファイルから原子的に置換する。成功時の出力は更新後の `fresh` と hash を示す。
+記録更新は verification directory のロックで直列化し、同時実行による記録の上書きを防ぐ。
 副 anchor は `path::symbol#callee[@literal]` と指定し、該当する最小の statement を照合する。literal は文字列定数の完全一致。
 300 行超の宣言に副 anchor がない場合、check は `coarse_symbol` を人が読む項目として表示する。副 anchor が複数に該当する場合は `ambiguous_sub_anchor` を表示する。照合記録のある anchor が曖昧または消失した場合は `stale` も表示する。これらの情報項目だけなら check の終了コードは 0 で、他のエラーがある場合はその終了コードを優先する。
 

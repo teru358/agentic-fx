@@ -151,3 +151,58 @@ def test_record_atomic_replace_failure_preserves_file(tmp_path, monkeypatch):
         module.verify(args)
     assert path.read_bytes() == original
     assert set(path.parent.iterdir()) == {path}
+
+
+def test_concurrent_records_keep_both_anchors(tmp_path):
+    import importlib.util
+    import multiprocessing
+    import os
+    import types
+
+    (tmp_path / 'sample.py').write_text('def f(): pass\ndef g(): pass\n')
+    ticket = tmp_path / 'docs/tickets/open/T-1.md'
+    ticket.parent.mkdir(parents=True)
+    ticket.write_text('')
+    record = tmp_path / 'docs/impact-map/verification/demo.json'
+    record.parent.mkdir(parents=True)
+    record.write_text('[]')
+    ctx = multiprocessing.get_context('fork')
+    first_read, second_done = ctx.Event(), ctx.Event()
+
+    def worker(anchor, pause):
+        os.chdir(tmp_path)
+        spec = importlib.util.spec_from_file_location('impact_map_concurrent', SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        digest = module.anchor_digest(anchor)[1]
+        original_read = Path.read_text
+        def read_text(path, *args, **kwargs):
+            result = original_read(path, *args, **kwargs)
+            if path == Path('docs/impact-map/verification/demo.json') and pause:
+                first_read.set()
+                second_done.wait(2)
+            return result
+        Path.read_text = read_text
+        args = types.SimpleNamespace(page='demo', anchor=anchor, record=True,
+                                     expected_hash=digest, reason='initial_record', evidence='T-1')
+        try:
+            module.verify(args)
+        finally:
+            if not pause:
+                second_done.set()
+
+    first = ctx.Process(target=worker, args=('sample.py::f', True))
+    second = ctx.Process(target=worker, args=('sample.py::g', False))
+    first.start()
+    try:
+        assert first_read.wait(5)
+        second.start()
+        first.join(10)
+        second.join(10)
+        assert first.exitcode == second.exitcode == 0
+        assert {r['anchor'] for r in json.loads(record.read_text())} == {'sample.py::f', 'sample.py::g'}
+    finally:
+        for process in (first, second):
+            if process.is_alive():
+                process.terminate()
+                process.join()
