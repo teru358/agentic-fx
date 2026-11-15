@@ -21,6 +21,7 @@ from agentic_fx.core.contracts import Clock
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.core.timeutil import as_utc
 from agentic_fx.core.transitions import TERMINAL
+from agentic_fx.ops.contracts import ErrorCode
 from agentic_fx.ops.rebase_accounting import (paper_equity, read_rebase_totals,
                                               rebase_figures)
 from agentic_fx.store import snapshots
@@ -77,17 +78,17 @@ def dto(evaluation: RebaseEvaluation) -> dict[str, Any]:
             "preview_token": evaluation.token, **evaluation.fields}
 
 
-def error_code_name(reason: str) -> str:
-    """POST が返す ErrorCode の名前 (contracts.ErrorCode のメンバー名)。"""
+def error_code_name(reason: str) -> ErrorCode:
+    """POST が返す固定エラーコード。"""
     if reason in ("rebase_unavailable", "broker_not_supported"):
-        return "UNAVAILABLE"
+        return ErrorCode.UNAVAILABLE
     if reason == "state_unavailable":
-        return "INVALID_STATE"
+        return ErrorCode.INVALID_STATE
     if reason == "generation_mismatch":
-        return "GENERATION_MISMATCH"
+        return ErrorCode.GENERATION_MISMATCH
     if reason == "market_closed":
-        return "MARKET_CLOSED"
-    return "PREVIEW_CHANGED"
+        return ErrorCode.MARKET_CLOSED
+    return ErrorCode.PREVIEW_CHANGED
 
 
 def _canonical(value: object) -> object:
@@ -165,16 +166,16 @@ def evaluate_rebase(conn: sqlite3.Connection, *, wiring: RebaseWiring | None,
     if row["cashflow"] != 0:
         return _reject("accounting_inconsistent", fields, latched)
 
-    broker_balance, broker_equity = paper_equity(conn, settings, wiring.clock)
-    if broker_balance != balance or broker_equity != equity:
-        return _reject("account_snapshot_changed", fields, latched)
-
     non_terminal = conn.execute(
         "SELECT 1 FROM orders WHERE status IS NULL OR status NOT IN (%s) LIMIT 1"
         % ",".join("?" * len(_TERMINAL_VALUES)), _TERMINAL_VALUES).fetchone()
     fields["flat"] = non_terminal is None
     if non_terminal is not None:
         return _reject("exposure_present", fields, latched)
+
+    broker_balance, broker_equity = paper_equity(conn, settings, wiring.clock)
+    if broker_balance != balance or broker_equity != equity:
+        return _reject("account_snapshot_changed", fields, latched)
 
     fields["drawdown_pct"] = drawdown_pct(equity, hwm)
     if fields["drawdown_pct"] < threshold or equity >= hwm:

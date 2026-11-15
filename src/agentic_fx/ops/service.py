@@ -979,9 +979,11 @@ class OpsService:
                                    state="outcome_unknown")
                     raise OpsError(ErrorCode.OUTCOME_UNKNOWN) from None
                 code = self._map_exception(exc)
+                error_response = _error_response(code or ErrorCode.INTERNAL)
+                if isinstance(exc, OpsError) and exc.detail is not None:
+                    error_response["error"]["detail"] = exc.detail
                 self._terminal(accepted, caller, endpoint,
-                               (code or ErrorCode.INTERNAL).value,
-                               _error_response(code or ErrorCode.INTERNAL))
+                               (code or ErrorCode.INTERNAL).value, error_response)
                 if code is not None and not isinstance(exc, OpsError):
                     raise OpsError(code) from None
                 raise
@@ -1882,7 +1884,7 @@ class OpsService:
         台帳の applied_at と日次基準の計算にも使う。"""
         state = guard.state
         if state is None or guard.marker_pending:
-            raise OpsError(ErrorCode[rebase_service.error_code_name("state_unavailable")])
+            raise OpsError(rebase_service.error_code_name("state_unavailable"))
         if state.autopilot:
             raise OpsError(ErrorCode.AUTOPILOT_RESTRICTED)
         instant: list[datetime] = []
@@ -1898,20 +1900,18 @@ class OpsService:
                 expected_generation=expected_generation, settings=self._settings,
                 now=instant[0])
             if evaluation.reason is not None:
-                raise OpsError(ErrorCode[rebase_service.error_code_name(evaluation.reason)])
+                raise OpsError(rebase_service.error_code_name(evaluation.reason),
+                               detail=evaluation.reason)
             if evaluation.token != preview_token:
                 raise OpsError(ErrorCode.PREVIEW_CHANGED)
 
-        try:
-            result = apply_rebase(
-                self._conn, accepted_audit_id=accepted.audit_id,
-                applied_at=lambda: instant[0], generation=state.kill_switch_generation,
-                latched_at=state.kill_switch_latched_at,
-                digest_version=rebase_service.DIGEST_VERSION, preview_token=preview_token,
-                threshold_pct=self._settings.risk.drawdown_kill_pct,
-                now=lambda: instant[0], validate=validate, check_budget=check_budget)
-        except ValueError:
-            raise OpsError(ErrorCode.PREVIEW_CHANGED) from None
+        result = apply_rebase(
+            self._conn, accepted_audit_id=accepted.audit_id,
+            applied_at=lambda: instant[0], generation=state.kill_switch_generation,
+            latched_at=state.kill_switch_latched_at,
+            digest_version=rebase_service.DIGEST_VERSION, preview_token=preview_token,
+            threshold_pct=self._settings.risk.drawdown_kill_pct,
+            now=lambda: instant[0], validate=validate, check_budget=check_budget)
         # 台帳の金額は応答 / 監査 terminal に載せない。latched は guard の state の値。
         return {"rebase_id": result["rebase_id"], "snapshot_id": result["snapshot_id"],
                 "generation": result["generation"], "latched": state.kill_switch_latched}

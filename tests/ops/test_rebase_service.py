@@ -795,3 +795,36 @@ def test_changed_value_snapshot_right_before_begin_immediate_is_rejected(rig, mo
     assert _post_error(rig, token) is ErrorCode.PREVIEW_CHANGED
     assert _ledger(rig.conn) == []
     assert [r["source"] for r in _snapshots(rig.conn)].count("manual_ks_rebase") == 0
+
+
+def test_open_order_takes_precedence_over_broker_mismatch(rig):
+    _order(rig.conn, "open", pnl=-1.0)
+    assert _preview(rig)["reason"] == "exposure_present"
+
+
+@pytest.mark.parametrize("reason", ["exposure_present", "rebase_not_needed"])
+def test_post_preserves_ineligibility_reason_in_error_and_audit(rig, reason):
+    token = _preview(rig)["preview_token"]
+    if reason == "exposure_present":
+        _order(rig.conn, "open")
+    else:
+        _snapshot_replaced(rig, balance=START - LOSS, equity=START - LOSS,
+                           hwm=START - LOSS + 5000)
+    with pytest.raises(OpsError) as raised:
+        _post(rig, token)
+    assert raised.value.code == ErrorCode.PREVIEW_CHANGED
+    assert raised.value.detail == reason
+    assert json.loads(_rebase_requests(rig.conn)[-1]["response_json"])["error"]["detail"] == reason
+
+
+def test_apply_value_error_is_internal_without_accounting_writes(rig, monkeypatch):
+    token = _preview(rig)["preview_token"]
+    before = _write_counts(rig.conn)
+    def fail(*args, **kwargs):
+        raise ValueError("private invariant")
+    monkeypatch.setattr(accounting, "rebase_figures", fail)
+    with pytest.raises(Exception) as raised:
+        _post(rig, token)
+    assert not isinstance(raised.value, OpsError) or raised.value.code == ErrorCode.INTERNAL
+    assert _write_counts(rig.conn) == before
+    assert _rebase_requests(rig.conn)[-1]["result_code"] == "internal"

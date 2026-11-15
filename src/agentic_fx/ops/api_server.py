@@ -664,7 +664,10 @@ class ApiServer:
                 self._record_rejection("limit_rejected")
             return reject.status, _error(reject.code)
         except OpsError as err:
-            return status_of(err.code), _error(err.code)
+            payload = _error(err.code)
+            if err.detail is not None:
+                payload["error"]["detail"] = err.detail
+            return status_of(err.code), payload
         except Exception:
             incident = uuid.uuid4().hex[:16]
             _log.error("api internal error incident=%s", incident, exc_info=True)
