@@ -87,3 +87,28 @@ def test_cover_and_edge_symbols(tmp_path):
     (tmp_path / 'app.py').write_text('VALUE = 1\ndef f(): return 1\ndef g(): return 3\n')
     code, result = run(tmp_path, base, '--worktree')
     assert code == 0 and any(i['kind'] == 'symbol_changed' and i['anchor'] == 'app.py::g' for i in result['items'])
+
+
+def test_removed_declaration_and_dependency(tmp_path):
+    base = setup(tmp_path)
+    page = tmp_path / 'docs/impact-map/domains/demo.md'
+    page.write_text(page.read_text().replace('- **E1** `app.py::f` → `app.py::g`\n', ''))
+    (tmp_path / 'app.py').write_text('VALUE = 1\ndef f(): return 1\n')
+    assert any(i['kind'] == 'unmapped_removed_dependency' and i['anchor'] == 'app.py::g' for i in run(tmp_path, base, '--worktree')[1]['items'])
+    git(tmp_path, 'add', '.')
+    git(tmp_path, 'commit', '-qm', 'remove')
+    page.write_text('invalid working tree')
+    assert any(i['anchor'] == 'app.py::g' and i['kind'] == 'unmapped_removed_dependency' for i in run(tmp_path, base, '--head', 'HEAD')[1]['items'])
+
+
+def test_unregistered_symbol_in_resource_file(tmp_path):
+    base = setup(tmp_path)
+    src = tmp_path / 'app.py'
+    src.write_text(src.read_text() + '\ndef emitter():\n    emit("signal")\n')
+    git(tmp_path, 'add', 'app.py')
+    git(tmp_path, 'commit', '-qm', 'resource')
+    base = git(tmp_path, 'rev-parse', 'HEAD')
+    src.write_text(src.read_text().replace('emit("signal")', 'emit("signal")\n    emit("new_event")'))
+    assert any(i['kind'] == 'unmapped_changed_unmapped_symbol' and i['anchor'] == 'app.py::emitter' for i in run(tmp_path, base, '--worktree')[1]['items'])
+    src.write_text(src.read_text().replace('    emit("new_event")\n', '').replace('return 1', 'return 2'))
+    assert 'unmapped_changed_unmapped_symbol' not in kinds(run(tmp_path, base, '--worktree')[1])

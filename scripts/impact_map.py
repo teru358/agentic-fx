@@ -28,7 +28,11 @@ def relative(path):
 
 
 def front_matter(path):
-    lines = Path(path).read_text(encoding='utf-8').splitlines()
+    return parse_front_matter(Path(path).read_text(encoding='utf-8'))
+
+
+def parse_front_matter(text):
+    lines = text.splitlines()
     if not lines or lines[0] != '---':
         raise ValueError('missing front matter')
     end = lines.index('---', 1)
@@ -247,7 +251,10 @@ def extract(args):
 
 
 def read_covers(path):
-    text = Path(path).read_text(encoding='utf-8')
+    return parse_covers(Path(path).read_text(encoding='utf-8'))
+
+
+def parse_covers(text):
     start, end = '<!-- impact-map:covers -->', '<!-- /impact-map:covers -->'
     if text.count(start) != 1 or text.count(end) != 1:
         raise ValueError('invalid covers markers')
@@ -535,12 +542,20 @@ def affected(args):
         return fail('invalid_page')
     try:
         page = Path('docs/impact-map/domains') / (args.page + '.md')
-        meta = front_matter(page)
+        def page_data(rev):
+            data = git('show', rev + ':' + page.as_posix()) if rev else page.read_bytes()
+            if data is None:
+                raise OSError('page unavailable')
+            text = data.decode('utf-8')
+            meta = parse_front_matter(text)
+            declarations = set(meta['anchors']) | {c['symbol'] for c in parse_covers(text)}
+            for m in re.finditer(r'^- \*\*E[0-9]+\*\* `([^`]+)` → `([^`]+)`', text, re.MULTILINE):
+                declarations.update(m.groups())
+            return meta, declarations
+        _, old_declarations = page_data(base)
+        meta, new_declarations = page_data(head)
+        declarations = old_declarations | new_declarations
         lookup = literals(meta['resources'], meta.get('literals'))
-        declarations = set(meta['anchors']) | {c['symbol'] for c in read_covers(page)}
-        text = page.read_text(encoding='utf-8')
-        for m in re.finditer(r'^- \*\*E[0-9]+\*\* `([^`]+)` → `([^`]+)`', text, re.MULTILINE):
-            declarations.update(m.groups())
         for anchor in declarations:
             path, symbol = anchor.split('::', 1)
             if not path or not symbol or Path(path).is_absolute() or '..' in Path(path).parts:
@@ -596,6 +611,29 @@ def affected(args):
                 Visitor(lookup, path, '', records, patterns).visit(ast.parse(data, filename=path))
                 return {(r['resource'], r['path'] + '::' + r['symbol']) for r in records.values()}
             before, after = extract_set(old), extract_set(new)
+            if old is not None and new is not None and after:
+                def symbols(data):
+                    tree = ast.parse(data, filename=path)
+                    result = {}
+                    def visit(body, prefix=''):
+                        for node in body:
+                            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                                name = prefix + node.name
+                                result[name] = ast.dump(node, annotate_fields=True, include_attributes=False)
+                                if isinstance(node, ast.ClassDef):
+                                    visit(node.body, name + '.')
+                            elif isinstance(node, (ast.Assign, ast.AnnAssign)) and not prefix:
+                                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                                for target in targets:
+                                    if isinstance(target, ast.Name):
+                                        result['<module>.' + target.id] = ast.dump(node, annotate_fields=True, include_attributes=False)
+                    visit(tree.body)
+                    return result
+                old_symbols, new_symbols = symbols(old), symbols(new)
+                for symbol in old_symbols.keys() | new_symbols.keys():
+                    anchor = path + '::' + symbol
+                    if anchor not in declarations and old_symbols.get(symbol) != new_symbols.get(symbol):
+                        items.add(('unmapped_changed_unmapped_symbol', anchor, '', ''))
             for resource, symbol in before ^ after:
                 items.add(('literal_candidates_changed', symbol, resource, 'added' if (resource, symbol) in after else 'removed'))
         rows = []
