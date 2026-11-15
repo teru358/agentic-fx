@@ -58,6 +58,8 @@ OMIT_CLI = "全件は afx ctl improve runs で確認してください"
 TRIGGER = {"manual": "手動", "scheduled": "週次"}
 RESULT = {"submitted": "候補を提出", "observation": "提出なし", "gate_failed": "見送り",
           "failed": "失敗", "report": "レポートを公開"}
+APPROVAL_KIND = {"plugin": "プラグイン承認"}
+
 HANDOFF_OUTCOME = {
     "not_submitted": "未提出", "duplicate": "重複", "pending": "承認待ち",
     "approved": "承認済み", "rejected_by_human": "人による却下",
@@ -243,7 +245,7 @@ def _overview(row: dict, snapshot: dict, approval: dict) -> str:
     if plugin is not None:
         approval_cell += " " + _plugin_link(plugin)
         if approval.get("kind") is not None:
-            approval_cell += " (" + _text(approval.get("kind"), KIND) + ")"
+            approval_cell += " (" + _text(approval.get("kind"), APPROVAL_KIND) + ")"
     elapsed = row.get("elapsed_sec")
     pairs = [
         ("run", _text(row.get("id"))),
@@ -355,7 +357,10 @@ def _floor_section(items: dict, report_floor: dict) -> str:
             body += (f"<h3>{_text(entry.get('stage'), STAGE)} ({_text(entry.get('state'), STAGE_STATE)})</h3>"
                      + (_table(PAIR_HEADERS, [_pair_row(p) for p in pairs], each, hidden)
                         if pairs else "<p>pair の数値はありません</p>"))
-        return _section("床との差", body) if body else ""
+        section = _section("床との差", body) if body else ""
+        if not any(_list_of(entry.get("pairs"), PAIR_FIELDS)[0] for entry in stages):
+            section += _floor_section({}, report_floor)
+        return section
     stages, _hidden = _list_of(report_floor.get("stages"), frozenset({"stage", "pairs"}))
     rows = []
     for entry in stages:

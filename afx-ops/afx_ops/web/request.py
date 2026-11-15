@@ -452,17 +452,23 @@ def handle_request(request: Request | bytes, client, *,
         if request.body:
             raise _Reject(400)
         report = _Reporter(match.route.client_method, report_upstream)
-        reply, renderer = _invoke(match, request.query, client, report)
-        if (match.route.client_method in _NOT_FOUND_METHODS and getattr(reply, "status", None) == 404
-                and getattr(reply, "code", None) == "not_found"):
-            return _error(404, head=head, writable=writable)
-        if getattr(reply, "status", None) != 200 or getattr(reply, "code", None) is not None or type(getattr(reply, "data", None)) is not dict:
-            _report_bad_reply(reply, report)
-            return _error(502, head=head, writable=writable)
         try:
-            _check_reply_shape(match.route.client_method, reply.data)
+            reply, renderer = _invoke(match, request.query, client, report)
+            if (match.route.client_method in _NOT_FOUND_METHODS and getattr(reply, "status", None) == 404
+                    and getattr(reply, "code", None) == "not_found"):
+                return _error(404, head=head, writable=writable)
+            if getattr(reply, "status", None) != 200 or getattr(reply, "code", None) is not None or type(getattr(reply, "data", None)) is not dict:
+                _report_bad_reply(reply, report)
+                raise _Upstream
+            try:
+                _check_reply_shape(match.route.client_method, reply.data)
+            except _Upstream:
+                report("shape=invalid")
+                raise
         except _Upstream:
-            report("shape=invalid")
+            if writable and match.route.client_method == "improve_list" and write_context.transport_ok:
+                body = render._page("Improve", "<p>一覧を取得できません</p>" + write_pages.improve_form_section())
+                return _response(200, write_pages.drop_refresh(body), head=head, writable=writable)
             raise
         if writable and match.route.client_method == "improve_list" and write_context.transport_ok:
             body = renderer(reply.data, forms=write_pages.improve_form_section())

@@ -761,3 +761,19 @@ def test_the_body_limit_boundary_is_exact():
     at = b"comment=" + b"x" * (write.MAX_WRITE_BODY - len(b"comment="))
     assert rig.post("/improve/runs", at).status != 413
     assert rig.post("/improve/runs", at + b"x").status == 413
+
+
+@pytest.mark.parametrize("reply", [Reply(500, None, "internal"),
+                                    Reply(200, {"runs": "bad"}, None),
+                                    Reply(404, None, "not_found")])
+@pytest.mark.parametrize("writable", [True, False])
+def test_improve_list_failure_preserves_available_form(reply, writable):
+    rig = _rig()
+    rig.client.improve_list = lambda **kwargs: reply
+    response = rig.send(rig.request("GET", "/improve"), writable=writable)
+    body = response.body.decode()
+    assert ('action="/improve/runs"' in body) is writable
+    if writable:
+        assert "一覧を取得できません" in body
+    else:
+        assert response.status == 502

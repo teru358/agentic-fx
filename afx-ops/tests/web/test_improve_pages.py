@@ -410,3 +410,21 @@ def test_a_bad_mission_id_is_refused_before_any_request(value):
     with pytest.raises(ValueError):
         client.improve_detail(value)
     assert calls == []
+
+
+def test_approval_kind_uses_approval_request_vocabulary():
+    text = detail_page("submitted")
+    assert "不明 (plugin)" not in text
+    assert "プラグイン承認" in text
+
+
+def test_floor_report_fills_in_when_summary_pairs_were_dropped():
+    data = dto("unprofitable_holdout")
+    for stage in data["summary"]["items"]["floor"]["stages"]:
+        stage["pairs"] = []
+    data["floor"] = {"stages": [{"stage": "holdout", "pairs": [
+        {"pair": "EURUSD", "trades": 12, "pf": 0.8, "avg_r": -0.1,
+         "evaluable": True, "conditions": ["pf"]}]}]}
+    text = detail_page(data)
+    assert "床を割った段" in text and "床との差 (レポートから)" in text
+    assert "EURUSD" in text and "0.8" in text
