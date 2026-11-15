@@ -9,7 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-EXCLUDED = {'data', 'logs', 'plugins', 'tmp', '.venv', '.git'}
+EXCLUDED = {'data', 'logs', 'plugins', 'tmp', '.venv', '.git', 'config'}
 SUFFIX_NAMESPACES = {'state', 'config'}
 
 
@@ -48,14 +48,32 @@ def literals(resources, overrides=None):
     return result
 
 
-def candidates(root, diagnostics):
-    root = Path(root).absolute()
-    if not root.is_dir():
-        diagnostics.append({'path': relative(root), 'reason': 'missing_root'})
-        return
+def validate_root(root, repo, diagnostics):
+    # Inspect the original components before normalizing away "..".
+    path = Path(root)
+    path = path if path.is_absolute() else Path.cwd() / path
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        if current.is_symlink():
+            diagnostics.append({'path': relative(path), 'reason': 'symlink_root'})
+            return None
+    normalized = Path(os.path.abspath(path))
+    if not normalized.is_relative_to(repo):
+        diagnostics.append({'path': relative(normalized), 'reason': 'root_outside_repo'})
+        return None
+    lexical_parts = path.relative_to(repo).parts if path.is_relative_to(repo) else normalized.relative_to(repo).parts
+    if any(part in EXCLUDED for part in lexical_parts):
+        diagnostics.append({'path': relative(normalized), 'reason': 'excluded_root'})
+        return None
+    if not normalized.is_dir():
+        diagnostics.append({'path': relative(normalized), 'reason': 'missing_root'})
+        return None
+    return normalized
+
+
+def candidates(root, diagnostics, tracked_set):
     resolved = root.resolve()
-    tracked = git('ls-files', '-z', '--', str(root))
-    tracked_set = None if tracked is None else {Path(os.fsdecode(p)).absolute() for p in tracked.split(b'\0') if p}
     for directory, dirs, files in os.walk(root, followlinks=False):
         base = Path(directory)
         if base != root and (base / '.git').exists():
@@ -151,8 +169,19 @@ def extract(args):
     diagnostics, records = [], {}
     inputs = size = 0
     roots = sorted(set(relative(Path(r).absolute()) for r in args.root))
-    for root in roots:
-        for path, base in candidates(root, diagnostics):
+    repo_raw = git('rev-parse', '--show-toplevel')
+    repo = Path(os.fsdecode(repo_raw).strip()).resolve() if repo_raw else Path.cwd().resolve()
+    validated = [validate_root(root, repo, diagnostics) for root in args.root]
+    tracked_sets = {}
+    if not diagnostics:
+        for root in set(validated):
+            tracked = git('ls-files', '-z', '--', str(root)) if repo_raw else None
+            if tracked is None and not args.allow_untracked_walk:
+                diagnostics.append({'path': relative(root), 'reason': 'git_unavailable'})
+            tracked_sets[root] = None if tracked is None else {Path(os.fsdecode(p)).absolute() for p in tracked.split(b'\0') if p}
+    for base in sorted(tracked_sets) if not diagnostics else []:
+        root = relative(base)
+        for path, base in candidates(base, diagnostics, tracked_sets[base]):
             rel = relative(path)
             try:
                 data = path.read_bytes()
@@ -170,7 +199,7 @@ def extract(args):
     output = {'header': header, 'records': [records[k] for k in sorted(records)]}
     Path(args.out).mkdir(parents=True, exist_ok=True)
     (Path(args.out) / 'index.json').write_text(json.dumps(output, sort_keys=True, separators=(',', ':')) + '\n', encoding='utf-8')
-    return int(any(d['reason'] in {'parse_error', 'missing_root'} for d in diagnostics))
+    return int(any(d['reason'] in {'parse_error', 'missing_root', 'excluded_root', 'symlink_root', 'root_outside_repo', 'git_unavailable'} for d in diagnostics))
 
 
 def read_covers(path):
@@ -288,6 +317,7 @@ def main():
     ex.add_argument('--page', required=True)
     ex.add_argument('--root', action='append', required=True)
     ex.add_argument('--out', required=True)
+    ex.add_argument('--allow-untracked-walk', action='store_true')
     ev = sub.add_parser('evaluate')
     for option in ('domain', 'index', 'oracle', 'page', 'out'):
         ev.add_argument('--' + option, required=True)

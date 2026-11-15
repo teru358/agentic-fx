@@ -13,7 +13,7 @@ def test_extract_does_not_execute_and_records_sites(tmp_path):
     page = tmp_path / 'page.md'
     page.write_text('---\n{"resources":["state:a.target"]}\n---\n')
     out = tmp_path / 'out'
-    subprocess.run([sys.executable, str(SCRIPT), 'extract', '--domain', 'x', '--page', str(page), '--root', str(root), '--out', str(out)], check=True, cwd=tmp_path)
+    subprocess.run([sys.executable, str(SCRIPT), 'extract', '--domain', 'x', '--page', str(page), '--root', str(root), '--allow-untracked-walk', '--out', str(out)], check=True, cwd=tmp_path)
     records = json.loads((out / 'index.json').read_text())['records']
     assert {(r['symbol'], r['match_kind']) for r in records} == {('C.f', 'string_exact'), ('C.f', 'attribute'), ('C.f', 'keyword')}
 
@@ -22,7 +22,7 @@ def run_extract(tmp_path, resources):
     page = tmp_path / 'page.md'
     page.write_text('---\n' + json.dumps({'resources': resources}) + '\n---\n')
     out = tmp_path / 'out'
-    result = subprocess.run([sys.executable, str(SCRIPT), 'extract', '--domain', 'x', '--page', str(page), '--root', 'source', '--out', str(out)], cwd=tmp_path)
+    result = subprocess.run([sys.executable, str(SCRIPT), 'extract', '--domain', 'x', '--page', str(page), '--root', 'source', '--allow-untracked-walk', '--out', str(out)], cwd=tmp_path)
     return result, (out / 'index.json').read_bytes()
 
 
@@ -205,7 +205,7 @@ def test_explicit_marker_literals(tmp_path):
     page = tmp_path / 'page.md'
     page.write_text('---\n' + json.dumps({'resources': ['marker:reset_marker'], 'literals': {'marker:reset_marker': ['_MARKER_SUFFIX']}}) + '\n---\n')
     out = tmp_path / 'out'
-    subprocess.run([sys.executable, str(SCRIPT), 'extract', '--domain', 'x', '--page', str(page), '--root', str(root), '--out', str(out)], cwd=tmp_path, check=True)
+    subprocess.run([sys.executable, str(SCRIPT), 'extract', '--domain', 'x', '--page', str(page), '--root', str(root), '--allow-untracked-walk', '--out', str(out)], cwd=tmp_path, check=True)
     assert [(r['resource'], r['symbol']) for r in json.loads((out / 'index.json').read_text())['records']] == [('marker:reset_marker', 'f')]
 
 
@@ -219,3 +219,100 @@ def test_evaluate_nested_symbols_are_directional(tmp_path):
     assert machine['precision'] == 0.5
     assert {r['symbol'] for r in machine['false_positives']} == {'a.py::inner', 'a.py::otherness'}
     assert {r['symbol']: r['classification'] for r in metrics['rows']} == {'a.py::outer': 'index_found', 'a.py::inner.child': 'both_missed', 'a.py::other': 'both_missed'}
+
+
+def invoke_roots(tmp_path, roots, *options, env=None):
+    page = tmp_path / 'safety-page.md'
+    page.write_text('---\n{"resources":["event:target"]}\n---\n')
+    out = tmp_path / 'safety-out'
+    args = [sys.executable, str(SCRIPT), 'extract', '--domain', 'x', '--page', str(page), '--out', str(out)]
+    for root in roots:
+        args += ['--root', str(root)]
+    result = subprocess.run(args + list(options), cwd=tmp_path, env=env, capture_output=True, text=True)
+    return result, json.loads((out / 'index.json').read_text())
+
+
+def test_rejects_unsafe_roots_before_scanning(tmp_path):
+    subprocess.run(['git', 'init', '-q'], cwd=tmp_path, check=True)
+    safe = tmp_path / 'source'
+    safe.mkdir()
+    (safe / 'a.py').write_text("'target'")
+    subprocess.run(['git', 'add', 'source/a.py'], cwd=tmp_path, check=True)
+    for name in ('data', 'logs', 'plugins', 'tmp', '.venv', '.git', 'config'):
+        root = tmp_path / name / 'nested'
+        root.mkdir(parents=True, exist_ok=True)
+        result, index = invoke_roots(tmp_path, ['source', root])
+        assert result.returncode != 0
+        assert index['header']['inputs'] == 0
+        assert {'path': f'{name}/nested', 'reason': 'excluded_root'} in index['header']['diagnostics']
+    result, index = invoke_roots(tmp_path, ['config/../source'])
+    assert result.returncode != 0
+    assert index['header']['diagnostics'][0]['reason'] == 'excluded_root'
+    assert index['header']['inputs'] == 0
+    (tmp_path / 'alias').symlink_to(safe, target_is_directory=True)
+    (safe / 'nested').mkdir()
+    for root in ('alias', 'alias/nested'):
+        result, index = invoke_roots(tmp_path, [root])
+        assert result.returncode != 0
+        assert index['header']['diagnostics'] == [{'path': root, 'reason': 'symlink_root'}]
+        assert index['header']['inputs'] == 0
+    result, index = invoke_roots(tmp_path, [tmp_path.parent])
+    assert result.returncode != 0
+    assert index['header']['diagnostics'][0]['reason'] == 'root_outside_repo'
+    assert index['header']['inputs'] == 0
+
+
+def test_git_failure_requires_explicit_walk(tmp_path):
+    root = tmp_path / 'source'
+    root.mkdir()
+    (root / 'a.py').write_text("'target'")
+    result, index = invoke_roots(tmp_path, ['source'])
+    assert result.returncode != 0
+    assert index['header']['diagnostics'] == [{'path': 'source', 'reason': 'git_unavailable'}]
+    assert index['header']['inputs'] == 0
+    result, index = invoke_roots(tmp_path, ['source'], '--allow-untracked-walk')
+    assert result.returncode == 0
+    assert index['header']['inputs'] == 1
+    assert index['records'][0]['path'] == 'source/a.py'
+
+
+def test_git_tracked_list_failure_stops_even_in_repo(tmp_path, monkeypatch):
+    import os
+    import shutil
+    subprocess.run(['git', 'init', '-q'], cwd=tmp_path, check=True)
+    root = tmp_path / 'source'
+    root.mkdir()
+    (root / 'a.py').write_text("'target'")
+    bindir = tmp_path / 'bin'
+    bindir.mkdir()
+    real_git = shutil.which('git')
+    fake = bindir / 'git'
+    fake.write_text(f'#!/bin/sh\nif [ "$1" = ls-files ]; then exit 1; fi\nexec "{real_git}" "$@"\n')
+    fake.chmod(0o755)
+    env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ['PATH'])
+    result, index = invoke_roots(tmp_path, ['source'], env=env)
+    assert result.returncode != 0
+    assert index['header']['diagnostics'] == [{'path': 'source', 'reason': 'git_unavailable'}]
+    assert index['header']['inputs'] == 0
+    result, index = invoke_roots(tmp_path, ['source'], '--allow-untracked-walk', env=env)
+    assert result.returncode == 0
+    assert index['header']['inputs'] == 1
+
+
+def test_repo_discovery_failure_stops_even_if_tracked_list_works(tmp_path):
+    import os
+    import shutil
+    subprocess.run(['git', 'init', '-q'], cwd=tmp_path, check=True)
+    (tmp_path / 'source').mkdir()
+    (tmp_path / 'source' / 'a.py').write_text("'target'")
+    subprocess.run(['git', 'add', 'source/a.py'], cwd=tmp_path, check=True)
+    bindir = tmp_path / 'bin'
+    bindir.mkdir()
+    fake = bindir / 'git'
+    fake.write_text(f'#!/bin/sh\nif [ "$1" = rev-parse ] && [ "$2" = --show-toplevel ]; then exit 1; fi\nexec "{shutil.which("git")}" "$@"\n')
+    fake.chmod(0o755)
+    env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ['PATH'])
+    result, index = invoke_roots(tmp_path, ['source'], env=env)
+    assert result.returncode != 0
+    assert index['header']['diagnostics'] == [{'path': 'source', 'reason': 'git_unavailable'}]
+    assert index['header']['inputs'] == 0
