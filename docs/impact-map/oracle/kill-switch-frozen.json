@@ -2865,6 +2865,123 @@
    "relation": "exposes",
    "resource": "activity:kill_switch_latched_durability_uncertain",
    "symbol": "src/agentic_fx/loops/trade_loop.py::TradeLoop._run_signal_mission"
+  },
+  {
+   "class": "G_lit",
+   "critical": true,
+   "origin": "fp_triage",
+   "rationale": "runner.py:226-231 で同時刻・同 kind の activity を検索し、text を replay event の reason に採用する。symbol/resource は本項の値。",
+   "relation": "consumes",
+   "resource": "activity:kill_switch_latched",
+   "symbol": "src/agentic_fx/backtest/runner.py::_kill_switch_event"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "fp_triage",
+   "rationale": "runner.py:498-500 で activity.entries を渡し、ラッチ理由を replay 結果へ取り込む。symbol/resource は本項の値。",
+   "relation": "invokes -> src/agentic_fx/backtest/runner.py::_kill_switch_event",
+   "resource": "activity:kill_switch_latched",
+   "symbol": "src/agentic_fx/backtest/runner.py::run_replay"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "fp_triage",
+   "rationale": "ops/service.py:148 の検索は guard_kind='kill_switch' に限定され、通知欠落判定を左右する。直接 literal は docstring のみ。symbol/resource は本項の値。",
+   "relation": "invokes -> src/agentic_fx/ops/events.py::kill_switch_event_states",
+   "resource": "ops:guard_kind",
+   "symbol": "src/agentic_fx/ops/service.py::plan_kill_switch_notice"
+  },
+  {
+   "class": "G_lit",
+   "critical": true,
+   "origin": "fp_triage",
+   "rationale": "state.py:85,100-106 で当該 field を bool 型検証の対象にし、不正状態の読込を拒否する。symbol/resource は本項の値。",
+   "relation": "schema",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/store/state.py::<module>._BOOL_FIELDS"
+  },
+  {
+   "class": "G_lit",
+   "critical": true,
+   "origin": "fp_triage",
+   "rationale": "state.py:86,96-98 で当該 field の欠落を検出し、状態読込を拒否する。symbol/resource は本項の値。",
+   "relation": "schema",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/store/state.py::<module>._REQUIRED_KEYS"
+  },
+  {
+   "class": "G_lit",
+   "critical": false,
+   "origin": "fp_triage",
+   "rationale": "commands.py:339-340 で解除前の発動時刻を kill_switch_reset activity builder に渡し、解除記録を構成する。299 の表示参照だけではない。symbol/resource は本項の値。",
+   "relation": "reads",
+   "resource": "state:app_state.kill_switch_latched_at",
+   "symbol": "src/agentic_fx/commands.py::Commands._dispatch"
+  },
+  {
+   "class": "G_lit",
+   "critical": true,
+   "origin": "fp_triage",
+   "rationale": "ops/service.py:1829-1833 で発動時刻を event の not_before に渡し、通知時刻の下限を制約する。symbol/resource は本項の値。",
+   "relation": "reads",
+   "resource": "state:app_state.kill_switch_latched_at",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "fp_triage",
+   "rationale": "executor.py:625 から共通 gate 評価へ進み、risk_gate.evaluate の DD 閾値判定を実行する。直接設定参照ではない。symbol/resource は本項の値。",
+   "relation": "invokes -> src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open",
+   "resource": "config:risk.drawdown_kill_pct",
+   "symbol": "src/agentic_fx/core/executor.py::Executor._open"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "fp_triage",
+   "rationale": "executor.py:929 から共通 gate 評価へ進み、DD 閾値による拒否・ラッチ処理に到達する。symbol/resource は本項の値。",
+   "relation": "invokes -> src/agentic_fx/core/executor.py::Executor._evaluate_and_execute_open",
+   "resource": "config:risk.drawdown_kill_pct",
+   "symbol": "src/agentic_fx/core/executor.py::Executor.open_from_snapshot"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "fp_triage",
+   "rationale": "ops/events.py:162 以降で code/fields を検証して保存し、失敗時は rollback する。_guard_event と _sweep_kill_switch が実際に使う保存経路。symbol/resource は本項の値。",
+   "relation": "invokes -> src/agentic_fx/ops/events.py::EventStore.emit",
+   "resource": "event:guard_state_changed",
+   "symbol": "src/agentic_fx/ops/events.py::EventStore.emit_best_effort"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "fp_triage",
+   "rationale": "ops/service.py:1694 の action が data_feed を渡し、guard_kind を含む resume_requested event を生成する。symbol/resource は本項の値。",
+   "relation": "invokes -> src/agentic_fx/ops/service.py::OpsService._guard_event",
+   "resource": "ops:guard_kind",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.resume_data"
+  },
+  {
+   "class": "G_reach",
+   "critical": false,
+   "origin": "fp_triage",
+   "rationale": "ops/service.py:1844 で lane 取得前に再入を検査し、GuardLaneReentry を送出する。symbol/resource は本項の値。",
+   "relation": "invokes -> src/agentic_fx/ops/service.py::OpsService._reject_lane_reentry",
+   "resource": "ops:guard_lane_reentry",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.emit_pending_guard_notices"
+  },
+  {
+   "class": "G_reach",
+   "critical": true,
+   "origin": "fp_triage",
+   "rationale": "ops/service.py:1796-1797 で marker 投影済み state を取得し、通知 sweep の latched/released 選択へ供給する。表示専用の読取ではない。symbol/resource は本項の値。",
+   "relation": "invokes -> src/agentic_fx/store/state.py::StateStore.load",
+   "resource": "state:app_state.kill_switch_latched",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._current_state"
   }
  ]
 }

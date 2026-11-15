@@ -128,3 +128,9 @@
 
 - 凍結表の `residual_unread` 6 件を、A・B と別の裁定者 (codex sol) が source で裁き、6 件とも `add` (unresolved 0)。指揮者が 3 件を抜取り照合 (BotClient.events・build_splash の marker 参照・MissionSupervisor._dispatch) して採用。追加 73 行 (critical 36)、凍結表は 294 行 (critical 197)。各件の裁定理由は凍結表の `residual_unread_resolved` に残した。
 - 出力を見た後の正解表の変更なので記録する (§4.1 (4))。役割: 裁定者 codex sol、確定は指揮者。frozen sha256: `b929322136ed…` → `cde1d229a985…`。追加前の点は上の final 測定の表。
+
+## FP の仕分け (1 回の実測) と正解表の追加
+
+- 仕分け: FP 70 件 (機械 54・頁 16) を A・B と別の仕分け者 (codex sol) が source で仕分けた。所要 **180 秒** (起動から完了まで、1 回)。内訳: literal_collision 31 (state field と activity kind などの同名 literal)、display_or_reader 16、**oracle_miss 15**、**page_overclaim 8**。
+- oracle_miss のうち重複を除く 13 行 (critical 11) を凍結表に追加 (state の検証定数 `_BOOL_FIELDS` / `_REQUIRED_KEYS`、`_sweep_kill_switch` の発動時刻の読取、replay の `_kill_switch_event` ほか)。指揮者が 2 件を抜取り照合。凍結表は 307 行 (critical 208)。出力を見た後の変更 (§4.1 (4))。frozen sha256: `cde1d229a985…` → `d745092e2753…`。
+- page_overclaim 8 件は頁の誤り: `Commands._data_resume` と `OutageStateMachine.request_resume` が guard event を出すかのような被覆宣言 (実際は出さない — D04 と矛盾)、`_build_ops_service` への帰属の過大 (正しくは入れ子の `status_provider`)、そして `guard_notice_deferred` / `guard_notice_backfill_skipped` を ops event として宣言したこと。後者 2 つは warning log の固定 code であり、resource の一覧で `event:` に入れたのは指揮者の誤り。namespace を `log:` に直す。
