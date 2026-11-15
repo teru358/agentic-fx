@@ -79,8 +79,8 @@ def rebase_figures(hwm_before: float, equity: float, threshold_pct: float) -> Re
     """Derive and validate the accounting figures for a rebase."""
     if not all(math.isfinite(v) for v in (hwm_before, equity, threshold_pct)):
         raise ValueError("rebase accounting values must be finite")
-    if hwm_before <= 0 or threshold_pct <= 0:
-        raise ValueError("HWM and threshold must be positive")
+    if hwm_before <= 0 or equity <= 0 or threshold_pct <= 0:
+        raise ValueError("HWM, equity and threshold must be positive")
     cut = hwm_before - equity
     if cut <= 0:
         raise ValueError("cut must be positive")
@@ -139,8 +139,8 @@ def apply_rebase(
             conn.set_authorizer(None)
         if not conn.in_transaction:
             raise RuntimeError("validate must not end the rebase transaction")
-        if not math.isfinite(balance):
-            raise ValueError("balance must be finite")
+        if not math.isfinite(balance) or balance <= 0:
+            raise ValueError("balance must be finite and positive")
         figures = rebase_figures(hwm_before, equity, threshold_pct)
         applied_at = as_utc(applied_at)
         source = conn.execute(

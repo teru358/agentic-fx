@@ -84,6 +84,25 @@ def test_invalid_ledger_values_are_rejected_before_writes(tmp_path, field, value
     assert not conn.in_transaction
 
 
+@pytest.mark.parametrize("equity,balance", [
+    (0.0, 0.0), (-10.0, -10.0), (900.0, 0.0), (900.0, -1.0)])
+def test_non_positive_account_values_matching_the_source_are_rejected(
+        tmp_path, equity, balance):
+    path = tmp_path / "non-positive.db"
+    conn, now, source_id, audit_id = _commit_fault_db(path)
+    conn.execute("UPDATE account_snapshots SET hwm=1000.0, equity=?, balance=? WHERE id=?",
+                 (equity, balance, source_id))
+    conn.commit()
+    with pytest.raises(ValueError):
+        apply_rebase(conn, source_snapshot_id=source_id, accepted_audit_id=audit_id,
+                     applied_at=now, generation=7, latched_at=None, digest_version=1,
+                     preview_token="non-positive", hwm_before=1000.0, equity=equity,
+                     balance=balance, threshold_pct=10.0, now=now,
+                     validate=lambda db: None)
+    assert _counts(path) == (0, 1)
+    assert not conn.in_transaction
+
+
 def test_derived_figures_are_saved_and_returned_with_rounding(tmp_path):
     conn, now, source_id, audit_id = _commit_fault_db(tmp_path / "round.db")
     conn.execute("UPDATE account_snapshots SET hwm=0.3, equity=0.1, balance=0.1 WHERE id=?", (source_id,))
