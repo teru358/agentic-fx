@@ -23,3 +23,7 @@ python3 scripts/impact_map.py evaluate --domain kill-switch --index tmp/impact-m
 2. 公開規則、抽出候補、F/K/D と手動辺を全件確認し、不明点を残す。契約・責務・影響関係が変わる場合は code と頁を同じ commit で更新する。
 3. 地図を除いた独立初読を保存してから頁差分を照合する。必要な root および afx-ops test を実行し、結果と未検証を記録する。
 4. 初回は独立 A/B の裁定、二セルと三分類、履歴再現、実行時間を記録する。未実装の check / affected を実行済みとしない。
+
+`python scripts/impact_map.py verify --page <domain> --anchor <path::symbol>` で照合状態を表示する。
+記録するには表示された hash を `--record --expected-hash <hash> --reason <公開可能な理由> --evidence <testまたはticket ID>` と共に指定する。
+300 行超の symbol は `coarse_symbol` として表示する。

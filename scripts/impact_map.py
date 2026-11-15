@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Extract literal candidates from Python source without importing it."""
+import hashlib
+from datetime import datetime, timezone
 import argparse
 import ast
 import json
@@ -353,6 +355,60 @@ def evaluate(args):
     return 0
 
 
+METHOD = f"python-{sys.version_info.major}.{sys.version_info.minor}:ast.dump(annotate_fields=True,include_attributes=False):v1"
+
+
+def verify(args):
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', args.page):
+        raise ValueError('invalid domain')
+    path, symbol = args.anchor.split('::', 1)
+    source = Path(path)
+    if source.is_absolute() or '..' in source.parts or source.resolve().is_relative_to(Path.cwd().resolve()) is False:
+        raise ValueError('invalid path')
+    node = None
+    try:
+        tree = ast.parse(source.read_bytes(), filename=path)
+        parts = symbol.split('.')
+        body = tree.body
+        if parts[0] == '<module>' and len(parts) == 2:
+            for item in body:
+                targets = item.targets if isinstance(item, ast.Assign) else [item.target] if isinstance(item, ast.AnnAssign) else []
+                if any(isinstance(t, ast.Name) and t.id == parts[1] for t in targets):
+                    node = item
+        else:
+            for part in parts:
+                matches = [n for n in body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == part]
+                if len(matches) != 1:
+                    node = None
+                    break
+                node = matches[0]
+                body = node.body
+    except FileNotFoundError:
+        pass
+    digest = hashlib.sha256(ast.dump(node, annotate_fields=True, include_attributes=False).encode()).hexdigest() if node else None
+    record_path = Path('docs/impact-map/verification') / (args.page + '.json')
+    records = json.loads(record_path.read_text()) if record_path.exists() else []
+    previous = next ( (r for r in records if r['anchor'] == args.anchor), None)
+    status = 'anchor_missing' if node is None else 'missing_record' if previous is None else 'method_mismatch' if previous['method'] != METHOD else 'fresh' if previous['hash'] == digest else 'stale'
+    if args.record:
+        if not digest or digest != args.expected_hash:
+            raise ValueError('expected hash mismatch')
+        for value in (args.reason, args.evidence):
+            if not value or re.search(r'[\r\n]|[a-z][a-z0-9+.-]*://|/home|tmp/', value, re.I):
+                raise ValueError('invalid public text')
+        revision = git('rev-parse', 'HEAD')
+        entry = dict(anchor=args.anchor, hash=digest, method=METHOD, date=datetime.now(timezone.utc).date().isoformat(), evidence=args.evidence, source_sha=revision.decode().strip() if revision else None, reason=args.reason)
+        records = [r for r in records if r['anchor'] != args.anchor] + [entry]
+        records.sort(key=lambda r: r['anchor'])
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        record_path.write_text(json.dumps(records, sort_keys=True, separators=(',', ':')) + '\n', encoding='utf-8')
+    result = dict(current_hash=digest, recorded_hash=previous['hash'] if previous else None, status=status)
+    if node and node.end_lineno - node.lineno + 1 > 300:
+        result['coarse_symbol'] = args.anchor
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest='command', required=True)
@@ -366,10 +422,16 @@ def main():
     ev = sub.add_parser('evaluate')
     for option in ('domain', 'index', 'oracle', 'page', 'out'):
         ev.add_argument('--' + option, required=True)
+    ve = sub.add_parser('verify')
+    ve.add_argument('--page', required=True)
+    ve.add_argument('--anchor', required=True)
+    ve.add_argument('--record', action='store_true')
+    for option in ('expected-hash', 'reason', 'evidence'):
+        ve.add_argument('--' + option)
     args = parser.parse_args()
     try:
-        return extract(args) if args.command == 'extract' else evaluate(args)
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return extract(args) if args.command == 'extract' else evaluate(args) if args.command == 'evaluate' else verify(args)
+    except (OSError, ValueError, KeyError, TypeError, SyntaxError) as exc:
         print(f'invalid input: {type(exc).__name__}', file=sys.stderr)
         return 2
 
