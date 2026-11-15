@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 import time
 from collections.abc import Callable
@@ -21,7 +22,7 @@ from agentic_fx.store.instance_lock import InstanceAlreadyRunning, acquire_insta
 from . import interfaces as interface_listing
 from .feature_config import InterfaceLookupFailed, collect, web_access_reason
 from .probe import run_probe
-from .systemd import Systemd, SystemdError
+from .systemd import AFX_RUNNING, AFX_STOPPED, Systemd, SystemdError
 from .write_key import KEY_MISMATCH_CODES, Inconsistent, check_write_key_consistency, stage_mode
 from .units import (OpsExecNotFound, UnitPaths, atomic_write, bot_dropin_exact, bot_systemd_problem, install_units,
                     remove_durably, resolve_ops_exec, uninstall_feature, units_match)
@@ -42,7 +43,7 @@ _STAGES = {"enable": _ENABLE_ORDER, "disable": _DISABLE_ORDER}
 Hook = Callable[[str], None]
 _KEY_MISMATCH_CODES = KEY_MISMATCH_CODES
 # enable 前に afx がこの状態だったときだけ、enable の最後に afx を起こす。
-_AFX_RUNNING = frozenset({"active", "activating", "reloading"})
+_AFX_RUNNING = AFX_RUNNING
 
 
 class SystemdPort(Protocol):
@@ -189,8 +190,99 @@ def _config_complete(root: Path, feature: str) -> bool:
     return collect(root, feature).complete
 
 
+_RECOVERY_MAX_BYTES = 4096
+_RECOVERY_STATES = AFX_STOPPED | AFX_RUNNING
+_RECOVERY_KEYS = frozenset({"version", "afx_before_stop"})
+
+
+def write_recovery_path(root: Path) -> Path:
+    return root / "data" / "ops" / "web.write-recovery.json"
+
+
+def _recovery_invalid(root: Path, why: str) -> InvalidState:
+    path = write_recovery_path(root)
+    return InvalidState("write_recovery_invalid",
+                        f"path={path} {why}。回復: afx を止め、file の原本を確かめる。壊れているだけなら"
+                        "削除して afx ops web enable --write (又は --no-write) を再実行する")
+
+
+def _unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+
+
+def read_write_recovery(root: Path) -> dict[str, Any] | None:
+    """idle の write 回復の記録を厳密に読む。無ければ None、読めない・形が違えば write_recovery_invalid。"""
+    path = write_recovery_path(root)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise _recovery_invalid(root, f"開けない ({type(error).__name__})") from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise _recovery_invalid(root, "自分の uid の 0600 の通常 file でない")
+        chunks: list[bytes] = []
+        size = 0
+        while size <= _RECOVERY_MAX_BYTES:
+            chunk = os.read(fd, _RECOVERY_MAX_BYTES + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        raw = b"".join(chunks)
+    except OSError as error:
+        raise _recovery_invalid(root, f"読めない ({type(error).__name__})") from None
+    finally:
+        os.close(fd)
+    if len(raw) > _RECOVERY_MAX_BYTES:
+        raise _recovery_invalid(root, f"{_RECOVERY_MAX_BYTES} byte を超えている")
+    try:
+        data = json.loads(raw, object_pairs_hook=_unique_pairs)
+    except (ValueError, RecursionError):
+        raise _recovery_invalid(root, "JSON として読めない (重複 key を含む)") from None
+    if not isinstance(data, dict) or set(data) != _RECOVERY_KEYS:
+        raise _recovery_invalid(root, "項目が version と afx_before_stop だけの object でない")
+    if type(data["version"]) is not int or data["version"] != 1:
+        raise _recovery_invalid(root, "version が 1 でない")
+    if not isinstance(data["afx_before_stop"], str) or data["afx_before_stop"] not in _RECOVERY_STATES:
+        raise _recovery_invalid(root, "afx_before_stop が停止 (inactive / failed) か稼働 (active / activating / reloading) でない")
+    return data
+
+
+def write_write_recovery(root: Path, afx_before_stop: str) -> None:
+    raw = (json.dumps({"version": 1, "afx_before_stop": afx_before_stop}, sort_keys=True) + "\n").encode()
+    try:
+        atomic_write(write_recovery_path(root), raw, 0o600)
+    except OSError as error:
+        raise SystemdError("material_write_failed", _describe(error)) from error
+
+
+def remove_write_recovery(root: Path) -> None:
+    try:
+        remove_durably(write_recovery_path(root))
+    except OSError as error:
+        raise SystemdError("material_write_failed", _describe(error)) from error
+
+
+def check_write_recovery_idle(root: Path) -> None:
+    """idle の write 回復が途中なら write_switch_pending、記録が読めなければ write_recovery_invalid で拒否する。
+
+    記録を読むだけで何も書かない。
+    """
+    if read_write_recovery(root) is not None:
+        raise InvalidState("write_switch_pending", WRITE_SWITCH_GUIDANCE)
+
+
 def check_write_switch_idle(root: Path) -> None:
-    """書込みの切替が途中なら write_switch_pending で拒否する。stage file を読むだけで何も書かない。"""
+    """書込みの切替が途中なら write_switch_pending で拒否する。stage file と回復の記録を読むだけで何も書かない。"""
+    check_write_recovery_idle(root)
     for feature in _FEATURE_PRINCIPALS:
         saved = read_stage(root, feature, missing_ok=True)
         if saved is not None and "write_target" in saved:
@@ -263,6 +355,8 @@ class OpsSetup:
         return self.paths.feature_unit(feature)
 
     def _unfinished(self, feature: str, operation: str, *, switching_write: bool = False) -> None:
+        if not switching_write:
+            check_write_recovery_idle(self.root)
         for other in _FEATURE_PRINCIPALS:
             saved = read_stage(self.root, other, missing_ok=True)
             if saved is None:

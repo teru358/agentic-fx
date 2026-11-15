@@ -163,6 +163,40 @@ def test_an_unfinished_ops_enable_stops_the_wizard(tmp_path):
     assert not (root / "config" / "settings.yaml").exists()
 
 
+def _put_write_recovery(root, raw=b'{"version": 1, "afx_before_stop": "active"}\n'):
+    path = root / "data" / "ops" / "web.write-recovery.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(raw)
+    path.chmod(0o600)
+
+
+def test_a_pending_web_write_recovery_stops_the_whole_wizard_right_after_the_lease(tmp_path):
+    from agentic_fx.ops_setup.stages import WRITE_SWITCH_GUIDANCE
+    root = make_root(tmp_path)
+    _put_write_recovery(root)
+    hooks: list[str] = []
+    deps, *_ = make_deps(tmp_path, hook=hooks.append)
+    io = ScriptedWizardIO(responder=fresh_responder())
+    before = snapshot(root)
+    assert run_wizard(root, io, deps) == 1
+    assert f"write_switch_pending: {WRITE_SWITCH_GUIDANCE}" in io.text
+    assert "after_setup_lock_acquire" in hooks and "before_instance_lock_acquire" not in hooks
+    assert io.asked == [] and not (root / "config" / "settings.yaml").exists()
+    only_locks_added(before, snapshot(root))
+
+
+def test_a_broken_web_write_recovery_stops_the_wizard_with_its_reason_and_repair_guidance(tmp_path):
+    root = make_root(tmp_path)
+    _put_write_recovery(root, b"{not json")
+    deps, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO(responder=fresh_responder())
+    before = snapshot(root)
+    assert run_wizard(root, io, deps) == 1
+    assert "write_recovery_invalid" in io.text and "web.write-recovery.json" in io.text
+    assert "回復" in io.text and not (root / "config" / "settings.yaml").exists()
+    only_locks_added(before, snapshot(root))
+
+
 def test_both_markers_report_the_ops_enable_first(tmp_path):
     root = make_root(tmp_path)
     (root / "data" / "ops").mkdir(parents=True)

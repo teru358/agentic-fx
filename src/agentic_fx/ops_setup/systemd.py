@@ -17,6 +17,11 @@ _UP_STATES = frozenset({"active", "reloading", "refreshing"})
 _BETWEEN_STATES = frozenset({"activating", "deactivating", "maintenance"})
 
 
+# afx の ActiveState の分類。回復の記録と afx の復帰の判断はこの定義だけを使う。
+AFX_STOPPED = frozenset({"inactive", "failed"})
+AFX_RUNNING = frozenset({"active", "activating", "reloading"})
+
+
 class SystemdError(RuntimeError):
     """systemd が要求された状態へ遷移できなかった。
 
