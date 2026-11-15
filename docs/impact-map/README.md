@@ -38,3 +38,12 @@ python3 scripts/impact_map.py evaluate --domain kill-switch --index tmp/impact-m
 
 `python scripts/impact_map.py affected --page <domain> --base <rev> --head <rev>` で revision 間の候補を表示する。`--head` の代わりに `--worktree` を指定すると作業 tree と比較する。
 出力は symbol・literal 候補・依存の変化と unmapped を区別する。runtime の候補走査は Python ファイルを対象に、tests、scripts、docs と extract の除外ディレクトリを除く。履歴や解析が取得できない場合は終了コード 2 を返す。
+
+記録理由は次の固定値から選ぶ。根拠は存在する `tests/...` のファイル（`::test_name` を付けてもよい）または `docs/tickets/open/`・`closed/` に存在する ticket の ID を指定する。
+
+| 理由 | 用途 |
+| --- | --- |
+| `initial_record` | 初回照合 |
+| `contract_unchanged` | 契約が変わらないことを確認 |
+| `relation_unchanged_refactor` | リファクタ後も関係が変わらないことを確認 |
+| `relation_changed_page_updated` | 関係の変更を頁に反映して確認 |

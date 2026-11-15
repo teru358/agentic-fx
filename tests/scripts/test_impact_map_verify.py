@@ -11,11 +11,14 @@ def run(root, *args):
 
 
 def test_verify_lifecycle(tmp_path):
+    ticket = tmp_path / 'docs/tickets/open/TEST-1.md'
+    ticket.parent.mkdir(parents=True)
+    ticket.write_text('')
     source = tmp_path / 'sample.py'
     source.write_text('def f():\n    return 1\n')
     first = json.loads(run(tmp_path).stdout)
     assert first['status'] == 'missing_record'
-    opts = ('--record', '--expected-hash', first['current_hash'], '--reason', 'reviewed', '--evidence', 'TEST-1')
+    opts = ('--record', '--expected-hash', first['current_hash'], '--reason', 'initial_record', '--evidence', 'TEST-1')
     assert run(tmp_path, *opts).returncode == 0
     record = tmp_path / 'docs/impact-map/verification/demo.json'
     original = record.read_bytes()
@@ -45,6 +48,9 @@ def test_reject_private_reason(tmp_path):
 
 
 def test_verify_class_constant_lifecycle(tmp_path):
+    ticket = tmp_path / 'docs/tickets/open/TEST-1.md'
+    ticket.parent.mkdir(parents=True)
+    ticket.write_text('')
     for assignment in ('VALUE = 1', 'VALUE: int = 1'):
         source = tmp_path / 'sample.py'
         source.write_text(f'class Outer:\n    class Inner:\n        {assignment}\n')
@@ -53,7 +59,7 @@ def test_verify_class_constant_lifecycle(tmp_path):
             return subprocess.run([sys.executable, str(SCRIPT), 'verify', '--page', 'demo', '--anchor', anchor, *args], cwd=tmp_path, capture_output=True, text=True)
         first = json.loads(verify().stdout)
         assert first['status'] == 'missing_record' and len(first['current_hash']) == 64
-        opts = ('--record', '--expected-hash', first['current_hash'], '--reason', 'reviewed', '--evidence', 'TEST-1')
+        opts = ('--record', '--expected-hash', first['current_hash'], '--reason', 'initial_record', '--evidence', 'TEST-1')
         assert verify(*opts).returncode == 0
         assert json.loads(verify().stdout)['status'] == 'fresh'
         source.write_text(f'\nclass Outer:\n    class Inner:\n        {assignment.replace("1", "2")}\n')
@@ -61,3 +67,22 @@ def test_verify_class_constant_lifecycle(tmp_path):
         source.write_text('class Outer:\n    class Inner:\n        pass\n')
         assert json.loads(verify().stdout)['status'] == 'anchor_missing'
         (tmp_path / 'docs/impact-map/verification/demo.json').unlink()
+
+
+def test_record_requires_allowed_reason_and_resolvable_evidence(tmp_path):
+    (tmp_path / 'sample.py').write_text('def f(): pass\n')
+    digest = json.loads(run(tmp_path).stdout)['current_hash']
+    def record(reason, evidence):
+        return run(tmp_path, '--record', '--expected-hash', digest, '--reason', reason, '--evidence', evidence)
+    assert record('free text', 'T-1').returncode != 0
+    assert record('initial_record', 'T-1').returncode != 0
+    assert record('initial_record', 'tests/missing.py::test_x').returncode != 0
+    assert not (tmp_path / 'docs/impact-map/verification/demo.json').exists()
+    test = tmp_path / 'tests/test_sample.py'
+    test.parent.mkdir()
+    test.write_text('')
+    assert record('initial_record', 'tests/test_sample.py::test_x').returncode == 0
+    ticket = tmp_path / 'docs/tickets/closed/T-1.md'
+    ticket.parent.mkdir(parents=True)
+    ticket.write_text('')
+    assert record('contract_unchanged', 'T-1').returncode == 0

@@ -19,8 +19,11 @@ def setup(root):
     page.parent.mkdir(parents=True)
     meta = dict(id='demo', owner_role='owner', resources=[], anchors=[ANCHOR], related=[], tests=[])
     page.write_text('---\n' + json.dumps(meta) + '\n---\n<!-- impact-map:covers -->\n```json\n{"covers": []}\n```\n<!-- /impact-map:covers -->\n- **E1** `sample.py::f` → `sample.py::g`\n')
+    ticket = root / 'docs/tickets/open/T-1.md'
+    ticket.parent.mkdir(parents=True)
+    ticket.write_text('')
     current = json.loads(cli(root, 'verify', '--page', 'demo', '--anchor', ANCHOR).stdout)['current_hash']
-    assert cli(root, 'verify', '--page', 'demo', '--anchor', ANCHOR, '--record', '--expected-hash', current, '--reason', 'reviewed', '--evidence', 'T-1').returncode == 0
+    assert cli(root, 'verify', '--page', 'demo', '--anchor', ANCHOR, '--record', '--expected-hash', current, '--reason', 'initial_record', '--evidence', 'T-1').returncode == 0
     return page
 
 
@@ -99,10 +102,42 @@ def test_check_class_constant_lifecycle(tmp_path):
     assert check(tmp_path)[0] == 0
     result = cli(tmp_path, 'verify', '--page', 'demo', '--anchor', anchor)
     digest = json.loads(result.stdout)['current_hash']
-    assert cli(tmp_path, 'verify', '--page', 'demo', '--anchor', anchor, '--record', '--expected-hash', digest, '--reason', 'reviewed', '--evidence', 'TEST-1').returncode == 0
+    assert cli(tmp_path, 'verify', '--page', 'demo', '--anchor', anchor, '--record', '--expected-hash', digest, '--reason', 'initial_record', '--evidence', 'T-1').returncode == 0
     src.write_text(src.read_text().replace('VALUE: int = 1', 'VALUE: int = 2'))
     code, result = check(tmp_path)
     assert code == 1 and result['counts']['stale'] == 1
     src.write_text(src.read_text().replace('VALUE: int = 2', 'pass'))
     code, result = check(tmp_path)
     assert code == 1 and any(item['anchor'] == anchor and item['reason'] == 'anchor_missing' for item in result['items'])
+
+
+def test_front_matter_schema_and_test_existence(tmp_path):
+    page = setup(tmp_path)
+    original = page.read_text()
+    for old, new in [('"id": "demo"', '"id": "Bad_ID"'), ('"owner_role": "owner"', '"owner_role": 1'), ('"resources": []', '"resources": ["other:x"]'), ('"resources": []', '"resources": ["event:"]'), ('"tests": []', '"tests": 123'), ('"related": []', '"related": [1]'), ('"anchors": ["sample.py::f"]', '"anchors": "bad"')]:
+        page.write_text(original.replace(old, new))
+        code, result = check(tmp_path)
+        assert code == 2 and result['counts']['invalid_front_matter'] == 1
+    page.write_text(original.replace('"tests": []', '"tests": ["tests/missing.py::test_x"]'))
+    code, result = check(tmp_path)
+    assert code == 1 and result['counts']['test_missing'] == 1
+    test = tmp_path / 'tests/missing.py'
+    test.parent.mkdir()
+    test.write_text('')
+    assert check(tmp_path)[0] == 0
+
+
+def test_check_public_rule_page_and_record(tmp_path):
+    page = setup(tmp_path)
+    original = page.read_text()
+    for value in ('tmp/private', '/home/user/file', '.claude/memory/file', 'memory/secret', 'https://example.org'):
+        page.write_text(original + '\n[private](' + value + ')\n')
+        code, result = check(tmp_path)
+        assert code == 1 and result['counts']['public_rule_violation'] >= 1
+    page.write_text(original)
+    record = tmp_path / 'docs/impact-map/verification/demo.json'
+    data = json.loads(record.read_text())
+    data[0]['reason'] = 'bad\nreason'
+    record.write_text(json.dumps(data))
+    code, result = check(tmp_path)
+    assert code == 1 and result['counts']['public_rule_violation'] >= 1

@@ -409,6 +409,31 @@ def anchor_digest(anchor, data=None):
     return node, digest
 
 
+REASONS = {'contract_unchanged', 'relation_unchanged_refactor',
+           'relation_changed_page_updated', 'initial_record'}
+NAMESPACES = {'state', 'marker', 'event', 'activity', 'db', 'config', 'metric', 'ops', 'log'}
+PUBLIC_PATH = re.compile(r'https?://|/home/|(?:^|[^\w])(?:tmp/|\.claude(?:/|\b)|memory/)', re.I)
+
+
+def test_path(value):
+    path = value.split('::', 1)[0]
+    parts = Path(path).parts
+    if not parts or parts[0] != 'tests' or '..' in parts or Path(path).is_absolute():
+        return False
+    resolved = Path(path).resolve()
+    return resolved.is_relative_to(Path('tests').resolve()) and resolved.is_file()
+
+
+def evidence_exists(value):
+    if not isinstance(value, str) or PUBLIC_PATH.search(value) or re.search(r'[\r\n]', value):
+        return False
+    if test_path(value):
+        return True
+    return bool(re.fullmatch(r'[A-Za-z0-9_-]+', value) and
+                any((Path('docs/tickets') / state / (value + '.md')).is_file()
+                    for state in ('open', 'closed')))
+
+
 def verify(args):
     if not re.fullmatch(r'[A-Za-z0-9_-]+', args.page):
         raise ValueError('invalid domain')
@@ -420,9 +445,8 @@ def verify(args):
     if args.record:
         if not digest or digest != args.expected_hash:
             raise ValueError('expected hash mismatch')
-        for value in (args.reason, args.evidence):
-            if not value or re.search(r'[\r\n]|[a-z][a-z0-9+.-]*://|/home|tmp/', value, re.I):
-                raise ValueError('invalid public text')
+        if args.reason not in REASONS or not evidence_exists(args.evidence):
+            raise ValueError('invalid reason or evidence')
         revision = git('rev-parse', 'HEAD')
         entry = dict(anchor=args.anchor, hash=digest, method=METHOD, date=datetime.now(timezone.utc).date().isoformat(), evidence=args.evidence, source_sha=revision.decode().strip() if revision else None, reason=args.reason)
         records = [r for r in records if r['anchor'] != args.anchor] + [entry]
@@ -456,9 +480,20 @@ def check(args):
         for name in ('id', 'owner_role', 'resources', 'anchors', 'related', 'tests'):
             if name not in meta:
                 add('required', name, 'missing_key')
-        for name in ('anchors', 'related'):
+        if 'id' in meta and (not isinstance(meta['id'], str) or not re.fullmatch(r'[a-z0-9-]+', meta['id'])):
+            raise ValueError()
+        if 'owner_role' in meta and not isinstance(meta['owner_role'], str):
+            raise ValueError()
+        for name in ('resources', 'anchors', 'related', 'tests'):
             if name in meta and (not isinstance(meta[name], list) or not all(isinstance(v, str) and v for v in meta[name])):
                 raise ValueError()
+        for resource in meta.get('resources', []):
+            namespace, sep, name = resource.partition(':')
+            if not sep or namespace not in NAMESPACES or not name or ':' in name or any(c.isspace() for c in name):
+                raise ValueError()
+        for test in meta.get('tests', []):
+            if not test_path(test):
+                add('test', test, 'test_missing')
         for anchor in meta.get('anchors', []):
             anchors.append(('anchor', anchor))
         for ticket in meta.get('related', []):
@@ -475,6 +510,8 @@ def check(args):
         add('declaration', 'covers', 'invalid_covers')
     try:
         text = page.read_text(encoding='utf-8')
+        if PUBLIC_PATH.search(text):
+            add('page', 'page', 'public_rule_violation')
         for match in re.finditer(r'^- \*\*E[0-9]+\*\* `([^`]+)` → `([^`]+)`', text, re.MULTILINE):
             anchors.extend(('edge_endpoint', value) for value in match.groups())
     except (OSError, UnicodeError):
@@ -485,6 +522,8 @@ def check(args):
         if not isinstance(records, list):
             raise ValueError()
         for record in records:
+            if any(PUBLIC_PATH.search(value) or (key == 'reason' and re.search(r'[\r\n]', value)) for key, value in record.items() if isinstance(value, str)):
+                add('record', 'verification', 'public_rule_violation')
             anchor, method, digest = record['anchor'], record['method'], record['hash']
             if not all(isinstance(x, str) and x for x in (anchor, method, digest)):
                 raise ValueError()
@@ -516,7 +555,7 @@ def check(args):
         if record['method'] == METHOD and hashes.get(anchor) is not None and hashes[anchor] != record['hash']:
             add('record', anchor, 'stale')
     errors2 = {'git_unavailable', 'invalid_domain', 'invalid_front_matter', 'invalid_covers', 'invalid_ticket', 'invalid_record', 'invalid_anchor', 'unreadable_page', 'parse_error', 'method_mismatch'}
-    reasons = ('stale', 'anchor_missing', 'missing_key', 'ticket_missing', *sorted(errors2))
+    reasons = ('stale', 'anchor_missing', 'missing_key', 'ticket_missing', 'test_missing', 'public_rule_violation', *sorted(errors2))
     result = {'counts': {reason: sum(item[2] == reason for item in items) for reason in reasons},
               'items': [dict(kind=k, anchor=a, reason=r) for k, a, r in sorted(items)]}
     print(json.dumps(result, sort_keys=True, separators=(',', ':')))
