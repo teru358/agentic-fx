@@ -294,11 +294,15 @@ def _invoke(match: RouteMatch, query: dict[str, str], client, report: _Reporter,
         limit = _positive(query, "limit", maximum=200, default=20)
         return _call(report, client.approvals, limit=limit), render.render_approvals
     if method == "approval":
-        if query:
+        if set(query) - {"tab"}:
+            raise _Reject(400)
+        tab = query.get("tab", tabs.default_tab(tabs.APPROVAL_DETAIL))
+        if tab not in tabs.tab_names(tabs.APPROVAL_DETAIL):
             raise _Reject(400)
         reply = _call(report, client.approval, match.values["id"])
         change_data = _change_of(client, match.values["id"], reply)
-        return reply, functools.partial(render.render_approval, change_data=change_data)
+        return reply, functools.partial(render.render_approval_view, change_data=change_data,
+                                        tab=tab, approval_id=match.values["id"])
     if method == "log":
         n = _positive(query, "n", maximum=500, default=100)
         return _call(report, client.log, n=n), render.render_log
@@ -520,9 +524,10 @@ def handle_request(request: Request | bytes, client, *,
                 return _response(502, improve_pages.render_improve_unavailable(), head=head,
                                  writable=writable)
             raise
-        body = renderer(reply.data)
-        if writable and match.route.client_method == "approval":
-            body = _with_decision_forms(body, reply.data)
+        if match.route.client_method == "approval":
+            body = _approval_body(renderer(reply.data), reply.data, writable_tabs)
+        else:
+            body = renderer(reply.data)
         return _response(200, body, head=head, writable=writable)
     except _Reject as reject:
         return _error(reject.status, head=head, writable=writable)
@@ -532,15 +537,18 @@ def handle_request(request: Request | bytes, client, *,
         return _error(500, head=head, writable=writable)
 
 
-def _with_decision_forms(body: bytes, data: dict) -> bytes:
-    """承認詳細が決定待ちの plugin のときだけ、承認・却下の form を足す。"""
+def _approval_body(view: render.ApprovalView, data: dict, writable: bool) -> bytes:
+    """承認詳細が決定待ちの plugin の概要のときだけ、決定のブロックと承認・却下の form を足す。
+
+    書込みが使え (有効かつ経路が許される)、ページが clip されていないことも条件。
+    """
     digest = data.get("payload_sha256")
     approval_id = data.get("id")
-    if (data.get("status") != "pending" or data.get("kind") != "plugin"
-            or type(digest) is not str or write.DIGEST.fullmatch(digest) is None
-            or type(approval_id) is not int):
-        return body
-    return write_pages.inject_forms(body, write_pages.approval_forms(approval_id, digest))
+    if (not writable or view.tab != "overview" or view.clipped or data.get("status") != "pending"
+            or data.get("kind") != "plugin" or type(digest) is not str
+            or write.DIGEST.fullmatch(digest) is None or type(approval_id) is not int):
+        return view.page
+    return write_pages.inject_forms(view.page, write_pages.approval_forms(approval_id, digest, view.block))
 
 
 def _host_values(request: Request) -> list[str]:

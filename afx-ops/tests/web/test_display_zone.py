@@ -159,12 +159,12 @@ def _change(computed="2026-11-06T10:06:00+00:00", summary="LLM 要約 2026-11-06
             "performance": {"in_sample": [], "holdout": []}, "summary": summary}
 
 
-def _approval_text(tz=TOKYO, **change):
+def _approval_text(tz=TOKYO, tab="overview", **change):
     change_data = {"id": 7, "change": _change(**change),
                    "claims": {"summary": "要約 2026-11-06T10:07:00Z",
                               "selection_rationale": "根拠 2026-11-06T10:08:00+00:00"},
                    "diff": {"files": [], "omitted_lines": 0}, "display_timezone": tz}
-    return _get(Client(approval=_detail(tz), change=change_data), "/approvals/7")
+    return _get(Client(approval=_detail(tz), change=change_data), "/approvals/7", {"tab": tab})
 
 
 def test_the_approval_page_converts_decided_at_and_the_hand_written_computed_time_row():
@@ -175,10 +175,10 @@ def test_the_approval_page_converts_decided_at_and_the_hand_written_computed_tim
 
 
 def test_llm_text_and_identifiers_are_not_converted():
-    text = _approval_text()
-    assert "要約 2026-11-06T10:07:00Z" in text
-    assert "根拠 2026-11-06T10:08:00+00:00" in text
-    assert "a1a1a1a1a1a1" in text
+    claims = _approval_text(tab="claims")
+    assert "要約 2026-11-06T10:07:00Z" in claims
+    assert "根拠 2026-11-06T10:08:00+00:00" in claims
+    assert "a1a1a1a1a1a1" in _approval_text()
 
 
 def test_an_unreadable_computed_time_stays_as_written_and_does_not_fail_the_page():

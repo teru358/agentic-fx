@@ -568,33 +568,63 @@ def _base_section(data: Mapping[str, object]) -> str:
     return "" if line is None else "<section><h2>土台</h2><p>" + _text(line) + "</p></section>"
 
 
+# 追加節の builder と、それを出すタブ。省くときは先頭の節から
+_EXTRA_BUILDERS = (("result", _baseline_section), ("overview", _gate_section),
+                   ("overview", _reevaluation_section), ("overview", _base_section),
+                   ("overview", _history_section))
+
+
+def _tagged_extras(data: Mapping[str, object]) -> list[tuple[str, str]]:
+    """承認ページ末尾の節を (タブ, html) で。重要でないものが先 (収まらないときは先頭から省く)。"""
+    tagged = [(tab, build(data)) for tab, build in _EXTRA_BUILDERS]
+    return [(tab, section) for tab, section in tagged if section]
+
+
 def _extra_sections(data: Mapping[str, object]) -> list[str]:
-    """承認ページ末尾の節。重要でないものが先 (収まらないときは先頭から省く)。"""
-    return [section for section in (_baseline_section(data), _gate_section(data),
-                                    _reevaluation_section(data), _base_section(data),
-                                    _history_section(data)) if section]
+    return [section for _tab, section in _tagged_extras(data)]
 
 
-def _unchanged_page(data: Mapping[str, object], message: str) -> bytes:
-    tz = zone_of(data)
-    body = (_pairs(data, DETAIL_FIELDS, nested_allowed=NESTED_FIELDS, tz=tz)
-            + "<section><h2>変更内容</h2><p>" + message + "</p></section>")
-    extra = _fit_extra_sections(len(_document("Approval", "", tz, current="/plugins")) + _bytes(body), _extra_sections(data))
-    page = _document("Approval", body + "".join(extra), tz, current="/plugins")
-    return page if len(page) < PAGE_LIMIT_BYTES else _page("Approval", "<p>Output clipped</p>", tz, current="/plugins")
+class ApprovalView:
+    """承認詳細 1 タブの描画結果。``block`` は概要で form の前に足す決定のブロック (足さないなら空)。"""
+
+    __slots__ = ("page", "tab", "clipped", "block")
+
+    def __init__(self, page: bytes, tab: str, clipped: bool, block: str) -> None:
+        self.page = page
+        self.tab = tab
+        self.clipped = clipped
+        self.block = block
 
 
-def render_approval(data: Mapping[str, object], change_data: Mapping[str, object] | None = None) -> bytes:
-    """承認 #N。``change_data`` は daemon の変更内容 endpoint の応答 (取れなければ None)。"""
+def _approval_at(data: Mapping[str, object], approval_id: int | None) -> str:
+    number = approval_id if approval_id is not None else data.get("id")
+    return f"/approvals/{number}" if type(number) is int and number >= 1 else "/approvals"
+
+
+def render_approval_view(data: Mapping[str, object], change_data: Mapping[str, object] | None = None,
+                         tab: str = "overview", approval_id: int | None = None) -> ApprovalView:
+    """承認 #N の 1 タブ。``change_data`` は daemon の変更内容 endpoint の応答 (取れなければ None)。
+
+    どのタブも同じ仮想の 1 ページ (全タブの節) を 1 回計算し、その結果のうち自分の節だけを出す。
+    """
     change = data.get("change") if type(data.get("change")) is dict else None
     if type(change_data) is dict and type(change_data.get("change")) is dict:
         change = change_data["change"]
+    at = _approval_at(data, approval_id)
+    tagged = _tagged_extras(data)
     if change is None:
-        return _unchanged_page(data, REASON_TEXT["unavailable"])
-    if not _change_is_well_formed(change):
-        return _unchanged_page(data, INVALID_CHANGE_TEXT)
-    return compose_approval_page(data, change, change_data if type(change_data) is dict else None,
-                                 extra_sections=_extra_sections(data)).page
+        virtual = _unchanged_virtual(data, REASON_TEXT["unavailable"], tagged, at)
+    elif not _change_is_well_formed(change):
+        virtual = _unchanged_virtual(data, INVALID_CHANGE_TEXT, tagged, at)
+    else:
+        virtual = compose_approval_page(data, change, change_data if type(change_data) is dict else None,
+                                        extra_sections=tagged, approval_id=approval_id)
+    return virtual.view(data, tab, at)
+
+
+def render_approval(data: Mapping[str, object], change_data: Mapping[str, object] | None = None,
+                    tab: str = "overview", approval_id: int | None = None) -> bytes:
+    return render_approval_view(data, change_data, tab, approval_id).page
 
 
 # ---------------------------------------------------------------- 承認の変更内容
@@ -680,6 +710,40 @@ def _computed_at(value: object, tz: str) -> str:
                                             raw=value, utc_fallback=True), 40)
 
 
+# 承認詳細の概要の群と群の中の並び。allowlist (DETAIL_FIELDS / OVERVIEW_FIELDS) と同じ集合を並べる。
+# 「対象」の群は change 由来の手書きの行で、allowlist の key を持たない
+APPROVAL_GROUPS = (
+    ("承認", ("id", "kind", "status", "decided_by", "decided_at")),
+    ("内部値", ("payload_sha256", "baseline", "parent_facts", "asserted_actor", "in_sample", "holdout")),
+)
+TARGET_GROUP = "対象"
+
+
+def _approval_groups(data: Mapping[str, object], tz: str, *, parent: bool = True,
+                     target: str = "", metrics: bool = True) -> str:
+    """承認の dl を群の小見出しに分けて並べる。値の無い行は出さず、行の無い群は小見出しも出さない。
+
+    ``target`` は「対象」の群の本文 (変更内容が無いときは空)。``metrics`` が偽なら成績の欄を外す。
+    """
+    blocked = set()
+    if not parent:
+        blocked.add("parent_facts")
+    if not metrics:
+        blocked |= {"in_sample", "holdout"}
+    parts = []
+    for title, keys in APPROVAL_GROUPS:
+        if title == "内部値" and target:
+            parts.append(f"<h3>{TARGET_GROUP}</h3>{target}")
+            target = ""
+        rows = _pairs(data, DETAIL_FIELDS, nested_allowed=NESTED_FIELDS, tz=tz,
+                      order=[key for key in keys if key not in blocked])
+        if rows:
+            parts.append(f"<h3>{title}</h3>{rows}")
+    if target:
+        parts.append(f"<h3>{TARGET_GROUP}</h3>{target}")
+    return "".join(parts)
+
+
 def _overview_section(data: Mapping[str, object], change: Mapping[str, object], parent: bool,
                       tz: str = "UTC") -> str:
     name = change.get("name")
@@ -690,14 +754,14 @@ def _overview_section(data: Mapping[str, object], change: Mapping[str, object], 
              ("候補", _hash12(change.get("candidate_hash"))),
              ("比較対象", _hash12(change.get("baseline_hash"))),
              ("計算時刻", _computed_at(change.get("computed_at"), tz))]
-    fields = OVERVIEW_FIELDS if parent else OVERVIEW_FIELDS - {"parent_facts"}
-    body = _pairs(data, fields, nested_allowed=NESTED_FIELDS, tz=tz) + _rows(pairs)
+    target = _rows(pairs)
     if change.get("classification") == "new":
-        body += "<p>前版なし</p>"
+        target += "<p>前版なし</p>"
     reason = change.get("reason")
     if reason is not None:
-        body += "<p>" + REASON_TEXT.get(reason, REASON_TEXT["unsafe_source"]) + "</p>"
-    return "<section><h2>概要</h2>" + body + "</section>"
+        target += "<p>" + REASON_TEXT.get(reason, REASON_TEXT["unsafe_source"]) + "</p>"
+    return ("<section><h2>概要</h2>"
+            + _approval_groups(data, tz, parent=parent, target=target, metrics=False) + "</section>")
 
 
 def _params_rows(change: Mapping[str, object]) -> tuple[list[str], str]:
@@ -882,6 +946,11 @@ def _diff_section(diff: object) -> tuple[str, int, list[FilePlan]]:
 
 
 EXTRA_OMITTED_SECTION = "<section><p>省略: 一部の節は表示容量の都合で省きました</p></section>"
+# 再読込を残すタブ。長い diff や申告を読んでいる間に読み直さないよう、変更と申告は外す
+REFRESH_TABS = frozenset({"overview", "result"})
+UNCHANGED_BLOCK_TEXT = "変更内容を取得できないため、比較と規模は出せません"
+DECISION_BASIS_TEXT = ("承認が結び付くのは承認の内容 (payload_sha256。候補の artifact・成績・申告・gate の警告を含む) で、"
+                       "比較対象は含まない。差分は表示した時点の配備中の版との比較で、配備中の版が変わると変わる。")
 
 
 def _fit_extra_sections(used: int, extra_sections: Sequence[str]) -> list[str]:
@@ -897,24 +966,161 @@ def _fit_extra_sections(used: int, extra_sections: Sequence[str]) -> list[str]:
     return kept
 
 
-class ApprovalPage:
-    __slots__ = ("page", "diff_bytes", "other_bytes", "plans")
+def _fit_tagged_extras(used: int, tagged: Sequence[tuple[str, str]]) -> tuple[list[tuple[str, str]], frozenset[str]]:
+    """``_fit_extra_sections`` の結果を (タブ, html) に戻す。省いた節が属するタブも返す。"""
+    kept = _fit_extra_sections(used, [section for _tab, section in tagged])
+    if len(kept) == len(tagged) and (not kept or kept[0] is not EXTRA_OMITTED_SECTION):
+        return list(tagged), frozenset()
+    survivors = len(kept) - 1
+    dropped = len(tagged) - survivors
+    return list(tagged[dropped:]), frozenset(tab for tab, _section in tagged[:dropped])
 
-    def __init__(self, page: bytes, diff_bytes: int, other_bytes: int, plans: list[FilePlan]) -> None:
-        self.page = page
+
+def _scale_params(change: Mapping[str, object], total: int) -> str:
+    params = change.get("params")
+    if type(params) is not dict:
+        return "params の差分: 取得できない"
+    if params.get("reason") == "redacted":
+        return "params の差分: 非表示"
+    notes = []
+    for label, key in (("ほか", "omitted"), ("形に合わない key", "invalid_keys"),
+                       ("比較していない key", "flatten_omitted")):
+        count = params.get(key)
+        if type(count) is int and count > 0:
+            notes.append(f"{label} {count} 件")
+    if total == 0 and not notes:
+        return "params の差分: 取得できない"
+    return f"params の差分 {total} 件" + (" (" + "、".join(notes) + ")" if notes else "")
+
+
+def _scale_diff(change_data: Mapping[str, object] | None, plans: Sequence[FilePlan]) -> str:
+    if change_data is None or type(change_data.get("diff")) is not dict:
+        return "diff: 取得できない"
+    hidden = sum(1 for plan in plans if plan.kind == "redacted")
+    seen = [plan for plan in plans if plan.kind != "redacted"]
+    parts = []
+    if seen or not hidden:
+        parts.append(f"表示 {sum(plan.shown for plan in seen if plan.kind == 'pre')} 行・省略 "
+                     f"{sum(plan.omitted for plan in seen if plan.kind == 'pre')} 行")
+    if hidden:
+        parts.append(f"非表示 {hidden} ファイル")
+    return "diff " + "・".join(parts)
+
+
+def _scale_claims(change_data: Mapping[str, object] | None, summary: object, rationale: object) -> str:
+    if change_data is None:
+        return "申告: 取得できない"
+    given = any(type(value) is str and value for value in (summary, rationale))
+    return "申告: " + ("あり" if given else "なし")
+
+
+def _decision_block(data: Mapping[str, object], at: str, *, change: Mapping[str, object] | None = None,
+                    scale: Sequence[str] = (), tz: str = "UTC") -> str:
+    """概要の末尾に form と一緒に足す決定のブロック。変更内容が無いときは比較と規模の代わりに固定文。"""
+    digest = data.get("payload_sha256")
+    rows = [("承認の内容 (payload_sha256)", _hash12(digest))]
+    body = ""
+    if change is not None:
+        label = CLASS_LABELS.get(change.get("classification"), CLASS_LABELS["unknown"])
+        rows += [("候補 (artifact)", _hash12(change.get("candidate_hash"))),
+                 ("比較対象", _hash12(change.get("baseline_hash"))), ("分類", label),
+                 ("計算時刻", _computed_at(change.get("computed_at"), tz))]
+    body += _rows(rows)
+    if change is None:
+        body += "<p>" + UNCHANGED_BLOCK_TEXT + "</p>"
+    else:
+        reason = change.get("reason")
+        if reason is not None:
+            body += "<p>" + REASON_TEXT.get(reason, REASON_TEXT["unsafe_source"]) + "</p>"
+        body += ("<h3>見ていないタブの規模</h3><ul>"
+                 + "".join(f"<li>{html.escape(text, quote=True)}</li>" for text in scale) + "</ul>"
+                 + "<p>" + " / ".join(f'<a href="{html.escape(at, quote=True)}?tab={name}">{label}</a>'
+                                      for name, label in (("result", "成績"), ("change", "変更"),
+                                                          ("claims", "申告"))) + "</p>")
+    return body + "<p>" + DECISION_BASIS_TEXT + "</p>"
+
+
+class ApprovalPage:
+    """承認詳細の仮想の 1 ページ (全タブの節を並べたもの) の計算結果。各タブはこの結果から自分の節を出す。
+
+    ``total_bytes`` が 64 KiB 以上なら全タブが「Output clipped」になる。``other_bytes`` は diff 以外 (骨格を含む)。
+    """
+
+    __slots__ = ("sections", "extras", "omitted_tabs", "total_bytes", "diff_bytes", "other_bytes",
+                 "plans", "params_total", "scale", "block")
+
+    def __init__(self, sections: Mapping[str, str], extras: Sequence[tuple[str, str]],
+                 omitted_tabs: frozenset[str], total_bytes: int, diff_bytes: int, other_bytes: int,
+                 plans: list[FilePlan], params_total: int, scale: Sequence[str], block: str) -> None:
+        self.sections = dict(sections)
+        self.extras = list(extras)
+        self.omitted_tabs = omitted_tabs
+        self.total_bytes = total_bytes
         self.diff_bytes = diff_bytes
         self.other_bytes = other_bytes
         self.plans = plans
+        self.params_total = params_total
+        self.scale = tuple(scale)
+        self.block = block
+
+    @property
+    def clipped(self) -> bool:
+        return self.total_bytes >= PAGE_LIMIT_BYTES
+
+    def body(self, tab: str) -> str:
+        tail = "".join(section for owner, section in self.extras if owner == tab)
+        note = EXTRA_OMITTED_SECTION if tab in self.omitted_tabs else ""
+        return (self.sections.get(tab, "") + note + tail) or "<p>なし</p>"
+
+    def view(self, data: Mapping[str, object], tab: str, at: str) -> ApprovalView:
+        tz = zone_of(data)
+        bar = tab_table.bar(tab_table.APPROVAL_DETAIL, tab, at=at)
+        refresh = tab in REFRESH_TABS
+        if self.clipped:
+            page = _document("Approval", "<p>Output clipped</p>", tz, refresh=refresh,
+                             current="/plugins", tabs=bar)
+            return ApprovalView(page, tab, True, "")
+        page = _document("Approval", self.body(tab), tz, refresh=refresh, current="/plugins", tabs=bar)
+        return ApprovalView(page, tab, False, self.block if tab == "overview" else "")
+
+
+def _virtual_page(data: Mapping[str, object], at: str, sections: Mapping[str, str], extras_fit,
+                  *, diff_bytes: int = 0, plans: Sequence[FilePlan] = (), params_total: int = 0,
+                  scale: Sequence[str] = (), block_change: Mapping[str, object] | None = None,
+                  tz: str = "UTC") -> ApprovalPage:
+    kept, omitted_tabs = extras_fit
+    extra_bytes = sum(_bytes(section) for _tab, section in kept)
+    if omitted_tabs:
+        extra_bytes += _bytes(EXTRA_OMITTED_SECTION)
+    skeleton = len(_document("Approval", "", tz, current="/plugins",
+                             tabs=tab_table.bar(tab_table.APPROVAL_DETAIL, "overview", at=at)))
+    total = skeleton + sum(_bytes(section) for section in sections.values()) + extra_bytes
+    block = _decision_block(data, at, change=block_change, scale=scale, tz=tz)
+    return ApprovalPage(sections, kept, omitted_tabs, total, diff_bytes, total - diff_bytes,
+                        list(plans), params_total, scale, block)
+
+
+def _unchanged_virtual(data: Mapping[str, object], message: str,
+                       extra_sections: Sequence[tuple[str, str]], at: str) -> ApprovalPage:
+    """変更内容の無い承認詳細。概要に dl と固定文、追加節は通常と同じタブ、変更と申告は「なし」。"""
+    tz = zone_of(data)
+    overview = ("<section><h2>概要</h2>" + _approval_groups(data, tz) + "</section>"
+                "<section><h2>変更内容</h2><p>" + message + "</p></section>")
+    skeleton = len(_document("Approval", "", tz, current="/plugins",
+                             tabs=tab_table.bar(tab_table.APPROVAL_DETAIL, "overview", at=at)))
+    fit = _fit_tagged_extras(skeleton + _bytes(overview), extra_sections)
+    return _virtual_page(data, at, {"overview": overview}, fit, tz=tz)
 
 
 def compose_approval_page(data: Mapping[str, object], change: Mapping[str, object],
                           change_data: Mapping[str, object] | None,
-                          extra_sections: Sequence[str] = ()) -> ApprovalPage:
-    """5 節 (概要・params の差分・成績・申告・変更 diff) を組み、ページ全体を 64 KiB 未満に収める。
-    diff は 48 KiB 以下、それ以外 (骨格を含む) は 15 KiB 以下。超えるときは params の差分 →
-    申告 → 親の記録 の順で省略する。``extra_sections`` は末尾に足す節 (配備中の版の比較・indicator gate
-    の警告) で、重要でない順。他の節と同じ 15 KiB の中に数え、他の節を縮め切ってもなお収まらない
-    ときだけ、先頭から節単位で省いて「省略」行を残す。"""
+                          extra_sections: Sequence[tuple[str, str]] = (),
+                          approval_id: int | None = None) -> ApprovalPage:
+    """全タブの節を並べた仮想の 1 ページを組み、64 KiB 未満に収める。
+    diff は 48 KiB 以下、それ以外 (帯を含む骨格を含む) は 15 KiB 以下。超えるときは params の差分 →
+    申告 → 親の記録 の順で省略する。``extra_sections`` は (タブ, 節) で、配備中の版の比較・indicator gate
+    の警告などの末尾に足す節 (重要でない順)。他の節と同じ 15 KiB の中に数え、他の節を縮め切ってもなお
+    収まらないときだけ、先頭から節単位で省いて「省略」行を残す。骨格は常に再読込付きで測る。"""
     claims = change_data.get("claims") if change_data and type(change_data.get("claims")) is dict else {}
     summary = claims.get("summary", change.get("summary"))
     rationale = claims.get("selection_rationale")
@@ -926,32 +1132,35 @@ def compose_approval_page(data: Mapping[str, object], change: Mapping[str, objec
     diff_html = "<section><h2>変更 diff</h2>" + diff_body + "</section>"
     frame = _bytes(diff_html) - diff_bytes
     tz = zone_of(data)
-    skeleton = len(_document("Approval", "", tz, current="/plugins"))
+    at = _approval_at(data, approval_id)
+    skeleton = len(_document("Approval", "", tz, current="/plugins",
+                             tabs=tab_table.bar(tab_table.APPROVAL_DETAIL, "overview", at=at)))
     params_total = len(_params_rows(change)[0])
 
-    def build(show_params: int | None, claim_limit: int, parent: bool) -> str:
+    def build(show_params: int | None, claim_limit: int, parent: bool) -> dict[str, str]:
         params_html, _ = _params_section(change, show_params)
-        return (_overview_section(data, change, parent, tz) + params_html
-                + _performance_section(change) + _claims_section(summary, rationale, claim_limit))
+        return {"overview": _overview_section(data, change, parent, tz),
+                "result": _performance_section(change),
+                "change": params_html,
+                "claims": _claims_section(summary, rationale, claim_limit)}
 
     candidates = [(None, CLAIM_CHARS, True)]
     candidates += [(k, CLAIM_CHARS, True) for k in range(params_total - 1, -1, -1)]
     candidates += [(0, limit, True) for limit in (1000, 500, 250, 100, 0)]
     candidates += [(0, 0, False)]
     fixed = skeleton + frame
-    others = ""
+    extra_bytes = sum(_bytes(section) for _tab, section in extra_sections)
+    others: dict[str, str] = {}
     for show, limit, parent in candidates:
         others = build(show, limit, parent)
-        if fixed + _bytes(others) + sum(_bytes(x) for x in extra_sections) <= OTHER_BUDGET_BYTES:
+        if fixed + sum(_bytes(section) for section in others.values()) + extra_bytes <= OTHER_BUDGET_BYTES:
             break
-    kept = _fit_extra_sections(fixed + _bytes(others), extra_sections)
-    extra_html = "".join(kept)
-    body = others + (diff_html if diff_body else "")
-    page = _document("Approval", body + extra_html, tz, current="/plugins")
-    other_bytes = len(page) - diff_bytes
-    if len(page) >= PAGE_LIMIT_BYTES:
-        page = _page("Approval", "<p>Output clipped</p>", tz, current="/plugins")
-    return ApprovalPage(page, diff_bytes, other_bytes, plans)
+    fit = _fit_tagged_extras(fixed + sum(_bytes(section) for section in others.values()), extra_sections)
+    others["change"] += diff_html if diff_body else ""
+    scale = (_scale_params(change, params_total), _scale_diff(change_data, plans),
+             _scale_claims(change_data, summary, rationale))
+    return _virtual_page(data, at, others, fit, diff_bytes=diff_bytes, plans=plans,
+                         params_total=params_total, scale=scale, block_change=change, tz=tz)
 
 
 def render_log(data: Mapping[str, object]) -> bytes:

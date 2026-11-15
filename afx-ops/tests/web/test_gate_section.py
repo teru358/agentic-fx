@@ -20,8 +20,8 @@ def _data(**fields):
     return data
 
 
-def _page(data) -> str:
-    return render_approval(data, None).decode("utf-8")
+def _page(data, tab="overview") -> str:
+    return render_approval(data, None, tab).decode("utf-8")
 
 
 LINES = [SCALE + " (列: gap, vol_move)", "警告: 配備済み `ema` と類似 (列: value)",
@@ -40,11 +40,13 @@ def test_the_web_package_has_no_word_table_so_it_shows_only_what_it_is_given():
     assert "警告" not in page and "インジケータ" not in page
 
 
-def test_the_section_sits_below_the_baseline_section():
+def test_the_baseline_section_is_in_the_result_tab_and_the_warnings_in_the_overview():
     comparison = {"verdict": "improved", "stages": {}}
-    page = _page(_data(baseline={"comparison": comparison},
-                       gate_lines=["警告: 有限値が少ない"]))
-    assert page.index("配備中の版 (同条件で再評価)") < page.index("有限値が少ない")
+    data = _data(baseline={"comparison": comparison}, gate_lines=["警告: 有限値が少ない"])
+    assert "配備中の版 (同条件で再評価)" in _page(data, "result")
+    assert "有限値が少ない" not in _page(data, "result")
+    assert "有限値が少ない" in _page(data)
+    assert "配備中の版 (同条件で再評価)" not in _page(data)
 
 
 def test_with_a_change_section_the_warnings_are_still_shown():

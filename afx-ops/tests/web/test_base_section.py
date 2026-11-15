@@ -4,7 +4,9 @@ from __future__ import annotations
 import pytest
 
 from afx_ops.web.render import render_approval
+from afx_ops.web.tabs import APPROVAL_DETAIL, tab_names
 
+TABS = tab_names(APPROVAL_DETAIL)
 MISMATCH = {"state": "mismatch", "base": "a" * 12, "live": "b" * 12}
 NONE_BUT_LIVE = {"state": "none_but_live", "base": "none", "live": "c" * 12}
 UNREADABLE = {"state": "unreadable", "base": "d" * 12, "live": "unreadable"}
@@ -22,8 +24,12 @@ def _data(base_check=None, **fields):
     return data
 
 
-def _page(data, change_data=None) -> str:
-    return render_approval(data, change_data).decode("utf-8")
+def _page(data, change_data=None, tab="overview") -> str:
+    return render_approval(data, change_data, tab).decode("utf-8")
+
+
+def _every_tab(data, change_data=None) -> str:
+    return "\n".join(_page(data, change_data, tab) for tab in TABS)
 
 
 def test_ac14_a_mismatch_shows_both_short_hashes():
@@ -45,8 +51,8 @@ def test_ac14_each_warning_state_shows_its_line(view, line):
 
 
 def test_ac14_the_section_does_not_need_a_comparison():
-    page = _page(_data(NONE_BUT_LIVE))
-    assert "配備中の版 (同条件で再評価)" not in page and "<h2>土台</h2>" in page
+    data = _data(NONE_BUT_LIVE)
+    assert "配備中の版 (同条件で再評価)" not in _every_tab(data) and "<h2>土台</h2>" in _page(data)
 
 
 def test_ac14_the_section_and_the_content_hash_warning_coexist():
@@ -54,9 +60,8 @@ def test_ac14_the_section_and_the_content_hash_warning_coexist():
         "base_content_hash": "b" * 64,
         "comparison": {"mode": "enforce", "verdict": "improved", "reason": "x", "stages": {}}},
         baseline_hash_warning={"expected": "e" * 12, "actual": "f" * 12})
-    page = _page(data)
-    assert "配備中の版の hash が比較時と異なります" in page
-    assert "<h2>土台</h2>" in page
+    assert "配備中の版の hash が比較時と異なります" in _page(data, tab="result")
+    assert "<h2>土台</h2>" in _page(data)
 
 
 @pytest.mark.parametrize("view", [
@@ -66,14 +71,14 @@ def test_ac14_the_section_and_the_content_hash_warning_coexist():
     None, "mismatch", 5, [], {}, {"state": 5}, {"state": ["mismatch"]}, {"state": "nonsense"},
 ])
 def test_ac14_no_section_otherwise(view):
-    page = _page(_data(view))
+    page = _every_tab(_data(view))
     assert "<h2>土台</h2>" not in page and "警告" not in page
 
 
 def test_ac14_a_response_without_base_check_renders_as_before():
     data = _data()
     del data["base_check"]
-    assert "<h2>土台</h2>" not in _page(data)
+    assert "<h2>土台</h2>" not in _every_tab(data)
 
 
 def test_ac14_a_malformed_value_is_shown_as_unknown_and_never_echoed():

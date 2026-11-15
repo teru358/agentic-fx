@@ -5,7 +5,7 @@ import re
 
 import pytest
 
-from afx_ops.web import render
+from afx_ops.web import render, tabs
 
 KIB = 1024
 HEADER = "@@ -1 +1 @@"
@@ -39,6 +39,15 @@ def change_data(change=None, files=None, claims=None):
 def compose(data, detail=None):
     return render.compose_approval_page(detail if detail is not None else dict(DETAIL),
                                         data["change"], data)
+
+
+def tab_page(built, tab, detail=None) -> bytes:
+    """仮想ページの結果から、あるタブの 1 ページを出す。"""
+    return built.view(detail if detail is not None else DETAIL, tab, "/approvals/7").page
+
+
+def tab_text(built, tab, detail=None) -> str:
+    return tab_page(built, tab, detail).decode()
 
 
 def overview_of(page: bytes) -> str:
@@ -103,28 +112,32 @@ def test_other_sections_may_use_exactly_15_kib_and_shrink_from_one_byte_more():
     change, claims = _claims_and_params(rows, summary, 2000)
     fit = compose(change_data(change, claims=claims))
     assert fit.other_bytes == render.OTHER_BUDGET_BYTES
-    assert fit.page.decode().count("<dt>params.k") == rows
+    assert tab_text(fit, "change").count("<dt>params.k") == rows
     change, claims = _claims_and_params(rows, summary + 1, 2000)
     over = compose(change_data(change, claims=claims))
     assert over.other_bytes <= render.OTHER_BUDGET_BYTES
-    assert over.page.decode().count("<dt>params.k") < rows
+    assert tab_text(over, "change").count("<dt>params.k") < rows
 
 
 # ---------------------------------------------------------------- ページ全体の 64 KiB
 
-def test_a_page_of_exactly_64_kib_is_clipped_and_one_byte_less_is_served(monkeypatch):
+def test_a_virtual_page_of_exactly_64_kib_clips_every_tab_and_one_byte_less_serves_them(monkeypatch):
     monkeypatch.setattr(render, "OTHER_BUDGET_BYTES", 10 ** 6)
     monkeypatch.setattr(render, "DIFF_BUDGET_BYTES", 10 ** 6)
     monkeypatch.setattr(render, "FILE_QUOTA_BYTES", 10 ** 6)
 
-    def page_with(chars):
-        return compose(change_data(files=[entry("plugin.py", ["+" + "a" * chars])])).page
-    fixed = len(page_with(1)) - 1
-    served = page_with(render.PAGE_LIMIT_BYTES - 1 - fixed)
-    assert len(served) == render.PAGE_LIMIT_BYTES - 1 and b"<h3>plugin.py</h3>" in served
-    clipped = page_with(render.PAGE_LIMIT_BYTES - fixed)
-    assert len(clipped) < render.PAGE_LIMIT_BYTES
-    assert b"Output clipped" in clipped and b"<h3>plugin.py</h3>" not in clipped
+    def built_with(chars):
+        return compose(change_data(files=[entry("plugin.py", ["+" + "a" * chars])]))
+    fixed = built_with(1).total_bytes - 1
+    served = built_with(render.PAGE_LIMIT_BYTES - 1 - fixed)
+    assert served.total_bytes == render.PAGE_LIMIT_BYTES - 1 and not served.clipped
+    assert b"<h3>plugin.py</h3>" in tab_page(served, "change")
+    clipped = built_with(render.PAGE_LIMIT_BYTES - fixed)
+    assert clipped.total_bytes == render.PAGE_LIMIT_BYTES and clipped.clipped
+    for tab in tabs.tab_names(tabs.APPROVAL_DETAIL):
+        page = tab_page(clipped, tab)
+        assert b"Output clipped" in page and b"<h3>plugin.py</h3>" not in page
+        assert len(page) < render.PAGE_LIMIT_BYTES
 
 
 def test_a_generic_page_of_exactly_the_response_limit_is_served_and_one_more_is_clipped():
@@ -136,9 +149,13 @@ def test_a_generic_page_of_exactly_the_response_limit_is_served_and_one_more_is_
 
 # ---------------------------------------------------------------- 縮小の段階
 
-def _ladder_page(tail_chars, items=21):
+def _ladder_detail(tail_chars, items=21):
     parent = {"result": ["p" * 500] * items + ["q" * tail_chars]}
-    detail = dict(DETAIL, parent_facts=parent)
+    return dict(DETAIL, parent_facts=parent)
+
+
+def _ladder_page(tail_chars, items=21):
+    detail = _ladder_detail(tail_chars, items)
     data = change_data(claims={"summary": "s" * 2000, "selection_rationale": "r" * 2000})
     return compose(data, detail)
 
@@ -149,9 +166,10 @@ def test_claims_shrink_through_each_step_before_the_parent_record_is_given_up():
         for tail in range(0, 501, 10):
             built = _ladder_page(tail, items)
             assert built.other_bytes <= render.OTHER_BUDGET_BYTES
-            match = re.search(r"<h3>summary</h3><pre>(s*)…?</pre>", built.page.decode())
+            claims = tab_text(built, "claims")
+            match = re.search(r"<h3>summary</h3><pre>(s*)…?</pre>", claims)
             seen.add(len(match.group(1)) if match else 0)
-            omitted_claims = omitted_claims or "<p>…(省略)</p>" in built.page.decode()
+            omitted_claims = omitted_claims or "<p>…(省略)</p>" in claims
     assert {2000, 1000, 500, 250, 100} <= seen
     assert omitted_claims
 
@@ -159,8 +177,9 @@ def test_claims_shrink_through_each_step_before_the_parent_record_is_given_up():
 def test_the_parent_record_is_dropped_last_and_only_when_nothing_else_is_left_to_shrink():
     built = _ladder_page(500, items=50)
     assert built.other_bytes <= render.OTHER_BUDGET_BYTES
-    assert b"<dt>parent_facts</dt>" not in built.page
-    assert b"<dt>parent_facts</dt>" in _ladder_page(0, items=1).page
+    assert b"<dt>parent_facts</dt>" not in tab_page(built, "overview", _ladder_detail(500, 50))
+    small = _ladder_page(0, items=1)
+    assert b"<dt>parent_facts</dt>" in tab_page(small, "overview", _ladder_detail(0, 1))
 
 
 # ---------------------------------------------------------------- 概要の allowlist
@@ -169,12 +188,12 @@ def test_overview_shows_the_decision_fields_the_parent_record_and_the_hash_of_th
     detail = dict(DETAIL, decided_by="alice", decided_at="2026-10-19T02:00:00+00:00",
                   parent_facts={"analysis_call_count": 3}, unknown_field="LEAK")
     built = compose(change_data(), detail)
-    overview = overview_of(built.page)
+    overview = overview_of(tab_page(built, "overview", detail))
     assert "<dt>decided_by</dt><dd>alice</dd>" in overview
     assert "<dt>decided_at</dt>" in overview
     assert "<dt>parent_facts</dt>" in overview and "analysis_call_count" in overview
     assert "<dt>payload_sha256</dt>" in overview
-    assert "LEAK" not in built.page.decode()
+    assert not any("LEAK" in tab_text(built, tab, detail) for tab in tabs.tab_names(tabs.APPROVAL_DETAIL))
 
 
 def test_overview_does_not_repeat_the_metrics_that_have_their_own_section():
@@ -182,30 +201,30 @@ def test_overview_does_not_repeat_the_metrics_that_have_their_own_section():
     built = compose(change_data(make_change(
         performance={"in_sample": [{"pair": None, "trades": 40, "pf": 1.3, "avg_r": 0.0}],
                      "holdout": []})), detail)
-    overview = overview_of(built.page)
+    overview = overview_of(tab_page(built, "overview", detail))
     assert "in_sample" not in overview and "holdout" not in overview
-    assert "<dt>in_sample</dt><dd>trades=40" in built.page.decode()
+    assert "<dt>in_sample</dt><dd>trades=40" in tab_text(built, "result", detail)
 
 
 # ---------------------------------------------------------------- 件数上限・並び・許可された名前
 
 def test_performance_shows_at_most_sixteen_pairs_per_scope():
     rows = [{"pair": f"P{i:02d}", "trades": 1, "pf": 1.0, "avg_r": 0.0} for i in range(20)]
-    text = compose(change_data(make_change(performance={"in_sample": rows,
-                                                         "holdout": []}))).page.decode()
+    text = tab_text(compose(change_data(make_change(performance={"in_sample": rows,
+                                                                  "holdout": []}))), "result")
     assert text.count("<dt>in_sample P") == 16 and "in_sample P16" not in text
 
 
 def test_params_show_at_most_the_params_limit_rows():
     items = [{"key": f"params.k{i:03d}", "old": "1", "new": "2"} for i in range(render.PARAMS_MAX + 6)]
-    text = compose(change_data(make_change(items))).page.decode()
+    text = tab_text(compose(change_data(make_change(items))), "change")
     assert text.count("<dt>params.k") == render.PARAMS_MAX
 
 
 def test_diff_files_are_listed_in_the_fixed_order_whatever_order_they_arrive_in():
     files = [entry("test_plugin.py", ["+t"]), entry("config.yaml", ["+c"]),
              entry("plugin.py", ["+p"])]
-    text = compose(change_data(files=files)).page.decode()
+    text = tab_text(compose(change_data(files=files)), "change")
     assert text.index("<h3>plugin.py</h3>") < text.index("<h3>config.yaml</h3>") \
         < text.index("<h3>test_plugin.py</h3>")
 
@@ -213,13 +232,13 @@ def test_diff_files_are_listed_in_the_fixed_order_whatever_order_they_arrive_in(
 def test_a_diff_entry_for_any_other_path_is_not_shown():
     files = [entry("../../etc/passwd", ["+LEAK"]), entry("evil.py", ["+LEAK"]),
              entry("plugin.py", ["+p"])]
-    text = compose(change_data(files=files)).page.decode()
+    text = tab_text(compose(change_data(files=files)), "change")
     assert "LEAK" not in text and "evil.py" not in text and "<h3>plugin.py</h3>" in text
 
 
 def test_a_changed_file_without_any_line_or_omission_is_shown_as_unchanged():
-    text = compose(change_data(files=[{"path": "plugin.py", "status": "changed", "reason": None,
-                                       "omitted_lines": 0, "hunks": []}])).page.decode()
+    text = tab_text(compose(change_data(files=[{"path": "plugin.py", "status": "changed", "reason": None,
+                                                "omitted_lines": 0, "hunks": []}])), "change")
     assert "<h3>plugin.py</h3><p>差分なし</p>" in text and "<pre>@@" not in text
 
 
@@ -227,7 +246,7 @@ def test_a_changed_file_without_any_line_or_omission_is_shown_as_unchanged():
 
 def test_diff_header_and_body_are_escaped_including_quotes():
     files = [entry("plugin.py", ['+say "hi" \'x\' <b>&'], header='@@ <i>"&" @@')]
-    text = compose(change_data(files=files)).page.decode()
+    text = tab_text(compose(change_data(files=files)), "change")
     assert "@@ &lt;i&gt;&quot;&amp;&quot; @@\n" in text
     assert "+say &quot;hi&quot; &#x27;x&#x27; &lt;b&gt;&amp;\n" in text
     assert "<i>" not in text and "<b>" not in text
@@ -236,9 +255,10 @@ def test_diff_header_and_body_are_escaped_including_quotes():
 def test_tabs_in_a_claim_and_in_a_diff_line_become_four_spaces():
     data = change_data(files=[entry("plugin.py", ["+a\tb"])],
                        claims={"summary": "x\ty", "selection_rationale": None})
-    text = compose(data).page.decode()
-    assert "<pre>x    y</pre>" in text and "+a    b\n" in text
-    assert "\t" not in text
+    built = compose(data)
+    assert "<pre>x    y</pre>" in tab_text(built, "claims")
+    assert "+a    b\n" in tab_text(built, "change")
+    assert not any("\t" in tab_text(built, tab) for tab in tabs.tab_names(tabs.APPROVAL_DETAIL))
 
 
 # ---------------------------------------------------------------- indicator gate の警告節の予約
@@ -263,46 +283,82 @@ def _baseline_big_section():
 def test_the_largest_gate_section_never_clips_a_page_whose_other_sections_fill_their_budget():
     data = _full_budget_change_data()
     detail = dict(DETAIL)
-    plain = render.compose_approval_page(detail, data["change"], data).page
-    assert len(plain) < render.PAGE_LIMIT_BYTES and b"Output clipped" not in plain
+    plain = render.compose_approval_page(detail, data["change"], data)
+    assert plain.total_bytes < render.PAGE_LIMIT_BYTES and not plain.clipped
     detail["gate_lines"] = _largest_gate_lines()
-    page = render.render_approval(detail, data)
-    assert b"Output clipped" not in page and len(page) < render.PAGE_LIMIT_BYTES
-    text = page.decode()
-    assert text.count("警告: " + "あ" * 80) == render.MAX_GATE_LINES
-    assert "<h3>plugin.py</h3>" in text
+    overview = render.render_approval(detail, data, "overview")
+    change = render.render_approval(detail, data, "change")
+    assert b"Output clipped" not in overview + change
+    assert len(overview) < render.PAGE_LIMIT_BYTES and len(change) < render.PAGE_LIMIT_BYTES
+    assert overview.decode().count("警告: " + "あ" * 80) == render.MAX_GATE_LINES
+    assert "<h3>plugin.py</h3>" in change.decode()
 
 
 def test_the_extra_sections_are_counted_in_the_budget_of_the_other_sections():
     data = _full_budget_change_data()
-    detail = dict(DETAIL)
-    built = render.compose_approval_page(detail, data["change"], data,
-                                         extra_sections=["<section>" + "g" * 3000 + "</section>"])
-    assert b"Output clipped" not in built.page
-    assert built.other_bytes <= render.OTHER_BUDGET_BYTES
+    built = render.compose_approval_page(
+        dict(DETAIL), data["change"], data,
+        extra_sections=[("overview", "<section>" + "g" * 3000 + "</section>")])
+    assert not built.clipped and built.other_bytes <= render.OTHER_BUDGET_BYTES
 
 
 def test_other_sections_shrink_before_the_extra_sections_are_clipped():
     data = _full_budget_change_data()
     built = render.compose_approval_page(
         dict(DETAIL), data["change"], data,
-        extra_sections=["<section>" + "g" * 1000 + "</section>"])
-    assert b"g" * 1000 in built.page
-    assert render.EXTRA_OMITTED_SECTION.encode() not in built.page
+        extra_sections=[("overview", "<section>" + "g" * 1000 + "</section>")])
+    assert "g" * 1000 in tab_text(built, "overview")
+    assert not any(render.EXTRA_OMITTED_SECTION in tab_text(built, tab)
+                   for tab in tabs.tab_names(tabs.APPROVAL_DETAIL))
 
 
 def test_an_oversized_baseline_section_is_clipped_whole_with_an_omission_line():
     data = _full_budget_change_data()
-    detail = dict(DETAIL)
     gate_section = "<section><h2>indicator gate の警告</h2><ul><li>GATE-LINE</li></ul></section>"
     built = render.compose_approval_page(
-        detail, data["change"], data,
-        extra_sections=[_baseline_big_section(), gate_section])
-    text = built.page.decode()
-    assert "GATE-LINE" in text and "bbbbbbbbbb" not in text
-    assert render.EXTRA_OMITTED_SECTION in text
-    assert built.other_bytes <= render.OTHER_BUDGET_BYTES
-    assert b"Output clipped" not in built.page
+        dict(DETAIL), data["change"], data,
+        extra_sections=[("result", _baseline_big_section()), ("overview", gate_section)])
+    overview, result = tab_text(built, "overview"), tab_text(built, "result")
+    assert "GATE-LINE" in overview and "bbbbbbbbbb" not in result
+    assert render.EXTRA_OMITTED_SECTION in result and render.EXTRA_OMITTED_SECTION not in overview
+    assert built.other_bytes <= render.OTHER_BUDGET_BYTES and not built.clipped
+
+
+def test_the_omission_line_is_in_every_tab_that_lost_a_section_before_what_is_left():
+    data = _full_budget_change_data()
+    gate_section = "<section><h2>indicator gate の警告</h2><ul><li>GATE-LINE</li></ul></section>"
+    big = _baseline_big_section()
+    built = render.compose_approval_page(
+        dict(DETAIL), data["change"], data,
+        extra_sections=[("result", big), ("overview", big), ("overview", gate_section)])
+    overview, result = tab_text(built, "overview"), tab_text(built, "result")
+    assert overview.count(render.EXTRA_OMITTED_SECTION) == 1
+    assert overview.index(render.EXTRA_OMITTED_SECTION) < overview.index("GATE-LINE")
+    assert result.count(render.EXTRA_OMITTED_SECTION) == 1 and "bbbbbbbbbb" not in result
+    for tab in ("change", "claims"):
+        assert render.EXTRA_OMITTED_SECTION not in tab_text(built, tab)
+
+
+def test_the_budget_result_does_not_depend_on_the_tab_it_is_read_from():
+    data = _full_budget_change_data()
+    built = render.compose_approval_page(
+        dict(DETAIL), data["change"], data,
+        extra_sections=[("result", _baseline_big_section()),
+                        ("overview", "<section>" + "g" * 3000 + "</section>")])
+    first = (built.total_bytes, built.other_bytes, built.diff_bytes, built.params_total)
+    for tab in tabs.tab_names(tabs.APPROVAL_DETAIL):
+        tab_page(built, tab)
+        assert (built.total_bytes, built.other_bytes, built.diff_bytes, built.params_total) == first
+
+
+def test_the_skeleton_is_measured_with_the_refresh_whatever_tab_is_returned():
+    data = _full_budget_change_data()
+    built = render.compose_approval_page(dict(DETAIL), data["change"], data)
+    # 変更・申告のタブは再読込を外すが、仮想ページの大きさは変わらない
+    assert b"http-equiv" not in tab_page(built, "change")
+    assert b"http-equiv" in tab_page(built, "result")
+    again = render.compose_approval_page(dict(DETAIL), data["change"], data)
+    assert again.total_bytes == built.total_bytes
 
 
 def test_other_bytes_stay_within_budget_for_the_largest_baseline_and_gate_together():
@@ -311,26 +367,25 @@ def test_other_bytes_stay_within_budget_for_the_largest_baseline_and_gate_togeth
     detail["gate_lines"] = _largest_gate_lines()
     built = render.compose_approval_page(
         detail, data["change"], data,
-        extra_sections=[_baseline_big_section(), render._gate_section(detail)])
+        extra_sections=[("result", _baseline_big_section()), ("overview", render._gate_section(detail))])
     assert built.other_bytes <= render.OTHER_BUDGET_BYTES
-    assert "警告: " in built.page.decode()
+    assert "警告: " in tab_text(built, "overview", detail)
 
 
 @pytest.mark.parametrize("change", [None, {"bogus": 1}])
-def test_a_missing_or_invalid_change_still_keeps_gate_rows_and_the_omission_line(change):
+def test_a_missing_or_invalid_change_still_keeps_gate_rows_and_the_omission_line(change, monkeypatch):
     detail = dict(DETAIL)
     detail["gate_lines"] = _largest_gate_lines()
     detail["baseline_comparison"] = {"verdict": "x" * 20000}
     if change is not None:
         detail["change"] = change
     big = _baseline_big_section()
-    original = render._baseline_section
-    render._baseline_section = lambda data: big
-    try:
-        page = render.render_approval(detail, None)
-    finally:
-        render._baseline_section = original
-    text = page.decode()
-    assert b"Output clipped" not in page and len(page) < render.PAGE_LIMIT_BYTES
+    monkeypatch.setattr(render, "_EXTRA_BUILDERS", (("result", lambda data: big),)
+                        + render._EXTRA_BUILDERS[1:])
+    overview = render.render_approval(detail, None, "overview")
+    result = render.render_approval(detail, None, "result")
+    assert b"Output clipped" not in overview + result
+    assert len(overview) < render.PAGE_LIMIT_BYTES
+    text = overview.decode()
     assert text.count("警告: " + "あ" * 80) == render.MAX_GATE_LINES
-    assert render.EXTRA_OMITTED_SECTION in text and "bbbbbbbbbb" not in text
+    assert render.EXTRA_OMITTED_SECTION in result.decode() and "bbbbbbbbbb" not in result.decode()
