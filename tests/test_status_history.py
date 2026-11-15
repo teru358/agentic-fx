@@ -433,6 +433,23 @@ def test_completion_pending_with_open_gap_does_not_offer_manual_sync(world):
                                  status_history.NextAction.LIST_GAPS)
 
 
+def test_unsupported_bridge_with_open_gap_does_not_offer_manual_sync(world):
+    from agentic_fx.store import history_sync as store
+
+    conn = world[1]
+    store.insert_run(conn, run_id="run1", owner="owner", trigger="manual", source="mt5",
+                     interval="5m", calendar_version="v1", lookback_days=7, epoch="epoch",
+                     t=NOW, b=NOW, e=NOW, started_at=NOW)
+    conn.execute("UPDATE history_sync_runs SET status='failed', failure_code='history_executor_unsupported'")
+    conn.execute("INSERT INTO history_sync_gaps "
+                 "(source, interval, symbol, day_utc, kind, first_seen_at, last_observed_at) "
+                 "VALUES (?,?,?,?,?,?,?)", ("mt5", "5m", "USDJPY", "2026-11-10",
+                 "primary_exact", NOW.isoformat(), NOW.isoformat()))
+    sync = status_history._collect_sync(conn, _settings(), _settings().backtest.dataset(), NOW)
+    assert sync.next_actions == (status_history.NextAction.UPDATE_BRIDGE,
+                                 status_history.NextAction.LIST_GAPS)
+
+
 @pytest.mark.parametrize("column", ["failure_code", "deferred_reason", "last_error", "last_health",
                                     "id", "request_id", "trigger", "status", "symbol",
                                     "day_utc", "missing_count"])

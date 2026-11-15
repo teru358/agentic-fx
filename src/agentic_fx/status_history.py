@@ -404,7 +404,8 @@ def _sync_next(sync: HistorySync) -> tuple[NextAction, ...]:
             actions.append(NextAction.STOP_DAEMON_THEN_SYNC)
     if (primary_open.get("primary_exact") or primary_open.get("unprocessed")) \
             and NextAction.STOP_DAEMON_THEN_SYNC not in actions \
-            and NextAction.CHECK_COMPLETION_PENDING not in actions:
+            and NextAction.CHECK_COMPLETION_PENDING not in actions \
+            and NextAction.UPDATE_BRIDGE not in actions:
         actions.append(NextAction.STOP_DAEMON_THEN_SYNC)
     if primary_open.get("primary_exact") or primary_open.get("unprocessed") \
             or primary_open.get("reference_suspected"):
