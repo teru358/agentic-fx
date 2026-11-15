@@ -123,7 +123,7 @@ def test_front_matter_schema_and_test_existence(tmp_path):
     assert code == 1 and result['counts']['test_missing'] == 1
     test = tmp_path / 'tests/missing.py'
     test.parent.mkdir()
-    test.write_text('')
+    test.write_text('def test_x(): pass\n')
     assert check(tmp_path)[0] == 0
 
 

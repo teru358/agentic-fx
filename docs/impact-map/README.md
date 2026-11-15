@@ -46,6 +46,10 @@ python3 scripts/impact_map.py evaluate --domain kill-switch --index tmp/impact-m
 `python scripts/impact_map.py affected --page <domain> --base <rev> --head <rev>` で revision 間の候補を表示する。`--head` の代わりに `--worktree` を指定すると作業 tree と比較する。
 出力は symbol・literal 候補・依存の変化と unmapped を区別する。runtime の候補走査は Python ファイルを対象に、tests、scripts、docs と extract の除外ディレクトリを除く。履歴や解析が取得できない場合は終了コード 2 を返す。
 
+閉鎖時には `symbol_changed`・`coarse_parent_changed`・`ambiguous_sub_anchor`・`base_declarations_partial` を指揮者が必ず source で確認し、必要な履歴と宣言を裁定する。check や affected の終了コード 0 は、これらの照合が済んだことを意味しない。
+
+宣言済み symbol の中に追加された新しい resource は、機械では新 resource と判別できない。`symbol_changed` が唯一の網なので、その symbol を読んで resource の増減を裁く。副 anchor は最小の statement（多くは単文）の hash であり、外側の制御条件の変化は親の `coarse_parent_changed` にだけ現れる。
+
 記録理由は次の固定値から選ぶ。根拠は存在する `tests/...` のファイル（`::test_name` を付けてもよい）または `docs/tickets/open/`・`closed/` に存在する ticket の ID を指定する。
 
 | 理由 | 用途 |

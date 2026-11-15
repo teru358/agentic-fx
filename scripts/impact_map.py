@@ -458,12 +458,31 @@ PUBLIC_PATH = re.compile(r'https?://|/home/|(?:^|[^\w])(?:tmp/|\.claude(?:/|\b)|
 
 
 def test_path(value):
-    path = value.split('::', 1)[0]
+    if not isinstance(value, str):
+        return False
+    path, sep, selector = value.partition('::')
     parts = Path(path).parts
     if not parts or parts[0] != 'tests' or '..' in parts or Path(path).is_absolute():
         return False
     resolved = Path(path).resolve()
-    return resolved.is_relative_to(Path('tests').resolve()) and resolved.is_file()
+    if not resolved.is_relative_to(Path('tests').resolve()) or not resolved.is_file():
+        return False
+    if not sep:
+        return True
+    match = re.fullmatch(r'([A-Za-z_]\w*(?:(?:::|\.)[A-Za-z_]\w*)*)(?:\[[^\[\]\r\n]+\])?', selector)
+    if not match:
+        return False
+    names = re.split(r'::|\.', match.group(1))
+    try:
+        body = ast.parse(resolved.read_bytes(), filename=path).body
+        for name in names[:-1]:
+            matches = [node for node in body if isinstance(node, ast.ClassDef) and node.name == name]
+            if not matches:
+                return False
+            body = matches[0].body
+        return any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == names[-1] for node in body)
+    except (OSError, SyntaxError, UnicodeError, ValueError, RecursionError):
+        return False
 
 
 def evidence_exists(value):
@@ -570,6 +589,18 @@ def check(args):
         for record in records:
             if any(PUBLIC_PATH.search(value) or (key == 'reason' and re.search(r'[\r\n]', value)) for key, value in record.items() if isinstance(value, str)):
                 add('record', 'verification', 'public_rule_violation')
+            reason, evidence = record['reason'], record['evidence']
+            if not isinstance(reason, str) or reason not in REASONS:
+                add('record', record.get('anchor', 'verification'), 'public_rule_violation')
+            if not evidence_exists(evidence):
+                if isinstance(evidence, str) and (PUBLIC_PATH.search(evidence) or re.search(r'[\r\n]', evidence)):
+                    add('record', record.get('anchor', 'verification'), 'public_rule_violation')
+                elif isinstance(evidence, str) and evidence.startswith('tests/'):
+                    add('record', evidence, 'test_missing')
+                elif isinstance(evidence, str) and re.fullmatch(r'[A-Za-z0-9_-]+', evidence):
+                    add('record', evidence, 'ticket_missing')
+                else:
+                    add('record', record.get('anchor', 'verification'), 'public_rule_violation')
             anchor, method, digest = record['anchor'], record['method'], record['hash']
             if not all(isinstance(x, str) and x for x in (anchor, method, digest)):
                 raise ValueError()
@@ -730,7 +761,7 @@ def affected(args):
                 Visitor(lookup, path, '', records, patterns).visit(ast.parse(data, filename=path))
                 return {(r['resource'], r['path'] + '::' + r['symbol']) for r in records.values()}
             before, after = extract_set(old), extract_set(new)
-            if old is not None and new is not None and after:
+            if old is not None and new is not None:
                 def symbols(data):
                     tree = ast.parse(data, filename=path)
                     result = {}

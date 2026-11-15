@@ -80,7 +80,7 @@ def test_record_requires_allowed_reason_and_resolvable_evidence(tmp_path):
     assert not (tmp_path / 'docs/impact-map/verification/demo.json').exists()
     test = tmp_path / 'tests/test_sample.py'
     test.parent.mkdir()
-    test.write_text('')
+    test.write_text('def test_x(): pass\n')
     assert record('initial_record', 'tests/test_sample.py::test_x').returncode == 0
     ticket = tmp_path / 'docs/tickets/closed/T-1.md'
     ticket.parent.mkdir(parents=True)
