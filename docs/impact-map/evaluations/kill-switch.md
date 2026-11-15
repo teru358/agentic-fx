@@ -210,26 +210,27 @@
 
 - 手順: 0dbcb27f の使い捨て worktree (repo 外) に今の `docs/impact-map/` と `scripts/impact_map.py` を写して一時 commit し、`affected --page kill-switch --base d7025768^1 --head <一時 commit>` を回した (差分は C4 の merge の親 → merge 結果、first-parent の 5 merge)。一時 commit が足す docs と scripts は裁定から除いた。終了後に worktree を remove した。
 - 出力: 185 項目 (終了コード 0)。内訳は `unmapped_changed_unmapped_symbol` 109、`symbol_changed` 33、`literal_candidates_changed` 32、`unmapped_new_file` 8、`ambiguous_sub_anchor` 1、`coarse_parent_changed` 1、`base_declarations_partial` 1。
-- 裁定 (全件、source で。差分 40 file のうち src と afx-ops を読んだ。この差分は kill switch の通知 (guard event の sweep) と bot の health・終了分類の二つの機能を含む):
+- 裁定: 185 項目を一件ずつ source を読んで分類し、個別の表を [kill-switch-c4-retro-table.md](kill-switch-c4-retro-table.md) に置いた (anchor・種別・分類・根拠の頁 ID か理由 1 行)。最初の裁定は変更行の特定語 (kill / guard / latch / reset_marker) の有無を領域外の根拠にしていたが、それでは配送の停止・再試行・自動復旧を左右する変更を落とすので改め、特定語を根拠にしない三分類に裁き直した。頁の更新は一時の手順で今の頁に対して出した結果と同じ形で再実行し、185 項目で変わらない。
 
-| 区分 | 件数 | 裁定 |
+| 分類 | 件数 | 内容 |
 |---|---|---|
-| 頁の記述と一致 (更新不要) | 79 | `symbol_changed` 28 と `literal_candidates_changed` 32 (入口 `dispatch` → `_dispatch` の分割に伴う literal の移動を含む)、`coarse_parent_changed` 1 (`build_app` の sweep 入口の差し替え、F20・F21・E16 と一致)、`ambiguous_sub_anchor` 1 (E13、T2 の裁定のとおり再確認)、通知機構の `unmapped_changed_unmapped_symbol` 17 (F09〜F12・F17〜F18・F21・F70・K-LANE・K-NOTICE の本文で説明済みの補助 symbol) |
-| kill switch と無関係 (頁に載せない) | 101 | bot の REST 分類・進捗・watchdog・health snapshot・logsafe・終了コード、`ops_setup` の systemd drop-in と units、snapshot の I/O 失敗の型 (`unmapped_changed_unmapped_symbol` 90、`unmapped_new_file` 7)、`status`・`ctl` の status 整形・web の `render_status` の bot health 表示 (`symbol_changed` 4)。これらの file の変更行に `kill` / `guard` / `latch` / `reset_marker` を含むものは無いことを grep で確認した。D09 の関連 ticket の範囲 |
-| 頁の更新が要った | 4 | 下記 |
+| 無関係 | 41 | 承認 UI (承認投稿の edit・fetch・履歴・interaction 応答)、表示専用の bot health (writer・status・web・ops status の行)、log の固定語化 (logsafe・cli)、設置 UI の文言、docstring のみの変更、task 生成の補助 |
+| 関連・既存の頁で足りる | 129 | 通知機構 (F09–F12・F17–F18・F21・F70・F92・E13–E16・E31–E33・E60) と、bot の cursor 保存・gateway・login・state の失敗分類 (F29・F168・K-CONSUME)、drop-in の設置手順 (F169) |
+| 頁の更新が要る (更新済み) | 14 | F29 の書き直し、F129、F130、F12 の一文、および配送の停止・再試行・自動復旧の新 F165–F171 (下記) |
 | 道具の情報項目 | 1 | `base_declarations_partial` (下記) |
 
-(計 185。F29 の `deliver_events` は `symbol_changed` 1、`_ops_lane` と `emit_pending_improve_notices` は `unmapped_changed_unmapped_symbol` 2、`kill_switch_words.py` は `unmapped_new_file` 1。)
+(計 185。`coarse_parent_changed` の `build_app` と `ambiguous_sub_anchor` の E13 は「関連・既存」に含め、E13 は T2 の裁定のとおり再確認した。)
 
 - `base_declarations_partial` 1 (`covers_absent`): base の頁が雛形のため想定どおり。この区間の削除は検出できないが、頁が初めて書かれた区間なので削除される宣言も無い。
-- 頁の更新が要った 4 点 (頁が拾えなかった変更。いずれも source で確かめて直した):
-  1. F29 (`BotAdapter.deliver_events`): 「送信失敗時は cursor を進めず再試行」だけでは不足だった。C4 で、恒久の拒否は BotFailure で止まり、event 固有の不正な本文は固定の代替文を送って確定する経路が加わった。F29 を三経路に書き直した。
-  2. `OpsService._ops_lane` (新 F129): 同一 thread の lane 再入の拒否と thread-local の所有 flag は guard 専用でなく ops lane を使う全 mutation の共通入口にある。F121 (`_reject_lane_reentry`) だけでは入口が読めなかった。被覆を `ops:guard_lane_reentry` に宣言した。
-  3. `core/kill_switch_words.py` の `KILL_SWITCH_RESET_WARNING` と ctl の reset 成功時の出力 (新 F130、`unmapped_new_file`): K-RESET-UI は shell 側 (F13) しか指していなかった。
-  4. `OpsService.emit_pending_improve_notices` が `GuardLaneReentry` を握らず伝える点 (`unmapped_changed_unmapped_symbol`): F12 に一文を足した。
+- 頁の更新が要った点 (頁が拾えなかった変更。source で確かめて直した):
+  1. F29 (`BotAdapter.deliver_events`): 恒久の拒否は BotFailure で止まり、event 固有の不正な本文は固定の代替文を送って確定する経路が加わっていた。三経路に書き直した。
+  2. `OpsService._ops_lane` (新 F129): 同一 thread の lane 再入の拒否と thread-local の所有 flag は ops lane を使う全 mutation の共通入口。
+  3. `core/kill_switch_words.py` の `KILL_SWITCH_RESET_WARNING` と ctl の reset 成功時の出力 (新 F130)。
+  4. `OpsService.emit_pending_improve_notices` が `GuardLaneReentry` を握らず伝える点 (F12 に一文)。
+  5. 配送の停止・再試行・自動復旧 (裁き直しで追加。F165–F171): `bot/rest.py::classify` (恒久か一時かの分類)、`bot/progress.py` の配送・poll の無進捗判定 (`delivery_begin`・`delivery_committed`・`poll_begin`・`poll_end`・`expired`)、`bot/runtime.py::_monitor`・`_main_body`・`run`、`bot/exits.py::rc_for_reason` (恒久 78 / 一時 79 / loop 停止 80)、`ops_setup/units.py` の drop-in (`RestartPreventExitStatus` による自動復旧の可否)。K-CONSUME に再起動の方針を足した。いずれも guard event を含む配送が止まる・再試行される・自動復旧するかを左右する。
 - 変更前の F06・F07・F09・D との照合: F06 (`confirm_latched`) の store は差分に無く不変。F07 (`reset_kill_switch`) は操作前・結果・現 state の guard step に変わり、頁の記述と一致。F09 (`plan_kill_switch_notice`) は新規で、released 済みを閉じ履歴を捏造しない規則と一致。D01・D04・D05 は C4 後の source と一致 (D04 の `_data_resume` と `resume_data` の `_guard_event` は差分に無い)。
-- 見つけた欠陥・見落とし: 上の 4 点 (すべて F の本文・入口の抜けで、被覆や辺の誤りではない)。道具の欠陥は無かった。ただし `unmapped_changed_unmapped_symbol` 109 件の大半は別機能 (bot の health) の変更で、頁の領域外か否かの切り分けは人手の grep が要った (resource の literal を含む変更行の有無を領域外の根拠にできるが、道具は出さない)。
-- 所要時間 (おおよそ): 道具の実行は数秒。裁定 (source の読取り) と頁の更新を含め、開始から頁の commit まで約 3 分 (`date` による wall clock の実測。source の読取りは diff の通読が中心)。
+- 見つけた欠陥・見落とし: 上の五つ。最初の裁定は 101 件を特定語の grep で「無関係」とまとめ、配送の停止・再試行・自動復旧に関わる変更 (五つ目) を落としていた。裁き直して個別の表を作り、更新した。道具の欠陥は無かったが、`unmapped_changed_unmapped_symbol` 107 件のうち領域内か否かは道具が出さず、人が一件ずつ読む必要がある。
+- 所要時間: 最初の裁定は開始から頁の commit まで約 3 分、裁き直しと 185 件の個別表・F165–F171 の追加は約 10 分の経過時間 (いずれも `date` と操作の記録による)。これは操作と編集を含む経過時間であり、全件の意味の照合の費用としては扱わない (最初の裁定が誤分類を含んでいたことからも、短い経過時間は照合の十分さを示さない)。
 - 更新後の `check --page kill-switch` は終了コード 0 (人が読む項目は E13 の 1 件のみ)。
 - 更新後の頁セル: 凍結表 310 行は TP 310 / FN 0 / U 0 (critical 208 / 208) のまま、頁セルの FP は 0 → 1。増えた 1 件は新しい F129 (`OpsService._ops_lane` × `ops:guard_lane_reentry`) で、凍結後の追加である (凍結表は変えない)。
 
@@ -253,4 +254,4 @@
 - 見落とし・所見: (a) `affected` は base の頁が雛形だと宣言済みか否かを区別できず、頁を直した後も 58 項目が同じ形で出る (比較は base 側の宣言に依るため。想定どおりで欠陥ではない)。(b) `GuardedState.projected` は現在の `src/` に呼出し元が無い (F162 に書いた)。(c) ledger を直接読む symbol は `read_rebase_totals` と `apply_rebase` だけで、`evaluate_rebase` は間接 (F131 に書き、被覆は宣言せず辺 E76 で結んだ)。(d) 抽出器は `OpsService._mutate` の `RebaseOutcomeUnknown` への分岐を資源の変更として出さず、`symbol_changed` だけで出る。
 - 検査: `check --page kill-switch` は終了コード 0 (人が読む項目は E13 の 1 件のみ)。`tests/scripts/test_impact_map*.py` 95 本 passed。
 - evaluate (凍結表は変えない): 頁セル 凍結表 310 行は TP 310 / FN 0 / U 0 (critical 208 / 208)、機械セル critical 81 / 81、FN 0、U 0。**FP は頁セル 1 → 42、機械セル 59 → 86。増えた分はすべて HWM の追加による凍結後の追加**で、凍結表の symbol への FP の増加は無い。頁セルの内訳 (41 件): 新 resource (台帳表・endpoint 二つ・error code 二つ・log code) の被覆 25、既存 resource の HWM symbol への被覆 16 (`evaluate_rebase`・`_rebase_commit`・`rebase_preview`・`shared_guard`・`GuardedState.projected`・`apply_rebase` の state・config・snapshot の読み書き)。機械セルの新しい FP 27 は同じ新 resource の literal の索引の命中と、`activity:kill_switch_latched` の衝突。凍結表の更新は次の正解表見直しで扱う。
-- 所要時間 (おおよそ): `affected` 約 5 秒、`check` 約 1 秒、`extract` + `evaluate` 約 2 秒、頁の更新 (約 50 行の新規と書き直し) と照合を含めて開始から commit まで約 4〜5 分 (`date` による wall clock の実測)。
+- 所要時間: `affected` 約 5 秒、`check` 約 1 秒、`extract` + `evaluate` 約 2 秒、頁の更新を含めて開始から commit まで約 4〜5 分の経過時間 (`date` による)。これは操作と編集を含む経過時間であり、58 項目の意味の照合の費用としては扱わない。
