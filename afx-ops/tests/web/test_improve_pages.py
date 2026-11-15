@@ -183,7 +183,7 @@ def test_a_submitted_run_shows_every_summary_item():
 def test_a_floor_miss_shows_the_failed_stage_conditions_and_the_thresholds():
     text = detail_page("unprofitable_holdout")
     assert "床を割った段: holdout" in text
-    assert "PF の下限" in text and "判定理由" in text and "床未達" in text
+    assert "PF の下限" in text and "床未達" in text
 
 
 def test_a_not_improved_run_shows_the_comparison_against_the_deployed_version():
@@ -428,3 +428,27 @@ def test_floor_report_fills_in_when_summary_pairs_were_dropped():
     text = detail_page(data)
     assert "床を割った段" in text and "床との差 (レポートから)" in text
     assert "EURUSD" in text and "0.8" in text
+
+
+def test_truncated_list_note_and_link_match_visible_rows():
+    runs = [run_row(10**17 - i, plugin="p" * 64, failed_conditions=["pf"] * 5,
+                    approval_id=10**17) for i in range(100)]
+    listing = {"runs": runs, "has_more": True}
+    body = improve_pages.render_improve_list(listing, limit=100,
+                                               forms="<section>" + "x" * 30000 + "</section>").decode()
+    table = body.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
+    shown = table.count("<tr>")
+    assert 0 < shown < 100
+    assert f"最新 {shown} 件を表示" in body
+    assert f"…({100 - shown} 件省略" in body
+    assert f'href="/improve?limit={min(100, shown * 2)}"' in body
+
+
+def test_reason_section_requires_parent_reason():
+    data = dto("unprofitable_holdout")
+    data["summary"]["items"].pop("parent_reason", None)
+    text = detail_page(data)
+    assert "床未達" in text
+    assert "<h2>判定理由</h2>" not in text
+    data["summary"]["items"]["parent_reason"] = "unprofitable"
+    assert "<h2>判定理由</h2>" in detail_page(data)

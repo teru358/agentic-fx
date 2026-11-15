@@ -12,7 +12,7 @@ from afx_ops.display_zone import zone_of
 from afx_ops.plugin_text import label
 from afx_ops.web import render
 from afx_ops.web import plugin_pages
-from afx_ops.web.plugin_pages import _pick, _plugin_link, _time
+from afx_ops.web.common import approval_link, display_time, pick, plugin_link
 from afx_ops.web.routes import resolve_route
 
 LIST_FIELDS = frozenset({"runs", "has_more"})
@@ -150,7 +150,7 @@ def _list_of(value: object, allowed: frozenset[str]) -> tuple[list[dict], int]:
     """list の dict を allowlist で絞る。ROW_LIMIT を超える分は整形せず件数だけ返す。"""
     if type(value) is not list:
         return [], 0
-    shown = [_pick(item, allowed) for item in value[:ROW_LIMIT] if type(item) is dict]
+    shown = [pick(item, allowed) for item in value[:ROW_LIMIT] if type(item) is dict]
     return shown, max(0, len(value) - ROW_LIMIT)
 
 
@@ -162,13 +162,6 @@ def _conditions(value: object) -> str:
     if omitted > 0:
         shown.append(f"ほか {omitted} 件")
     return " / ".join(shown)
-
-
-def _approval_link(approval_id: object) -> str:
-    if type(approval_id) is int and approval_id >= 1:
-        if resolve_route(f"/approvals/{approval_id}") is not None:
-            return f'<a href="/approvals/{approval_id}">#{approval_id}</a>'
-    return "-"
 
 
 def _run_link(run_id: object) -> str:
@@ -202,13 +195,13 @@ def _floor_cell(row: dict) -> str:
 
 
 def _list_row(raw: dict, tz: str) -> list[str]:
-    row = _pick(raw, RUN_FIELDS)
+    row = pick(raw, RUN_FIELDS)
     plugin = row.get("plugin")
-    return [_run_link(row.get("id")), _time(row.get("started_at"), tz),
-            _time(row.get("finished_at"), tz), _text(row.get("trigger"), TRIGGER),
+    return [_run_link(row.get("id")), display_time(row.get("started_at"), tz),
+            display_time(row.get("finished_at"), tz), _text(row.get("trigger"), TRIGGER),
             _result_text(row.get("result_code"), row.get("reason_code")),
-            _plugin_link(plugin) if plugin is not None else "-", _floor_cell(row),
-            _approval_link(row.get("approval_id"))]
+            plugin_link(plugin) if plugin is not None else "-", _floor_cell(row),
+            approval_link(row.get("approval_id"))]
 
 
 def _more_note(shown: int, has_more: bool, limit: int) -> str:
@@ -224,7 +217,7 @@ def _more_note(shown: int, has_more: bool, limit: int) -> str:
 def render_improve_list(data: Mapping[str, object], limit: int = DEFAULT_LIMIT,
                         forms: str = "") -> bytes:
     tz = zone_of(data)
-    listing = _pick(data, LIST_FIELDS)
+    listing = pick(data, LIST_FIELDS)
     runs = listing.get("runs")
     rows = [_list_row(row, tz) for row in runs[:ROW_LIMIT] if type(row) is dict] \
         if type(runs) is list else []
@@ -233,17 +226,22 @@ def render_improve_list(data: Mapping[str, object], limit: int = DEFAULT_LIMIT,
     # 書込みの form を足す余地と、枠・nav・style を引いた残りが table の予算
     budget = (render.MAX_RESPONSE_BYTES - len(render._document("Improve", intro + note, tz))
               - render._bytes(forms) - 1024)
-    table = _table(LIST_HEADERS, rows, budget) if rows else "<p>終了した改善 mission はありません</p>"
+    if rows:
+        table, shown = plugin_pages.table_with_count(LIST_HEADERS, rows, budget, cli=OMIT_CLI)
+        if shown < len(rows):
+            note = _more_note(shown, True, shown)
+    else:
+        table = "<p>終了した改善 mission はありません</p>"
     return render._page("Improve", intro + table + note + forms, tz)
 
 
 # ---------------------------------------------------------------- 詳細
 
 def _overview(row: dict, snapshot: dict, approval: dict) -> str:
-    approval_cell = _approval_link(approval.get("id"))
+    approval_cell = approval_link(approval.get("id"))
     plugin = approval.get("plugin")
     if plugin is not None:
-        approval_cell += " " + _plugin_link(plugin)
+        approval_cell += " " + plugin_link(plugin)
         if approval.get("kind") is not None:
             approval_cell += " (" + _text(approval.get("kind"), APPROVAL_KIND) + ")"
     elapsed = row.get("elapsed_sec")
@@ -266,7 +264,7 @@ def _text_section(title: str, items: list[tuple[str, object]]) -> str:
 
 
 def _hypothesis_section(items: dict) -> str:
-    hypothesis = _pick(items.get("hypothesis"), HYPOTHESIS_FIELDS)
+    hypothesis = pick(items.get("hypothesis"), HYPOTHESIS_FIELDS)
     if not hypothesis:
         return ""
     body = _quote(hypothesis.get("idea"))
@@ -276,7 +274,7 @@ def _hypothesis_section(items: dict) -> str:
 
 
 def _explanation_section(items: dict) -> str:
-    explanation = _pick(items.get("explanation"), EXPLANATION_FIELDS)
+    explanation = pick(items.get("explanation"), EXPLANATION_FIELDS)
     if not explanation:
         return ""
     parts = [("理由", explanation.get("rationale")),
@@ -294,25 +292,23 @@ def _observation_section(items: dict, snapshot: dict) -> str:
     return _section("観察文", _quote(text))
 
 
-def _reason_section(items: dict, snapshot: dict) -> str:
+def _reason_section(items: dict) -> str:
     reason = items.get("parent_reason")
-    if reason is None:
-        reason = snapshot.get("reason_code")
     if reason is None:
         return ""
     return _section("判定理由", f"<p>{_text(reason, REASON)}</p>")
 
 
 def _tried_section(items: dict) -> str:
-    tried = _pick(items.get("tried"), TRIED_FIELDS)
+    tried = pick(items.get("tried"), TRIED_FIELDS)
     if not tried:
         return ""
     names = tried.get("indicators")
     indicators = ""
     if type(names) is list and names:
-        shown = [_plugin_link(name) for name in names[:20]]
+        shown = [plugin_link(name) for name in names[:20]]
         indicators = " / ".join(shown)
-    pairs = [("plugin", _plugin_link(tried.get("plugin"))),
+    pairs = [("plugin", plugin_link(tried.get("plugin"))),
              ("kind", _text(tried.get("kind"), KIND)),
              ("由来", _text(tried.get("origin"), ORIGIN)),
              ("使った indicator", indicators or "-")]
@@ -320,7 +316,7 @@ def _tried_section(items: dict) -> str:
 
 
 def _thresholds(value: object) -> str:
-    limits = _pick(value, THRESHOLD_FIELDS)
+    limits = pick(value, THRESHOLD_FIELDS)
     if not limits:
         return ""
     pairs = [("PF の下限", _num(limits.get("min_pf"))),
@@ -342,7 +338,7 @@ def _pair_row(pair: dict) -> list[str]:
 
 
 def _floor_section(items: dict, report_floor: dict) -> str:
-    floor = _pick(items.get("floor"), FLOOR_FIELDS)
+    floor = pick(items.get("floor"), FLOOR_FIELDS)
     if floor:
         body = _thresholds(floor.get("thresholds"))
         stage = floor.get("failed_stage")
@@ -382,7 +378,7 @@ def _report_conditions(value: object) -> str:
 
 
 def _side(value: object) -> str:
-    side = _pick(value, SIDE_FIELDS)
+    side = pick(value, SIDE_FIELDS)
     if not side:
         return "-"
     return (f"PF {_num(side.get('pf'))} / 平均 R {_num(side.get('avg_r'))} / "
@@ -390,7 +386,7 @@ def _side(value: object) -> str:
 
 
 def _comparison_section(items: dict) -> str:
-    comparison = _pick(items.get("comparison"), COMPARISON_FIELDS)
+    comparison = pick(items.get("comparison"), COMPARISON_FIELDS)
     if not comparison:
         return ""
     metrics = comparison.get("metrics")
@@ -411,7 +407,7 @@ def _comparison_section(items: dict) -> str:
 
 
 def _handoff_section(items: dict) -> str:
-    handoff = _pick(items.get("handoff"), HANDOFF_FIELDS)
+    handoff = pick(items.get("handoff"), HANDOFF_FIELDS)
     if not handoff:
         return ""
     outcomes = handoff.get("outcomes")
@@ -429,12 +425,12 @@ def _handoff_section(items: dict) -> str:
 
 def render_improve_detail(data: Mapping[str, object]) -> bytes:
     tz = zone_of(data)
-    row = _pick(data, DETAIL_FIELDS)
-    snapshot = _pick(row.get("snapshot"), SNAPSHOT_FIELDS)
-    approval = _pick(row.get("approval"), APPROVAL_FIELDS)
-    summary = _pick(row.get("summary"), SUMMARY_FIELDS)
+    row = pick(data, DETAIL_FIELDS)
+    snapshot = pick(row.get("snapshot"), SNAPSHOT_FIELDS)
+    approval = pick(row.get("approval"), APPROVAL_FIELDS)
+    summary = pick(row.get("summary"), SUMMARY_FIELDS)
     state = summary.get("state")
-    items = _pick(summary.get("items"), ITEM_FIELDS) if state == "ok" else {}
+    items = pick(summary.get("items"), ITEM_FIELDS) if state == "ok" else {}
     run_id = row.get("id")
     shown = run_id if type(run_id) is int and run_id >= 1 else "-"
     nav = '<p><a href="/improve">Improve (一覧)</a> / <a href="/plugins">Plugins</a></p>'
@@ -449,7 +445,7 @@ def render_improve_detail(data: Mapping[str, object]) -> bytes:
         notice = ""
     parts = [nav, _overview(row, snapshot, approval), notice,
              _hypothesis_section(items), _explanation_section(items),
-             _observation_section(items, snapshot), _reason_section(items, snapshot),
-             _tried_section(items), _floor_section(items, _pick(row.get("floor"), REPORT_FLOOR_FIELDS)),
+             _observation_section(items, snapshot), _reason_section(items),
+             _tried_section(items), _floor_section(items, pick(row.get("floor"), REPORT_FLOOR_FIELDS)),
              _comparison_section(items), _handoff_section(items)]
     return render._page(f"Improve #{shown}", "".join(parts), tz)
