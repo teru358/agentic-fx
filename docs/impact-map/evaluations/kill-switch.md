@@ -229,5 +229,28 @@
   4. `OpsService.emit_pending_improve_notices` が `GuardLaneReentry` を握らず伝える点 (`unmapped_changed_unmapped_symbol`): F12 に一文を足した。
 - 変更前の F06・F07・F09・D との照合: F06 (`confirm_latched`) の store は差分に無く不変。F07 (`reset_kill_switch`) は操作前・結果・現 state の guard step に変わり、頁の記述と一致。F09 (`plan_kill_switch_notice`) は新規で、released 済みを閉じ履歴を捏造しない規則と一致。D01・D04・D05 は C4 後の source と一致 (D04 の `_data_resume` と `resume_data` の `_guard_event` は差分に無い)。
 - 見つけた欠陥・見落とし: 上の 4 点 (すべて F の本文・入口の抜けで、被覆や辺の誤りではない)。道具の欠陥は無かった。ただし `unmapped_changed_unmapped_symbol` 109 件の大半は別機能 (bot の health) の変更で、頁の領域外か否かの切り分けは人手の grep が要った (resource の literal を含む変更行の有無を領域外の根拠にできるが、道具は出さない)。
-- 所要時間 (おおよそ): 道具の実行は数秒。裁定 (source の読み取り) と頁の更新を含めて約 15 分 (この session の実測では、道具の実行を含めて開始から頁の commit まで約 3〜4 分の wall clock。source の読取りは大半を diff の通読で済ませた)。
+- 所要時間 (おおよそ): 道具の実行は数秒。裁定 (source の読取り) と頁の更新を含め、開始から頁の commit まで約 3 分 (`date` による wall clock の実測。source の読取りは diff の通読が中心)。
 - 更新後の `check --page kill-switch` は終了コード 0 (人が読む項目は E13 の 1 件のみ)。
+- 更新後の頁セル: 凍結表 310 行は TP 310 / FN 0 / U 0 (critical 208 / 208) のまま、頁セルの FP は 0 → 1。増えた 1 件は新しい F129 (`OpsService._ops_lane` × `ops:guard_lane_reentry`) で、凍結後の追加である (凍結表は変えない)。
+
+## T3 二件目: HWM の運用確認 (§6.4)
+
+**この確認は、HWM が頁の無い branch で実装されたため、「関係を変える code と頁が同 commit で更新された」ことの実地試験にはならない。** 頁は HWM の merge の後に合わせた。同 commit の更新の実地試験は、次の通常の変更 (頁のある領域に触れるチケット) で行う。
+
+- 手順: `affected --page kill-switch --base 0dbcb27f --head HEAD` (終了コード 0)。58 項目: `unmapped_changed_unmapped_symbol` 33、`literal_candidates_changed` 13、`symbol_changed` 5、`unmapped_new_file` 3、`ambiguous_sub_anchor` 1、`coarse_parent_changed` 1、`dependency_changed` 1、`base_declarations_partial` 1。
+- HWM 以外の混入: 無い。`src/` と `afx-ops/` の差分は HWM の 12 file だけ (`ops/rebase_service.py`・`ops/rebase_accounting.py`・`ops/rebase_view.py` の新規 3 file と、`ops/service.py`・`ops/client.py`・`ops/api_server.py`・`ops/contracts.py`・`cli_surface.py`・`store/state.py`・`store/db.py`・`service.py`・`afx-ops/afx_ops/web/write.py` の変更)。影響地図の道具と記録は `scripts/`・`docs/`・`tests/` にあり候補走査から除かれる。
+- 裁定 (58 項目を全件 source で。HWM の設計の §1–2・§4–5 と突き合わせた):
+
+| 区分 | 件数 | 裁定 |
+|---|---|---|
+| 頁の更新が要り、更新した | 52 | 付け直しの新 file・symbol・literal・辺。入口 (ctl の parse・`_op_killswitch_rebase`・`_rebase_done`・固定文・端末、cli_surface、api_server の route と件数固定、endpoint 表、error code、web の既知 code)、検査 (evaluate_rebase・RebaseWiring・error_code_name)、原子的な書込み (apply_rebase・台帳の読取・図形の導出・broker 評価)、排他と state の読取り (rebase_under_core・rebase_commit・shared_guard・GuardedState)、台帳表と許可集合。F131–F164 と E66–E78、F36・F40・F43 の本文の更新で対応づけた |
+| literal の衝突で頁に載せない | 3 | `evaluate_rebase`・`_rebase_commit`・`GuardedState.projected` の `activity:kill_switch_latched` (state の属性名と同じ literal。activity の読み書きは無い) |
+| 道具の情報項目で追従済み | 3 | `coarse_parent_changed` の `build_app` (core_lock と broker を ops service に渡す、F20・F36)、`ambiguous_sub_anchor` の E13 (T2 の裁定のとおり再確認)、`base_declarations_partial` (0dbcb27f の頁が雛形のため想定どおり) |
+
+(計 58。`dependency_changed` の `_SCHEMA` は F43 の更新に、`symbol_changed` の `_mutate`・`_build_ops_service`・`_op_killswitch_reset`・`_call` は F146・F36・F130・F149 に含めた。)
+- 頁の更新: K-REBASE を「実装済み」に (approver の明示操作と service 先頭の直接検査、PaperBroker・注文状態・新鮮 snapshot・DD・世代・autopilot・閉場の検査、HWM のみ変更で latch・世代・発動時刻を保持し state を書かない、値 CAS と ledger / snapshot の一つの transaction、通常 reset・shell・bot・web・notify に入口を足さない — それぞれ source で確かめた。入口が無いことは `Commands`・`afx-ops` の全 file の grep と cli_surface の record (shell の欄が無い) と api_server の `_match` (local_guard は UDS のみ) で確認)。D08 を解消済みにし、D10 (累積の硬い上限が無い、paper 限定) と D11 (COMMIT 結果不明は自動で再送しない) を残余として追加。K-RESET-UI を ctl の案内の追加に合わせた。頁の冒頭と影響先の記述 (観測 revision `160f1e47`、「未実装」の文) を直した。
+- 更新量: F 34 行 (F131–F164) と E 13 行 (E66–E78) と D 2 行を新規、K 2 行・D 1 行・F 5 行 (F20・F36・F40・F43・F130) と前文 3 箇所を更新。front matter に resource 6 (`db:kill_switch_hwm_rebases`・`ops:killswitch_rebase`・`ops:killswitch_rebase_preview`・`ops:preview_changed`・`ops:market_closed`・`log:rebase_release_failed`)・anchor 8・test 2 を追加。被覆宣言は 41 行追加 (すべて凍結表に無い行で、下の FP の 41 件と一致する)。頁の差分は 389 行追加・12 行削除 (被覆宣言の JSON が大半)。
+- 見落とし・所見: (a) `affected` は base の頁が雛形だと宣言済みか否かを区別できず、頁を直した後も 58 項目が同じ形で出る (比較は base 側の宣言に依るため。想定どおりで欠陥ではない)。(b) `GuardedState.projected` は現在の `src/` に呼出し元が無い (F162 に書いた)。(c) ledger を直接読む symbol は `read_rebase_totals` と `apply_rebase` だけで、`evaluate_rebase` は間接 (F131 に書き、被覆は宣言せず辺 E76 で結んだ)。(d) 抽出器は `OpsService._mutate` の `RebaseOutcomeUnknown` への分岐を資源の変更として出さず、`symbol_changed` だけで出る。
+- 検査: `check --page kill-switch` は終了コード 0 (人が読む項目は E13 の 1 件のみ)。`tests/scripts/test_impact_map*.py` 95 本 passed。
+- evaluate (凍結表は変えない): 頁セル 凍結表 310 行は TP 310 / FN 0 / U 0 (critical 208 / 208)、機械セル critical 81 / 81、FN 0、U 0。**FP は頁セル 1 → 42、機械セル 59 → 86。増えた分はすべて HWM の追加による凍結後の追加**で、凍結表の symbol への FP の増加は無い。頁セルの内訳 (41 件): 新 resource (台帳表・endpoint 二つ・error code 二つ・log code) の被覆 25、既存 resource の HWM symbol への被覆 16 (`evaluate_rebase`・`_rebase_commit`・`rebase_preview`・`shared_guard`・`GuardedState.projected`・`apply_rebase` の state・config・snapshot の読み書き)。機械セルの新しい FP 27 は同じ新 resource の literal の索引の命中と、`activity:kill_switch_latched` の衝突。凍結表の更新は次の正解表見直しで扱う。
+- 所要時間 (おおよそ): `affected` 約 5 秒、`check` 約 1 秒、`extract` + `evaluate` 約 2 秒、頁の更新 (約 50 行の新規と書き直し) と照合を含めて開始から commit まで約 4〜5 分 (`date` による wall clock の実測)。
