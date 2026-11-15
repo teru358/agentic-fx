@@ -141,3 +141,42 @@ def test_check_public_rule_page_and_record(tmp_path):
     record.write_text(json.dumps(data))
     code, result = check(tmp_path)
     assert code == 1 and result['counts']['public_rule_violation'] >= 1
+
+
+def test_check_rejects_non_object_records_and_invalid_anchor_types(tmp_path):
+    page = setup(tmp_path)
+    record = tmp_path / 'docs/impact-map/verification/demo.json'
+    original_record = record.read_text()
+    for value in ([1], ['x'], [{'anchor': [], 'method': 'm', 'hash': 'h', 'reason': 'bad', 'evidence': None}]):
+        record.write_text(json.dumps(value))
+        code, result = check(tmp_path)
+        assert code == 2 and result['counts']['invalid_record'] == 1
+    record.write_text(original_record)
+    page.write_text(page.read_text().replace('"anchors": ["sample.py::f"]', '"anchors": [1]'))
+    code, result = check(tmp_path)
+    assert code == 2 and result['counts']['invalid_front_matter'] == 1
+
+
+def test_recorded_ambiguous_or_missing_anchor_is_stale(tmp_path):
+    setup(tmp_path)
+    source = tmp_path / 'sample.py'
+    source.write_text('def f():\n    emit("old")\ndef g(): pass\n')
+    anchor = 'sample.py::f#emit@old'
+    digest = json.loads(cli(tmp_path, 'verify', '--page', 'demo', '--anchor', anchor).stdout)['current_hash']
+    assert cli(tmp_path, 'verify', '--page', 'demo', '--anchor', anchor, '--record', '--expected-hash', digest, '--reason', 'initial_record', '--evidence', 'T-1').returncode == 0
+    source.write_text('def f():\n    emit("old")\n    emit("old")\ndef g(): pass\n')
+    code, result = check(tmp_path)
+    assert code == 1 and any(x['anchor'] == anchor and x['reason'] == 'stale' for x in result['items'])
+    assert result['counts']['ambiguous_sub_anchor'] >= 1
+    records_path = tmp_path / 'docs/impact-map/verification/demo.json'
+    records = json.loads(records_path.read_text())
+    next(r for r in records if r['anchor'] == anchor)['method'] = 'old'
+    records_path.write_text(json.dumps(records))
+    code, result = check(tmp_path)
+    assert code == 2 and any(x['anchor'] == anchor and x['reason'] == 'stale' for x in result['items'])
+    # Restore the method from the other record.
+    next(r for r in records if r['anchor'] == anchor)['method'] = next(r for r in records if r['anchor'] != anchor)['method']
+    records_path.write_text(json.dumps(records))
+    source.write_text('def f():\n    pass\ndef g(): pass\n')
+    code, result = check(tmp_path)
+    assert code == 1 and any(x['anchor'] == anchor and x['reason'] == 'stale' for x in result['items'])

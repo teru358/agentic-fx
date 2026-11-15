@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Extract literal candidates from Python source without importing it."""
 import hashlib
+import copy
 from datetime import datetime, timezone
 import argparse
 import ast
@@ -9,6 +10,7 @@ import os
 import re
 from pathlib import Path
 import subprocess
+import tempfile
 import sys
 
 EXCLUDED = {'data', 'logs', 'plugins', 'tmp', '.venv', '.git', 'config'}
@@ -517,7 +519,16 @@ def verify(args):
         records = [r for r in records if r['anchor'] != args.anchor] + [entry]
         records.sort(key=lambda r: r['anchor'])
         record_path.parent.mkdir(parents=True, exist_ok=True)
-        record_path.write_text(json.dumps(records, sort_keys=True, separators=(',', ':')) + '\n', encoding='utf-8')
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=record_path.parent, delete=False) as stream:
+                temporary = stream.name
+                stream.write(json.dumps(records, sort_keys=True, indent=1) + '\n')
+            os.replace(temporary, record_path)
+        finally:
+            if temporary is not None and os.path.exists(temporary):
+                os.unlink(temporary)
+        previous, status = entry, 'fresh'
     result = dict(current_hash=digest, recorded_hash=previous['hash'] if previous else None, status=status)
     if node and node.end_lineno - node.lineno + 1 > 300:
         result['coarse_symbol'] = args.anchor
@@ -587,6 +598,11 @@ def check(args):
         if not isinstance(records, list):
             raise ValueError()
         for record in records:
+            if not isinstance(record, dict):
+                raise ValueError()
+            anchor, method, digest = record['anchor'], record['method'], record['hash']
+            if not all(isinstance(x, str) and x for x in (anchor, method, digest)):
+                raise ValueError()
             if any(PUBLIC_PATH.search(value) or (key == 'reason' and re.search(r'[\r\n]', value)) for key, value in record.items() if isinstance(value, str)):
                 add('record', 'verification', 'public_rule_violation')
             reason, evidence = record['reason'], record['evidence']
@@ -601,9 +617,6 @@ def check(args):
                     add('record', evidence, 'ticket_missing')
                 else:
                     add('record', record.get('anchor', 'verification'), 'public_rule_violation')
-            anchor, method, digest = record['anchor'], record['method'], record['hash']
-            if not all(isinstance(x, str) and x for x in (anchor, method, digest)):
-                raise ValueError()
             path_part = anchor.split('::', 1)[0]
             if '::' not in anchor or Path(path_part).is_absolute() or '..' in Path(path_part).parts:
                 raise ValueError()
@@ -635,7 +648,8 @@ def check(args):
             add('source', anchor, 'parse_error')
     for record in records:
         anchor = record['anchor']
-        if record['method'] == METHOD and hashes.get(anchor) is not None and hashes[anchor] != record['hash']:
+        if (anchor in hashes and (hashes[anchor] is None or
+                (record['method'] == METHOD and hashes[anchor] != record['hash']))):
             add('record', anchor, 'stale')
     errors2 = {'git_unavailable', 'invalid_domain', 'invalid_front_matter', 'invalid_covers', 'invalid_ticket', 'invalid_record', 'invalid_anchor', 'unreadable_page', 'parse_error', 'method_mismatch'}
     reasons = ('stale', 'anchor_missing', 'missing_key', 'ticket_missing', 'test_missing', 'public_rule_violation', 'coarse_symbol', 'ambiguous_sub_anchor', *sorted(errors2))
@@ -676,6 +690,8 @@ def affected(args):
                 raise OSError('page unavailable')
             text = data.decode('utf-8')
             meta = parse_front_matter(text)
+            if not isinstance(meta, dict) or not isinstance(meta.get('anchors'), list) or not all(isinstance(a, str) and a for a in meta['anchors']):
+                raise ValueError('invalid anchors')
             start, end = '<!-- impact-map:covers -->', '<!-- /impact-map:covers -->'
             partial = is_base and start not in text and end not in text
             covers = [] if partial else parse_covers(text)
@@ -683,10 +699,12 @@ def affected(args):
             for m in re.finditer(r'^- \*\*E[0-9]+\*\* `([^`]+)` → `([^`]+)`', text, re.MULTILINE):
                 declarations.update(m.groups())
             return meta, declarations, 'covers_absent' if partial else None
-        _, old_declarations, partial_reason = page_data(base, is_base=True)
+        old_meta, old_declarations, partial_reason = page_data(base, is_base=True)
         meta, new_declarations, _ = page_data(head)
         declarations = old_declarations | new_declarations
         lookup = literals(meta['resources'], meta.get('literals'))
+        for literal, resources in literals(old_meta.get('resources', []), old_meta.get('literals')).items():
+            lookup[literal] = sorted(set(lookup.get(literal, [])) | set(resources))
         for anchor in declarations:
             path, symbol = anchor.split('::', 1)
             if not path or not symbol or Path(path).is_absolute() or '..' in Path(path).parts:
@@ -764,18 +782,39 @@ def affected(args):
                 def symbols(data):
                     tree = ast.parse(data, filename=path)
                     result = {}
+                    definitions = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+                    def scoped_definitions(nodes):
+                        for child in nodes:
+                            if isinstance(child, definitions):
+                                yield child
+                            else:
+                                yield from scoped_definitions(ast.iter_child_nodes(child))
+
+                    class StripDefinitions(ast.NodeTransformer):
+                        def visit_FunctionDef(self, node):
+                            return None
+                        visit_AsyncFunctionDef = visit_FunctionDef
+                        visit_ClassDef = visit_FunctionDef
+
                     def visit(body, prefix=''):
-                        for node in body:
-                            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                                name = prefix + node.name
-                                result[name] = ast.dump(node, annotate_fields=True, include_attributes=False)
-                                if isinstance(node, ast.ClassDef):
-                                    visit(node.body, name + '.')
-                            elif isinstance(node, (ast.Assign, ast.AnnAssign)) and not prefix:
-                                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                                for target in targets:
-                                    if isinstance(target, ast.Name):
-                                        result['<module>.' + target.id] = ast.dump(node, annotate_fields=True, include_attributes=False)
+                        for node in scoped_definitions(body):
+                            name = prefix + node.name
+                            if isinstance(node, ast.ClassDef):
+                                shallow = copy.deepcopy(node)
+                                shallow.body = [item for item in (StripDefinitions().visit(child) for child in shallow.body) if item is not None]
+                                comparison = shallow
+                                visit(node.body, name + '.')
+                            else:
+                                comparison = node
+                            result.setdefault(name, []).append(ast.dump(comparison, annotate_fields=True, include_attributes=False))
+                        if not prefix:
+                            for node in body:
+                                if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                                    for target in targets:
+                                        if isinstance(target, ast.Name):
+                                            result.setdefault('<module>.' + target.id, []).append(ast.dump(node, annotate_fields=True, include_attributes=False))
                     visit(tree.body)
                     return result
                 old_symbols, new_symbols = symbols(old), symbols(new)

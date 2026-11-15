@@ -98,3 +98,56 @@ def test_hash_preserves_docstrings_annotations_and_ignores_position(tmp_path):
     assert json.loads(run(tmp_path).stdout)['current_hash'] != digest
     source.write_text(source.read_text().replace('second', 'first').replace('x: int', 'x: str'))
     assert json.loads(run(tmp_path).stdout)['current_hash'] != digest
+
+
+def test_record_reports_fresh_and_canonical_json(tmp_path):
+    ticket = tmp_path / 'docs/tickets/open/T-1.md'
+    ticket.parent.mkdir(parents=True)
+    ticket.write_text('')
+    source = tmp_path / 'sample.py'
+    source.write_text('def f(): return 1\n')
+    digest = json.loads(run(tmp_path).stdout)['current_hash']
+    opts = ('--record', '--expected-hash', digest, '--reason', 'initial_record', '--evidence', 'T-1')
+    result = run(tmp_path, *opts)
+    assert result.returncode == 0
+    assert json.loads(result.stdout)['status'] == 'fresh'
+    assert json.loads(result.stdout)['recorded_hash'] == digest
+    path = tmp_path / 'docs/impact-map/verification/demo.json'
+    first = path.read_bytes()
+    assert first == (json.dumps(json.loads(first), sort_keys=True, indent=1) + '\n').encode()
+    assert run(tmp_path, *opts).returncode == 0 and path.read_bytes() == first
+    source.write_text('def f(): return 2\n')
+    new_hash = json.loads(run(tmp_path).stdout)['current_hash']
+    updated = run(tmp_path, '--record', '--expected-hash', new_hash, '--reason', 'initial_record', '--evidence', 'T-1')
+    assert json.loads(updated.stdout)['status'] == 'fresh' and json.loads(updated.stdout)['recorded_hash'] == new_hash
+
+
+def test_record_atomic_replace_failure_preserves_file(tmp_path, monkeypatch):
+    import importlib.util
+    import os
+    import types
+    spec = importlib.util.spec_from_file_location('impact_map_atomic_test', SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / 'sample.py').write_text('def f(): return 1\n')
+    ticket = tmp_path / 'docs/tickets/open/T-1.md'
+    ticket.parent.mkdir(parents=True)
+    ticket.write_text('')
+    digest = module.anchor_digest('sample.py::f')[1]
+    args = types.SimpleNamespace(page='demo', anchor='sample.py::f', record=True, expected_hash=digest, reason='initial_record', evidence='T-1')
+    module.verify(args)
+    path = tmp_path / 'docs/impact-map/verification/demo.json'
+    original = path.read_bytes()
+    (tmp_path / 'sample.py').write_text('def f(): return 2\n')
+    args.expected_hash = module.anchor_digest(args.anchor)[1]
+    def fail_replace(src, dst):
+        assert Path(src).parent == path.parent and Path(src).read_bytes() != original
+        assert Path(dst).resolve() == path and path.read_bytes() == original
+        raise OSError('simulated interruption')
+    monkeypatch.setattr(os, 'replace', fail_replace)
+    import pytest
+    with pytest.raises(OSError, match='simulated interruption'):
+        module.verify(args)
+    assert path.read_bytes() == original
+    assert set(path.parent.iterdir()) == {path}

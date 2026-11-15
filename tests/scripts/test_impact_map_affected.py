@@ -160,3 +160,82 @@ def test_broken_base_page_remains_error(tmp_path):
         page.write_text(text)
         code, result = run(tmp_path, base, '--worktree')
         assert code == 2 and result['error'] == 'analysis_failed'
+
+
+def test_affected_rejects_non_string_anchor(tmp_path):
+    base = setup(tmp_path)
+    page = tmp_path / 'docs/impact-map/domains/demo.md'
+    page.write_text(page.read_text().replace('"anchors": ["app.py::f", "app.py::<module>.VALUE"]', '"anchors": [1]'))
+    code, result = run(tmp_path, base, '--worktree')
+    assert code == 2 and result == {'error': 'analysis_failed'}
+
+
+def test_unmapped_duplicate_definitions_and_control_scopes(tmp_path):
+    setup(tmp_path)
+    source = tmp_path / 'app.py'
+    original = '''class Example:
+    @property
+    def value(self): return 1
+    @value.setter
+    def value(self, v): pass
+if True:
+    def conditional(): return 1
+else:
+    def conditional(): return 2
+try:
+    def attempted(): return 1
+except Exception:
+    pass
+with context():
+    async def managed(): return 1
+'''
+    source.write_text(original)
+    git(tmp_path, 'add', 'app.py')
+    git(tmp_path, 'commit', '-qm', 'definitions')
+    base = git(tmp_path, 'rev-parse', 'HEAD')
+    for old, new, anchor in [
+        ('def value(self): return 1', 'def value(self): return 3', 'app.py::Example.value'),
+        ('def conditional(): return 1', 'def conditional(): return 3', 'app.py::conditional'),
+        ('def attempted(): return 1', 'def attempted(): return 3', 'app.py::attempted'),
+        ('async def managed(): return 1', 'async def managed(): return 3', 'app.py::managed'),
+    ]:
+        source.write_text(original.replace(old, new))
+        code, result = run(tmp_path, base, '--worktree')
+        assert code == 0 and {'kind': 'unmapped_changed_unmapped_symbol', 'anchor': anchor} in result['items']
+
+
+def test_class_candidate_excludes_nested_definitions_but_tracks_class_changes(tmp_path):
+    setup(tmp_path)
+    page = tmp_path / 'docs/impact-map/domains/demo.md'
+    page.write_text(page.read_text().replace('"app.py::f"', '"app.py::Example.method"'))
+    source = tmp_path / 'app.py'
+    original = 'class Example(Base):\n    value = 1\n    def method(self): return 1\n    class Inner:\n        def nested(self): return 1\n'
+    source.write_text(original)
+    git(tmp_path, 'add', '.')
+    git(tmp_path, 'commit', '-qm', 'class')
+    base = git(tmp_path, 'rev-parse', 'HEAD')
+    for changed in (original.replace('def method(self): return 1', 'def method(self): return 2'),
+                    original.replace('def nested(self): return 1', 'def nested(self): return 2')):
+        source.write_text(changed)
+        code, result = run(tmp_path, base, '--worktree')
+        assert code == 0 and {'kind': 'unmapped_changed_unmapped_symbol', 'anchor': 'app.py::Example'} not in result['items']
+    for changed in (original.replace('value = 1', 'value = 2'), original.replace('Example(Base)', 'Example(Other)')):
+        source.write_text(changed)
+        code, result = run(tmp_path, base, '--worktree')
+        assert code == 0 and {'kind': 'unmapped_changed_unmapped_symbol', 'anchor': 'app.py::Example'} in result['items']
+
+
+def test_removed_resource_uses_base_literal_override(tmp_path):
+    setup(tmp_path)
+    page = tmp_path / 'docs/impact-map/domains/demo.md'
+    text = page.read_text().replace('"resources": ["event:signal"]', '"resources": ["event:old"], "literals": {"event:old": ["legacy"]}')
+    page.write_text(text)
+    source = tmp_path / 'app.py'
+    source.write_text('def emitter():\n    emit("legacy")\n')
+    git(tmp_path, 'add', '.')
+    git(tmp_path, 'commit', '-qm', 'old resource')
+    base = git(tmp_path, 'rev-parse', 'HEAD')
+    page.write_text(text.replace('"resources": ["event:old"], "literals": {"event:old": ["legacy"]}', '"resources": []'))
+    source.write_text('def emitter():\n    pass\n')
+    code, result = run(tmp_path, base, '--worktree')
+    assert code == 0 and {'kind': 'literal_candidates_changed', 'anchor': 'app.py::emitter', 'resource': 'event:old', 'change': 'removed'} in result['items']
