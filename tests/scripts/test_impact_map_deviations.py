@@ -33,69 +33,79 @@ def scan_sites(source):
                 return {'other'}
             return {None}
 
-        def visit_Assign(self, node):
-            self.visit(node.value)
-            value = self.receiver(node.value)
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    self.env[target.id] = set(value)
-                else:
-                    self.visit(target)
-
-        def visit_AnnAssign(self, node):
-            if node.value is not None:
-                self.visit(node.value)
-            if isinstance(node.target, ast.Name):
-                if node.value is not None:
-                    self.env[node.target.id] = set(self.receiver(node.value))
-                elif isinstance(node.annotation, ast.Name) and node.annotation.id in methods:
-                    self.env[node.target.id] = {node.annotation.id}
-                else:
-                    self.env[node.target.id] = {None}
-
-        def visit_If(self, node):
-            self.visit(node.test)
-            before = {k: set(v) for k, v in self.env.items()}
-            for stmt in node.body:
-                self.visit(stmt)
-            left = self.env
-            self.env = {k: set(v) for k, v in before.items()}
-            for stmt in node.orelse:
-                self.visit(stmt)
-            right = self.env
-            self.env = {k: left.get(k, {None}) | right.get(k, {None})
-                        for k in left.keys() | right.keys()}
-
         def visit_FunctionDef(self, node):
             self.stack.append(node.name)
             outer = self.env
-            self.env = {k: set(v) for k, v in outer.items()}
+
             class Bindings(ast.NodeVisitor):
                 def __init__(self):
                     self.names = set()
+                    self.assignments = []
+
                 def visit_Name(self, item):
                     if isinstance(item.ctx, (ast.Store, ast.Del)):
                         self.names.add(item.id)
+
+                def visit_Assign(self, item):
+                    for target in item.targets:
+                        if isinstance(target, ast.Name):
+                            self.assignments.append((target.id, item.value))
+                    self.generic_visit(item)
+
+                def visit_AnnAssign(self, item):
+                    if isinstance(item.target, ast.Name):
+                        value = item.value
+                        if value is None and isinstance(item.annotation, ast.Name) and item.annotation.id in methods:
+                            value = item.annotation
+                        self.assignments.append((item.target.id, value))
+                    self.generic_visit(item)
+
                 def visit_FunctionDef(self, item):
                     self.names.add(item.name)
+
                 visit_AsyncFunctionDef = visit_FunctionDef
+
                 def visit_ClassDef(self, item):
                     self.names.add(item.name)
+
             bindings = Bindings()
             for stmt in node.body:
                 bindings.visit(stmt)
-            for name in bindings.names:
-                self.env[name] = {None}
             args = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs,
                     *((node.args.vararg,) if node.args.vararg else ()),
                     *((node.args.kwarg,) if node.args.kwarg else ()))
+            local_names = bindings.names | {arg.arg for arg in args}
+            self.env = {k: set(v) for k, v in outer.items() if k not in local_names}
+            self.env.update({name: set() for name in local_names})
+            assigned = {name for name, _ in bindings.assignments}
+            for name in bindings.names - assigned:
+                self.env[name].add(None)
             for arg in args:
-                self.env[arg.arg] = ({arg.annotation.id} if isinstance(arg.annotation, ast.Name)
-                                     and arg.annotation.id in methods else {None})
+                self.env[arg.arg].add(arg.annotation.id if isinstance(arg.annotation, ast.Name)
+                                      and arg.annotation.id in methods else None)
+            # Resolve aliases to a fixed point before visiting calls.  Empty sets are
+            # pending local names, not unknown bindings, so forward chains work.
+            while True:
+                previous = {k: set(v) for k, v in self.env.items()}
+                for name, value in bindings.assignments:
+                    self.env[name].update(self.receiver(value) if value is not None else {None})
+                if self.env == previous:
+                    break
+            # Cycles with no known origin remain unresolved, including their users.
+            for name in local_names:
+                if not self.env[name]:
+                    self.env[name].add(None)
+            while True:
+                previous = {k: set(v) for k, v in self.env.items()}
+                for name, value in bindings.assignments:
+                    self.env[name].update(self.receiver(value) if value is not None else {None})
+                if self.env == previous:
+                    break
             for stmt in node.body:
                 self.visit(stmt)
             self.env = outer
             self.stack.pop()
+
         visit_AsyncFunctionDef = visit_FunctionDef
 
         def visit_Call(self, node):
@@ -211,7 +221,7 @@ def test_nested_scope_arguments_and_assignments_shadow_alias():
     sites = scan_sites(source)
     assert sites['certain'] == {(SOURCE, 'Commands.f', 'StateStore.save', '')}
     assert not sites['possible']
-    assert {row[1] for row in sites['unresolved']} == {'Commands.f.arg', 'Commands.f.assigned'}
+    assert {row[1] for row in sites['unresolved']} == {'Commands.f.arg'}
 
 
 def test_straight_line_reassignment_removes_alias():
@@ -222,4 +232,44 @@ def test_straight_line_reassignment_removes_alias():
         store.save()
 '''
     sites = scan_sites(source)
-    assert not sites['certain'] and not sites['possible']
+    assert not sites['certain']
+    assert sites['possible'] == {(SOURCE, 'Commands.f', 'StateStore.save', '')}
+
+
+@pytest.mark.parametrize('body', [
+    'for x in items:\n            store = {}',
+    'while flag:\n            store = {}',
+    'try:\n            store = {}\n        except Exception:\n            pass',
+    'with context:\n            store = {}',
+    'match flag:\n            case True:\n                store = {}',
+], ids=['for', 'while', 'try', 'with', 'match'])
+def test_control_constructs_keep_may_alias(body):
+    source = ("class Commands:\n    def f(self, items, flag, context):\n"
+              "        store = self.state\n        " + body + "\n        store.save()\n")
+    sites = scan_sites(source)
+    assert sites['possible'] == {(SOURCE, 'Commands.f', 'StateStore.save', '')}
+    assert not sites['certain']
+
+
+def test_may_alias_applies_before_and_through_alias_chain():
+    source = """class Commands:
+    def f(self):
+        other.save()
+        other = store
+        store = self.state
+        store = {}
+"""
+    sites = scan_sites(source)
+    assert sites['possible'] == {(SOURCE, 'Commands.f', 'StateStore.save', '')}
+
+
+def test_all_tracked_bindings_are_certain():
+    source = """class Commands:
+    def f(self):
+        store.save()
+        store = self.state
+        store = self.state
+"""
+    sites = scan_sites(source)
+    assert sites['certain'] == {(SOURCE, 'Commands.f', 'StateStore.save', '')}
+    assert not sites['possible']

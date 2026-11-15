@@ -17,6 +17,12 @@ python3 scripts/impact_map.py evaluate --domain kill-switch --index tmp/impact-m
 
 採点には裁定済みの凍結表 (`kill-switch-frozen.json`、各行に class 欄がある) を使う。A・B の表 (`kill-switch-a.json` / `kill-switch-b.json`) は独立作成の記録で、class 欄が無いので evaluate には渡さない。出力と被覆宣言は人が source と照合する材料で、頁の意味の自動証明ではない。
 
+## 直呼び検査
+
+`tests/scripts/test_impact_map_deviations.py` は `Commands` の StateStore / OutageStateMachine に対する対象メソッドの直呼びを例外台帳と照合する。各関数 scope の単純な名前への代入と注釈付き引数・代入を流れに依らず集め、追跡対象だけの束縛は確定、他の束縛と混在する場合は可能として扱う。未解決と可能は人が確認する。内側関数の引数とローカル名は外側の同名束縛を遮蔽する。
+
+構文検査の保証外は、`getattr` 等による動的取得・呼出し、receiver やメソッドを引数として渡した先での呼出し、属性・コンテナへの代入を経由する alias、`with ... as`、unpack 代入、ループ変数・match capture・代入式など単純な名前への通常代入以外の束縛、関数戻り値や型推論を介した receiver の追跡である。`global` / `nonlocal`、内包表記や lambda 等の独立 scope も正確な解決を保証しない。これらを使う場合は source を人が確認する。
+
 ## 手動閉鎖の雛形
 
 1. 予定 symbol と入口・副作用を頁と source で照合し、守る K と禁止経路を brief に渡す。
