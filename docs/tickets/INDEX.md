@@ -1,9 +1,9 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 174 件。完了分は closed/。
+未完了: 175 件。完了分は closed/。
 
-## 実装中 (5)
+## 実装中 (6)
 
 ### 不具合 (3)
 
@@ -13,11 +13,12 @@
 | [history-import-stops-at-first-conflict](open/history-import-stops-at-first-conflict.md) | 中 | 2026-11-13 | history import は食い違う足 1 本で partial 停止し後続を取り込まない |
 | [status-history-hidden-while-daemon-runs](open/status-history-hidden-while-daemon-runs.md) | 中 | 2026-11-13 | daemon 稼働中は評価用履歴の状態を見る面が無い |
 
-### 機能 (1)
+### 機能 (2)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [web-plugin-improve-hub](open/web-plugin-improve-hub.md) | 高 | 2026-11-08 | 同梱 web に plugin と改善の画面群を作る (一覧・依存・承認・改善の実行) |
+| [killswitch-reset-hwm-rebase](open/killswitch-reset-hwm-rebase.md) | 高 | 2026-11-13 | kill switch の手動解除で HWM を付け直す明示操作が無い |
 
 ### 保守 (1)
 
@@ -25,7 +26,7 @@
 |---|---|---|---|
 | [code-impact-map](open/code-impact-map.md) | 高 | 2026-11-14 | コードから読み取る現状の影響地図 (機械索引・契約表・領域頁) を docs/ に置く |
 
-## 実装待ち (13)
+## 実装待ち (12)
 
 ### 不具合 (7)
 
@@ -39,11 +40,10 @@
 | [flaky-tool-schemas](open/flaky-tool-schemas.md) | 低 |  | 全ツールのスキーマテストがフル suite でだけ ERROR になる |
 | [improve-add-quotes](open/improve-add-quotes.md) | 低 |  | improve add がクォートを剥がさず表示が崩れる |
 
-### 機能 (2)
+### 機能 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
-| [killswitch-reset-hwm-rebase](open/killswitch-reset-hwm-rebase.md) | 高 | 2026-11-13 | kill switch の手動解除で HWM を付け直す明示操作が無い |
 | [legacy-oc-tool-not-found](open/legacy-oc-tool-not-found.md) | 低 |  | 存在しない候補名を読むときの誘導が足りない |
 
 ### 保守 (4)
@@ -78,9 +78,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (150)
+## 設計待ち (151)
 
-### 不具合 (80)
+### 不具合 (81)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -151,6 +151,7 @@
 | [first-run-acceptance-doc-quotes-drift](open/first-run-acceptance-doc-quotes-drift.md) | 低 | 2026-11-03 | 初回受入手順書の逐語引用 test 3 件が main で落ちる |
 | [mission-worker-improve-rpc-frame-test-fails](open/mission-worker-improve-rpc-frame-test-fails.md) | 低 | 2026-11-03 | mission_worker の improve RPC frame test が main で落ちる |
 | [killswitch-latched-activity-repeats](open/killswitch-latched-activity-repeats.md) | 低 | 2026-11-14 | 同一 kill switch 世代で繰り返される latch activity を一件にする |
+| [paper-starting-balance-cashflow-history](open/paper-starting-balance-cashflow-history.md) | 低 | 2026-11-15 | paper.starting_balance の変更が cashflow 履歴に残らない |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backtest-scheduler-log-leak](open/backtest-scheduler-log-leak.md) | 低 |  | backtest 内部 Scheduler の `maintain_reservations failed: no c… |
 | [graceful-stop-waits-mission](open/graceful-stop-waits-mission.md) | 低 |  | graceful stop が走行中 improve mission の timeout (最大 60 分) を待つ … |
