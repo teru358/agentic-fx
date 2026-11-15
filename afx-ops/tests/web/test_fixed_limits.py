@@ -150,6 +150,12 @@ def test_security_headers_are_the_literal_fixed_set():
     assert set(SECURITY_HEADERS) <= set(response.headers)
 
 
+def test_only_the_writable_web_relaxes_the_referrer_policy_to_same_origin():
+    from afx_ops.web.headers import response_headers
+    assert response_headers(length=0)["Referrer-Policy"] == "no-referrer"
+    assert response_headers(length=0, writable=True)["Referrer-Policy"] == "same-origin"
+
+
 def test_fields_outside_the_status_allowlist_are_not_shown():
     page = handle_request(Request("GET", "/", {}),
                           Recorder(data={"mode": "paper", "api_token": "tok-literal-123"})).body.decode()

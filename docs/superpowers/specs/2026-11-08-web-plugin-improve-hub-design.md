@@ -177,7 +177,7 @@ JS と Node.js の使用は許可された (2026-11-08)。11-01 の方針とし�
 **要求の検査** (書込みの POST は、すべてを満たしたときだけ受ける。どれかが欠ければ 4xx で、daemon を呼ばない):
 1. `write = true` で、経路が loopback か HTTPS。
 2. Basic で認証済み。
-3. `Origin` が、設定と検査済みの Host から組み立てた web 自身の origin (scheme を含む。既定の port を省いた形も扱う) と完全に一致する。`Origin` が無い・`null`・重複・不正値は拒否する (`Referrer-Policy: no-referrer` のため Referer は見ない)。
+3. `Origin` が、設定と検査済みの Host から組み立てた web 自身の origin (scheme を含む。既定の port を省いた形も扱う) と完全に一致する。`Origin` が無い・`null`・重複・不正値は拒否する (Referer は見ない)。書込みが有効な web は `Referrer-Policy: same-origin` を返す (`no-referrer` の文書から送る form の POST にはブラウザが `Origin: null` を付け、この検査で必ず落ちるため。読取専用の web は `no-referrer` のまま)。
 4. token が有効で、まだ使われておらず、認証済みのユーザーと一致する (2 回目の POST)。
 5. 対象外の method・path は今どおり 405 / 404。
 
@@ -339,6 +339,7 @@ JS と Node.js の使用は許可された (2026-11-08)。11-01 の方針とし�
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-11-15 | C2.4 | 書込みが有効な web の `Referrer-Policy` を `same-origin` にする | `no-referrer` の文書の form の POST にブラウザが `Origin: null` を付け、承認ボタンが常に 403 になった (実ブラウザで発覚、test は Origin を手で付けていた) | — |
 | 2026-11-08 | C2.3 | reconfigure は `write` を保持し、`write` の変更は enable へ案内する。有効化のときに password の変更を勧める。token の作り方と冪等 key (token の SHA-256)。B1 の実装の順序と検証の粒度。受入 12 を却下・改善・job・回復まで広げ、reconfigure と token の受入、afx-ops 側の固定 test の範囲。資格情報の流出の残余 | B1 の実装前レビュー (sol、Important 1 / Minor 2) | — |
 | 2026-11-08 | C2.2 | §3 を利用者の裁定で確定 (承認者は Basic のユーザー名で 1 人扱い、段 A は表だけ、A を今始め B1 は実装前にもう 1 周、B2・C は別チケット) | 利用者の裁定 | — |
 | 2026-11-08 | C2.1 | 鍵の切替を状態機械に合わせる (未登録 enroll・active 照合・revoked rotate、目標を stage に記録、中断から再開、止まっていた afx は起動しない)。確認 record に状態 (未使用・実行中・結果判明・結果不明) と結果の回復の口、消費済みの保持、満杯時の 4xx。改善の候補を API → job → supervisor → `_execute_mission` → `prepare` へ運び、週次は default、繰り返しは同じ snapshot、実行専用の Settings を admission と handshake へ。TLS の handshake も接続枠に数える。却下の digest 照合は直前時点までと明記。CLI と API の一致、CLI は DB を作らない | sol 3 周目 (Important 4 / Minor 1) | — |

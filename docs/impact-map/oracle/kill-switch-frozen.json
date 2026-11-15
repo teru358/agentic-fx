@@ -2982,6 +2982,33 @@
    "relation": "invokes -> src/agentic_fx/store/state.py::StateStore.load",
    "resource": "state:app_state.kill_switch_latched",
    "symbol": "src/agentic_fx/ops/service.py::OpsService._current_state"
+  },
+  {
+   "class": "G_lit",
+   "critical": false,
+   "origin": "page_review",
+   "rationale": "補完を見送ったときに warning log の固定 code を出す。",
+   "relation": "produces",
+   "resource": "log:guard_notice_backfill_skipped",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService._sweep_kill_switch"
+  },
+  {
+   "class": "G_lit",
+   "critical": false,
+   "origin": "page_review",
+   "rationale": "lane を取れない・例外のときに warning log の固定 code を出す。",
+   "relation": "produces",
+   "resource": "log:guard_notice_deferred",
+   "symbol": "src/agentic_fx/ops/service.py::OpsService.emit_pending_notices"
+  },
+  {
+   "class": "G_lit",
+   "critical": false,
+   "origin": "page_review",
+   "rationale": "世代不一致の例外に発動時刻を渡し、解除後も値を保つ。",
+   "relation": "reads",
+   "resource": "state:app_state.kill_switch_latched_at",
+   "symbol": "src/agentic_fx/store/state.py::StateStore.reset_kill_switch"
   }
  ]
 }

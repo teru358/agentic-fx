@@ -23,11 +23,14 @@ def response_headers(*, length: int, extra: dict[str, str] | None = None,
                      writable: bool = False) -> dict[str, str]:
     """本文と同じ長さを示す header を、固定の安全 header と共に作る。
 
-    `writable` (書込みが有効な web) のときだけ、form の送信先を同一 origin に緩める。
+    `writable` (書込みが有効な web) のときだけ、form の送信先を同一 origin に緩め、referrer を
+    同一 origin に限って送る。`no-referrer` の文書から送る form の POST にはブラウザが
+    `Origin: null` を付けるので、Origin の完全一致を要求する書込みが通らなくなる。
     """
     headers = dict(SECURITY_HEADERS)
     if writable:
         headers["Content-Security-Policy"] = WRITABLE_CSP
+        headers["Referrer-Policy"] = "same-origin"
     headers["Content-Type"] = "text/html; charset=utf-8"
     headers["Content-Length"] = str(length)
     if extra:

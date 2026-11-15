@@ -191,3 +191,82 @@
 
 - 採用 6 件 (代入先の添字・属性の照合、symlink 検査を repo 内に限定、致命的な診断で index.json を残さない、literal の正規表現の前計算、TP・FN・U の排他集計、構文解析の再帰・メモリ超過の診断) を入れて再測定。不採用 1 件 (頁の FP を合否に含める) は §4.3 が FP をゼロ条件にしないため。
 - 機械セル critical 81 / TP 81 / FN 0 / U 0 (全体 FP 54 → 49)、頁セル critical 208 / TP 208 / FN 0 / U 0 (全体 FP 3)。合否は変わらない。extract 0.97 秒 (一回)。
+
+## T2 (verify / check / affected / 固有例外台帳 / 非 critical の頁補完)
+
+- 道具: `verify` (正規化 AST hash と方式 version、期待 hash が一致したときだけ照合記録)、`check` (stale・根拠消失・必須違反は 1、解析失敗・宣言不正・方式不整合・履歴取得不能は 2)、`affected` (revision 間または作業 tree との差を種類別に)、固有例外台帳 `deviations.json` と Commands の直呼び検査 (D02 の shell reset / confirm、D04 の data resume)。
+- 頁の補完: 非 critical 83 行のうち 82 行を頁に足した。残る 1 行 (`ImproveLoop._FLOOR_REPORT_METRIC_KEYS`) は、class 直下の定数を extract は `Class.NAME` で記録するのに verify / check の anchor 解決が解けない食い違いのため、頁に被覆を書くと check が落ちる。解決側を extract に揃える是正を入れてから被覆する。
+- 正解表の追加 (§4.1 (4)): 頁の FP 3 件を source で確かめた結果、頁の宣言が正しかった (正解表の漏れ) ので非 critical として凍結表に足した — `OpsService._sweep_kill_switch` × `log:guard_notice_backfill_skipped`、`OpsService.emit_pending_notices` × `log:guard_notice_deferred`、`StateStore.reset_kill_switch` × `state:app_state.kill_switch_latched_at` (reads)。凍結表 310 行。frozen sha256: `d745092e…` → `65ee08c7…`。
+- 0dbcb27f..HEAD (HWM の merge を含む) の affected: dependency_changed 1 (`store/db.py::<module>._SCHEMA`)、symbol_changed 4 (`ops/api_server.py::_call`・`ops/client.py::Runner._op_killswitch_reset`・`service.py::_build_ops_service`・`service.py::build_app`)、literal_candidates_changed 13、unmapped_new_file 3 (`ops/rebase_accounting.py`・`ops/rebase_service.py`・`ops/rebase_view.py`)。HWM の実運用確認 (§6.4 の二件目、T3) の材料。
+- 最終 (T2): anchor 解決を揃えた後に残り 1 行を被覆。頁セル 全体 310 / TP 310 / FN 0 / FP 0 (critical 208 / 208)、機械セル 全体 114 / TP 114 / FN 0 / FP 59 (critical 81 / 81)。`check --page kill-switch` は終了コード 0。
+- 人手の裁定 (`ambiguous_sub_anchor`、E13): `src/agentic_fx/commands.py::Commands._dispatch#_emit_guard_notices` は、shell の `killswitch reset <世代>` の分岐にある `_emit_guard_notices` の 3 文 (store の reset 前の `None`、`ResetNotApplied` のときの `self._projected_state`、成功時の `lambda: after`) に該当し、callee と literal では 1 文に絞れない。3 文とも同じ分岐の前処理・保存失敗時・成功時の wrapper で、E13 の記述 (shell reset の前後 wrapper) と一致することを 94ad84e3 の source で確かめた。照合記録はこの裁定を前提に人が読む項目として残し、exit 0 を照合済みとは扱わない。
+- 人手の裁定 (`base_declarations_partial`、0dbcb27f): base の頁は a58dc4bb で置いた雛形 (front matter の resources・anchors が空、covers marker 無し) で、破損ではないことを履歴で確かめた。base 側の宣言は空として扱うので、0dbcb27f..HEAD で依存の削除は検出できない (この区間では頁が初めて書かれたので、削除される宣言も無い)。
+- 新 resource の保守的検出の実測 (0dbcb27f..HEAD、HWM の差分): HWM が足した resource は `db:kill_switch_hwm_rebases` (`store/db.py` の `_SCHEMA`・`TABLE_NAMES`)、ops の endpoint `killswitch_rebase`・`killswitch_rebase_preview` (`ops/service.py` の `ENDPOINTS`・`ops/api_server.py::_call`・`ops/client.py`・`cli_surface.py`)、ops の error code (`ops/contracts.py` の `preview_changed`・`market_closed`、新しい 3 file の拒否 code)、`log:rebase_release_failed` (`OpsService`)。既知 literal の無い file の未宣言 symbol を候補に出さない規則では `cli_surface.py`・`ops/contracts.py`・`ops/client.py` (宣言済みの 1 symbol を除く)・`afx-ops/afx_ops/web/write.py` が一件も出なかった。規則を外すと `unmapped_changed_unmapped_symbol` は 15 → 38 件で、これらがすべて出る。
+- T2 の閉鎖: 道具に入った追加 — 副 anchor (`path::symbol#callee[@literal]`、最小 statement の hash)、`ambiguous_sub_anchor` / `coarse_symbol` / `coarse_parent_changed` / `base_declarations_partial` の情報項目 (閉鎖時に必ず読む、exit 0 は照合済みではない)、既存の照合記録の reason・evidence の再検査、根拠 test 名の AST 照合、既知 literal の無い file も候補走査、base と head の resource の和集合、照合記録の原子的・排他の書込み、直呼び検査の scope 単位の may-alias。tests/scripts/test_impact_map*.py 95 本。実頁: `check` 終了コード 0 (人が読む項目は E13 の 1 件)、0dbcb27f..HEAD の `affected` 58 項目。所要: `check` 約 0.9 秒、`affected` 約 4.7 秒。
+
+## T3 一件目: C4 の遡及運用確認 (§6.4)
+
+**これは遡及運用確認であり、「関係を変える code と頁が同 commit で更新された」ことの実地試験ではない。** したがって T3 は二件目の同 commit の実地試験が未達で、閉鎖していない (下の「T3 の状態」)。 C4 の merge 時点 (0dbcb27f) の頁は雛形で、今の頁は C4 の後に書かれたものである。
+
+- 手順: 0dbcb27f の使い捨て worktree (repo 外) に今の `docs/impact-map/` と `scripts/impact_map.py` を写して一時 commit し、`affected --page kill-switch --base d7025768^1 --head <一時 commit>` を回した (差分は C4 の merge の親 → merge 結果、first-parent の 5 merge)。一時 commit が足す docs と scripts は裁定から除いた。終了後に worktree を remove した。
+- 出力: 185 項目 (終了コード 0)。内訳は `unmapped_changed_unmapped_symbol` 109、`symbol_changed` 33、`literal_candidates_changed` 32、`unmapped_new_file` 8、`ambiguous_sub_anchor` 1、`coarse_parent_changed` 1、`base_declarations_partial` 1。
+- 裁定: 185 項目を一件ずつ source を読んで分類し、個別の表を [kill-switch-c4-retro-table.md](kill-switch-c4-retro-table.md) に置いた (anchor・種別・分類・根拠の頁 ID か理由 1 行)。最初の裁定は変更行の特定語 (kill / guard / latch / reset_marker) の有無を領域外の根拠にしていたが、それでは配送の停止・再試行・自動復旧を左右する変更を落とすので改め、特定語を根拠にしない三分類に裁き直した。頁の更新は一時の手順で今の頁に対して出した結果と同じ形で再実行し、185 項目で変わらない。
+
+| 分類 | 件数 | 内容 |
+|---|---|---|
+| 無関係 | 27 | web の bot health 表示 (daemon の status を描くだけの純粋な関数・固定語)、`status` / `ctl status` の bot health 行、`ops/bot_health.py` と `health.py` (別 daemon thread で書き失敗は握る。終了判断の集合に入らない)、log の固定語化 (logsafe・cli)、docstring のみの変更、task 生成の補助、設置 UI の文言、`_respond_within` (応答の失敗を握るだけで state・再試行を持たない)。各行に source で確かめた根拠を書いた |
+| 関連・既存の頁で足りる | 143 | 通知機構 (F09–F12・F17–F18・F21・F70・F92・E13–E16・E31–E33・E60)、bot の cursor 保存・state の読書き・snapshot の掃除・gateway・login の失敗分類 (F29・F168・K-CONSUME)、drop-in の設置手順 (F169)、承認表示の取得・再試行・投稿・更新 (起動 reconcile と poll 周回を占め、恒久拒否・state 失敗で bot 全体が止まるので配送に効く。F165・F168・F170・F172・F173) |
+| 頁の更新が要る (更新済み) | 14 | F29 の書き直し、F129、F130、F12 の一文、および配送の停止・再試行・自動復旧の新 F165–F171 (下記)。承認表示の再試行が配送の開始を待たせる点を F172・F173 に足した (関連の行から結んだ) |
+| 道具の情報項目 | 1 | `base_declarations_partial` (下記) |
+
+(計 185。`coarse_parent_changed` の `build_app` と `ambiguous_sub_anchor` の E13 は「関連・既存」に含め、E13 は T2 の裁定のとおり再確認した。)
+
+- `base_declarations_partial` 1 (`covers_absent`): base の頁が雛形のため想定どおり。この区間の削除は検出できないが、頁が初めて書かれた区間なので削除される宣言も無い。
+- 頁の更新が要った点 (頁が拾えなかった変更。source で確かめて直した):
+  1. F29 (`BotAdapter.deliver_events`): 恒久の拒否は BotFailure で止まり、event 固有の不正な本文は固定の代替文を送って確定する経路が加わっていた。三経路に書き直した。
+  2. `OpsService._ops_lane` (新 F129): 同一 thread の lane 再入の拒否と thread-local の所有 flag は ops lane を使う全 mutation の共通入口。
+  3. `core/kill_switch_words.py` の `KILL_SWITCH_RESET_WARNING` と ctl の reset 成功時の出力 (新 F130)。
+  4. `OpsService.emit_pending_improve_notices` が `GuardLaneReentry` を握らず伝える点 (F12 に一文)。
+  5. 配送の停止・再試行・自動復旧 (裁き直しで追加。F165–F171): `bot/rest.py::classify` (恒久か一時かの分類)、`bot/progress.py` の配送・poll の無進捗判定 (`delivery_begin`・`delivery_committed`・`poll_begin`・`poll_end`・`expired`)、`bot/runtime.py::_monitor`・`_main_body`・`run`、`bot/exits.py::rc_for_reason` (恒久 78 / 一時 79 / loop 停止 80)、`ops_setup/units.py` の drop-in (`RestartPreventExitStatus` による自動復旧の可否)。K-CONSUME に再起動の方針を足した。いずれも guard event を含む配送が止まる・再試行される・自動復旧するかを左右する。
+- 変更前の F06・F07・F09・D との照合: F06 (`confirm_latched`) の store は差分に無く不変。F07 (`reset_kill_switch`) は操作前・結果・現 state の guard step に変わり、頁の記述と一致。F09 (`plan_kill_switch_notice`) は新規で、released 済みを閉じ履歴を捏造しない規則と一致。D01・D04・D05 は C4 後の source と一致 (D04 の `_data_resume` と `resume_data` の `_guard_event` は差分に無い)。
+- 見つけた欠陥・見落とし: 上の五つ。最初の裁定は 101 件を特定語の grep で「無関係」とまとめ、配送の停止・再試行・自動復旧に関わる変更 (五つ目) を落としていた。裁き直して個別の表を作り、更新した。道具の欠陥は無かったが、`unmapped_changed_unmapped_symbol` 107 件のうち領域内か否かは道具が出さず、人が一件ずつ読む必要がある。
+- 所要時間: 最初の裁定は開始から頁の commit まで約 3 分、裁き直しと 185 件の個別表・F165–F171 の追加は約 10 分の経過時間 (いずれも `date` と操作の記録による)。これは操作と編集を含む経過時間であり、全件の意味の照合の費用としては扱わない (最初の裁定が誤分類を含んでいたことからも、短い経過時間は照合の十分さを示さない)。
+- 更新後の `check --page kill-switch` は終了コード 0 (人が読む項目は E13 の 1 件のみ)。
+- 更新後の頁セル: 凍結表 310 行は TP 310 / FN 0 / U 0 (critical 208 / 208) のまま、頁セルの FP は 0 → 1。増えた 1 件は新しい F129 (`OpsService._ops_lane` × `ops:guard_lane_reentry`) で、凍結後の追加である (凍結表は変えない)。
+
+## T3 二件目: HWM の運用確認 (§6.4)
+
+**この確認は、HWM が頁の無い branch で実装されたため、「関係を変える code と頁が同 commit で更新された」ことの実地試験にはならない。** 頁は HWM の merge の後に合わせた。同 commit の更新の実地試験は未達である (下の「T3 の状態」)。
+
+- 手順: `affected --page kill-switch --base 0dbcb27f --head HEAD` (終了コード 0)。58 項目: `unmapped_changed_unmapped_symbol` 33、`literal_candidates_changed` 13、`symbol_changed` 5、`unmapped_new_file` 3、`ambiguous_sub_anchor` 1、`coarse_parent_changed` 1、`dependency_changed` 1、`base_declarations_partial` 1。
+- HWM 以外の混入: 無い。`src/` と `afx-ops/` の差分は HWM の 12 file だけ (`ops/rebase_service.py`・`ops/rebase_accounting.py`・`ops/rebase_view.py` の新規 3 file と、`ops/service.py`・`ops/client.py`・`ops/api_server.py`・`ops/contracts.py`・`cli_surface.py`・`store/state.py`・`store/db.py`・`service.py`・`afx-ops/afx_ops/web/write.py` の変更)。影響地図の道具と記録は `scripts/`・`docs/`・`tests/` にあり候補走査から除かれる。
+- 裁定 (58 項目を全件 source で。HWM の設計の §1–2・§4–5 と突き合わせた):
+
+| 区分 | 件数 | 裁定 |
+|---|---|---|
+| 頁の更新が要り、更新した | 52 | 付け直しの新 file・symbol・literal・辺。入口 (ctl の parse・`_op_killswitch_rebase`・`_rebase_done`・固定文・端末、cli_surface、api_server の route と件数固定、endpoint 表、error code、web の既知 code)、検査 (evaluate_rebase・RebaseWiring・error_code_name)、原子的な書込み (apply_rebase・台帳の読取・図形の導出・broker 評価)、排他と state の読取り (rebase_under_core・rebase_commit・shared_guard・GuardedState)、台帳表と許可集合。F131–F164 と E66–E78、F36・F40・F43 の本文の更新で対応づけた |
+| literal の衝突で頁に載せない | 3 | `evaluate_rebase`・`_rebase_commit`・`GuardedState.projected` の `activity:kill_switch_latched` (state の属性名と同じ literal。activity の読み書きは無い) |
+| 道具の情報項目で追従済み | 3 | `coarse_parent_changed` の `build_app` (core_lock と broker を ops service に渡す、F20・F36)、`ambiguous_sub_anchor` の E13 (T2 の裁定のとおり再確認)、`base_declarations_partial` (0dbcb27f の頁が雛形のため想定どおり) |
+
+(計 58。`dependency_changed` の `_SCHEMA` は F43 の更新に、`symbol_changed` の `_mutate`・`_build_ops_service`・`_op_killswitch_reset`・`_call` は F146・F36・F130・F149 に含めた。)
+- 頁の更新: K-REBASE を「実装済み」に (approver の明示操作と service 先頭の直接検査、PaperBroker・注文状態・新鮮 snapshot・DD・世代・autopilot・閉場の検査、HWM のみ変更で latch・世代・発動時刻を保持し state を書かない、値 CAS と ledger / snapshot の一つの transaction、通常 reset・shell・bot・web・notify に入口を足さない — それぞれ source で確かめた。入口が無いことは `Commands`・`afx-ops` の全 file の grep と cli_surface の record (shell の欄が無い) と api_server の `_match` (local_guard は UDS のみ) で確認)。D08 を解消済みにし、D10 (累積の硬い上限が無い、paper 限定) と D11 (COMMIT 結果不明は自動で再送しない) を残余として追加。K-RESET-UI を ctl の案内の追加に合わせた。頁の冒頭と影響先の記述 (観測 revision `160f1e47`、「未実装」の文) を直した。
+- 更新量: F 34 行 (F131–F164) と E 13 行 (E66–E78) と D 2 行を新規、K 2 行・D 1 行・F 5 行 (F20・F36・F40・F43・F130) と前文 3 箇所を更新。front matter に resource 6 (`db:kill_switch_hwm_rebases`・`ops:killswitch_rebase`・`ops:killswitch_rebase_preview`・`ops:preview_changed`・`ops:market_closed`・`log:rebase_release_failed`)・anchor 8・test 2 を追加。被覆宣言は 41 行追加 (すべて凍結表に無い行で、下の FP の 41 件と一致する)。頁の差分は 389 行追加・12 行削除 (被覆宣言の JSON が大半)。
+- 見落とし・所見: (a) `affected` は base の頁が雛形だと宣言済みか否かを区別できず、頁を直した後も 58 項目が同じ形で出る (比較は base 側の宣言に依るため。想定どおりで欠陥ではない)。(b) `GuardedState.projected` は現在の `src/` に呼出し元が無い (F162 に書いた)。(c) ledger を直接読む symbol は `read_rebase_totals` と `apply_rebase` だけで、`evaluate_rebase` は間接 (F131 に書き、被覆は宣言せず辺 E76 で結んだ)。(d) 抽出器は `OpsService._mutate` の `RebaseOutcomeUnknown` への分岐を資源の変更として出さず、`symbol_changed` だけで出る。
+- 検査: `check --page kill-switch` は終了コード 0 (人が読む項目は E13 の 1 件のみ)。`tests/scripts/test_impact_map*.py` 95 本 passed。
+- evaluate (凍結表は変えない): 頁セル 凍結表 310 行は TP 310 / FN 0 / U 0 (critical 208 / 208)、機械セル critical 81 / 81、FN 0、U 0。**FP は頁セル 1 → 42、機械セル 59 → 86。増えた分はすべて HWM の追加による凍結後の追加**で、凍結表の symbol への FP の増加は無い。頁セルの内訳 (41 件): 新 resource (台帳表・endpoint 二つ・error code 二つ・log code) の被覆 25、既存 resource の HWM symbol への被覆 16 (`evaluate_rebase`・`_rebase_commit`・`rebase_preview`・`shared_guard`・`GuardedState.projected`・`apply_rebase` の state・config・snapshot の読み書き)。機械セルの新しい FP 27 は同じ新 resource の literal の索引の命中と、`activity:kill_switch_latched` の衝突。凍結表の更新は次の正解表見直しで扱う。
+- 所要時間: `affected` 約 5 秒、`check` 約 1 秒、`extract` + `evaluate` 約 2 秒、頁の更新を含めて開始から commit まで約 4〜5 分の経過時間 (`date` による)。これは操作と編集を含む経過時間であり、58 項目の意味の照合の費用としては扱わない。
+
+## T3 の照合記録 (verify --record の初回)
+
+T3 の二件の確認で source を読んで頁の記述と合っていることを確かめた 43 anchor に、`initial_record` で初回の照合を記録した (`docs/impact-map/verification/kill-switch.json`)。内訳は HWM の 8 anchor (`evaluate_rebase`・`apply_rebase`・`rebase_preview`・`rebase_kill_switch`・`_rebase_under_core`・`_rebase_commit`・`shared_guard`・`_op_killswitch_rebase`、根拠は HWM の test) と、C4 で変わった既存の宣言 35 (副 anchor を含む。根拠は commands・ops service・status の test と bot の閉鎖済みチケット)。記録後の `check --page kill-switch` は終了コード 0 で stale 0。
+
+記録しなかった C4 側の anchor: `commands.py::Commands._dispatch#_emit_guard_notices` (E13 の端点。副 anchor が 3 文に該当して曖昧のため、記録しても stale になる。T2 の人手の裁定のまま)、`service.py::build_app` (coarse の親で副 anchor `build_app#emit_pending_notices` を記録した)。C4 で変わっていない既存の宣言は、この確認で source を読み直していないので記録していない。鮮度の運用 (§6.4) は、記録した anchor について成立し、それ以外の初回基準は次の通常チケットで該当 anchor を読むときに足す。
+
+## T3 の状態
+
+**T3 は二件目の同 commit の実地試験 (設計 §6.4: 関係を変える code と頁が実際に同 commit で更新されたことの確認) が未達で、未閉鎖である。** HWM は頁の無い branch で実装され、頁は後から合わせたため、この確認は満たされない。次の通常チケット (kill switch 領域を触るもの) で、code と頁を同 commit で更新し、閉鎖束 (§6.4 の (a)〜(e)) を実行して確認するまで、T3 は開いたままとする。一件目 (C4 の遡及運用確認)・二件目の頁の更新・照合記録は行ったが、それは未達の条件を満たさない。
+
+## C4 の裁き直し (二回目)
+
+「無関係」41 件を source で読み直し、配送の開始・継続・停止・復旧に効くものを移した。gateway・poll の開始前の処理 (prepare の `_load_and_invalidate`、起動 reconcile の `_fetch`・`_find_posted`) と、同じ poll 周回を止め得る承認表示の処理 (`_edit`・`_send_approval`・`_update_display_locked`・`_repost_locked`) は、恒久拒否・state 失敗で bot 全体が止まり、一時失敗の再試行が配送の開始を待たせるため「関連・既存」に移した。`write_snapshot` の前処理 (`_remove_stale_temps`) も cursor の保存の失敗分類に効くので移した。結果は無関係 27 / 関連・既存 143 / 更新 14 / 情報項目 1。F172 (起動 reconcile)・F173 (poll_once) を足した。この裁き直しの経過時間は操作と編集を含む約 10 分で、全件の意味の照合の費用としては扱わない。
+

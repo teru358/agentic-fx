@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Extract literal candidates from Python source without importing it."""
+import hashlib
+import fcntl
+import copy
+from datetime import datetime, timezone
 import argparse
 import ast
 import json
@@ -7,6 +11,7 @@ import os
 import re
 from pathlib import Path
 import subprocess
+import tempfile
 import sys
 
 EXCLUDED = {'data', 'logs', 'plugins', 'tmp', '.venv', '.git', 'config'}
@@ -26,7 +31,11 @@ def relative(path):
 
 
 def front_matter(path):
-    lines = Path(path).read_text(encoding='utf-8').splitlines()
+    return parse_front_matter(Path(path).read_text(encoding='utf-8'))
+
+
+def parse_front_matter(text):
+    lines = text.splitlines()
     if not lines or lines[0] != '---':
         raise ValueError('missing front matter')
     end = lines.index('---', 1)
@@ -245,7 +254,10 @@ def extract(args):
 
 
 def read_covers(path):
-    text = Path(path).read_text(encoding='utf-8')
+    return parse_covers(Path(path).read_text(encoding='utf-8'))
+
+
+def parse_covers(text):
     start, end = '<!-- impact-map:covers -->', '<!-- /impact-map:covers -->'
     if text.count(start) != 1 or text.count(end) != 1:
         raise ValueError('invalid covers markers')
@@ -353,6 +365,494 @@ def evaluate(args):
     return 0
 
 
+# v1 retains the complete AST, including docstrings, annotations, string literals,
+# decorators and defaults; only source location attributes are omitted.
+METHOD = f"python-{sys.version_info.major}.{sys.version_info.minor}:ast.dump(annotate_fields=True,include_attributes=False):v1"
+
+
+class AmbiguousSubAnchor(Exception):
+    pass
+
+
+def anchor_digest(anchor, data=None):
+    path, symbol = anchor.split('::', 1)
+    symbol, separator, selector = symbol.partition('#')
+    if separator:
+        callee, at, literal = selector.partition('@')
+        if not callee.isidentifier() or (at and not literal):
+            raise ValueError('invalid sub-anchor')
+    source = Path(path)
+    if source.is_absolute() or '..' in source.parts or source.resolve().is_relative_to(Path.cwd().resolve()) is False:
+        raise ValueError('invalid path')
+    node = None
+    try:
+        tree = ast.parse(source.read_bytes() if data is None else data, filename=path)
+        parts = symbol.split('.')
+        body = tree.body
+        if parts[0] == '<module>' and len(parts) == 2:
+            for item in body:
+                targets = item.targets if isinstance(item, ast.Assign) else [item.target] if isinstance(item, ast.AnnAssign) else []
+                if any(isinstance(t, ast.Name) and t.id == parts[1] for t in targets):
+                    node = item
+        else:
+            def scoped_definitions(nodes):
+                for child in nodes:
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        yield child
+                    else:
+                        yield from scoped_definitions(ast.iter_child_nodes(child))
+            for index, part in enumerate(parts):
+                if index == len(parts) - 1 and isinstance(node, ast.ClassDef):
+                    assignments = []
+                    for item in body:
+                        targets = item.targets if isinstance(item, ast.Assign) else [item.target] if isinstance(item, ast.AnnAssign) else []
+                        if any(isinstance(target, ast.Name) and target.id == part for target in targets):
+                            assignments.append(item)
+                    if assignments:
+                        node = assignments[-1]
+                        break
+                matches = [n for n in scoped_definitions(body) if n.name == part]
+                if len(matches) != 1:
+                    node = None
+                    break
+                node = matches[0]
+                body = node.body
+    except FileNotFoundError:
+        pass
+    if separator and node is not None:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            node = None
+        else:
+            matches = []
+            def scan(statement):
+                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    return
+                expressions = []
+                nested = []
+                def collect(item):
+                    for child in ast.iter_child_nodes(item):
+                        if isinstance(child, ast.stmt):
+                            nested.append(child)
+                        else:
+                            expressions.append(child)
+                            collect(child)
+                collect(statement)
+                has_call = any(isinstance(n, ast.Call) and
+                               (n.func.id if isinstance(n.func, ast.Name) else n.func.attr if isinstance(n.func, ast.Attribute) else None) == callee
+                               for n in expressions)
+                has_literal = not at or any(isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value == literal for n in expressions)
+                if has_call and has_literal:
+                    matches.append(statement)
+                for child in nested:
+                    scan(child)
+            for statement in node.body:
+                scan(statement)
+            if len(matches) > 1:
+                raise AmbiguousSubAnchor(anchor)
+            node = matches[0] if matches else None
+    digest = hashlib.sha256(ast.dump(node, annotate_fields=True, include_attributes=False).encode()).hexdigest() if node else None
+    return node, digest
+
+
+REASONS = {'contract_unchanged', 'relation_unchanged_refactor',
+           'relation_changed_page_updated', 'initial_record'}
+NAMESPACES = {'state', 'marker', 'event', 'activity', 'db', 'config', 'metric', 'ops', 'log'}
+PUBLIC_PATH = re.compile(r'https?://|/home/|(?:^|[^\w])(?:tmp/|\.claude(?:/|\b)|memory/)', re.I)
+
+
+def test_path(value):
+    if not isinstance(value, str):
+        return False
+    path, sep, selector = value.partition('::')
+    parts = Path(path).parts
+    if not parts or parts[0] != 'tests' or '..' in parts or Path(path).is_absolute():
+        return False
+    resolved = Path(path).resolve()
+    if not resolved.is_relative_to(Path('tests').resolve()) or not resolved.is_file():
+        return False
+    if not sep:
+        return True
+    match = re.fullmatch(r'([A-Za-z_]\w*(?:(?:::|\.)[A-Za-z_]\w*)*)(?:\[[^\[\]\r\n]+\])?', selector)
+    if not match:
+        return False
+    names = re.split(r'::|\.', match.group(1))
+    try:
+        body = ast.parse(resolved.read_bytes(), filename=path).body
+        for name in names[:-1]:
+            matches = [node for node in body if isinstance(node, ast.ClassDef) and node.name == name]
+            if not matches:
+                return False
+            body = matches[0].body
+        return any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == names[-1] for node in body)
+    except (OSError, SyntaxError, UnicodeError, ValueError, RecursionError):
+        return False
+
+
+def evidence_exists(value):
+    if not isinstance(value, str) or PUBLIC_PATH.search(value) or re.search(r'[\r\n]', value):
+        return False
+    if test_path(value):
+        return True
+    return bool(re.fullmatch(r'[A-Za-z0-9_-]+', value) and
+                any((Path('docs/tickets') / state / (value + '.md')).is_file()
+                    for state in ('open', 'closed')))
+
+
+def verify(args):
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', args.page):
+        raise ValueError('invalid domain')
+    directory = Path('docs/impact-map/verification')
+    if args.record:
+        directory.mkdir(parents=True, exist_ok=True)
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            return _verify(args, directory)
+        finally:
+            os.close(fd)
+    return _verify(args, directory)
+
+
+def _verify(args, directory):
+    record_path = directory / (args.page + '.json')
+    records = json.loads(record_path.read_text()) if record_path.exists() else []
+    try:
+        node, digest = anchor_digest(args.anchor)
+        ambiguous = False
+    except AmbiguousSubAnchor:
+        node, digest, ambiguous = None, None, True
+    previous = next ( (r for r in records if r['anchor'] == args.anchor), None)
+    status = 'ambiguous_sub_anchor' if ambiguous else 'anchor_missing' if node is None else 'missing_record' if previous is None else 'method_mismatch' if previous['method'] != METHOD else 'fresh' if previous['hash'] == digest else 'stale'
+    if args.record:
+        if not digest or digest != args.expected_hash:
+            raise ValueError('expected hash mismatch')
+        if args.reason not in REASONS or not evidence_exists(args.evidence):
+            raise ValueError('invalid reason or evidence')
+        revision = git('rev-parse', 'HEAD')
+        entry = dict(anchor=args.anchor, hash=digest, method=METHOD, date=datetime.now(timezone.utc).date().isoformat(), evidence=args.evidence, source_sha=revision.decode().strip() if revision else None, reason=args.reason)
+        records = [r for r in records if r['anchor'] != args.anchor] + [entry]
+        records.sort(key=lambda r: r['anchor'])
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=record_path.parent, delete=False) as stream:
+                temporary = stream.name
+                stream.write(json.dumps(records, sort_keys=True, indent=1) + '\n')
+            os.replace(temporary, record_path)
+        finally:
+            if temporary is not None and os.path.exists(temporary):
+                os.unlink(temporary)
+        previous, status = entry, 'fresh'
+    result = dict(current_hash=digest, recorded_hash=previous['hash'] if previous else None, status=status)
+    if node and node.end_lineno - node.lineno + 1 > 300:
+        result['coarse_symbol'] = args.anchor
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+
+def check(args):
+    items = set()
+    def add(kind, anchor, reason):
+        items.add((kind, anchor, reason))
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', args.page):
+        add('declaration', 'page', 'invalid_domain')
+    if not git('rev-parse', 'HEAD'):
+        add('history', 'HEAD', 'git_unavailable')
+    page = Path('docs/impact-map/domains') / (args.page + '.md')
+    anchors = []
+    try:
+        if not re.fullmatch(r'[A-Za-z0-9_-]+', args.page):
+            raise ValueError()
+        meta = front_matter(page)
+        if not isinstance(meta, dict):
+            raise ValueError()
+        for name in ('id', 'owner_role', 'resources', 'anchors', 'related', 'tests'):
+            if name not in meta:
+                add('required', name, 'missing_key')
+        if 'id' in meta and (not isinstance(meta['id'], str) or not re.fullmatch(r'[a-z0-9-]+', meta['id'])):
+            raise ValueError()
+        if 'owner_role' in meta and not isinstance(meta['owner_role'], str):
+            raise ValueError()
+        for name in ('resources', 'anchors', 'related', 'tests'):
+            if name in meta and (not isinstance(meta[name], list) or not all(isinstance(v, str) and v for v in meta[name])):
+                raise ValueError()
+        for resource in meta.get('resources', []):
+            namespace, sep, name = resource.partition(':')
+            if not sep or namespace not in NAMESPACES or not name or ':' in name or any(c.isspace() for c in name):
+                raise ValueError()
+        for test in meta.get('tests', []):
+            if not test_path(test):
+                add('test', test, 'test_missing')
+        for anchor in meta.get('anchors', []):
+            anchors.append(('anchor', anchor))
+        for ticket in meta.get('related', []):
+            if not re.fullmatch(r'[A-Za-z0-9_-]+', ticket):
+                add('declaration', 'related', 'invalid_ticket')
+            elif not any((Path('docs/tickets') / state / (ticket + '.md')).is_file() for state in ('open', 'closed')):
+                add('ticket', ticket, 'ticket_missing')
+    except (OSError, ValueError, TypeError, KeyError):
+        add('declaration', 'front_matter', 'invalid_front_matter')
+    try:
+        for cover in read_covers(page):
+            anchors.append(('cover', cover['symbol']))
+    except (OSError, ValueError, TypeError, KeyError, IndexError):
+        add('declaration', 'covers', 'invalid_covers')
+    try:
+        text = page.read_text(encoding='utf-8')
+        if PUBLIC_PATH.search(text):
+            add('page', 'page', 'public_rule_violation')
+        for match in re.finditer(r'^- \*\*E[0-9]+\*\* `([^`]+)` → `([^`]+)`', text, re.MULTILINE):
+            anchors.extend(('edge_endpoint', value) for value in match.groups())
+    except (OSError, UnicodeError):
+        add('declaration', 'page', 'unreadable_page')
+    record_path = Path('docs/impact-map/verification') / ((args.page if re.fullmatch(r'[A-Za-z0-9_-]+', args.page) else '_invalid_') + '.json')
+    try:
+        records = json.loads(record_path.read_text(encoding='utf-8')) if record_path.exists() else []
+        if not isinstance(records, list):
+            raise ValueError()
+        for record in records:
+            if not isinstance(record, dict):
+                raise ValueError()
+            anchor, method, digest = record['anchor'], record['method'], record['hash']
+            if not all(isinstance(x, str) and x for x in (anchor, method, digest)):
+                raise ValueError()
+            if any(PUBLIC_PATH.search(value) or (key == 'reason' and re.search(r'[\r\n]', value)) for key, value in record.items() if isinstance(value, str)):
+                add('record', 'verification', 'public_rule_violation')
+            reason, evidence = record['reason'], record['evidence']
+            if not isinstance(reason, str) or reason not in REASONS:
+                add('record', record.get('anchor', 'verification'), 'public_rule_violation')
+            if not evidence_exists(evidence):
+                if isinstance(evidence, str) and (PUBLIC_PATH.search(evidence) or re.search(r'[\r\n]', evidence)):
+                    add('record', record.get('anchor', 'verification'), 'public_rule_violation')
+                elif isinstance(evidence, str) and evidence.startswith('tests/'):
+                    add('record', evidence, 'test_missing')
+                elif isinstance(evidence, str) and re.fullmatch(r'[A-Za-z0-9_-]+', evidence):
+                    add('record', evidence, 'ticket_missing')
+                else:
+                    add('record', record.get('anchor', 'verification'), 'public_rule_violation')
+            path_part = anchor.split('::', 1)[0]
+            if '::' not in anchor or Path(path_part).is_absolute() or '..' in Path(path_part).parts:
+                raise ValueError()
+            anchors.append(('record', anchor))
+            if method != METHOD:
+                add('record', anchor, 'method_mismatch')
+    except (OSError, ValueError, TypeError, KeyError):
+        records = []
+        add('declaration', 'verification', 'invalid_record')
+    hashes = {}
+    sub_parents = {anchor.split('#', 1)[0] for kind, anchor in anchors if kind != 'record' and '#' in anchor}
+    for kind, anchor in sorted(set(anchors)):
+        try:
+            path, symbol = anchor.split('::', 1)
+            if not path or not symbol or Path(path).is_absolute() or '..' in Path(path).parts:
+                raise ValueError()
+            if anchor not in hashes:
+                node, hashes[anchor] = anchor_digest(anchor)
+                if node and '#' not in anchor and anchor not in sub_parents and node.end_lineno - node.lineno + 1 > 300:
+                    add(kind, anchor, 'coarse_symbol')
+            if hashes[anchor] is None:
+                add(kind, anchor, 'anchor_missing')
+        except AmbiguousSubAnchor:
+            hashes[anchor] = None
+            add(kind, anchor, 'ambiguous_sub_anchor')
+        except (ValueError, TypeError):
+            add('declaration', kind, 'invalid_anchor')
+        except (OSError, SyntaxError, UnicodeError, RecursionError, MemoryError):
+            add('source', anchor, 'parse_error')
+    for record in records:
+        anchor = record['anchor']
+        if (anchor in hashes and (hashes[anchor] is None or
+                (record['method'] == METHOD and hashes[anchor] != record['hash']))):
+            add('record', anchor, 'stale')
+    errors2 = {'git_unavailable', 'invalid_domain', 'invalid_front_matter', 'invalid_covers', 'invalid_ticket', 'invalid_record', 'invalid_anchor', 'unreadable_page', 'parse_error', 'method_mismatch'}
+    reasons = ('stale', 'anchor_missing', 'missing_key', 'ticket_missing', 'test_missing', 'public_rule_violation', 'coarse_symbol', 'ambiguous_sub_anchor', *sorted(errors2))
+    result = {'counts': {reason: sum(item[2] == reason for item in items) for reason in reasons},
+              'items': [dict(kind=k, anchor=a, reason=r) for k, a, r in sorted(items)]}
+    print(json.dumps(result, sort_keys=True, separators=(',', ':')))
+    return 2 if any(r in errors2 for _, _, r in items) else 1 if any(r not in ('coarse_symbol', 'ambiguous_sub_anchor') for _, _, r in items) else 0
+
+
+
+def affected(args):
+    def fail(reason):
+        print(json.dumps({'error': reason}, sort_keys=True))
+        return 2
+    base = git('rev-parse', '--verify', '--end-of-options', args.base + '^{commit}')
+    if not base:
+        return fail('base_unavailable')
+    base = base.decode().strip()
+    head = None
+    if not args.worktree:
+        raw = git('rev-parse', '--verify', '--end-of-options', args.head + '^{commit}')
+        if not raw:
+            return fail('head_unavailable')
+        head = raw.decode().strip()
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', args.page):
+        return fail('invalid_page')
+    try:
+        page = Path('docs/impact-map/domains') / (args.page + '.md')
+        def page_data(rev, *, is_base=False):
+            if rev and is_base:
+                listing = git('ls-tree', '-z', rev, '--', page.as_posix())
+                if listing is None:
+                    raise OSError('page listing unavailable')
+                if not listing:
+                    return {}, set(), 'page_absent'
+            data = git('show', rev + ':' + page.as_posix()) if rev else page.read_bytes()
+            if data is None:
+                raise OSError('page unavailable')
+            text = data.decode('utf-8')
+            meta = parse_front_matter(text)
+            if not isinstance(meta, dict) or not isinstance(meta.get('anchors'), list) or not all(isinstance(a, str) and a for a in meta['anchors']):
+                raise ValueError('invalid anchors')
+            start, end = '<!-- impact-map:covers -->', '<!-- /impact-map:covers -->'
+            partial = is_base and start not in text and end not in text
+            covers = [] if partial else parse_covers(text)
+            declarations = set(meta['anchors']) | {c['symbol'] for c in covers}
+            for m in re.finditer(r'^- \*\*E[0-9]+\*\* `([^`]+)` → `([^`]+)`', text, re.MULTILINE):
+                declarations.update(m.groups())
+            return meta, declarations, 'covers_absent' if partial else None
+        old_meta, old_declarations, partial_reason = page_data(base, is_base=True)
+        meta, new_declarations, _ = page_data(head)
+        declarations = old_declarations | new_declarations
+        lookup = literals(meta['resources'], meta.get('literals'))
+        for literal, resources in literals(old_meta.get('resources', []), old_meta.get('literals')).items():
+            lookup[literal] = sorted(set(lookup.get(literal, [])) | set(resources))
+        for anchor in declarations:
+            path, symbol = anchor.split('::', 1)
+            if not path or not symbol or Path(path).is_absolute() or '..' in Path(path).parts:
+                raise ValueError('invalid anchor')
+        def runtime(path):
+            parts = Path(path).parts
+            return (path.endswith('.py') and not Path(path).name.startswith('.') and
+                    not any(p in EXCLUDED or p in ('tests', 'test', 'scripts', 'docs') for p in parts))
+        def listing(rev):
+            raw = git('ls-tree', '-r', '--name-only', '-z', rev) if rev else git('ls-files', '-z', '--cached', '--others', '--exclude-standard')
+            if raw is None:
+                raise OSError('listing failed')
+            return {os.fsdecode(p) for p in raw.split(b'\0') if p and runtime(os.fsdecode(p))}
+        old_files, new_files = listing(base), listing(head)
+        if head is None:
+            new_files = {p for p in new_files if Path(p).is_file() and not Path(p).is_symlink()}
+        def read(rev, path, files):
+            if path not in files:
+                return None
+            data = git('show', rev + ':' + path) if rev else Path(path).read_bytes()
+            if data is None:
+                raise OSError('source unavailable')
+            return data
+        # Declarations can name files outside the runtime scan.
+        def declared_data(rev, path):
+            if rev:
+                raw = git('cat-file', '-e', rev + ':' + path)
+                return git('show', rev + ':' + path) if raw is not None else None
+            source = Path(path)
+            return source.read_bytes() if source.is_file() else None
+        items = set()
+        if partial_reason:
+            items.add(('base_declarations_partial', '', partial_reason, ''))
+        sub_parents = {a.split('#', 1)[0] for a in declarations if '#' in a}
+        for parent in sorted(sub_parents):
+            path = parent.split('::', 1)[0]
+            old, new = declared_data(base, path), declared_data(head, path)
+            old_hash = anchor_digest(parent, old)[1] if old is not None else None
+            new_hash = anchor_digest(parent, new)[1] if new is not None else None
+            if old_hash is not None and new_hash is not None and old_hash != new_hash:
+                items.add(('coarse_parent_changed', parent, '', ''))
+        for anchor in sorted(declarations):
+            path = anchor.split('::', 1)[0]
+            old, new = declared_data(base, path), declared_data(head, path)
+            if anchor in sub_parents:
+                nodes = [anchor_digest(anchor, data)[0] for data in (old, new) if data is not None]
+                if any(node and node.end_lineno - node.lineno + 1 > 300 for node in nodes):
+                    continue
+            try:
+                before = anchor_digest(anchor, old)[1] if old is not None else None
+                after = anchor_digest(anchor, new)[1] if new is not None else None
+            except AmbiguousSubAnchor:
+                items.add(('ambiguous_sub_anchor', anchor, '', ''))
+                continue
+            if before is not None and after is None:
+                items.add(('unmapped_removed_dependency', anchor, '', ''))
+            elif before != after:
+                kind = 'dependency_changed' if '::<module>.' in anchor else 'symbol_changed'
+                items.add((kind, anchor, '', ''))
+        patterns = compile_patterns(lookup)
+        for path in sorted(old_files | new_files):
+            old, new = read(base, path, old_files), read(head, path, new_files)
+            if old is None and new is not None:
+                items.add(('unmapped_new_file', path, '', ''))
+            if old == new:
+                continue
+            def extract_set(data):
+                if data is None:
+                    return set()
+                records = {}
+                Visitor(lookup, path, '', records, patterns).visit(ast.parse(data, filename=path))
+                return {(r['resource'], r['path'] + '::' + r['symbol']) for r in records.values()}
+            before, after = extract_set(old), extract_set(new)
+            if old is not None and new is not None:
+                def symbols(data):
+                    tree = ast.parse(data, filename=path)
+                    result = {}
+                    definitions = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+                    def scoped_definitions(nodes):
+                        for child in nodes:
+                            if isinstance(child, definitions):
+                                yield child
+                            else:
+                                yield from scoped_definitions(ast.iter_child_nodes(child))
+
+                    class StripDefinitions(ast.NodeTransformer):
+                        def visit_FunctionDef(self, node):
+                            return None
+                        visit_AsyncFunctionDef = visit_FunctionDef
+                        visit_ClassDef = visit_FunctionDef
+
+                    def visit(body, prefix=''):
+                        for node in scoped_definitions(body):
+                            name = prefix + node.name
+                            if isinstance(node, ast.ClassDef):
+                                shallow = copy.deepcopy(node)
+                                shallow.body = [item for item in (StripDefinitions().visit(child) for child in shallow.body) if item is not None]
+                                comparison = shallow
+                                visit(node.body, name + '.')
+                            else:
+                                comparison = node
+                            result.setdefault(name, []).append(ast.dump(comparison, annotate_fields=True, include_attributes=False))
+                        if not prefix:
+                            for node in body:
+                                if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                                    for target in targets:
+                                        if isinstance(target, ast.Name):
+                                            result.setdefault('<module>.' + target.id, []).append(ast.dump(node, annotate_fields=True, include_attributes=False))
+                    visit(tree.body)
+                    return result
+                old_symbols, new_symbols = symbols(old), symbols(new)
+                for symbol in old_symbols.keys() | new_symbols.keys():
+                    anchor = path + '::' + symbol
+                    if anchor not in declarations and anchor not in sub_parents and old_symbols.get(symbol) != new_symbols.get(symbol):
+                        items.add(('unmapped_changed_unmapped_symbol', anchor, '', ''))
+            for resource, symbol in before ^ after:
+                items.add(('literal_candidates_changed', symbol, resource, 'added' if (resource, symbol) in after else 'removed'))
+        rows = []
+        for kind, anchor, resource, change in sorted(items):
+            row = {'kind': kind}
+            if kind == 'base_declarations_partial':
+                row['reason'] = resource
+            else:
+                row['anchor'] = anchor
+                if resource:
+                    row.update(resource=resource, change=change)
+            rows.append(row)
+        print(json.dumps({'items': rows}, sort_keys=True, separators=(',', ':')))
+        return 0
+    except (OSError, ValueError, KeyError, TypeError, SyntaxError, UnicodeError, RecursionError):
+        return fail('analysis_failed')
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest='command', required=True)
@@ -366,10 +866,24 @@ def main():
     ev = sub.add_parser('evaluate')
     for option in ('domain', 'index', 'oracle', 'page', 'out'):
         ev.add_argument('--' + option, required=True)
+    ve = sub.add_parser('verify')
+    ve.add_argument('--page', required=True)
+    ve.add_argument('--anchor', required=True)
+    ve.add_argument('--record', action='store_true')
+    for option in ('expected-hash', 'reason', 'evidence'):
+        ve.add_argument('--' + option)
+    ck = sub.add_parser('check')
+    ck.add_argument('--page', required=True)
+    af = sub.add_parser('affected')
+    af.add_argument('--page', required=True)
+    af.add_argument('--base', required=True)
+    target = af.add_mutually_exclusive_group(required=True)
+    target.add_argument('--head')
+    target.add_argument('--worktree', action='store_true')
     args = parser.parse_args()
     try:
-        return extract(args) if args.command == 'extract' else evaluate(args)
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return extract(args) if args.command == 'extract' else evaluate(args) if args.command == 'evaluate' else verify(args) if args.command == 'verify' else check(args) if args.command == 'check' else affected(args)
+    except (OSError, ValueError, KeyError, TypeError, SyntaxError) as exc:
         print(f'invalid input: {type(exc).__name__}', file=sys.stderr)
         return 2
 
