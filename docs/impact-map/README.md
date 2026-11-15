@@ -27,3 +27,11 @@ python3 scripts/impact_map.py evaluate --domain kill-switch --index tmp/impact-m
 `python scripts/impact_map.py verify --page <domain> --anchor <path::symbol>` で照合状態を表示する。
 記録するには表示された hash を `--record --expected-hash <hash> --reason <公開可能な理由> --evidence <testまたはticket ID>` と共に指定する。
 300 行超の symbol は `coarse_symbol` として表示する。
+
+`python scripts/impact_map.py check --page <domain>` で頁、辺、照合記録を検査する。結果は件数と項目の JSON として表示する。
+
+| 終了コード | 意味 |
+| --- | --- |
+| 0 | 問題なし |
+| 1 | stale、根拠消失、必須項目違反 |
+| 2 | 解析・宣言・方式・履歴のエラー（1 と同時の場合も 2） |

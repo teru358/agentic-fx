@@ -358,10 +358,8 @@ def evaluate(args):
 METHOD = f"python-{sys.version_info.major}.{sys.version_info.minor}:ast.dump(annotate_fields=True,include_attributes=False):v1"
 
 
-def verify(args):
-    if not re.fullmatch(r'[A-Za-z0-9_-]+', args.page):
-        raise ValueError('invalid domain')
-    path, symbol = args.anchor.split('::', 1)
+def anchor_digest(anchor):
+    path, symbol = anchor.split('::', 1)
     source = Path(path)
     if source.is_absolute() or '..' in source.parts or source.resolve().is_relative_to(Path.cwd().resolve()) is False:
         raise ValueError('invalid path')
@@ -376,8 +374,14 @@ def verify(args):
                 if any(isinstance(t, ast.Name) and t.id == parts[1] for t in targets):
                     node = item
         else:
+            def scoped_definitions(nodes):
+                for child in nodes:
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        yield child
+                    else:
+                        yield from scoped_definitions(ast.iter_child_nodes(child))
             for part in parts:
-                matches = [n for n in body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == part]
+                matches = [n for n in scoped_definitions(body) if n.name == part]
                 if len(matches) != 1:
                     node = None
                     break
@@ -386,6 +390,13 @@ def verify(args):
     except FileNotFoundError:
         pass
     digest = hashlib.sha256(ast.dump(node, annotate_fields=True, include_attributes=False).encode()).hexdigest() if node else None
+    return node, digest
+
+
+def verify(args):
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', args.page):
+        raise ValueError('invalid domain')
+    node, digest = anchor_digest(args.anchor)
     record_path = Path('docs/impact-map/verification') / (args.page + '.json')
     records = json.loads(record_path.read_text()) if record_path.exists() else []
     previous = next ( (r for r in records if r['anchor'] == args.anchor), None)
@@ -409,6 +420,93 @@ def verify(args):
     return 0
 
 
+
+def check(args):
+    items = set()
+    def add(kind, anchor, reason):
+        items.add((kind, anchor, reason))
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', args.page):
+        add('declaration', 'page', 'invalid_domain')
+    if not git('rev-parse', 'HEAD'):
+        add('history', 'HEAD', 'git_unavailable')
+    page = Path('docs/impact-map/domains') / (args.page + '.md')
+    anchors = []
+    try:
+        if not re.fullmatch(r'[A-Za-z0-9_-]+', args.page):
+            raise ValueError()
+        meta = front_matter(page)
+        if not isinstance(meta, dict):
+            raise ValueError()
+        for name in ('id', 'owner_role', 'resources', 'anchors', 'related', 'tests'):
+            if name not in meta:
+                add('required', name, 'missing_key')
+        for name in ('anchors', 'related'):
+            if name in meta and (not isinstance(meta[name], list) or not all(isinstance(v, str) and v for v in meta[name])):
+                raise ValueError()
+        for anchor in meta.get('anchors', []):
+            anchors.append(('anchor', anchor))
+        for ticket in meta.get('related', []):
+            if not re.fullmatch(r'[A-Za-z0-9_-]+', ticket):
+                add('declaration', 'related', 'invalid_ticket')
+            elif not any((Path('docs/tickets') / state / (ticket + '.md')).is_file() for state in ('open', 'closed')):
+                add('ticket', ticket, 'ticket_missing')
+    except (OSError, ValueError, TypeError, KeyError):
+        add('declaration', 'front_matter', 'invalid_front_matter')
+    try:
+        for cover in read_covers(page):
+            anchors.append(('cover', cover['symbol']))
+    except (OSError, ValueError, TypeError, KeyError, IndexError):
+        add('declaration', 'covers', 'invalid_covers')
+    try:
+        text = page.read_text(encoding='utf-8')
+        for match in re.finditer(r'^- \*\*E[0-9]+\*\* `([^`]+)` → `([^`]+)`', text, re.MULTILINE):
+            anchors.extend(('edge_endpoint', value) for value in match.groups())
+    except (OSError, UnicodeError):
+        add('declaration', 'page', 'unreadable_page')
+    record_path = Path('docs/impact-map/verification') / ((args.page if re.fullmatch(r'[A-Za-z0-9_-]+', args.page) else '_invalid_') + '.json')
+    try:
+        records = json.loads(record_path.read_text(encoding='utf-8')) if record_path.exists() else []
+        if not isinstance(records, list):
+            raise ValueError()
+        for record in records:
+            anchor, method, digest = record['anchor'], record['method'], record['hash']
+            if not all(isinstance(x, str) and x for x in (anchor, method, digest)):
+                raise ValueError()
+            path_part = anchor.split('::', 1)[0]
+            if '::' not in anchor or Path(path_part).is_absolute() or '..' in Path(path_part).parts:
+                raise ValueError()
+            anchors.append(('record', anchor))
+            if method != METHOD:
+                add('record', anchor, 'method_mismatch')
+    except (OSError, ValueError, TypeError, KeyError):
+        records = []
+        add('declaration', 'verification', 'invalid_record')
+    hashes = {}
+    for kind, anchor in sorted(set(anchors)):
+        try:
+            path, symbol = anchor.split('::', 1)
+            if not path or not symbol or Path(path).is_absolute() or '..' in Path(path).parts:
+                raise ValueError()
+            if anchor not in hashes:
+                hashes[anchor] = anchor_digest(anchor)[1]
+            if hashes[anchor] is None:
+                add(kind, anchor, 'anchor_missing')
+        except (ValueError, TypeError):
+            add('declaration', kind, 'invalid_anchor')
+        except (OSError, SyntaxError, UnicodeError, RecursionError, MemoryError):
+            add('source', anchor, 'parse_error')
+    for record in records:
+        anchor = record['anchor']
+        if record['method'] == METHOD and hashes.get(anchor) is not None and hashes[anchor] != record['hash']:
+            add('record', anchor, 'stale')
+    errors2 = {'git_unavailable', 'invalid_domain', 'invalid_front_matter', 'invalid_covers', 'invalid_ticket', 'invalid_record', 'invalid_anchor', 'unreadable_page', 'parse_error', 'method_mismatch'}
+    reasons = ('stale', 'anchor_missing', 'missing_key', 'ticket_missing', *sorted(errors2))
+    result = {'counts': {reason: sum(item[2] == reason for item in items) for reason in reasons},
+              'items': [dict(kind=k, anchor=a, reason=r) for k, a, r in sorted(items)]}
+    print(json.dumps(result, sort_keys=True, separators=(',', ':')))
+    return 2 if any(r in errors2 for _, _, r in items) else 1 if items else 0
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest='command', required=True)
@@ -428,9 +526,11 @@ def main():
     ve.add_argument('--record', action='store_true')
     for option in ('expected-hash', 'reason', 'evidence'):
         ve.add_argument('--' + option)
+    ck = sub.add_parser('check')
+    ck.add_argument('--page', required=True)
     args = parser.parse_args()
     try:
-        return extract(args) if args.command == 'extract' else evaluate(args) if args.command == 'evaluate' else verify(args)
+        return extract(args) if args.command == 'extract' else evaluate(args) if args.command == 'evaluate' else verify(args) if args.command == 'verify' else check(args)
     except (OSError, ValueError, KeyError, TypeError, SyntaxError) as exc:
         print(f'invalid input: {type(exc).__name__}', file=sys.stderr)
         return 2
