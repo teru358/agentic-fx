@@ -86,6 +86,7 @@ def test_git_inputs_only(tmp_path):
     index = json.loads(raw)
     assert index['header']['inputs'] == 1
     assert [r['path'] for r in index['records']] == ['source/tracked.py']
+    assert index['header']['diagnostics'] == [{'path': 'source/untracked.py', 'reason': 'untracked_runtime'}]
 
 
 def test_minimum_line_and_package(tmp_path):
@@ -316,3 +317,60 @@ def test_repo_discovery_failure_stops_even_if_tracked_list_works(tmp_path):
     assert result.returncode != 0
     assert index['header']['diagnostics'] == [{'path': 'source', 'reason': 'git_unavailable'}]
     assert index['header']['inputs'] == 0
+
+
+def test_explicit_include_reads_new_source(tmp_path):
+    subprocess.run(['git', 'init', '-q'], cwd=tmp_path, check=True)
+    (tmp_path / 'source').mkdir()
+    (tmp_path / 'source' / 'new.py').write_text("def added(): return 'target'\n")
+    result, index = invoke_roots(tmp_path, ['source'], '--include', 'source/new.py')
+    assert result.returncode == 0
+    assert index['header']['inputs'] == 1
+    assert index['header']['diagnostics'] == []
+    assert [(r['path'], r['symbol']) for r in index['records']] == [('source/new.py', 'added')]
+
+
+def test_untracked_diagnostic_is_repo_relative_from_subdirectory(tmp_path):
+    subprocess.run(['git', 'init', '-q'], cwd=tmp_path, check=True)
+    (tmp_path / 'project' / 'source').mkdir(parents=True)
+    (tmp_path / 'project' / 'source' / 'new.py').write_text('invalid syntax !')
+    result, index = invoke_roots(tmp_path / 'project', ['source'])
+    assert result.returncode == 0
+    assert index['header']['inputs'] == 0
+    assert index['header']['diagnostics'] == [{'path': 'project/source/new.py', 'reason': 'untracked_runtime'}]
+
+
+def test_include_rejects_unsafe_paths_before_reading(tmp_path):
+    subprocess.run(['git', 'init', '-q'], cwd=tmp_path, check=True)
+    root = tmp_path / 'source'
+    root.mkdir()
+    (root / 'safe.py').write_text("'target'")
+    (root / 'config').mkdir()
+    (root / 'config' / 'private.py').write_text("'target'")
+    (root / 'alias.py').symlink_to(root / 'safe.py')
+    (root / 'aliasdir').symlink_to(root / 'config', target_is_directory=True)
+    (root / '.hidden.py').write_text("'target'")
+    (root / 'note.txt').write_text("'target'")
+    (tmp_path / 'outside.py').write_text("'target'")
+    nested = root / 'nested'
+    nested.mkdir()
+    subprocess.run(['git', 'init', '-q'], cwd=nested, check=True)
+    (nested / 'nested.py').write_text("'target'")
+    for name in ('source/config/private.py', 'source/alias.py', 'source/aliasdir/private.py',
+                 'source/.hidden.py', 'source/note.txt', 'outside.py', 'source/missing.py', 'source/nested/nested.py'):
+        result, index = invoke_roots(tmp_path, ['source'], '--include', name)
+        assert result.returncode != 0, name
+        assert index['header']['inputs'] == 0, name
+        assert index['header']['diagnostics'], name
+
+
+def test_overlapping_roots_do_not_duplicate_untracked_diagnostics_or_includes(tmp_path):
+    subprocess.run(['git', 'init', '-q'], cwd=tmp_path, check=True)
+    (tmp_path / 'source' / 'sub').mkdir(parents=True)
+    (tmp_path / 'source' / 'sub' / 'new.py').write_text("def new(): return 'target'\n")
+    (tmp_path / 'source' / 'sub' / 'other.py').write_text('not python !')
+    result, index = invoke_roots(tmp_path, ['source', 'source/sub'], '--include', 'source/sub/new.py')
+    assert result.returncode == 0
+    assert index['header']['inputs'] == 1
+    assert index['header']['diagnostics'] == [{'path': 'source/sub/other.py', 'reason': 'untracked_runtime'}]
+    assert [(r['path'], r['symbol']) for r in index['records']] == [('source/sub/new.py', 'new')]

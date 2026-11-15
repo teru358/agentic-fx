@@ -48,7 +48,7 @@ def literals(resources, overrides=None):
     return result
 
 
-def validate_root(root, repo, diagnostics):
+def validate_root(root, repo, diagnostics, *, source_file=False):
     # Inspect the original components before normalizing away "..".
     path = Path(root)
     path = path if path.is_absolute() else Path.cwd() / path
@@ -66,13 +66,13 @@ def validate_root(root, repo, diagnostics):
     if any(part in EXCLUDED for part in lexical_parts):
         diagnostics.append({'path': relative(normalized), 'reason': 'excluded_root'})
         return None
-    if not normalized.is_dir():
-        diagnostics.append({'path': relative(normalized), 'reason': 'missing_root'})
+    if not (normalized.is_file() if source_file else normalized.is_dir()):
+        diagnostics.append({'path': relative(normalized), 'reason': 'invalid_include' if source_file else 'missing_root'})
         return None
     return normalized
 
 
-def candidates(root, diagnostics, tracked_set):
+def candidates(root, diagnostics, tracked_set, includes, repo, seen):
     resolved = root.resolve()
     for directory, dirs, files in os.walk(root, followlinks=False):
         base = Path(directory)
@@ -90,7 +90,11 @@ def candidates(root, diagnostics, tracked_set):
             path = base / name
             if not name.endswith('.py') or name.startswith('.') or path.is_symlink():
                 continue
-            if tracked_set is not None and path not in tracked_set:
+            if path in seen:
+                continue
+            seen.add(path)
+            if tracked_set is not None and path not in tracked_set and path not in includes:
+                diagnostics.append({'path': path.relative_to(repo).as_posix(), 'reason': 'untracked_runtime'})
                 continue
             yield path, root
 
@@ -172,6 +176,19 @@ def extract(args):
     repo_raw = git('rev-parse', '--show-toplevel')
     repo = Path(os.fsdecode(repo_raw).strip()).resolve() if repo_raw else Path.cwd().resolve()
     validated = [validate_root(root, repo, diagnostics) for root in args.root]
+    includes = set()
+    for value in args.include:
+        path = validate_root(value, repo, diagnostics, source_file=True)
+        if path is None:
+            continue
+        matching = [root for root in validated if root is not None and path.is_relative_to(root)]
+        if (not matching or path.suffix != '.py' or path.name.startswith('.') or
+                not any(not any((parent / '.git').exists() for parent in path.parents
+                                    if parent != root and parent.is_relative_to(root))
+                        for root in matching)):
+            diagnostics.append({'path': relative(path), 'reason': 'invalid_include'})
+        else:
+            includes.add(path)
     tracked_sets = {}
     if not diagnostics:
         for root in set(validated):
@@ -179,9 +196,10 @@ def extract(args):
             if tracked is None and not args.allow_untracked_walk:
                 diagnostics.append({'path': relative(root), 'reason': 'git_unavailable'})
             tracked_sets[root] = None if tracked is None else {Path(os.fsdecode(p)).absolute() for p in tracked.split(b'\0') if p}
+    seen = set()
     for base in sorted(tracked_sets) if not diagnostics else []:
         root = relative(base)
-        for path, base in candidates(base, diagnostics, tracked_sets[base]):
+        for path, base in candidates(base, diagnostics, tracked_sets[base], includes, repo, seen):
             rel = relative(path)
             try:
                 data = path.read_bytes()
@@ -199,7 +217,7 @@ def extract(args):
     output = {'header': header, 'records': [records[k] for k in sorted(records)]}
     Path(args.out).mkdir(parents=True, exist_ok=True)
     (Path(args.out) / 'index.json').write_text(json.dumps(output, sort_keys=True, separators=(',', ':')) + '\n', encoding='utf-8')
-    return int(any(d['reason'] in {'parse_error', 'missing_root', 'excluded_root', 'symlink_root', 'root_outside_repo', 'git_unavailable'} for d in diagnostics))
+    return int(any(d['reason'] in {'parse_error', 'missing_root', 'excluded_root', 'symlink_root', 'root_outside_repo', 'git_unavailable', 'invalid_include'} for d in diagnostics))
 
 
 def read_covers(path):
@@ -318,6 +336,7 @@ def main():
     ex.add_argument('--root', action='append', required=True)
     ex.add_argument('--out', required=True)
     ex.add_argument('--allow-untracked-walk', action='store_true')
+    ex.add_argument('--include', action='append', default=[])
     ev = sub.add_parser('evaluate')
     for option in ('domain', 'index', 'oracle', 'page', 'out'):
         ev.add_argument('--' + option, required=True)
