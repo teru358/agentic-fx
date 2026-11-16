@@ -4,7 +4,7 @@
 payload や応答 DTO を JSON で渡し、ここで描画した文字列を受け取る。
 
 標準入力: `{"kind": "discord_finish", "event": {...}, "dto": {...}}` または
-`{"kind": "web_approval", "data": {...}}`。標準出力: `{"text": "..."}`。
+`{"kind": "web_approval", "data": {...}}`。標準出力: `{"text": "..."}` (web_approval は全タブの連結と、タブ別の `tabs`)。
 """
 from __future__ import annotations
 
@@ -23,8 +23,12 @@ def main() -> int:
         text = render_improve_finish(event, detail)
         out = {"text": text, "validated": detail is not None}
     elif kind == "web_approval":
+        from afx_ops.web import tabs
         from afx_ops.web.render import render_approval
-        out = {"text": render_approval(request["data"], None).decode("utf-8")}
+        names = tabs.tab_names(tabs.APPROVAL_DETAIL)
+        by_tab = {name: render_approval(request["data"], None, name).decode("utf-8")
+                  for name in names}
+        out = {"text": "\n".join(by_tab.values()), "tabs": by_tab}
     else:
         raise SystemExit(f"unknown kind {kind}")
     json.dump(out, sys.stdout, ensure_ascii=False)

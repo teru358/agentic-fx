@@ -289,11 +289,17 @@ def _web_constants():
 
     source = (Path(__file__).resolve().parents[2] / "afx-ops" / "afx_ops" / "web"
               / "render.py").read_text(encoding="utf-8")
-    return {node.targets[0].id: ast.literal_eval(node.value)
-            for node in ast.parse(source).body
-            if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id.isupper() | node.targets[0].id.startswith("_")
-            and isinstance(node.value, (ast.Tuple, ast.Constant))}
+    constants = {}
+    for node in ast.parse(source).body:
+        if not (isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id.isupper() | node.targets[0].id.startswith("_")
+                and isinstance(node.value, (ast.Tuple, ast.Constant))):
+            continue
+        try:
+            constants[node.targets[0].id] = ast.literal_eval(node.value)
+        except ValueError:  # 関数の参照を並べた表など、literal でない定数は突き合わせの対象外
+            continue
+    return constants
 
 
 def test_web_copies_of_the_daemon_vocabulary_match():

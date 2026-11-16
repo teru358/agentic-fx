@@ -300,5 +300,5 @@ def test_detail_does_not_compute_a_diff_and_the_page_computes_each_file_once(
     alone = len(calls)
     assert alone == len([f for f in body["diff"]["files"] if f["status"] in ("added", "changed")])
     del calls[:]
-    _page(ops_env, approval_id)
+    _page(ops_env, approval_id, "change")
     assert len(calls) == alone

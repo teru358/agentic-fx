@@ -502,9 +502,11 @@ def test_cli_shell_and_web_show_the_same_stored_values(runs):
     data = world.app.ops.approval_detail(Principal.OPERATOR, approval_id)
     comparison = data["baseline"]["comparison"]
     cli = ops_client.format_approval_detail(data)
-    web = bw.afx_ops_render({
+    rendered = bw.afx_ops_render({
         "kind": "web_approval",
-        "data": json.loads(json.dumps(data, default=str))})["text"]
+        "data": json.loads(json.dumps(data, default=str))})
+    web = rendered["text"]
+    web_result = rendered["tabs"]["result"]
     from agentic_fx.commands import Commands
     shell = Commands._approval_detail(_shell(world), approval_id)
     base12 = runs.deployed[:12]
@@ -516,7 +518,7 @@ def test_cli_shell_and_web_show_the_same_stored_values(runs):
             entry = comparison["stages"][stage]["USDJPY"]
             for version in ("candidate", "deployed"):
                 metrics = entry[version]
-                shown = (_web_metric_cells(surface, stage, version)
+                shown = (_web_metric_cells(web_result, stage, version)
                          if name == "web"
                          else _text_metric_cells(surface, stage, version))
                 for key in ("pf", "trades", "win_rate", "avg_r",
@@ -543,7 +545,7 @@ def test_cli_shell_and_web_show_the_same_stored_values(runs):
         for line in surface.splitlines():
             if "候補:" in line or "配備中の版:" in line:
                 assert "kill_switch_latches=-" not in line, line
-    assert "<th>kill_switch_latches</th>" in web
+    assert "<th>kill_switch_latches</th>" in web_result
     assert "<td></td>" not in web
 
 
