@@ -1364,10 +1364,14 @@ class Scheduler:
                 self.executor.cancel_order(row, reason=reason)
             except Exception as e:  # noqa: BLE001 — 他注文の取消を止めない
                 text = safe_error_text(e)
-                self.activity.write(
-                    Category.TRADE, "cancel_all_pending_error",
-                    f"#{row['id']} {row['pair']}: {text} — 次 tick 再試行",
-                    ref_id=str(row["id"]))
+                try:
+                    self.activity.write(
+                        Category.TRADE, "cancel_all_pending_error",
+                        f"#{row['id']} {row['pair']}: {text} — 次 tick 再試行",
+                        ref_id=str(row["id"]))
+                except Exception as we:  # noqa: BLE001 — 観測の失敗で次の取消を止めない
+                    _log.warning("cancel_all_pending activity failed: %s",
+                                 safe_error_text(we))
                 _log.warning("cancel_all_pending failed #%s: %s", row["id"],
                             text)
 

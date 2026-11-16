@@ -101,11 +101,11 @@
  {
   "anchor": "src/agentic_fx/core/scheduler.py::Scheduler._cancel_all_pending",
   "date": "2026-11-16",
-  "evidence": "tests/core/test_scheduler_kill_switch_fills.py",
-  "hash": "dd50a0afada3ffc6a1c4ac59e4212658935b3250a428d35ec88597dabff2bd0c",
+  "evidence": "tests/core/test_scheduler_kill_switch_fills.py::test_cancel_error_activity_failure_does_not_stop_later_cancels",
+  "hash": "627ff013de22599b06291c099177731f40f4db2d7287bff2ea337a953df0d4b6",
   "method": "python-3.13:ast.dump(annotate_fields=True,include_attributes=False):v1",
-  "reason": "relation_changed_page_updated",
-  "source_sha": "0cd66a10d9080a54767d7c19e3694f6006e34ae6"
+  "reason": "contract_unchanged",
+  "source_sha": "43d515e9d8be60edc053c2c0aafa6c6f84578410"
  },
  {
   "anchor": "src/agentic_fx/core/scheduler.py::Scheduler._fills_allowed_by_state",

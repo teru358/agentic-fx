@@ -426,6 +426,35 @@ def test_pending_that_failed_to_cancel_is_retried_while_latched(
     assert (row["status"], row["close_reason"]) == ("cancelled", "kill_switch")
 
 
+def test_cancel_error_activity_failure_does_not_stop_later_cancels(
+        tmp_path, monkeypatch):
+    env = Env(tmp_path)
+    first = env.place_limit(price=148.20)
+    later = env.place_limit(price=148.10)
+    open_id = _swing_open(env)
+    _latch(env)
+    real_cancel = env.executor.cancel_order
+    real_write = env.sched.activity.write
+
+    def cancel(row, reason):
+        if row["id"] == first:
+            raise RuntimeError("db down")
+        return real_cancel(row, reason)
+
+    def write(category, event, text, **kw):
+        if event == "cancel_all_pending_error":
+            raise OSError("log full")
+        return real_write(category, event, text, **kw)
+
+    monkeypatch.setattr(env.executor, "cancel_order", cancel)
+    monkeypatch.setattr(env.sched.activity, "write", write)
+    env.bars["USDJPY"] = _bar(WED, o=148.0, h=148.05, l=147.5, c=147.6)
+    env.sched.tick(WED + timedelta(minutes=1))
+    assert _status(env, first) == "pending_fill"
+    assert orders.get(env.conn, later)["close_reason"] == "kill_switch"
+    assert orders.get(env.conn, open_id)["close_reason"] == "sl"
+
+
 def test_broker_unknown_cancel_is_not_counted_as_released_and_not_finalised(
         tmp_path, monkeypatch):
     env = Env(tmp_path)

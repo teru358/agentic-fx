@@ -4,6 +4,7 @@ clear→latched の writer は core_lock 下か replay の単一 thread だけ�
 新しい書き手や呼出し元が増えたら、ここが赤になる。
 """
 import ast
+from collections import Counter
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -64,13 +65,36 @@ def _attr(node):
     return node.func.attr if isinstance(node.func, ast.Attribute) else None
 
 
+def _bag(items):
+    """同じ呼出しが同じ scope に 2 回あっても 2 と数える多重集合。"""
+    return Counter(items)
+
+
+def _keyword_items(node):
+    """(キー名, 値 node) の列。`**{"k": v}` の dict literal は展開して見る。
+
+    展開できない `**x` は キー名 "**" で返す。
+    """
+    for kw in node.keywords:
+        if kw.arg is not None:
+            yield kw.arg, kw.value
+        elif isinstance(kw.value, ast.Dict):
+            for key, value in zip(kw.value.keys, kw.value.values):
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    yield key.value, value
+                else:
+                    yield "**", value
+        else:
+            yield "**", kw.value
+
+
 def test_every_call_that_can_set_latched_true_is_enumerated():
-    found = set()
+    found = []
     for rel, scope, node, _ in _calls():
-        for kw in node.keywords:
-            if kw.arg == "kill_switch_latched" and not _is_false(kw.value):
-                found.add((rel, scope))
-    assert found == {
+        for key, value in _keyword_items(node):
+            if key == "kill_switch_latched" and not _is_false(value):
+                found.append((rel, scope))
+    assert _bag(found) == _bag({
         # 通常・signal・replay の open が DD で発動する唯一の executor 経路
         ("src/agentic_fx/core/executor.py", "Executor._evaluate_and_execute_open"),
         # gate の入力へ現在の値を写す読取
@@ -84,21 +108,21 @@ def test_every_call_that_can_set_latched_true_is_enumerated():
         ("src/agentic_fx/store/state.py", "StateStore.confirm_latched"),
         # 文書の値をそのまま写す構築
         ("src/agentic_fx/store/state.py", "parse_state"),
-    }
+    })
 
 
 def test_reset_marker_has_a_single_writer_and_only_reset_calls_it():
-    found = {(rel, scope) for rel, scope, node, _ in _calls()
-             if _attr(node) == "_write_marker"}
-    assert found == {("src/agentic_fx/store/state.py",
-                      "StateStore.reset_kill_switch")}
+    found = [(rel, scope) for rel, scope, node, _ in _calls()
+             if _attr(node) == "_write_marker"]
+    assert _bag(found) == _bag({("src/agentic_fx/store/state.py",
+                                 "StateStore.reset_kill_switch")})
 
 
 def test_reset_and_confirm_have_only_the_known_callers():
     names = {"reset_kill_switch", "confirm_latched"}
-    found = {(rel, scope, _attr(node)) for rel, scope, node, _ in _calls()
-             if _attr(node) in names}
-    assert found == {
+    found = [(rel, scope, _attr(node)) for rel, scope, node, _ in _calls()
+             if _attr(node) in names]
+    assert _bag(found) == _bag({
         ("src/agentic_fx/commands.py", "Commands._dispatch",
          "reset_kill_switch"),
         ("src/agentic_fx/commands.py", "Commands._killswitch_reconcile",
@@ -108,20 +132,26 @@ def test_reset_and_confirm_have_only_the_known_callers():
          "reset_kill_switch"),
         ("src/agentic_fx/ops/service.py",
          "OpsService.reconcile_kill_switch.action", "confirm_latched"),
-    }
+    })
 
 
 def test_state_updates_by_keyword_are_limited_to_known_fields():
-    receivers = {"state", "self.state", "self._state_store", "store"}
-    found = set()
+    """receiver の名前には頼らず、キーワードを取る `update` 呼出しを全部拾う。
+
+    StateStore.update は keyword だけを取る。位置引数の dict.update は
+    知られた receiver (state の dict) の分だけ拾う。キーワード付きで拾う
+    非 state の呼出しは下の一覧で許可する。
+    """
+    dict_receivers = {"state", "self.state", "self._state_store", "store"}
+    found = []
     for rel, scope, node, _ in _calls():
         if _attr(node) != "update":
             continue
-        if ast.unparse(node.func.value) not in receivers:
+        keys = tuple(sorted(k for k, _ in _keyword_items(node)))
+        if not keys and ast.unparse(node.func.value) not in dict_receivers:
             continue
-        found.add((rel, scope, tuple(sorted(k.arg or "**" for k in node.keywords)),
-                   len(node.args)))
-    assert found == {
+        found.append((rel, scope, keys, len(node.args)))
+    assert _bag(found) == _bag({
         ("src/agentic_fx/service.py", "run_init", ("initialized",), 0),
         ("src/agentic_fx/service.py", "run_init",
          ("autopilot", "initialized", "mode"), 0),
@@ -137,36 +167,63 @@ def test_state_updates_by_keyword_are_limited_to_known_fields():
          ("autopilot", "initialized", "mode"), 0),
         ("src/agentic_fx/core/executor.py", "Executor._evaluate_and_execute_open",
          ("kill_switch_latched",), 0),
-    }
+        # 以下は state ではない (dict / 別 store の update)
+        ("src/agentic_fx/backtest/runner.py", "_RecordingStateStore.update",
+         ("**",), 0),
+        ("src/agentic_fx/egress/handoff.py", "SyncHandoff._judge",
+         ("accepted_inode", "client_inode", "client_state", "server_inode",
+          "server_state"), 0),
+        ("src/agentic_fx/ops/change.py", "_shrink_to_reason_only",
+         ("claims",), 0),
+        ("src/agentic_fx/ops/change.py", "_shrink_to_reason_only",
+         ("items",), 0),
+        ("src/agentic_fx/ops/rebase_service.py", "evaluate_rebase",
+         ("generation", "latched", "latched_at"), 0),
+        ("src/agentic_fx/ops/rebase_service.py", "evaluate_rebase",
+         ("source_snapshot_id", "source_snapshot_source",
+          "source_snapshot_ts"), 0),
+        ("src/agentic_fx/ops/rebase_service.py", "evaluate_rebase",
+         ("balance", "equity", "hwm"), 0),
+        ("src/agentic_fx/ops/rebase_service.py", "evaluate_rebase",
+         ("additional_headroom", "count_after", "cumulative_cut_after",
+          "cumulative_cut_pct_after", "cumulative_warning", "cut", "cut_pct",
+          "new_hwm", "past_count", "past_cut", "past_cut_pct",
+          "warning_threshold_pct"), 0),
+        ("src/agentic_fx/plugin/deploy_ops.py", "write_intent_rows",
+         ("actor", "approval_id", "commit", "now", "revoke", "revoke_row_id"),
+         0),
+        ("src/agentic_fx/plugin/history_audit.py", "_build_report",
+         ("reason", "result"), 0),
+    })
 
 
 def test_open_entry_points_have_only_the_known_callers():
     entries = {"open_from_snapshot", "handle_intent"}
-    found = {(rel, scope, _attr(node)) for rel, scope, node, _ in _calls()
-             if _attr(node) in entries}
-    assert found == {
+    found = [(rel, scope, _attr(node)) for rel, scope, node, _ in _calls()
+             if _attr(node) in entries]
+    assert _bag(found) == _bag({
         ("src/agentic_fx/loops/trade_loop.py", "TradeLoop._run_once_impl",
          "open_from_snapshot"),
         ("src/agentic_fx/loops/trade_loop.py", "TradeLoop._run_signal_mission",
          "open_from_snapshot"),
         ("src/agentic_fx/backtest/runner.py", "run_replay", "handle_intent"),
-    }
+    })
 
 
 def test_executor_open_evaluation_has_only_the_two_known_entry_points():
-    found = {(rel, scope) for rel, scope, node, _ in _calls()
-             if _attr(node) == "_evaluate_and_execute_open"}
-    assert found == {
+    found = [(rel, scope) for rel, scope, node, _ in _calls()
+             if _attr(node) == "_evaluate_and_execute_open"]
+    assert _bag(found) == _bag({
         ("src/agentic_fx/core/executor.py", "Executor._open"),
         ("src/agentic_fx/core/executor.py", "Executor.open_from_snapshot"),
-    }
+    })
 
 
 def test_executor_open_has_only_handle_intent_as_caller():
-    found = {(rel, scope) for rel, scope, node, _ in _calls()
-             if _attr(node) == "_open"}
-    assert found == {("src/agentic_fx/core/executor.py",
-                      "Executor.handle_intent")}
+    found = [(rel, scope) for rel, scope, node, _ in _calls()
+             if _attr(node) == "_open"]
+    assert _bag(found) == _bag({("src/agentic_fx/core/executor.py",
+                                 "Executor.handle_intent")})
 
 
 def test_live_open_callers_are_under_the_core_lock():
