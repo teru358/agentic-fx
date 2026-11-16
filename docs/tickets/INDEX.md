@@ -1,9 +1,9 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 175 件。完了分は closed/。
+未完了: 174 件。完了分は closed/。
 
-## 実装中 (6)
+## 実装中 (5)
 
 ### 不具合 (3)
 
@@ -13,12 +13,11 @@
 | [history-import-stops-at-first-conflict](open/history-import-stops-at-first-conflict.md) | 中 | 2026-11-13 | history import は食い違う足 1 本で partial 停止し後続を取り込まない |
 | [status-history-hidden-while-daemon-runs](open/status-history-hidden-while-daemon-runs.md) | 中 | 2026-11-13 | daemon 稼働中は評価用履歴の状態を見る面が無い |
 
-### 機能 (2)
+### 機能 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [killswitch-reset-hwm-rebase](open/killswitch-reset-hwm-rebase.md) | 高 | 2026-11-13 | kill switch の手動解除で HWM を付け直す明示操作が無い |
-| [web-layout-tabs](open/web-layout-tabs.md) | 中 | 2026-11-15 | 同梱 web の各画面をタブに分け、plugin と improve の表を並べ替え可能にする |
 
 ### 保守 (1)
 
