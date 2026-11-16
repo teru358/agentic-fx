@@ -1,7 +1,7 @@
 ---
 id: killswitch-latch-pending-limit-fills
 title: kill switch のラッチ中も未約定の指値が約定する
-status: 設計待ち
+status: 実装中
 priority: 中
 kind: 不具合
 opened: 2026-11-16
@@ -10,7 +10,7 @@ related: [killswitch-latched-activity-repeats]
 ---
 # [killswitch-latch-pending-limit-fills] kill switch のラッチ中も未約定の指値が約定する
 
-**状態**: 設計待ち / **優先**: 中 / **種別**: 不具合
+**状態**: 実装中 / **優先**: 中 / **種別**: 不具合
 
 ## 現象
 
@@ -25,3 +25,4 @@ related: [killswitch-latched-activity-repeats]
 ## 経緯
 
 - 2026-11-16: 起票。
+- 2026-11-16: 状態: 実装中 — 設計 C0.2 (docs/superpowers/specs/2026-11-16-killswitch-latch-pending-limits-design.md) を 2026-11-16 に利用者承認。案 A: ラッチ中は開場 tick ごとに全 pending を取消し約定停止、DD 閾値以上は約定だけ停止、state 読取不能・lock 競合は約定だけ停止
