@@ -871,3 +871,41 @@ def test_update_to_unlatched_clears_latched_at_but_keeps_generation(tmp_path):
     s = store.update(kill_switch_latched=False)
     assert s.kill_switch_latched_at is None
     assert s.kill_switch_generation == 1
+
+
+def test_shared_guard_with_an_already_reached_deadline_reads_when_uncontended(
+        tmp_path):
+    clock = {"now": 100.0}
+    store = StateStore(tmp_path / "app_state.json",
+                       monotonic=lambda: clock["now"])
+    store.update(initialized=True)
+    with store.shared_guard(deadline=clock["now"]) as guard:
+        assert guard.projected.initialized is True
+
+
+def test_shared_guard_with_an_already_reached_deadline_fails_without_waiting(
+        tmp_path, monkeypatch):
+    import fcntl
+    import os
+    import agentic_fx.store.state as state_module
+
+    clock = {"now": 100.0}
+    store = StateStore(tmp_path / "app_state.json",
+                       monotonic=lambda: clock["now"])
+    store.update(initialized=True)
+    fd = os.open(str(tmp_path / "app_state.json") + ".lock",
+                 os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    flocks, sleeps = [], []
+    real_flock = fcntl.flock
+    monkeypatch.setattr(state_module.fcntl, "flock",
+                        lambda f, op: (flocks.append(op), real_flock(f, op))[1])
+    monkeypatch.setattr(state_module.time, "sleep", sleeps.append)
+    try:
+        with pytest.raises(state_module.StateLockTimeout):
+            with store.shared_guard(deadline=clock["now"]):
+                pass
+    finally:
+        os.close(fd)
+    assert len(flocks) == 1 and flocks[0] & fcntl.LOCK_NB
+    assert sleeps == []

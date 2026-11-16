@@ -439,3 +439,154 @@ def test_scheduler_snapshot_failure_executor_latch_has_null_drawdown(
     assert not [row for row in result.snapshots
                 if row["ts"] == failed_tick.isoformat()
                 and row["source"] == "paper"]
+
+
+# --- ラッチ中・DD 閾値以上の約定停止 ---
+
+START = datetime(2026, 7, 23, 12, 0, tzinfo=UTC)
+LIMIT_BELOW = {
+    "action": "open", "pair": "USDJPY", "direction": "long",
+    "entry_type": "limit", "horizon": "swing", "limit_price": 148.0,
+    "expires_in": "20h", "stop_loss": 147.0, "take_profit": 151.5,
+    "reasoning": "pending-fill-stop",
+}
+MARKET_OPEN = {
+    "action": "open", "pair": "USDJPY", "direction": "long",
+    "entry_type": "market", "horizon": "swing",
+    "stop_loss": 147.0, "take_profit": 151.5,
+    "reasoning": "pending-fill-stop",
+}
+
+
+def _drawdown_replay(tmp_path, intents, *, drop, threshold=0.05, minutes=14):
+    """分足 flat → drop 以降で下げる。intents は呼び出し番号 → intent。"""
+    hist = _conn(tmp_path)
+    rows = []
+    for i in range(minutes):
+        px = 148.5 if i < drop else 147.5
+        rows.append(_row_at(START + timedelta(minutes=i), o=px, h=px + 0.05,
+                            l=px - 0.05, c=px))
+    ohlcv.import_history_bars(hist, rows, source="dukascopy")
+    calls = []
+
+    def source(bar):
+        calls.append(bar.ts)
+        return intents.get(len(calls))
+
+    settings = SETTINGS.model_copy(update={
+        "risk": SETTINGS.risk.model_copy(update={
+            "drawdown_kill_pct": threshold, "max_positions": 5})})
+    result = run_replay(
+        settings, symbol="USDJPY", dataset=DATASET_1M, start=START,
+        end=START + timedelta(minutes=minutes), intent_source=source,
+        eval_timeframe="1m", history_conn=hist)
+    return result
+
+
+def _summary(result):
+    return (
+        [(o["id"], o["status"], o["close_reason"], o["avg_fill_price"])
+         for o in result.orders],
+        [(e["kind"], e["ts"]) for e in result.kill_switch_events],
+        result.kill_switch_latches, result.equity_curve)
+
+
+def test_replay_drawdown_threshold_stops_a_reserved_limit_without_a_latch(
+        tmp_path):
+    intents = {1: dict(MARKET_OPEN), 2: dict(LIMIT_BELOW)}
+    (tmp_path / "a").mkdir()
+    stopped = _drawdown_replay(tmp_path / "a", intents, drop=7)
+    assert stopped.kill_switch_latches == 0
+    limit = [o for o in stopped.orders if o["entry_type"] == "limit"]
+    assert len(limit) == 1
+    assert limit[0]["status"] == "pending_fill"
+    assert limit[0]["close_reason"] is None
+    (tmp_path / "b").mkdir()
+    free = _drawdown_replay(tmp_path / "b", intents, drop=7, threshold=50.0)
+    assert free.kill_switch_latches == 0
+    free_limit = [o for o in free.orders if o["entry_type"] == "limit"]
+    assert free_limit[0]["status"] == "open"
+    assert free_limit[0]["avg_fill_price"] == pytest.approx(147.505)
+
+
+def test_replay_latch_cancels_the_reserved_limit_with_the_kill_switch_reason(
+        tmp_path):
+    intents = {1: dict(MARKET_OPEN), 2: dict(LIMIT_BELOW), 10: dict(MARKET_OPEN)}
+    result = _drawdown_replay(tmp_path, intents, drop=7)
+    assert result.kill_switch_latches == 1
+    limit = [o for o in result.orders if o["entry_type"] == "limit"]
+    assert [(o["status"], o["close_reason"]) for o in limit] == [
+        ("cancelled", "kill_switch")]
+    latched = [e for e in result.kill_switch_events if e["kind"] == "latched"]
+    assert len(latched) == 1
+
+
+def test_replay_with_the_same_input_is_deterministic(tmp_path):
+    intents = {1: dict(MARKET_OPEN), 2: dict(LIMIT_BELOW), 10: dict(MARKET_OPEN)}
+    (tmp_path / "x").mkdir()
+    (tmp_path / "y").mkdir()
+    first = _drawdown_replay(tmp_path / "x", intents, drop=7)
+    second = _drawdown_replay(tmp_path / "y", intents, drop=7)
+    assert _summary(first) == _summary(second)
+    assert first.snapshots == second.snapshots
+
+
+def test_replay_without_latch_or_drawdown_is_unchanged_by_the_new_stop(
+        tmp_path):
+    intents = {1: dict(MARKET_OPEN), 2: dict(LIMIT_BELOW)}
+    (tmp_path / "x").mkdir()
+    (tmp_path / "y").mkdir()
+    base = _drawdown_replay(tmp_path / "x", intents, drop=99, threshold=2.0)
+    wide = _drawdown_replay(tmp_path / "y", intents, drop=99, threshold=50.0)
+    assert base.kill_switch_latches == 0
+    assert [e["drawdown_pct"] for e in base.kill_switch_events] == []
+    assert _summary(base) == _summary(wide)
+    assert [(o["status"], o["close_reason"]) for o in base.orders
+            if o["entry_type"] == "limit"] == [("pending_fill", None)]
+
+
+def test_weekend_replay_cancels_the_limit_at_the_latch_and_it_never_fills_later(
+        tmp_path, monkeypatch):
+    hist = _conn(tmp_path)
+    flat = dict(o=148.5, h=148.6, l=148.4, c=148.5)
+    low = dict(o=147.5, h=147.55, l=147.4, c=147.5)
+    rows = [_row_at(THU, **flat),
+            _row_at(THU + timedelta(minutes=1), **flat),
+            _row_at(THU + timedelta(minutes=2), **flat),
+            _row_at(THU + timedelta(minutes=3), **flat),
+            _row_at(THU + timedelta(minutes=4), **low),
+            _row_at(THU + timedelta(minutes=5), **low),
+            _row_at(THU + timedelta(minutes=6), **low),
+            _row_at(datetime(2026, 7, 25, 20, 59, tzinfo=UTC), **low),
+            _row_at(datetime(2026, 7, 25, 21, 0, tzinfo=UTC), **low),
+            _row_at(SUN_OPEN - timedelta(minutes=1), o=147.8, h=147.85,
+                    l=147.75, c=147.8),
+            _row_at(SUN_OPEN, o=147.8, h=147.85, l=147.75, c=147.8),
+            _row_at(SUN_OPEN + timedelta(minutes=1), o=147.8, h=147.85,
+                    l=147.75, c=147.8)]
+    ohlcv.import_history_bars(hist, rows, source="dukascopy")
+    sequence = {1: dict(SAFE_OPEN), 2: {
+        "action": "open", "pair": "USDJPY", "direction": "long",
+        "entry_type": "limit", "horizon": "swing", "limit_price": 147.9,
+        "expires_in": "20h", "stop_loss": 147.0, "take_profit": 151.5,
+        "reasoning": "stale-limit"}, 4: dict(MARKET_OPEN)}
+    calls = []
+
+    def source(bar):
+        calls.append(bar.ts)
+        return sequence.get(len(calls))
+
+    settings = SETTINGS.model_copy(update={
+        "risk": SETTINGS.risk.model_copy(update={
+            "drawdown_kill_pct": 0.05, "max_positions": 5})})
+    result = run_replay(
+        settings, symbol="USDJPY", dataset=DATASET_1M, start=THU,
+        end=SUN_OPEN + timedelta(minutes=3), intent_source=source,
+        eval_timeframe="1m", history_conn=hist)
+    limits = [o for o in result.orders if o["entry_type"] == "limit"]
+    assert [(o["status"], o["close_reason"]) for o in limits] == [
+        ("cancelled", "kill_switch")]
+    kinds = [e["kind"] for e in result.kill_switch_events]
+    assert kinds[:2] == ["latched", "released"]
+    assert result.kill_switch_latches >= 1
+    assert not [o for o in limits if o["avg_fill_price"] is not None]
