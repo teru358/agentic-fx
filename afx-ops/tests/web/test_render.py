@@ -71,7 +71,7 @@ from afx_ops.web import headers, render  # noqa: E402
 from afx_ops.web.routes import ROUTE_TABLE  # noqa: E402
 
 # CSS を変えたらこの値も変える (CSP の hash と埋め込む CSS の取り違えを防ぐ)
-PINNED_STYLE_HASH = "sha256-LTD12P28Uy1nqEG8Ug154drZ3pH6F9EnG8flNemSejY="
+PINNED_STYLE_HASH = "sha256-ikbXKLrXYVfxPcWWcuDZtzvvyqj/k6rP5KkKwrMxPpU="
 
 
 class ReadClient:
@@ -100,9 +100,15 @@ class ReadClient:
     def plugin(self, name):
         return Reply(200, {"plugin": {"name": name}}, None)
 
+    def improve_list(self, *, limit):
+        return Reply(200, {"runs": [], "has_more": False}, None)
+
+    def improve_detail(self, mission_id):
+        return Reply(200, {"id": mission_id, "snapshot": None, "summary": None}, None)
+
 
 PAGES = ["/", "/approvals", "/approvals/7", "/logs", "/activity", "/plugins", "/plugins/rsi",
-         "/missing"]
+         "/improve", "/improve/3", "/missing"]
 
 
 def test_the_csp_style_hash_is_the_hash_of_the_embedded_css():
@@ -121,12 +127,12 @@ def test_the_csp_style_hash_is_the_hash_of_the_embedded_css():
 def test_every_page_has_the_route_nav_and_a_read_only_refresh():
     static = [route.path for route in ROUTE_TABLE if "{" not in route.path]
     # /approvals は nav に出さず、/plugins の画面から辿る
-    in_nav = ["/", "/plugins", "/logs", "/activity"]
+    in_nav = ["/", "/plugins", "/improve", "/logs", "/activity"]
     assert sorted(in_nav + ["/approvals"]) == sorted(static)
     for path in PAGES:
         page = handle_request(Request("GET", path, {}), ReadClient()).body.decode()
         nav = re.search(r"<nav>(.*?)</nav>", page, re.S).group(1)
-        assert re.findall(r'<a href="([^"]*)">', nav) == in_nav, path
+        assert re.findall(r'<a href="([^"]*)"(?: aria-current="page")?>', nav) == in_nav, path
         assert 'Approvals</a>' not in nav, path
         assert page.count('<meta http-equiv="refresh" content="30">') == 1, path
 
@@ -139,8 +145,8 @@ def test_each_pending_approval_links_to_its_detail_route():
         {"id": 0, "name": "zero id"},
     ]}
     page = handle_request(Request("GET", "/approvals", {}), ReadClient(approvals=approvals)).body.decode()
-    links = re.findall(r'<a href="([^"]*)">', page.split("</nav>", 1)[1])
-    assert links == ["/approvals/7"]
+    content = re.sub(r'<nav class="tabs">.*?</nav>', "", page).split("</nav>", 1)[1]
+    assert re.findall(r'<a href="([^"]*)">', content) == ["/approvals/7"]
     assert "&lt;b&gt;p&lt;/b&gt;" in page and "<b>" not in page
     assert "<script>" not in page
 
@@ -152,7 +158,7 @@ def test_kill_switch_and_autopilot_are_marked_by_class_only_when_on():
     assert '<dt class="warn">autopilot</dt><dd class="warn">' in on
     off = handle_request(Request("GET", "/", {}), ReadClient(status={
         "kill_switch": {"latched": False}, "autopilot": False})).body.decode()
-    assert "class=" not in off.split("</nav>", 1)[1]
+    assert "class=" not in off.split("</nav>")[-1]
 
 
 def test_log_and_activity_show_the_newest_lines_of_a_long_window():

@@ -49,7 +49,7 @@ from agentic_fx.cli_surface import render_ctl_help
 from agentic_fx.setup.pending_text import (STEP_PARAMS, PendingStep, is_ident,
                                            parse_observed_at, render_pending_step)
 
-from . import base_view, bot_health, change_limits, keys, redactor
+from . import base_view, bot_health, change_limits, keys, rebase_view, redactor
 from .contracts import IMPROVE_RUNS_DEFAULT_LIMIT, IMPROVE_RUNS_MAX_LIMIT, Principal
 from .events import EventCursor, EventPage
 from .tail import ACTIVITY_CATEGORIES
@@ -106,6 +106,15 @@ MESSAGES = {
     "cancelled": "取り消しました (何も送っていません)",
 }
 
+_REBASE_PREVIEW = "/v1/killswitch/rebase-preview"
+_REBASE_MAX_ROUNDS = 5
+_REBASE_MOVED = ("状態が変わっているため同じ要求を再送しません。付け直しが適用されたかは "
+                 "`afx ctl status` と台帳で確認し、必要なら改めて "
+                 "`afx ctl --as approver killswitch rebase <世代>` を実行してください")
+_REBASE_UNKNOWN = ("付け直しの結果が不明です。自動では再送しません。"
+                   "`afx ctl status` で HWM と DD を確認し、台帳 (受理した要求の audit id) で"
+                   "成立を調べてから、必要なら改めて実行してください")
+
 # 409 などの業務上の失敗。対話シェルと同じ言い回しにそろえる。
 _ERROR_TEXT = {
     "invalid_argument": "引数が不正です",
@@ -122,6 +131,10 @@ _ERROR_TEXT = {
     "generation_mismatch": "kill switch のラッチが更新されたので status を確認してから"
                            "もう一度実行してください",
     "not_latched": "kill switch はラッチされていません",
+    "preview_changed": "表示した後に値が変わったため付け直しませんでした。"
+                       "もう一度確認してください",
+    "market_closed": "閉場中は付け直せません。市場が開き、新しい MTM が記録されてから"
+                     "再実行してください",
     "invalid_state": "現在の状態ではこの操作を行えません",
     "attempt_changed": "試行記録が更新されたため戻しませんでした。もう一度実行してください",
     "idempotency_mismatch": "同じ要求 key で別の内容が送られました",
@@ -553,7 +566,14 @@ class Terminal:
             os.close(self._fd)
             self._fd = -1
 
-    def ask(self, prompt: str) -> str | None:
+    def show(self, text: str) -> None:
+        """確認と同じ端末にだけ書く (stdout へは出さない)。"""
+        view = memoryview(text.encode())
+        while view:
+            view = view[os.write(self._fd, view):]
+
+    def ask(self, prompt: str, *, exact: bool = False) -> str | None:
+        """1 行を読む。exact なら末尾の改行だけを除き、空白・タブはそのまま返す。"""
         os.write(self._fd, prompt.encode())
         data = b""
         while not data.endswith(b"\n"):
@@ -561,7 +581,10 @@ class Terminal:
             if not chunk:
                 return None
             data += chunk
-        return data.decode(errors="replace").strip()
+        text = data.decode(errors="replace")
+        if exact:
+            return text.removesuffix("\n").removesuffix("\r")
+        return text.strip()
 
     def yes(self, prompt: str) -> bool:
         answer = self.ask(f"{prompt} [y/N]: ")
@@ -1045,7 +1068,7 @@ def _save_cursor(path: Path, position: int, high_watermark: int = 0) -> None:
 
 
 _APPROVER_OPS = frozenset({"approve", "reject", "retry", "killswitch_reset",
-                           "killswitch_reconcile", "data_resume"})
+                           "killswitch_reconcile", "killswitch_rebase", "data_resume"})
 _CONFIRM_OPS = _APPROVER_OPS | {"job_cancel"}
 # approve job が done で返す outcome のうち、承認されて版が切り替わったもの。
 _APPROVING_OUTCOMES = frozenset({"deployed", "deployed_after_rollback"})
@@ -1132,6 +1155,8 @@ def parse(tokens: list[str]) -> Op:
             return Op("killswitch_reset", [_int_arg(args[1])])
     if cmd == "killswitch" and args in (["reconcile"], ["reconcile", "confirm"]):
         return Op("killswitch_reconcile", [])
+    if cmd == "killswitch" and n == 2 and args[0] == "rebase":
+        return Op("killswitch_rebase", [_int_arg(args[1])])
     if cmd == "data" and args in (["resume"], ["resume", "--acknowledge"]):
         return Op("data_resume", [n == 2])
     if cmd == "jobs" and n == 2 and args[0] in ("get", "cancel"):
@@ -1764,8 +1789,83 @@ class Runner:
                                   "印が残っています)。`afx ctl --as approver killswitch "
                                   "reconcile` で確認してください")
             raise _fail(reply)
-        self.say(f"kill switch ラッチを解除しました (gen={_ident(reply.data.get('generation'))})")
+        shown_generation = _ident(reply.data.get("generation"))
+        self.say(f"kill switch ラッチを解除しました (gen={shown_generation})")
         self.say(KILL_SWITCH_RESET_WARNING)
+        # DD の状態は推測せず、毎回同じ案内を出す。
+        self.say(f"HWM を付け直すには `afx ctl --as approver killswitch rebase {generation}` を"
+                 "実行してください")
+        return RC_OK
+
+    def _op_killswitch_rebase(self, generation: int, *, terminal: Terminal) -> int:
+        """preview を読み、`rebase <世代>` の完全一致だけを受けて POST する。
+
+        金額は再計算せず DTO の値を写す。値が変わったときは preview を取り直して確認も
+        取り直す。同じ token を送り直すのは、取り直した preview の token が同じ (= 台帳も
+        HWM も動いていない) と分かった無変更の timeout の後だけ。成功・不明は再送しない。"""
+        try:
+            tz = _tz_of(self._get("/v1/status"))
+        except ClientError:
+            tz = _tz_of({})
+        sent_token: str | None = None
+        for _ in range(_REBASE_MAX_ROUNDS):
+            data = self._get(_REBASE_PREVIEW, expected_generation=generation)
+            token = data.get("preview_token")
+            if data.get("eligible") is not True or not isinstance(token, str) or not token:
+                text = rebase_view.reason_text(data.get("reason"))
+                if sent_token is not None:
+                    # 送った後に不適格になった: 適用された可能性があるので理由だけで終えない。
+                    text += "\n" + _REBASE_MOVED
+                raise ClientError(RC_FAILED, text)
+            if sent_token is not None and token != sent_token:
+                raise ClientError(RC_FAILED, _REBASE_MOVED)
+            try:
+                terminal.show("".join(line + "\n" for line in rebase_view.preview_lines(
+                    data, generation, lambda value: _when(value, tz))))
+                answer = terminal.ask(rebase_view.confirm_sentence(data, generation), exact=True)
+            except OSError:
+                raise ClientError(RC_FAILED, "端末での確認に失敗しました") from None
+            if answer != f"rebase {generation}":
+                raise ClientError(RC_FAILED, MESSAGES["cancelled"])
+            try:
+                reply = self._post("/v1/killswitch/rebase",
+                                   {"expected_generation": generation, "preview_token": token})
+            except _ResponseLost:
+                raise ClientError(RC_FAILED, _REBASE_UNKNOWN) from None
+            if reply.data is not None:
+                return self._rebase_done(reply.data, generation)
+            if reply.code == "preview_changed":
+                self.say(rebase_view.CHANGED)
+                sent_token = None
+                continue
+            if reply.code in ("request_timeout", "database_busy"):
+                self.say("時間内に処理できず、付け直しは適用されていない可能性があります。"
+                         "preview を取り直して無変更を確かめます。")
+                sent_token = token
+                continue
+            if reply.code == "outcome_unknown":
+                raise ClientError(RC_FAILED, _REBASE_UNKNOWN)
+            if reply.code == "invalid_state":
+                raise ClientError(RC_FAILED, rebase_view.REASON_TEXT["state_unavailable"])
+            raise _fail(reply)
+        if sent_token is not None:
+            raise ClientError(RC_FAILED, "時間切れが続きました。付け直しは適用されていません。")
+        raise ClientError(RC_FAILED, "確認のあいだに状況が変わり続けています。"
+                          "時間をおいてもう一度実行してください")
+
+    def _rebase_done(self, data: dict, generation: int) -> int:
+        rebase_id, snapshot_id = _ident(data.get("rebase_id")), _ident(data.get("snapshot_id"))
+        shown = _ident(data.get("generation"))
+        self.say(f"rebase_id={rebase_id} snapshot_id={snapshot_id} gen={shown}")
+        latched = data.get("latched")
+        if latched is True:
+            self.say(rebase_view.SUCCESS_LATCHED)
+            self.say(f"解除するには別に `afx ctl --as approver killswitch reset {shown}` を"
+                     "実行してください")
+        elif latched is False:
+            self.say(rebase_view.SUCCESS_CLEAR)
+        else:
+            self.say(rebase_view.SUCCESS_UNSTATED)
         return RC_OK
 
     def _op_killswitch_reconcile(self, *, terminal: Terminal) -> int:

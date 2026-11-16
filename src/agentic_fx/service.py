@@ -61,6 +61,7 @@ from agentic_fx.logging_setup import setup_technical_logging
 from agentic_fx.ops import bot_health
 from agentic_fx.ops import keys as ops_keys
 from agentic_fx.ops.api_server import ApiLimits, ApiServer, ApiStartError
+from agentic_fx.ops.rebase_service import RebaseWiring
 from agentic_fx.ops.service import OpsLimits, OpsService, plan_kill_switch_notice
 from agentic_fx.ops.trade_event_sink import BUSY_RETRY_SEC, TradeEventEmitter, TradeEventSink
 from agentic_fx.loops import econ_signal_report, reflection_cycle
@@ -1933,7 +1934,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             improve_supervisor=improve_supervisor, plugins_dir=plugins_dir, outage=outage,
             trade_event_sink=trade_sink, ingest=ingest, admission=admission,
             econ_health=econ_health, capacity_reader=capacity_reader,
-            econ_status_cache=econ_status_cache)
+            econ_status_cache=econ_status_cache, core_lock=core_lock, broker=broker)
         # 親専有の日次 report。市場の当日 close 後に 1 回、起動時は当日分が無ければ 1 回
         # (scheduler が呼ぶ。生成側が取引日で一意にする)。
         scheduler.register_daily_report(econ_signal_report.make_daily_report_callback(
@@ -2157,7 +2158,8 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
                        health_latch, supervisor, improve_supervisor, plugins_dir,
                        outage, trade_event_sink=None, ingest=None,
                        admission=None, econ_health=None,
-                       capacity_reader=None, econ_status_cache=None) -> OpsService:
+                       capacity_reader=None, econ_status_cache=None,
+                       core_lock=None, broker=None) -> OpsService:
     db_path = root / "data" / "agentic.db"
     status_lock = threading.Lock()
     landlock_cache: list[bool] = []
@@ -2262,7 +2264,10 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
         activity_path=root / "logs" / "activity.log", data_resume=data_resume,
         ask_submitter=ask_submitter, improve_supervisor=improve_supervisor,
         plugins_root=plugins_dir, settings=settings, activity_log=activity,
-        improve_reports_dir=root / "data" / "improve_reports")
+        improve_reports_dir=root / "data" / "improve_reports",
+        # HWM の付け直しだけが使う依存。core_lock か broker が無ければ付け直しだけ使えない。
+        rebase=(RebaseWiring(core_lock=core_lock, broker=broker, clock=clock)
+                if core_lock is not None and broker is not None else None))
     holder.append(service)
     return service
 

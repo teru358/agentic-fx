@@ -1,6 +1,7 @@
 """書込みの adapter: 書込みが無効なら今のまま、有効でも検査 1〜5 を欠く要求は daemon を呼ばない。"""
 from __future__ import annotations
 
+import dataclasses
 import threading
 from urllib.parse import urlencode
 
@@ -17,7 +18,7 @@ from _write_support import (
 
 READ_ONLY_CSP_ACTION = "form-action 'none'"
 WRITE_PATHS = ["/approvals/7/approve", "/approvals/7/reject", "/improve/runs", "/confirm",
-               "/confirm/check", "/improve", "/jobs/" + "0123456789abcdef" * 2,
+               "/confirm/check", "/jobs/" + "0123456789abcdef" * 2,
                "/jobs/" + "0123456789abcdef" * 2 + "/cancel"]
 
 
@@ -52,6 +53,7 @@ def test_with_write_off_the_approval_page_has_no_form_and_keeps_the_read_only_cs
     assert response.status == 200
     assert b"<form" not in response.body
     assert READ_ONLY_CSP_ACTION in response.headers["Content-Security-Policy"]
+    assert response.headers["Referrer-Policy"] == "no-referrer"
     assert rig.client.calls == [("approval", 7), ("approval_change", 7)]
 
 
@@ -86,8 +88,11 @@ def test_with_write_on_every_response_relaxes_form_action_to_self_only():
 
 def test_the_pending_plugin_approval_page_gets_decision_forms_without_auto_refresh():
     rig = _rig()
-    page = rig.send(rig.request("GET", "/approvals/7")).body.decode("utf-8")
+    response = rig.send(rig.request("GET", "/approvals/7"))
+    page = response.body.decode("utf-8")
     assert 'action="/approvals/7/approve"' in page and 'action="/approvals/7/reject"' in page
+    # form を載せた文書の referrer policy が、その form の POST の Origin を決める。
+    assert response.headers["Referrer-Policy"] == "same-origin"
     assert page.count(f'name="payload_sha256" value="{DIGEST}"') == 2
     assert 'http-equiv="refresh"' not in page
     assert page.endswith("</body></html>")
@@ -106,14 +111,72 @@ def test_other_approval_pages_get_no_form_and_keep_the_refresh(detail):
     assert "<form" not in page and 'http-equiv="refresh"' in page
 
 
-def test_the_improve_form_is_a_static_page_that_posts_to_the_first_step():
+def with_query(request, **query):
+    return dataclasses.replace(request, query=query)
+
+
+def test_the_run_tab_holds_the_form_that_posts_to_the_first_step_and_reads_nothing():
     rig = _rig()
-    response = rig.send(rig.request("GET", "/improve"))
+    response = rig.send(with_query(rig.request("GET", "/improve"), tab="run"))
     assert response.status == 200 and rig.client.calls == []
     body = response.body.decode("utf-8")
     assert 'action="/improve/runs"' in body and "token" not in body
+    assert 'http-equiv="refresh"' not in body and body.endswith("</body></html>")
+    assert "UTC" not in body and "+09:00" not in body
+    head = rig.send(with_query(rig.request("HEAD", "/improve"), tab="run"))
+    assert head.status == 200 and head.body == b"" and rig.client.calls == []
+    assert head.headers["Content-Length"] == str(len(response.body))
+
+
+def test_the_history_tab_keeps_the_refresh_and_has_no_form_even_when_write_is_on():
+    rig = _rig()
+    response = rig.send(rig.request("GET", "/improve"))
+    body = response.body.decode("utf-8")
+    assert response.status == 200 and rig.client.calls == [("improve_list", 50)]
+    assert "<form" not in body and 'http-equiv="refresh"' in body
+    assert body.index("終了した改善 mission") < body.index("</body>")
+    assert '<a href="/improve?tab=run">実行</a>' in body
     head = rig.send(rig.request("HEAD", "/improve"))
     assert head.status == 200 and head.body == b""
+
+
+def test_the_improve_page_without_write_is_read_only_and_keeps_the_refresh():
+    rig = _rig()
+    response = rig.send(rig.request("GET", "/improve"), writable=False)
+    body = response.body.decode("utf-8")
+    assert response.status == 200 and "<form" not in body and 'http-equiv="refresh"' in body
+    assert ">実行</a>" not in body and '?tab=run"' not in body
+    assert READ_ONLY_CSP_ACTION in response.headers["Content-Security-Policy"]
+    assert rig.send(rig.request("POST", "/improve", {}), writable=False).status == 405
+    assert rig.send(rig.request("POST", "/improve/runs", {}), writable=False).status == 404
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_the_run_tab_is_404_when_write_is_off_without_calling_the_daemon(method):
+    rig = _rig()
+    request = with_query(rig.request(method, "/improve"), tab="run")
+    response = rig.send(request, writable=False)
+    assert response.status == 404 and rig.client.calls == []
+    assert b"<form" not in response.body and b'class="tabs"' not in response.body
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_the_run_tab_is_404_when_the_transport_forbids_writing(method):
+    rig = _rig(loopback=False)
+    response = rig.send(with_query(rig.request(method, "/improve"), tab="run"))
+    assert response.status == 404 and rig.client.calls == []
+    page = rig.send(rig.request("GET", "/improve")).body.decode()
+    assert '?tab=run"' not in page and "<form" not in page
+
+
+@pytest.mark.parametrize("query", [{"tab": "run", "limit": "50"}, {"tab": "run", "sort": "run"},
+                                   {"tab": "run", "dir": "asc"}, {"tab": "run", "x": "1"}])
+@pytest.mark.parametrize("writable", [True, False])
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_the_run_tab_with_a_history_key_is_400_before_the_404_check(query, writable, method):
+    rig = _rig()
+    response = rig.send(with_query(rig.request(method, "/improve"), **query), writable=writable)
+    assert response.status == 400 and rig.client.calls == []
 
 
 def test_a_wrong_method_on_a_write_route_is_405_with_its_allow_list():
@@ -197,8 +260,10 @@ def test_a_non_loopback_non_tls_context_refuses_every_write_post_and_the_form():
                                         ("/confirm/check", {"token": token})]:
         response = rig.post(path, form)
         assert response.status == 403, path
-    assert rig.send(rig.request("GET", "/improve")).status == 403
-    assert rig.client.calls == [] and rig.store.counts() == (0, 0)
+    # 経路が書込みを許さないときは、読む画面だけを出し、実行タブは無い
+    page = rig.send(rig.request("GET", "/improve"))
+    assert page.status == 200 and b"<form" not in page.body and b'?tab=run"' not in page.body
+    assert rig.client.calls == [("improve_list", 50)] and rig.store.counts() == (0, 0)
 
 
 def test_a_tls_context_without_loopback_is_allowed_to_write():
@@ -348,7 +413,9 @@ def test_the_first_step_only_shows_a_confirmation_and_never_calls_the_daemon():
     assert 'action="/confirm"' in body and 'http-equiv="refresh"' not in body
     assert rig.store.counts() == (1, 0)
     assert response.headers["Cache-Control"] == "no-store"
-    assert response.headers["Referrer-Policy"] == "no-referrer"
+    # no-referrer の文書から送る form の POST は、同じ origin でもブラウザが Origin: null を付ける
+    # (Fetch の append a request Origin header)。Origin の完全一致を要求するので same-origin にする。
+    assert response.headers["Referrer-Policy"] == "same-origin"
 
 
 def test_the_token_appears_only_in_the_hidden_field_of_the_confirmation():
@@ -671,7 +738,8 @@ def test_a_get_never_changes_the_store():
     for path in ("/", "/approvals", "/approvals/7", "/improve", "/plugins"):
         rig.send(rig.request("GET", path))
     assert rig.store.counts() == (0, 0)
-    assert all(call[0] in {"status", "approvals", "approval", "approval_change", "plugins"}
+    assert all(call[0] in {"status", "approvals", "approval", "approval_change", "plugins",
+                              "improve_list"}
                for call in rig.client.calls)
 
 
@@ -746,3 +814,37 @@ def test_the_body_limit_boundary_is_exact():
     at = b"comment=" + b"x" * (write.MAX_WRITE_BODY - len(b"comment="))
     assert rig.post("/improve/runs", at).status != 413
     assert rig.post("/improve/runs", at + b"x").status == 413
+
+
+@pytest.mark.parametrize("reply", [Reply(500, None, "internal"),
+                                    Reply(200, {"runs": "bad"}, None),
+                                    Reply(404, None, "not_found")])
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_improve_list_failure_with_write_is_502_with_the_bar_and_a_link_to_the_run_tab(reply, method):
+    rig = _rig()
+    rig.client.improve_list = lambda **kwargs: reply
+    response = rig.send(rig.request(method, "/improve"))
+    got = rig.send(rig.request("GET", "/improve"))
+    assert response.status == got.status == 502
+    assert response.headers["Content-Length"] == str(len(got.body))
+    body = got.body.decode()
+    assert "一覧を取得できません" in body and '<a href="/improve?tab=run">実行</a>' in body
+    assert "<form" not in body and "<table" not in body
+    assert b"internal" not in got.body and (method == "GET" or response.body == b"")
+
+
+@pytest.mark.parametrize("reply", [Reply(500, None, "internal"), Reply(200, {"runs": "bad"}, None),
+                                   Reply(404, None, "not_found")])
+def test_improve_list_failure_without_write_is_the_plain_error_page(reply):
+    rig = _rig()
+    rig.client.improve_list = lambda **kwargs: reply
+    response = rig.send(rig.request("GET", "/improve"), writable=False)
+    assert response.status == 502
+    assert b'class="tabs"' not in response.body and b"Service unavailable" in response.body
+
+
+def test_improve_list_failure_by_a_broken_connection_is_502_with_the_bar():
+    rig = _rig()
+    rig.client.fail["improve_list"] = ConnectionError("lost")
+    response = rig.send(rig.request("GET", "/improve"))
+    assert response.status == 502 and "tab=run" in response.body.decode()

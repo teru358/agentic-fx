@@ -1,0 +1,29 @@
+[
+  {
+    "path": "src/agentic_fx/commands.py",
+    "qualified_symbol": "Commands._dispatch",
+    "callee_method": "StateStore.reset_kill_switch",
+    "d_id": "D02",
+    "reason": "Shell reset directly mutates the store outside the shared lane; the notice wrapper supplements notification.",
+    "ticket": "not filed (accepted residual risk)",
+    "approval_boundary": "Existing shell reset mutation remains outside the lane; no additional direct mutation is approved."
+  },
+  {
+    "path": "src/agentic_fx/commands.py",
+    "qualified_symbol": "Commands._killswitch_reconcile",
+    "callee_method": "StateStore.confirm_latched",
+    "d_id": "D02",
+    "reason": "Shell confirm directly mutates the store outside the shared lane; the notice wrapper supplements notification.",
+    "ticket": "not filed (accepted residual risk)",
+    "approval_boundary": "Existing shell confirm mutation remains outside the lane; no additional direct mutation is approved."
+  },
+  {
+    "path": "src/agentic_fx/commands.py",
+    "qualified_symbol": "Commands._data_resume",
+    "callee_method": "OutageStateMachine.request_resume",
+    "d_id": "D04",
+    "reason": "Shell data resume bypasses the operations lane and does not emit the guard event.",
+    "ticket": "not filed",
+    "approval_boundary": "Only the existing shell data resume bypass is recorded; no additional bypass is approved."
+  }
+]

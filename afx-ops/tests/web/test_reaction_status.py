@@ -34,7 +34,7 @@ def _reaction(rows, **over):
 
 def _page(reaction, **extra):
     status = {"econ_signal": {"slice_worker": "alive", "reaction": reaction}, **extra}
-    return handle_request(Request("GET", "/", {}), Client(status)).body.decode()
+    return handle_request(Request("GET", "/", {"tab": "reaction"}), Client(status)).body.decode()
 
 
 def _table_rows(page, heading):
@@ -89,7 +89,7 @@ def test_the_backlog_counts_are_shown():
 
 def test_an_unavailable_reaction_section_is_marked_and_absent_is_left_out():
     assert re.search(r"<dt>reaction</dt><dd>unavailable</dd>", _page(None))
-    page = handle_request(Request("GET", "/", {}), Client(
+    page = handle_request(Request("GET", "/", {"tab": "reaction"}), Client(
         {"econ_signal": {"slice_worker": "alive"}})).body.decode()
     assert "Economic reactions" not in page
 

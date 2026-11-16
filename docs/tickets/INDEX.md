@@ -1,9 +1,9 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 174 件。完了分は closed/。
+未完了: 175 件。完了分は closed/。
 
-## 実装中 (5)
+## 実装中 (6)
 
 ### 不具合 (3)
 
@@ -13,11 +13,12 @@
 | [history-import-stops-at-first-conflict](open/history-import-stops-at-first-conflict.md) | 中 | 2026-11-13 | history import は食い違う足 1 本で partial 停止し後続を取り込まない |
 | [status-history-hidden-while-daemon-runs](open/status-history-hidden-while-daemon-runs.md) | 中 | 2026-11-13 | daemon 稼働中は評価用履歴の状態を見る面が無い |
 
-### 機能 (1)
+### 機能 (2)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
-| [web-plugin-improve-hub](open/web-plugin-improve-hub.md) | 高 | 2026-11-08 | 同梱 web に plugin と改善の画面群を作る (一覧・依存・承認・改善の実行) |
+| [killswitch-reset-hwm-rebase](open/killswitch-reset-hwm-rebase.md) | 高 | 2026-11-13 | kill switch の手動解除で HWM を付け直す明示操作が無い |
+| [web-layout-tabs](open/web-layout-tabs.md) | 中 | 2026-11-15 | 同梱 web の各画面をタブに分け、plugin と improve の表を並べ替え可能にする |
 
 ### 保守 (1)
 
@@ -25,7 +26,7 @@
 |---|---|---|---|
 | [code-impact-map](open/code-impact-map.md) | 高 | 2026-11-14 | コードから読み取る現状の影響地図 (機械索引・契約表・領域頁) を docs/ に置く |
 
-## 実装待ち (13)
+## 実装待ち (12)
 
 ### 不具合 (7)
 
@@ -39,11 +40,10 @@
 | [flaky-tool-schemas](open/flaky-tool-schemas.md) | 低 |  | 全ツールのスキーマテストがフル suite でだけ ERROR になる |
 | [improve-add-quotes](open/improve-add-quotes.md) | 低 |  | improve add がクォートを剥がさず表示が崩れる |
 
-### 機能 (2)
+### 機能 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
-| [killswitch-reset-hwm-rebase](open/killswitch-reset-hwm-rebase.md) | 高 | 2026-11-13 | kill switch の手動解除で HWM を付け直す明示操作が無い |
 | [legacy-oc-tool-not-found](open/legacy-oc-tool-not-found.md) | 低 |  | 存在しない候補名を読むときの誘導が足りない |
 
 ### 保守 (4)
@@ -78,7 +78,7 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (150)
+## 設計待ち (151)
 
 ### 不具合 (80)
 
@@ -114,7 +114,6 @@
 | [verify-backend-counts-preexisting-descendants](open/verify-backend-counts-preexisting-descendants.md) | 中 | 2026-11-06 | verify_backend が実行前から居た子孫プロセスも未回収と数えて失敗する |
 | [plugin-inherited-filter-test-hits-fingerprint-selftest-first](open/plugin-inherited-filter-test-hits-fingerprint-selftest-first.md) | 中 | 2026-11-07 | 継承 seccomp filter の拒否 test が fingerprint 自己試験の失敗を先に返す |
 | [improve-eval-window-reference-availability](open/improve-eval-window-reference-availability.md) | 中 | 2026-11-09 | 参照系列を宣言した候補の評価区間に、参照の履歴が無い先頭の足が入る |
-| [web-write-recover-idle-interruption](open/web-write-recover-idle-interruption.md) | 中 | 2026-11-10 | 有効でない web の鍵と write の回復が中断に弱い |
 | [reference-daily-session-completeness](open/reference-daily-session-completeness.md) | 中 | 2026-11-14 | 非24時間銘柄の1d参照を取引セッションに沿って確定する |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
@@ -151,6 +150,7 @@
 | [first-run-acceptance-doc-quotes-drift](open/first-run-acceptance-doc-quotes-drift.md) | 低 | 2026-11-03 | 初回受入手順書の逐語引用 test 3 件が main で落ちる |
 | [mission-worker-improve-rpc-frame-test-fails](open/mission-worker-improve-rpc-frame-test-fails.md) | 低 | 2026-11-03 | mission_worker の improve RPC frame test が main で落ちる |
 | [killswitch-latched-activity-repeats](open/killswitch-latched-activity-repeats.md) | 低 | 2026-11-14 | 同一 kill switch 世代で繰り返される latch activity を一件にする |
+| [paper-starting-balance-cashflow-history](open/paper-starting-balance-cashflow-history.md) | 低 | 2026-11-15 | paper.starting_balance の変更が cashflow 履歴に残らない |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backtest-scheduler-log-leak](open/backtest-scheduler-log-leak.md) | 低 |  | backtest 内部 Scheduler の `maintain_reservations failed: no c… |
 | [graceful-stop-waits-mission](open/graceful-stop-waits-mission.md) | 低 |  | graceful stop が走行中 improve mission の timeout (最大 60 分) を待つ … |
@@ -212,7 +212,7 @@
 | [legacy-e2e-model](open/legacy-e2e-model.md) | 低 |  | backend を切り替えるたびにモデル名の手編集が要る |
 | [legacy-oc-qwen3-8-toolcall](open/legacy-oc-qwen3-8-toolcall.md) | 低 |  | モデルが壊れた引数でツールを連打し予算を焼く |
 
-### 保守 (28)
+### 保守 (29)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -235,6 +235,7 @@
 | [bot-discord-log-template-inventory](open/bot-discord-log-template-inventory.md) | 低 | 2026-11-14 | discord.py 内部の log を安全な固定 code に写す保守契約を作る |
 | [improve-admission-host-leaks-across-tests](open/improve-admission-host-leaks-across-tests.md) | 低 | 2026-11-14 | tests/service の後で improve admission の test が落ちる |
 | [killswitch-generation-floor-on-state-recreate](open/killswitch-generation-floor-on-state-recreate.md) | 低 | 2026-11-14 | state を作り直したときの kill switch 世代の再利用を防ぐ |
+| [history-audit-work-root-guarded-misreported](open/history-audit-work-root-guarded-misreported.md) | 低 | 2026-11-15 | 非配備版の監査で work_root を隔離の保護領域に置くと理由が worker_failed になる |
 | [backend-descriptor](open/backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
 | [credentials-file-copied-unused](open/credentials-file-copied-unused.md) | 低 |  | `ClaudeRunner.__init__(credentials_file_copied)` が未使用 |
 | [db-rebuild-helper](open/db-rebuild-helper.md) | 低 |  | DB の table rebuild migration が 7 本重複している |

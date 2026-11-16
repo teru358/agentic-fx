@@ -841,8 +841,10 @@ def test_killswitch_reset_success_prints_the_fixed_warning_once_without_numbers(
     assert runner._op_killswitch_reset(3, terminal=_Typed("reset")) == 0
 
     lines = out.getvalue().splitlines()
-    assert lines[-2] == "kill switch ラッチを解除しました (gen=3)"
-    assert lines[-1] == "DD が閾値以上のままなら、次の新規判断で kill switch が再びラッチします。"
+    assert lines[-3] == "kill switch ラッチを解除しました (gen=3)"
+    assert lines[-2] == "DD が閾値以上のままなら、次の新規判断で kill switch が再びラッチします。"
+    assert lines[-1] == ("HWM を付け直すには `afx ctl --as approver killswitch rebase 3` を"
+                         "実行してください")
     assert out.getvalue().count("閾値以上のまま") == 1
 
 

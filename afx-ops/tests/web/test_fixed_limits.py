@@ -141,13 +141,19 @@ def test_security_headers_are_the_literal_fixed_set():
     response = handle_request(Request("GET", "/missing", {}), Recorder())
 
     assert response.headers["Content-Security-Policy"] == (
-        "default-src 'none'; style-src 'sha256-LTD12P28Uy1nqEG8Ug154drZ3pH6F9EnG8flNemSejY='; "
+        "default-src 'none'; style-src 'sha256-ikbXKLrXYVfxPcWWcuDZtzvvyqj/k6rP5KkKwrMxPpU='; "
         "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     assert response.headers["X-Frame-Options"] == "DENY"
     assert response.headers["Referrer-Policy"] == "no-referrer"
     assert response.headers["Cache-Control"] == "no-store"
     assert set(SECURITY_HEADERS) <= set(response.headers)
+
+
+def test_only_the_writable_web_relaxes_the_referrer_policy_to_same_origin():
+    from afx_ops.web.headers import response_headers
+    assert response_headers(length=0)["Referrer-Policy"] == "no-referrer"
+    assert response_headers(length=0, writable=True)["Referrer-Policy"] == "same-origin"
 
 
 def test_fields_outside_the_status_allowlist_are_not_shown():

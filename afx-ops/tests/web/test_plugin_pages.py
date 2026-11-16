@@ -38,8 +38,9 @@ class Client:
         return Reply(200, self.details[name], None)
 
 
-def page(path: str, client=None) -> str:
-    response = handle_request(Request("GET", path, {}), client or Client())
+def page(path: str, client=None, tab: str | None = None) -> str:
+    query = {} if tab is None else {"tab": tab}
+    response = handle_request(Request("GET", path, query), client or Client())
     assert response.status == 200, (path, response.status)
     return response.body.decode()
 
@@ -166,30 +167,32 @@ def test_open_operations_are_shown_with_words():
 # ---------------------------------------------------------------- 詳細
 
 def test_the_detail_of_a_strategy_shows_dependencies_with_the_state_words():
-    html = page("/plugins/brk")
+    html = page("/plugins/brk", tab="deps")
     section = re.search(r"<h2>使う indicator</h2>(.*?)</section>", html, re.S).group(1)
     assert re.findall(r"<td>(.*?)</td>", section) == [
         "a", '<a href="/plugins/rsi">rsi</a>', "a" * 12, "pin 不一致"]
     assert "pin_mismatch" not in html
-    ok = re.search(r"<h2>使う indicator</h2>(.*?)</section>", page("/plugins/mom"), re.S).group(1)
+    ok = re.search(r"<h2>使う indicator</h2>(.*?)</section>", page("/plugins/mom", tab="deps"), re.S).group(1)
     assert re.findall(r"<td>(.*?)</td>", ok)[-1] == "一致"
 
 
 def test_the_detail_of_an_indicator_shows_dependents_usefulness_and_pins():
-    html = page("/plugins/rsi")
+    html = page("/plugins/rsi", tab="deps")
     dependents = re.search(r"<h2>参照する strategy</h2>(.*?)</section>", html, re.S).group(1)
     assert re.findall(r"<td>(.*?)</td>", dependents) == [
         '<a href="/plugins/brk">brk</a>', "a", "a" * 12, "pin 不一致",
         '<a href="/plugins/mom">mom</a>', "fast", sample("plugin_rsi")["plugin"]["dependents"][1]["pin"][:12],
         "一致"]
-    useful = re.search(r"<h2>有用性</h2>(.*?)</section>", html, re.S).group(1)
+    useful = re.search(r"<h2>有用性</h2>(.*?)</section>", page("/plugins/rsi", tab="usefulness"),
+                       re.S).group(1)
     assert "<dt>提出</dt><dd>2</dd>" in useful and "<dt>配備成功</dt><dd>2</dd>" in useful
     assert "1 件は、上の数に含めていません" in useful
 
 
 def test_the_detail_lists_versions_and_the_approval_history_with_links_and_user_tz():
-    html = page("/plugins/rsi")
-    versions = re.search(r"<h2>版の履歴</h2>(.*?)</section>", html, re.S).group(1)
+    versions = re.search(r"<h2>版の履歴</h2>(.*?)</section>", page("/plugins/rsi", tab="versions"),
+                         re.S).group(1)
+    html = page("/plugins/rsi", tab="approvals")
     assert '配備中</td><td><a href="/approvals/1">#1</a></td><td>承認済み</td>' in versions
     history = re.search(r"<h2>承認の履歴</h2>(.*?)</section>", html, re.S).group(1)
     rows = re.findall(r"<tr><td>(.*?)</tr>", history, re.S)
@@ -208,29 +211,30 @@ def test_a_history_cut_by_the_daemon_says_how_many_there_are():
     data = sample("plugin_rsi")
     shown = len(data["plugin"]["history"])
     data["plugin"]["history_total"] = shown + 120
-    html = page("/plugins/rsi", Client(details={"rsi": data}))
+    html = page("/plugins/rsi", Client(details={"rsi": data}), tab="approvals")
     history = re.search(r"<h2>承認の履歴</h2>(.*?)</section>", html, re.S).group(1)
     assert f"最新 {shown} 件 (全 {shown + 120} 件)" in history
-    whole = page("/plugins/rsi")
+    whole = page("/plugins/rsi", tab="approvals")
     assert "最新" not in re.search(r"<h2>承認の履歴</h2>(.*?)</section>", whole, re.S).group(1)
     data["plugin"]["history_total"] = "many"
-    odd = page("/plugins/rsi", Client(details={"rsi": data}))
+    odd = page("/plugins/rsi", Client(details={"rsi": data}), tab="approvals")
     assert "最新" not in re.search(r"<h2>承認の履歴</h2>(.*?)</section>", odd, re.S).group(1)
 
 
 def test_without_display_timezone_the_times_are_utc():
     data = sample("plugin_rsi")
     del data["display_timezone"]
-    html = page("/plugins/rsi", Client(details={"rsi": data}))
+    html = page("/plugins/rsi", Client(details={"rsi": data}), tab="approvals")
     assert "2026-11-01 00:00:09 +00:00" in html
 
 
 def test_the_detail_of_unreadable_and_absent_names_renders_without_missing_parts():
     junk = page("/plugins/junk")
     assert "読めない (必要なファイルが無い)" in junk and "config.yaml が不正" not in junk
-    assert "<h2>使う indicator</h2>" not in junk and "<h2>参照する strategy</h2>" not in junk
+    junk_deps = page("/plugins/junk", tab="deps")
+    assert "<h2>使う indicator</h2>" not in junk_deps and "<h2>参照する strategy</h2>" not in junk_deps
     ghost = page("/plugins/ghost")
-    assert "却下" in ghost and "配備なし" in ghost
+    assert "却下" in page("/plugins/ghost", tab="approvals") and "配備なし" in ghost
 
 
 # ---------------------------------------------------------------- 語の写し表
@@ -255,10 +259,11 @@ def test_unknown_state_words_in_the_detail_are_unknown_not_match():
     data["plugin"]["dependencies"][0]["state"] = "frobnicated"
     data["plugin"]["admission"]["detail"] = "frobnicated"
     html = page("/plugins/brk", Client(details={"brk": data}))
+    html += page("/plugins/brk", Client(details={"brk": data}), tab="deps")
     assert "不明 (frobnicated)" in html
     assert not MATCH.search(html)
     data["plugin"]["dependencies"][0]["state"] = "unknown"
-    assert "<td>不明</td>" in page("/plugins/brk", Client(details={"brk": data}))
+    assert "<td>不明</td>" in page("/plugins/brk", Client(details={"brk": data}), tab="deps")
 
 
 def test_a_word_that_is_not_a_plain_word_is_unknown_without_echoing_it():
@@ -370,7 +375,7 @@ def test_a_hostile_alias_and_name_are_escaped_not_linked():
     data = sample("plugin_brk")
     data["plugin"]["dependencies"][0]["alias"] = HOSTILE
     data["plugin"]["dependencies"][0]["plugin"] = "../x"
-    html = page("/plugins/brk", Client(details={"brk": data}))
+    html = page("/plugins/brk", Client(details={"brk": data}), tab="deps")
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
     assert 'href="/plugins/../x"' not in html and "../x" in html
 
@@ -428,11 +433,13 @@ def test_a_detail_with_the_largest_lists_and_longest_values_stays_in_the_limit()
     plugin["pending"] = [{"id": i + 1, "content_hash": "b" * 64, "kind": "strategy"} for i in range(300)]
     plugin["usefulness"] = {"submitted": 1, "deployed": 1,
                             "by_pin": [{"content_hash": "c" * 64, "submitted": 1, "deployed": 1}] * 300}
-    response = handle_request(Request("GET", "/plugins/brk", {}),
-                              Client(details={"brk": data}))
-    assert response.status == 200 and len(response.body) <= render.MAX_RESPONSE_BYTES
-    html = response.body.decode()
-    assert "Output clipped" not in html
+    html = ""
+    for tab in ("overview", "approvals", "deps", "usefulness", "versions"):
+        response = handle_request(Request("GET", "/plugins/brk", {"tab": tab}),
+                                  Client(details={"brk": data}))
+        assert response.status == 200 and len(response.body) <= render.MAX_RESPONSE_BYTES, tab
+        assert "Output clipped" not in response.body.decode(), tab
+        html += response.body.decode()
     for title in ("承認待ち", "使う indicator", "参照する strategy", "版の履歴", "承認の履歴"):
         section = re.search(rf"<h2>{title}</h2>(.*?)</section>", html, re.S).group(1)
         assert "件省略" in section, title

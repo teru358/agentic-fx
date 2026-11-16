@@ -19,12 +19,13 @@ def _page(title: str, body: str) -> bytes:
     return render._document(title, body, refresh=False)
 
 
-def approval_forms(approval_id: int, digest: str) -> str:
-    """承認詳細に足す「承認」「却下」の form。押しても確認画面が出るだけで、実行は 2 回目。"""
+def approval_forms(approval_id: int, digest: str, block: str = "") -> str:
+    """承認詳細の概要に足す決定の節。``block`` (決定のブロックの本文) の後に「承認」「却下」の form を置く。
+    押しても確認画面が出るだけで、実行は 2 回目。"""
     hidden = f'<input type="hidden" name="payload_sha256" value="{escape(digest)}">'
     base = f"/approvals/{int(approval_id)}"
-    return ("<section><h2>決定</h2>"
-            f'<form method="post" action="{base}/approve">{hidden}'
+    return ("<section><h2>決定</h2>" + block
+            + f'<form method="post" action="{base}/approve">{hidden}'
             '<button type="submit">承認</button></form>'
             f'<form method="post" action="{base}/reject">{hidden}'
             '<label>却下の理由 <input type="text" name="reason" maxlength="500"></label> '
@@ -41,8 +42,9 @@ def inject_forms(page: bytes, forms: str) -> bytes:
     return merged if len(merged) <= render.MAX_RESPONSE_BYTES else page
 
 
-def improve_form_page() -> bytes:
-    body = ("<section><form method=\"post\" action=\"/improve/runs\">"
+def improve_form_section() -> str:
+    """Improve の実行タブに置く、改善の実行 form。"""
+    return ("<section><h2>改善を実行</h2><form method=\"post\" action=\"/improve/runs\">"
             "<p><label>期間 (秒、省略可) <input type=\"text\" name=\"duration_sec\" "
             "inputmode=\"numeric\" maxlength=\"5\"></label></p>"
             "<p><label>回数 (省略可) <input type=\"text\" name=\"max_runs\" "
@@ -50,7 +52,6 @@ def improve_form_page() -> bytes:
             "<p><label>一時指示 (省略可) <input type=\"text\" name=\"comment\" "
             "maxlength=\"1000\"></label></p>"
             "<button type=\"submit\">確認へ進む</button></form></section>")
-    return _page("改善を実行", body)
 
 
 def _intent_rows(intent: Intent) -> str:

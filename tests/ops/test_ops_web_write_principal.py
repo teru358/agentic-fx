@@ -53,7 +53,7 @@ def test_every_route_is_allowed_to_ops_web_write_exactly_as_designed(api5):
         else:
             assert response.status_code == 403 and code == "forbidden", route.handler
     assert seen >= ALLOWED
-    assert len(ROUTES) == 33
+    assert len(ROUTES) == 35
 
 
 def test_ops_web_write_cannot_reach_ask_backlog_policy_or_the_local_guard(api5, ops_env):

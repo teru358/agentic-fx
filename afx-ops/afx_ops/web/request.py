@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from urllib.parse import parse_qsl
 
 from afx_ops.api_client import ApiError, with_detail
-from afx_ops.web import auth, plugin_pages, render, write, write_pages
+from afx_ops.web import auth, improve_pages, plugin_pages, render, tabs, write, write_pages
 from afx_ops.web.headers import response_headers
 from afx_ops.web.routes import RouteMatch, resolve_route
 
@@ -23,8 +23,8 @@ MAX_BODY_BYTES = 65536
 _METHOD = re.compile(r"[A-Z]+\Z")
 _TARGET = re.compile(r"/[!-~]*\Z")
 _INTEGER = re.compile(r"[1-9][0-9]{0,2}\Z")
-_ACTIVITY_CATEGORIES = frozenset({"NEWS", "TECH", "AGGREGATE", "TRADE", "IMPROVE",
-                                  "APPROVAL", "SYSTEM"})
+_NOT_FOUND_METHODS = frozenset({"plugin", "improve_detail"})
+_ACTIVITY_CATEGORIES = frozenset(tabs.ACTIVITY_CATEGORIES)
 
 
 @dataclass(frozen=True)
@@ -224,6 +224,10 @@ def _check_reply_shape(route: str, data: dict) -> None:
                  and (not data.get("invalid_pending") or type(data["invalid_pending"]) is list))
     elif route == "plugin":
         valid = type(data.get("plugin")) is dict and type(data["plugin"].get("name")) is str
+    elif route == "improve_list":
+        valid = _list_of(data.get("runs"), dict) and type(data.get("has_more")) is bool
+    elif route == "improve_detail":
+        valid = type(data.get("id")) is int
     else:
         valid = False
     if not valid:
@@ -276,21 +280,29 @@ def _report_bad_reply(reply: object, report: _Reporter) -> None:
     report(detail)
 
 
-def _invoke(match: RouteMatch, query: dict[str, str], client, report: _Reporter):
+def _invoke(match: RouteMatch, query: dict[str, str], client, report: _Reporter,
+            writable: bool = False):
     method = match.route.client_method
     if method == "status":
-        if query:
+        if set(query) - {"tab"}:
             raise _Reject(400)
-        return _call(report, client.status), render.render_status
+        tab = query.get("tab", tabs.default_tab("/"))
+        if tab not in tabs.tab_names("/"):
+            raise _Reject(400)
+        return _call(report, client.status), functools.partial(render.render_status, tab=tab)
     if method == "approvals":
         limit = _positive(query, "limit", maximum=200, default=20)
         return _call(report, client.approvals, limit=limit), render.render_approvals
     if method == "approval":
-        if query:
+        if set(query) - {"tab"}:
+            raise _Reject(400)
+        tab = query.get("tab", tabs.default_tab(tabs.APPROVAL_DETAIL))
+        if tab not in tabs.tab_names(tabs.APPROVAL_DETAIL):
             raise _Reject(400)
         reply = _call(report, client.approval, match.values["id"])
         change_data = _change_of(client, match.values["id"], reply)
-        return reply, functools.partial(render.render_approval, change_data=change_data)
+        return reply, functools.partial(render.render_approval_view, change_data=change_data,
+                                        tab=tab, approval_id=match.values["id"])
     if method == "log":
         n = _positive(query, "n", maximum=500, default=100)
         return _call(report, client.log, n=n), render.render_log
@@ -301,16 +313,68 @@ def _invoke(match: RouteMatch, query: dict[str, str], client, report: _Reporter)
         category = query.get("category")
         if category is not None and category not in _ACTIVITY_CATEGORIES:
             raise _Reject(400)
-        return _call(report, client.activity, n=n, category=category), render.render_activity
+        return (_call(report, client.activity, n=n, category=category),
+                functools.partial(render.render_activity, category=category,
+                                  n=n if "n" in query else None))
     if method == "plugins":
-        if query:
+        if set(query) - {"tab", "sort", "dir"}:
             raise _Reject(400)
-        return _call(report, client.plugins), plugin_pages.render_plugins
+        if query.get("tab", tabs.default_tab("/plugins")) not in tabs.tab_names("/plugins"):
+            raise _Reject(400)
+        sort, direction = query.get("sort"), query.get("dir")
+        if (sort is not None and sort not in plugin_pages.SORT_COLUMNS) or (
+                direction is not None and (sort is None or direction not in plugin_pages.DIRECTIONS)):
+            raise _Reject(400)
+        return (_call(report, client.plugins),
+                functools.partial(plugin_pages.render_plugins, sort=sort, direction=direction))
     if method == "plugin":
-        if query:
+        if set(query) - {"tab"}:
             raise _Reject(400)
-        return _call(report, client.plugin, match.values["name"]), plugin_pages.render_plugin
+        tab = query.get("tab", tabs.default_tab(tabs.PLUGIN_DETAIL))
+        if tab not in tabs.tab_names(tabs.PLUGIN_DETAIL):
+            raise _Reject(400)
+        return (_call(report, client.plugin, match.values["name"]),
+                functools.partial(plugin_pages.render_plugin, tab=tab, name=match.values["name"]))
+    if method == "improve_list":
+        return _improve_list(query, client, report, writable)
+    if method == "improve_detail":
+        if set(query) - {"tab"}:
+            raise _Reject(400)
+        tab = query.get("tab", tabs.default_tab(tabs.IMPROVE_DETAIL))
+        if tab not in tabs.tab_names(tabs.IMPROVE_DETAIL):
+            raise _Reject(400)
+        return (_call(report, client.improve_detail, match.values["id"]),
+                functools.partial(improve_pages.render_improve_detail, tab=tab,
+                                  run_id=match.values["id"]))
     raise _Reject(404)
+
+
+def _improve_list(query: dict[str, str], client, report: _Reporter, writable: bool):
+    """/improve の query の検査 (key → 値と組合せ → 書込み専用タブ) と、タブごとの振り分け。
+
+    実行タブは form だけを描くので、daemon を呼ばない (reply は None)。
+    """
+    if set(query) - {"tab", "limit", "sort", "dir"}:
+        raise _Reject(400)
+    tab = query.get("tab", tabs.default_tab("/improve"))
+    if tab not in tabs.tab_names("/improve", writable=True):
+        raise _Reject(400)
+    if tab == "run" and set(query) & {"limit", "sort", "dir"}:
+        raise _Reject(400)
+    limit = _positive({key: value for key, value in query.items() if key == "limit"}, "limit",
+                      maximum=improve_pages.MAX_LIMIT, default=improve_pages.DEFAULT_LIMIT)
+    sort, direction = query.get("sort"), query.get("dir")
+    if (sort is not None and sort not in improve_pages.SORT_COLUMNS) or (
+            direction is not None and (sort is None or direction not in improve_pages.DIRECTIONS)):
+        raise _Reject(400)
+    if tab not in tabs.tab_names("/improve", writable=writable):
+        raise _Reject(404)
+    if tab == "run":
+        return None, functools.partial(improve_pages.render_improve_run,
+                                       write_pages.improve_form_section())
+    return (_call(report, client.improve_list, limit=limit),
+            functools.partial(improve_pages.render_improve_list, limit=limit, sort=sort,
+                              direction=direction, writable=writable))
 
 
 def _validate_request(request: Request) -> None:
@@ -401,6 +465,8 @@ def handle_request(request: Request | bytes, client, *,
         raise ValueError("write requires host and auth")
     head = _is_head(request)
     writable = write_context is not None
+    # 書込み専用のタブを出せるのは、書込みが有効で、経路が書込みを許すときだけ
+    writable_tabs = writable and write_context.transport_ok
     try:
         if isinstance(request, bytes):
             if authorization is None:
@@ -438,21 +504,30 @@ def handle_request(request: Request | bytes, client, *,
         if request.body:
             raise _Reject(400)
         report = _Reporter(match.route.client_method, report_upstream)
-        reply, renderer = _invoke(match, request.query, client, report)
-        if (match.route.client_method == "plugin" and getattr(reply, "status", None) == 404
-                and getattr(reply, "code", None) == "not_found"):
-            return _error(404, head=head, writable=writable)
-        if getattr(reply, "status", None) != 200 or getattr(reply, "code", None) is not None or type(getattr(reply, "data", None)) is not dict:
-            _report_bad_reply(reply, report)
-            return _error(502, head=head, writable=writable)
         try:
-            _check_reply_shape(match.route.client_method, reply.data)
+            reply, renderer = _invoke(match, request.query, client, report, writable_tabs)
+            if reply is None:
+                return _response(200, renderer(), head=head, writable=writable)
+            if (match.route.client_method in _NOT_FOUND_METHODS and getattr(reply, "status", None) == 404
+                    and getattr(reply, "code", None) == "not_found"):
+                return _error(404, head=head, writable=writable)
+            if getattr(reply, "status", None) != 200 or getattr(reply, "code", None) is not None or type(getattr(reply, "data", None)) is not dict:
+                _report_bad_reply(reply, report)
+                raise _Upstream
+            try:
+                _check_reply_shape(match.route.client_method, reply.data)
+            except _Upstream:
+                report("shape=invalid")
+                raise
         except _Upstream:
-            report("shape=invalid")
+            if writable_tabs and match.route.client_method == "improve_list":
+                return _response(502, improve_pages.render_improve_unavailable(), head=head,
+                                 writable=writable)
             raise
-        body = renderer(reply.data)
-        if writable and match.route.client_method == "approval":
-            body = _with_decision_forms(body, reply.data)
+        if match.route.client_method == "approval":
+            body = _approval_body(renderer(reply.data), reply.data, writable_tabs)
+        else:
+            body = renderer(reply.data)
         return _response(200, body, head=head, writable=writable)
     except _Reject as reject:
         return _error(reject.status, head=head, writable=writable)
@@ -462,15 +537,18 @@ def handle_request(request: Request | bytes, client, *,
         return _error(500, head=head, writable=writable)
 
 
-def _with_decision_forms(body: bytes, data: dict) -> bytes:
-    """承認詳細が決定待ちの plugin のときだけ、承認・却下の form を足す。"""
+def _approval_body(view: render.ApprovalView, data: dict, writable: bool) -> bytes:
+    """承認詳細が決定待ちの plugin の概要のときだけ、決定のブロックと承認・却下の form を足す。
+
+    書込みが使え (有効かつ経路が許される)、ページが clip されていないことも条件。
+    """
     digest = data.get("payload_sha256")
     approval_id = data.get("id")
-    if (data.get("status") != "pending" or data.get("kind") != "plugin"
-            or type(digest) is not str or write.DIGEST.fullmatch(digest) is None
-            or type(approval_id) is not int):
-        return body
-    return write_pages.inject_forms(body, write_pages.approval_forms(approval_id, digest))
+    if (not writable or view.tab != "overview" or view.clipped or data.get("status") != "pending"
+            or data.get("kind") != "plugin" or type(digest) is not str
+            or write.DIGEST.fullmatch(digest) is None or type(approval_id) is not int):
+        return view.page
+    return write_pages.inject_forms(view.page, write_pages.approval_forms(approval_id, digest, view.block))
 
 
 def _host_values(request: Request) -> list[str]:
@@ -483,10 +561,6 @@ def _write_response(context: write.WriteContext, match: write.WriteMatch, reques
     if request.method not in match.methods:
         return _error(405, head=head, extra={"Allow": ", ".join(match.methods)}, writable=True)
     try:
-        if match.kind == "improve_form":
-            if not context.transport_ok:
-                raise write.WriteReject(403)
-            return _response(200, write_pages.improve_form_page(), head=head, writable=True)
         if match.kind == "job_view":
             if not context.transport_ok:
                 raise write.WriteReject(403)

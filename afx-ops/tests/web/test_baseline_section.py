@@ -4,6 +4,9 @@ from __future__ import annotations
 import pytest
 
 from afx_ops.web.render import DETAIL_FIELDS, render_approval
+from afx_ops.web.tabs import APPROVAL_DETAIL, tab_names
+
+TABS = tab_names(APPROVAL_DETAIL)
 
 SECTION = "配備中の版 (同条件で再評価)"
 BASE = "b" * 64
@@ -28,8 +31,12 @@ def _data(**fields):
     return data
 
 
-def _page(data) -> str:
-    return render_approval(data, None).decode("utf-8")
+def _page(data, tab="result") -> str:
+    return render_approval(data, None, tab).decode("utf-8")
+
+
+def _every_tab(data, change_data=None) -> str:
+    return "\n".join(render_approval(data, change_data, tab).decode("utf-8") for tab in TABS)
 
 
 def test_the_baseline_field_is_a_detail_field():
@@ -61,7 +68,7 @@ def test_the_section_is_below_the_in_sample_and_holdout_tables():
               "summary": "要約"}
     change_data = {"id": 7, "change": change, "claims": {"summary": "S", "selection_rationale": "R"},
                    "diff": {"files": [], "omitted_lines": 0}}
-    page = render_approval(_data(), change_data).decode("utf-8")
+    page = render_approval(_data(), change_data, "result").decode("utf-8")
     assert SECTION in page
     assert page.index("holdout") < page.index(SECTION)
 
@@ -80,7 +87,7 @@ def test_a_hash_mismatch_warning_is_shown_and_absent_otherwise():
     warned = _page(_data(baseline_hash_warning={"expected": "b" * 12, "actual": "c" * 12}))
     assert "警告: 配備中の版の hash が比較時と異なります" in warned
     assert "現在=" + "c" * 12 in warned
-    assert "警告" not in _page(_data())
+    assert "警告" not in _every_tab(_data())
 
 
 @pytest.mark.parametrize("fields", [
@@ -92,12 +99,12 @@ def test_a_hash_mismatch_warning_is_shown_and_absent_otherwise():
 ])
 def test_a_payload_without_a_usable_comparison_renders_no_table_and_does_not_fail(fields):
     data = _data(**fields)
-    assert SECTION not in _page(data)
-    assert SECTION not in render_approval(data, {"change": "broken"}).decode("utf-8")
+    assert SECTION not in _every_tab(data)
+    assert SECTION not in _every_tab(data, {"change": "broken"})
 
 
 def test_the_page_stays_static_without_script():
-    assert "<script" not in _page(_data()).lower()
+    assert "<script" not in _every_tab(_data()).lower()
 
 
 def test_each_row_carries_its_pair_verdict():
@@ -124,12 +131,13 @@ def test_the_approval_page_with_a_large_comparison_never_exceeds_the_response_li
     from afx_ops.web.render import MAX_RESPONSE_BYTES
     data = _data(baseline={"base_content_hash": BASE, "comparison": _big_comparison()})
     change_data = _change_with_diff(lines)
-    page = render_approval(data, change_data)
-    assert len(page) <= MAX_RESPONSE_BYTES
-    assert page.rstrip().endswith(b"</html>")
+    for tab in TABS:
+        page = render_approval(data, change_data, tab)
+        assert len(page) <= MAX_RESPONSE_BYTES
+        assert page.rstrip().endswith(b"</html>")
 
 
 def test_the_section_is_kept_inside_the_page_when_the_size_allows():
     from tests.web.test_approval_page_budget import change_data
-    page = render_approval(_data(), change_data()).decode("utf-8")
+    page = render_approval(_data(), change_data(), "result").decode("utf-8")
     assert SECTION in page and page.count("</body>") == 1

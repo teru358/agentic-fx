@@ -45,7 +45,7 @@ def _econ(**over):
 
 
 def _page(status):
-    return handle_request(Request("GET", "/", {}), Client(status)).body.decode()
+    return handle_request(Request("GET", "/", {"tab": "econ"}), Client(status)).body.decode()
 
 
 def _cells(page):

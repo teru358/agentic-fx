@@ -52,6 +52,7 @@ from agentic_fx.display_tz import is_region_name
 from agentic_fx.store import news_sources
 from agentic_fx.logging_setup import setup_technical_logging
 from agentic_fx.ops_setup.interactive import EnableResult, interactive_enable
+from agentic_fx.ops_setup.stages import InvalidState, check_write_recovery_idle
 from agentic_fx.ops_setup.setup_lease import (
     SetupLease, SetupLeaseBusy, SetupLeaseUnsafe, acquire_setup_lease,
 )
@@ -682,6 +683,11 @@ def _stage0(sess: _Session) -> _Start:
     except SetupLeaseUnsafe:
         sess.say("data/ops の権限が安全ではありません (自分以外が書ける、または他人の所有です)。"
                  "権限を直してから再実行してください。設定・DB は変更していません。")
+        raise _Exit(RC_STOPPED) from None
+    try:
+        check_write_recovery_idle(root)
+    except InvalidState as error:
+        sess.say(f"{error.reason}: {error.detail}")
         raise _Exit(RC_STOPPED) from None
     try:
         sess.lease.acquire_instance_lock(hook=deps.hook)

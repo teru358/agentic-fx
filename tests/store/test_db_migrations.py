@@ -2,6 +2,8 @@
 Task 12 の `WHERE mission_id=?` assert が依存する既存テーブルへの列追加)。"""
 from __future__ import annotations
 
+import pytest
+
 
 def test_backtest_runs_and_analysis_runs_have_mission_id_column(tmp_path):
     from agentic_fx.store.db import connect, init_db
@@ -103,7 +105,136 @@ def test_table_names_include_candidate_archives():
             "improve_run_notices",
             "improve_run_summaries", "signal_decisions", "signal_shadow", "ohlcv_slice_sets", "ohlcv_slices",
             "ohlcv_slice_generations", "econ_reaction_keys", "econ_reaction_values",
+            "kill_switch_hwm_rebases",
         })
+
+
+def test_old_database_gets_empty_rebase_ledger_and_second_init_is_noop(tmp_path):
+    import sqlite3
+
+    from agentic_fx.store.db import connect, init_db
+
+    path = tmp_path / "old.db"
+    conn = connect(path)
+    init_db(conn)
+    conn.execute("INSERT INTO account_snapshots "
+                 "(ts,balance,equity,hwm,cashflow,source) VALUES "
+                 "('2026-01-01T00:00:00+00:00',100,100,120,0,'paper')")
+    conn.commit()
+    conn.close()
+
+    raw = sqlite3.connect(path)
+    raw.execute("DROP TABLE kill_switch_hwm_rebases")
+    raw.commit()
+    raw.close()
+
+    migrated = connect(path)
+    init_db(migrated)
+    assert migrated.execute(
+        "SELECT COUNT(*) FROM kill_switch_hwm_rebases").fetchone()[0] == 0
+    before = migrated.execute(
+        "SELECT * FROM account_snapshots").fetchall()
+    init_db(migrated)
+    assert migrated.execute(
+        "SELECT COUNT(*) FROM kill_switch_hwm_rebases").fetchone()[0] == 0
+    assert migrated.execute(
+        "SELECT * FROM account_snapshots").fetchall() == before
+
+
+def test_real_schema_v5_fixture_migrates_without_inventing_rebases(tmp_path):
+    import sqlite3
+    from pathlib import Path
+
+    from agentic_fx.store.db import connect, init_db
+
+    path = tmp_path / "schema-v5.db"
+    legacy = sqlite3.connect(path)
+    legacy.executescript((Path(__file__).parents[1] / "fixtures" /
+                          "db_schema_v5.sql").read_text())
+    legacy.commit()
+    legacy.close()
+    migrated = connect(path)
+    init_db(migrated)
+    assert migrated.execute(
+        "SELECT COUNT(*) FROM kill_switch_hwm_rebases").fetchone()[0] == 0
+    migrated.close()
+
+
+def test_rebase_ledger_rejects_each_missing_foreign_key(tmp_path):
+    import sqlite3
+    from agentic_fx.store.db import connect, init_db
+
+    conn = connect(tmp_path / "fk.db")
+    init_db(conn)
+    now = "2026-11-14T00:00:00+00:00"
+    source_id = conn.execute(
+        "INSERT INTO account_snapshots(ts,balance,equity,hwm) VALUES(?,100,100,100)",
+        (now,)).lastrowid
+    rebase_id = conn.execute(
+        "INSERT INTO account_snapshots(ts,balance,equity,hwm,source) "
+        "VALUES(?,100,100,100,'manual_ks_rebase')", (now,)).lastrowid
+    audit_id = conn.execute(
+        "INSERT INTO ops_requests(request_id,endpoint,authenticated_principal,"
+        "body_sha256,phase,created_at) VALUES('fk','e','p','h','accepted',?)",
+        (now,)).lastrowid
+    conn.commit()
+    values = (now, 1, source_id, rebase_id, audit_id, 1,
+              "x", 100, 100, 100, 100, 0, 1, 0, 0, 0)
+    sql = ("INSERT INTO kill_switch_hwm_rebases "
+           "(applied_at,generation,source_snapshot_id,rebase_snapshot_id,"
+           "accepted_audit_id,digest_version,preview_token,hwm_before,hwm_after,"
+           "equity,balance,drawdown_pct,threshold_pct,cut,cut_pct,additional_headroom) "
+           "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    for missing_index in (2, 3, 4):
+        row = list(values)
+        row[missing_index] = -missing_index
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+            conn.execute(sql, row)
+        conn.rollback()
+
+
+def test_rebase_ledger_is_append_only_and_references_are_unique(tmp_path):
+    import sqlite3
+    from agentic_fx.store.db import connect, init_db
+
+    conn = connect(tmp_path / "ledger.db")
+    init_db(conn)
+    now = "2026-11-14T00:00:00+00:00"
+    conn.execute("INSERT INTO account_snapshots(ts,balance,equity,hwm) "
+                 "VALUES(?,100,100,100)", (now,))
+    source_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute("INSERT INTO account_snapshots(ts,balance,equity,hwm,source) "
+                 "VALUES(?,100,100,100,'manual_ks_rebase')", (now,))
+    rebase_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    audit_id = conn.execute(
+        "INSERT INTO ops_requests(request_id,endpoint,authenticated_principal,"
+        "body_sha256,phase,created_at) VALUES('r','e','p','h','accepted',?)",
+        (now,)).lastrowid
+    conn.execute("INSERT INTO kill_switch_hwm_rebases "
+                 "(applied_at,generation,source_snapshot_id,rebase_snapshot_id,"
+                 "accepted_audit_id,digest_version,preview_token,hwm_before,"
+                 "hwm_after,equity,balance,drawdown_pct,threshold_pct,cut,"
+                 "cut_pct,additional_headroom) "
+                 "VALUES(?,1,?,?,?,1,'x',100,100,100,100,0,1,0,0,0)",
+                 (now, source_id, rebase_id, audit_id))
+    conn.commit()
+    for operation in (
+            "UPDATE kill_switch_hwm_rebases SET generation=2 WHERE id=1",
+            "DELETE FROM kill_switch_hwm_rebases WHERE id=1"):
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute(operation)
+    unique_columns = set()
+    for index in conn.execute("PRAGMA index_list(kill_switch_hwm_rebases)"):
+        if index["unique"]:
+            cols = tuple(row["name"] for row in conn.execute(
+                f"PRAGMA index_info('{index['name']}')"))
+            unique_columns.add(cols)
+    assert {("source_snapshot_id",), ("rebase_snapshot_id",),
+            ("accepted_audit_id",)} <= unique_columns
+    assert ("generation",) not in unique_columns
+    ddl = conn.execute("SELECT sql FROM sqlite_master WHERE name=?",
+                       ("kill_switch_hwm_rebases",)).fetchone()[0]
+    assert "UNIQUE (generation)" not in ddl
 
 
 # round2 D4 是正 (検収 acceptance-round2.md D4): #8 是正 (idea_norm 列の

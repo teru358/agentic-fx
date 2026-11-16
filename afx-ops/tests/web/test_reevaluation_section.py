@@ -6,8 +6,11 @@ import html
 import pytest
 
 from afx_ops import display_time, display_zone
-from afx_ops.web import render
+from afx_ops.web import render, tabs
 from tests.gate.test_reevaluation_display import CHANGE, VIEW
+
+
+TABS = tabs.tab_names(tabs.APPROVAL_DETAIL)
 
 
 @pytest.fixture(autouse=True)
@@ -18,12 +21,16 @@ def _fresh_zone_state(monkeypatch):
     display_time.clear_zone_cache()
 
 
-def _page(**fields) -> str:
+def _page(tab="overview", **fields) -> str:
     data = {"id": 7, "kind": "plugin", "status": "pending", "change": dict(CHANGE),
             "payload_sha256": "a" * 64, "display_timezone": "Asia/Tokyo",
             "candidate_origin": "reevaluation", "reevaluation": VIEW, "deploy_phase": None}
     data.update(fields)
-    return html.unescape(render.render_approval(data).decode())
+    return html.unescape(render.render_approval(data, None, tab).decode())
+
+
+def _every_tab(**fields) -> str:
+    return "\n".join(_page(tab, **fields) for tab in TABS)
 
 
 def test_the_page_headlines_the_reevaluation_and_says_the_code_is_unchanged():
@@ -61,7 +68,7 @@ def test_a_rejected_request_shows_how_far_the_stop_went(phase, expected):
 
 
 def test_an_ordinary_approval_page_has_no_reevaluation_section():
-    text = _page(candidate_origin=None, reevaluation=None)
+    text = _every_tab(candidate_origin=None, reevaluation=None)
     assert "再評価" not in text and "前回" not in text
 
 
@@ -69,7 +76,8 @@ def test_a_response_from_an_old_daemon_renders_without_the_section():
     data = {"id": 7, "kind": "plugin", "status": "pending", "change": dict(CHANGE),
             "payload_sha256": "a" * 64}
     assert b"<h2>" in render.render_approval(data)
-    assert "前回" not in html.unescape(render.render_approval(data).decode())
+    assert all("前回" not in html.unescape(render.render_approval(data, None, tab).decode())
+               for tab in TABS)
 
 
 @pytest.mark.parametrize("bad", [None, "x", 5, [], {"rows": "x"}, {"rows": [None, 3]},

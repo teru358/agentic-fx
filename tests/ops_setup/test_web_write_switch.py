@@ -16,7 +16,7 @@ from agentic_fx.ops.keys import enrolled_key_matches, key_dir, key_file_name, pr
 from agentic_fx.ops_setup.feature_config import web_access_check, web_live_config
 from agentic_fx.ops_setup.interactive import interactive_enable
 from agentic_fx.ops_setup.reconfigure import run_ops_reconfigure
-from agentic_fx.ops_setup.stages import InvalidState, read_marker, read_stage, run_ops_command
+from agentic_fx.ops_setup.stages import InvalidState, OpsSetup, read_marker, read_stage, run_ops_command
 from agentic_fx.ops_setup.web_setup import SecretPlan, WebOptions, access_line, apply_secret
 from web_support import (ACCESS_Q, AUTH_Q, CANDIDATES, KEEP_BASIC_Q, LAN, PASSWORD_Q, SCOPE_Q, USER_Q, ScriptIO,
                          make_bundle, tree)
@@ -41,6 +41,13 @@ def make(tmp_path, monkeypatch, *, afx_active=True, values=None):
     assert bundle.setup.enable("web").stage == "enabled"
     bundle.systemd.calls.clear()
     return bundle
+
+
+def restart(bundle):
+    """中断の後の再実行用に、OpsSetup を作り直す。引き継ぐのは file と fake systemd の状態と注入した検査だけ。"""
+    old = bundle.setup
+    bundle.setup = OpsSetup(bundle.root, systemd=bundle.systemd, paths=bundle.paths, ready=old.ready,
+                            config_check=old.config_check, probe=old.probe, access_check=old.access_check)
 
 
 def toml_of(bundle) -> dict:
@@ -259,7 +266,7 @@ def test_an_interruption_after_any_step_converges_on_rerun(tmp_path_factory, mon
 
         with pytest.raises(Crash):
             run(bundle, target, hook=hook)
-        bundle.setup.hook = lambda _name: None
+        restart(bundle)
         result, _ = run(bundle, target, io=ScriptIO(answers=["yes"]))
         assert result.rc == 0, (index, result)
         assert toml_of(bundle).get("write", False) is target, index
@@ -281,7 +288,7 @@ def test_a_stopped_afx_stays_stopped_across_an_interruption(tmp_path, monkeypatc
     with pytest.raises(Crash):
         run(bundle, True, hook=hook)
     assert read_stage(bundle.root, "web")["write_step"] == "stopped"
-    bundle.setup.hook = lambda _name: None
+    restart(bundle)
     assert run(bundle, True, io=ScriptIO(answers=[]))[0].rc == 0
     assert afx_calls(bundle, "start") == [] and entry(bundle) == ("active", None)
 
@@ -296,7 +303,7 @@ def test_a_different_target_on_rerun_replaces_the_recorded_one(tmp_path, monkeyp
     with pytest.raises(Crash):
         run(bundle, True, hook=hook)
     assert entry(bundle) == ("active", None) and "write" not in toml_of(bundle)
-    bundle.setup.hook = lambda _name: None
+    restart(bundle)
     assert run(bundle, False)[0].rc == 0
     assert entry(bundle) == ("revoked", None) and "write" not in toml_of(bundle)
     assert "write_step" not in read_stage(bundle.root, "web")
@@ -338,7 +345,7 @@ def _leave_pending(bundle):
 
     with pytest.raises(Crash):
         run(bundle, True, hook=hook)
-    bundle.setup.hook = lambda _name: None
+    restart(bundle)
 
 
 def test_a_pending_switch_blocks_plain_enable_and_reconfigure(tmp_path, monkeypatch, capsys):
@@ -511,7 +518,7 @@ def _crash_at(bundle, point, target=True):
 
     with pytest.raises(Crash):
         run(bundle, target, hook=hook)
-    bundle.setup.hook = lambda _name: None
+    restart(bundle)
 
 
 def _start_from_outside(bundle):
@@ -646,7 +653,7 @@ def test_a_disable_or_another_feature_is_refused_while_a_switch_is_pending(tmp_p
 
         with pytest.raises(Crash):
             run(bundle, True, hook=hook)
-        bundle.setup.hook = lambda _name: None
+        restart(bundle)
         before = world(bundle)
         calls = len(bundle.systemd.calls)
         for operation in (lambda: bundle.setup.disable("web"), lambda: bundle.setup.enable("notify")):
@@ -1084,14 +1091,16 @@ def _idle_base(kind):
     return build
 
 
-def _enable_resume_base(stage):
+def _enable_resume_base(stage, point=None):
+    point = point or f"after_stage_{stage}"
+
     def build(tmp_path, monkeypatch):
         bundle = make_bundle(tmp_path, monkeypatch, enable_web=False, web_values=BASIC)
         apply_secret(bundle.root, SecretPlan("install", PW))
-        bundle.setup.hook = lambda name: (_ for _ in ()).throw(Crash(name)) if name == f"after_stage_{stage}" else None
+        bundle.setup.hook = lambda name: (_ for _ in ()).throw(Crash(name)) if name == point else None
         with pytest.raises(Crash):
             bundle.setup.enable("web")
-        bundle.setup.hook = lambda _name: None
+        restart(bundle)
         return bundle
     return build
 
@@ -1101,16 +1110,16 @@ def _disable_resume_base(tmp_path, monkeypatch):
     bundle.setup.hook = lambda name: (_ for _ in ()).throw(Crash(name)) if name == "after_stage_stopping-ops" else None
     with pytest.raises(Crash):
         bundle.setup.disable("web")
-    bundle.setup.hook = lambda _name: None
+    restart(bundle)
     return bundle
 
 
-def _switch_resume_base(target):
+def _switch_resume_base(target, step="staged"):
     def build(tmp_path, monkeypatch):
         bundle = make(tmp_path, monkeypatch)
         saved = json.loads(bundle.stage_file.read_text())
         saved.update(write_target=target, write_principal="ops-web-write" if target else "ops-web",
-                     write_step="staged", afx_before_stop="active")
+                     write_step=step, afx_before_stop="active")
         bundle.stage_file.write_text(json.dumps(saved))
         return bundle
     return build
@@ -1154,7 +1163,10 @@ ENTRIES = {
     "fresh-never-enabled": (_idle_base("never"), lambda b, t, s: _interactive(b, t, "keep", s), "gate"),
     "enabled-recheck": (_enabled_base, _enable_plain, "gate"),
     "resume-stopped": (_enable_resume_base("stopped"), _enable_plain, "gate"),
+    "resume-staged": (_enable_resume_base("staged", "before_marker"), _enable_plain, "gate"),
+    "resume-enrolled": (_enable_resume_base("enrolled"), _enable_plain, "gate"),
     "resume-installed": (_enable_resume_base("installed"), _enable_plain, "gate"),
+    "resume-started": (_enable_resume_base("started"), _enable_plain, "gate"),
     "resume-checked": (_enable_resume_base("checked"), _enable_plain, "gate"),
     "reconfigure-non-interactive": (_enabled_base, _reconf_ni, "gate"),
     "reconfigure-interactive": (_enabled_base, _reconf_ia, "gate"),
@@ -1167,8 +1179,11 @@ ENTRIES = {
     "write-idle": (_idle_base("disabled"), _switch(True), "switch_idle"),
     "no-write-idle": (_idle_base("disabled"), _switch(False), "switch_idle"),
     "write-never-enabled": (_idle_base("never"), _switch(True), "switch_idle"),
+    "no-write-never-enabled": (_idle_base("never"), _switch(False), "switch_idle"),
     "write-resume": (_switch_resume_base(True), _switch(True), "switch_resume"),
     "no-write-resume": (_switch_resume_base(False), _switch(False), "switch_resume"),
+    **{f"{name}-resume-{step}": (_switch_resume_base(target, step), _switch(target), "switch_resume")
+       for step in ("stopped", "keyed", "configured") for name, target in (("write", True), ("no-write", False))},
 }
 
 
@@ -1212,6 +1227,8 @@ def test_every_entry_keeps_the_write_and_the_write_key_consistent(tmp_path, monk
     tmp_before = sorted(p.name for p in bundle.xdg.rglob(".*.tmp"))
     rc = drive(bundle, tmp_path, state)
     want = expected(entry, state)
+    recovery = bundle.root / "data" / "ops" / "web.write-recovery.json"
+    assert not recovery.exists(), (entry, state)
     if want == "stop":
         # 止める操作は食い違いでは拒否しない。web は disabled になり、次の enable が判定で止める。
         assert rc == 0, (entry, state)
@@ -1236,6 +1253,7 @@ def test_every_entry_keeps_the_write_and_the_write_key_consistent(tmp_path, monk
     elif want == "converge":
         assert verdict == Consistent(_target_of(entry)), (entry, state, verdict)
         assert read_marker(bundle.root) is None
+        assert bundle.systemd.afx_state == "active", (entry, state)
         if mode == "enabled":
             assert "write_step" not in read_stage(bundle.root, "web")
     else:
@@ -1297,7 +1315,7 @@ def test_finishing_an_interrupted_key_operation_fires_the_key_hooks(tmp_path, mo
     with pytest.raises(Crash):
         run(bundle, target, hook=hook)
     assert any(name.startswith("key:") for name in seen)
-    bundle.setup.hook = lambda _name: None
+    restart(bundle)
     assert run(bundle, target)[0].rc == 0
     assert check_write_key_consistency(bundle.root, mode=mode) == Consistent(target)
 
