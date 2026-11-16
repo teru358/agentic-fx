@@ -159,7 +159,7 @@ def test_ac20_an_unknown_reason_code_gets_a_fixed_generic_sentence_without_the_r
 
 @pytest.mark.parametrize("code,text", [
     ("sl", "損切り到達"), ("tp", "利確到達"), ("day_rollover", "日次の強制決済"),
-    ("llm_close", "判断による決済")])
+    ("llm_close", "判断による決済"), ("kill_switch", "kill switch による取消")])
 def test_ac20_close_reason_table(code, text):
     assert render_trade(_close(reason_code=code)).splitlines()[0].endswith(f"({text})")
 
@@ -167,7 +167,8 @@ def test_ac20_close_reason_table(code, text):
 @pytest.mark.parametrize("code,text", [
     ("llm_cancel", "判断による取消"), ("market_close", "市場クローズ前の取消"),
     ("reservation", "予約を維持できない"), ("rate_unavailable", "換算レート不明"),
-    ("account_unknown", "口座情報なし"), ("equity_nonpositive", "残高が正でない")])
+    ("account_unknown", "口座情報なし"), ("equity_nonpositive", "残高が正でない"),
+    ("kill_switch", "kill switch による取消")])
 def test_ac20_cancel_reason_table(code, text):
     assert render_trade(_order("cancelled", reason_code=code)).endswith(f"({text})")
 

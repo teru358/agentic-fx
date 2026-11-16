@@ -18,13 +18,22 @@
   "source_sha": "639c269439cd35ebd3242f96876c694b070b1262"
  },
  {
-  "anchor": "afx-ops/afx_ops/web/render.py::render_status",
-  "date": "2026-11-15",
-  "evidence": "bot-gateway-disconnect-is-silent",
-  "hash": "a98728e988279099e62ff6dd75a72b0ed3c7ab72e815684c7fb5e10fec79a9dc",
+  "anchor": "afx-ops/afx_ops/gate/trade_render.py::<module>._REASONS",
+  "date": "2026-11-16",
+  "evidence": "killswitch-latch-pending-limit-fills",
+  "hash": "6203da545588d6a17068f6a7e2fdebc36fd9f30cbd98d062c56375dd7db9ff53",
   "method": "python-3.13:ast.dump(annotate_fields=True,include_attributes=False):v1",
-  "reason": "initial_record",
-  "source_sha": "639c269439cd35ebd3242f96876c694b070b1262"
+  "reason": "relation_changed_page_updated",
+  "source_sha": "0cd66a10d9080a54767d7c19e3694f6006e34ae6"
+ },
+ {
+  "anchor": "afx-ops/afx_ops/web/render.py::render_status",
+  "date": "2026-11-16",
+  "evidence": "web-layout-tabs",
+  "hash": "b2668f516197965004698c7b41f3023cc4bc2399cea3baf529d5324dbe984152",
+  "method": "python-3.13:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "relation_unchanged_refactor",
+  "source_sha": "0cd66a10d9080a54767d7c19e3694f6006e34ae6"
  },
  {
   "anchor": "src/agentic_fx/commands.py::Commands._dispatch#reset_kill_switch",
@@ -79,6 +88,60 @@
   "method": "python-3.13:ast.dump(annotate_fields=True,include_attributes=False):v1",
   "reason": "initial_record",
   "source_sha": "639c269439cd35ebd3242f96876c694b070b1262"
+ },
+ {
+  "anchor": "src/agentic_fx/core/executor.py::Executor.cancel_order",
+  "date": "2026-11-16",
+  "evidence": "tests/core/test_executor.py",
+  "hash": "e87bf4da27f524f0cd5ff0b5a37d08c9b31db68ab10957a691d5f43821b3c4de",
+  "method": "python-3.13:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "ffdc64ffb872e07c1e0a0fadb69f10a9801f0747"
+ },
+ {
+  "anchor": "src/agentic_fx/core/scheduler.py::Scheduler._cancel_all_pending",
+  "date": "2026-11-16",
+  "evidence": "tests/core/test_scheduler_kill_switch_fills.py",
+  "hash": "dd50a0afada3ffc6a1c4ac59e4212658935b3250a428d35ec88597dabff2bd0c",
+  "method": "python-3.13:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "relation_changed_page_updated",
+  "source_sha": "0cd66a10d9080a54767d7c19e3694f6006e34ae6"
+ },
+ {
+  "anchor": "src/agentic_fx/core/scheduler.py::Scheduler._fills_allowed_by_state",
+  "date": "2026-11-16",
+  "evidence": "tests/core/test_scheduler_kill_switch_fills.py",
+  "hash": "7a0da1d88a3ed03bcef5b81cfbdbbc5bdb15f590acf82590e1bcff2aa25e703f",
+  "method": "python-3.13:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "relation_changed_page_updated",
+  "source_sha": "0cd66a10d9080a54767d7c19e3694f6006e34ae6"
+ },
+ {
+  "anchor": "src/agentic_fx/core/scheduler.py::Scheduler._note_fill_guard_unavailable",
+  "date": "2026-11-16",
+  "evidence": "tests/core/test_scheduler_kill_switch_fills.py",
+  "hash": "8fcbd0c4d9e9a5e9c259cff53cf5ff875f27bbf9efe8f6275d9e4c34fb77ca3e",
+  "method": "python-3.13:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "relation_changed_page_updated",
+  "source_sha": "0cd66a10d9080a54767d7c19e3694f6006e34ae6"
+ },
+ {
+  "anchor": "src/agentic_fx/core/scheduler.py::Scheduler._tick_body",
+  "date": "2026-11-16",
+  "evidence": "tests/core/test_scheduler_kill_switch_fills.py",
+  "hash": "72d4198d40ab81b12bc5c2a8c3457aaa39c4aaf731de5d3dae6f09c00ecb7483",
+  "method": "python-3.13:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "relation_changed_page_updated",
+  "source_sha": "0cd66a10d9080a54767d7c19e3694f6006e34ae6"
+ },
+ {
+  "anchor": "src/agentic_fx/loops/baseline_monitor.py::monitor_summary",
+  "date": "2026-11-16",
+  "evidence": "killswitch-latch-pending-limit-fills",
+  "hash": "1020336650b51b8fa66fe0e0280ededbff72553d2876c21a5597cc801f23c552",
+  "method": "python-3.13:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "ffdc64ffb872e07c1e0a0fadb69f10a9801f0747"
  },
  {
   "anchor": "src/agentic_fx/ops/client.py::Runner._op_killswitch_rebase",
@@ -315,6 +378,24 @@
   "source_sha": "639c269439cd35ebd3242f96876c694b070b1262"
  },
  {
+  "anchor": "src/agentic_fx/ops/trade_event_sink.py::TradeEventEmitter.__call__",
+  "date": "2026-11-16",
+  "evidence": "killswitch-latch-pending-limit-fills",
+  "hash": "a205d4fcf4a3eed26e3c265696adf721aa709dc22eeff3832c83ab2b9be34c16",
+  "method": "python-3.13:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "ffdc64ffb872e07c1e0a0fadb69f10a9801f0747"
+ },
+ {
+  "anchor": "src/agentic_fx/ops/trade_events.py::build_event",
+  "date": "2026-11-16",
+  "evidence": "killswitch-latch-pending-limit-fills",
+  "hash": "eb90f4850e33a7c7cc7e3e77a96249d73ddbc03c5f41bc7094c48a756cf230af",
+  "method": "python-3.13:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "ffdc64ffb872e07c1e0a0fadb69f10a9801f0747"
+ },
+ {
   "anchor": "src/agentic_fx/service.py::_GuardNoticeProbe.__call__",
   "date": "2026-11-15",
   "evidence": "tests/service/test_improve_notice_wiring.py",
@@ -342,6 +423,15 @@
   "source_sha": "639c269439cd35ebd3242f96876c694b070b1262"
  },
  {
+  "anchor": "src/agentic_fx/service.py::_scheduler_tick_body",
+  "date": "2026-11-16",
+  "evidence": "tests/core/test_kill_switch_latch_writers.py",
+  "hash": "781e496d0fc467d60b3239c1eb2e026f86b2865a74d7191e86f76ebb7188173c",
+  "method": "python-3.13:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "ffdc64ffb872e07c1e0a0fadb69f10a9801f0747"
+ },
+ {
   "anchor": "src/agentic_fx/service.py::_sweep_improve_notices",
   "date": "2026-11-15",
   "evidence": "tests/service/test_improve_notice_wiring.py",
@@ -361,12 +451,12 @@
  },
  {
   "anchor": "src/agentic_fx/status.py::collect_status",
-  "date": "2026-11-15",
-  "evidence": "tests/test_status_acceptance.py",
-  "hash": "1c285e9db397eda94b45b29f5f2d5e1a7348f64afe69d754f82e67768124ede9",
+  "date": "2026-11-16",
+  "evidence": "live-confirmed-bars-into-history",
+  "hash": "b873c96f229c028f2a547e1fc08f096510b50a7d2349d884ea3f2802aa2263b7",
   "method": "python-3.13:ast.dump(annotate_fields=True,include_attributes=False):v1",
-  "reason": "initial_record",
-  "source_sha": "639c269439cd35ebd3242f96876c694b070b1262"
+  "reason": "contract_unchanged",
+  "source_sha": "0cd66a10d9080a54767d7c19e3694f6006e34ae6"
  },
  {
   "anchor": "src/agentic_fx/status.py::render_status",
@@ -376,6 +466,15 @@
   "method": "python-3.13:ast.dump(annotate_fields=True,include_attributes=False):v1",
   "reason": "initial_record",
   "source_sha": "639c269439cd35ebd3242f96876c694b070b1262"
+ },
+ {
+  "anchor": "src/agentic_fx/store/backtest_runs.py::_insert",
+  "date": "2026-11-16",
+  "evidence": "killswitch-latch-pending-limit-fills",
+  "hash": "55fa8a345979e24eace6c10dcb830d6eff3476a2b2af21f6e010be068afa5403",
+  "method": "python-3.13:ast.dump(annotate_fields=True,include_attributes=False):v1",
+  "reason": "initial_record",
+  "source_sha": "ffdc64ffb872e07c1e0a0fadb69f10a9801f0747"
  },
  {
   "anchor": "src/agentic_fx/store/state.py::StateStore.shared_guard",

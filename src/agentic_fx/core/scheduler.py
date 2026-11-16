@@ -98,6 +98,7 @@ class Scheduler:
                  pair_currencies: Mapping[str, tuple[str, str]] | None = None,
                  writer_admission: WriterAdmission | None = None) -> None:
         self.conn = conn
+        self._fill_guard_unavailable = False
         self.executor = executor
         self.settings = settings
         self.state = state_store
@@ -271,6 +272,9 @@ class Scheduler:
                 return pending
             self._resolve_unknowns(now)
             self._expire_limits(now)
+            # kill switch ラッチ・state 読取障害は約定だけを止める。以降の
+            # 判定は AND で重ね、ここで落とした False を True に戻さない。
+            fills_allowed = self._fills_allowed_by_state(now)
             # codex 1: account snapshot が陳腐化/欠損 (current_account が None) の
             # 場合、総リスク・レバレッジを再検証できない。_maintain_reservations
             # が何もせず戻るだけでは、同じ tick で _process_fills が新たな建玉を
@@ -284,7 +288,14 @@ class Scheduler:
             # 債務超過のまま OPEN が生まれてしまう (fail-open)。account 欠損と
             # 同じ経路で全 pending_fill を取消し、この tick の約定処理も飛ばす。
             account = accounting.current_account(self.conn, now)
-            fills_allowed = account is not None and account[0] > 0
+            fills_allowed = (fills_allowed and account is not None
+                             and account[0] > 0)
+            if account is not None and account[0] > 0 and (
+                    accounting.drawdown_pct(account[0], account[1])
+                    >= self.settings.risk.drawdown_kill_pct):
+                # 予約約定では gate を再実行しないため、現在 DD が閾値以上の
+                # 間は約定だけを止める (取消もラッチ書込みもしない)。
+                fills_allowed = False
             if account is None:
                 self._cancel_all_pending(
                     now, reason="account_unknown",
@@ -1277,6 +1288,49 @@ class Scheduler:
                     ref_id=str(row["id"]))
                 _log.warning("limit expire failed #%s: %s", row["id"], text)
 
+    def _fills_allowed_by_state(self, now: datetime) -> bool:
+        """state を一度だけ非 blocking で読み、約定してよいかを返す。
+
+        ラッチ中 (reset marker の投影を含む) は全 pending を取消して False。
+        共有 lock 競合・state 読取不能・例外は約定停止だけ (取消しない)。
+        scheduler は state を書かない。
+        """
+        try:
+            # 取得開始前に到達済みの deadline で、lock 競合時は待たず即時に
+            # StateLockTimeout になる (sleep・再試行なし)。
+            with self.state.shared_guard(
+                    deadline=self.state._monotonic()) as guard:
+                projected = guard.projected
+        except Exception as e:  # noqa: BLE001 — 読取障害は約定停止だけ
+            self._note_fill_guard_unavailable(safe_error_text(e))
+            return False
+        if projected is None:
+            self._note_fill_guard_unavailable("state を読めない")
+            return False
+        self._fill_guard_unavailable = False
+        if not projected.kill_switch_latched:
+            return True
+        try:
+            self._cancel_all_pending(
+                now, reason="kill_switch",
+                event="kill_switch_pending_cancel",
+                why="kill switch ラッチ中")
+        except Exception as e:  # noqa: BLE001 — 取消・観測の失敗で exits を止めない
+            text = safe_error_text(e)
+            _log.warning("kill switch pending cancel failed: %s", text)
+        return False
+
+    def _note_fill_guard_unavailable(self, text: str) -> None:
+        if self._fill_guard_unavailable:
+            return
+        self._fill_guard_unavailable = True
+        try:
+            self.activity.write(
+                Category.SYSTEM, "kill_switch_fill_guard_unavailable",
+                f"{text} — この tick の約定を止める")
+        except Exception as e:  # noqa: BLE001 — 観測は best effort
+            _log.warning("fill guard activity failed: %s", safe_error_text(e))
+
     def _cancel_all_pending(self, now: datetime, *, reason: str, event: str,
                             why: str) -> None:
         """予約済み指値を「約定させてはいけない」状態で全取消しする共通経路。
@@ -1293,9 +1347,13 @@ class Scheduler:
         """
         pending = orders.list_by_status(self.conn, S.PENDING_FILL)
         if pending:
-            self.activity.write(
-                Category.SYSTEM, event,
-                f"{len(pending)} 件の pending_fill を取消 ({why})")
+            try:
+                self.activity.write(
+                    Category.SYSTEM, event,
+                    f"{len(pending)} 件の pending_fill を取消 ({why})")
+            except Exception as e:  # noqa: BLE001 — 観測の失敗で取消を止めない
+                _log.warning("cancel_all_pending activity failed: %s",
+                             safe_error_text(e))
         for row in pending:
             # N3: この関数は equity<=0 (債務超過 = SL/TP が最も要る状態) で
             # 呼ばれ、_process_exits より **前** に立つ。1 件の cancel_order
