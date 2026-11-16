@@ -235,14 +235,41 @@ def test_live_open_callers_are_under_the_core_lock():
         assert any("_core_lock" in w for w in withs), scope
 
 
+def _imported_modules(tree):
+    mods = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            mods.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            mods.add(base)
+            mods.update(f"{base}.{a.name}" for a in node.names)
+    return mods
+
+
+_CONCURRENCY_ROOTS = ("threading", "concurrent", "multiprocessing")
+
+
+def _concurrency_imports(source):
+    return sorted(m for m in _imported_modules(ast.parse(source))
+                  if m.split(".")[0] in _CONCURRENCY_ROOTS)
+
+
 def test_replay_open_runs_in_a_single_threaded_module():
     source = (REPO / "src/agentic_fx/backtest/runner.py").read_text(
         encoding="utf-8")
-    assert "threading" not in source
-    assert "Thread" not in source
-    assert "concurrent" not in source
+    assert _concurrency_imports(source) == []
     assert "kill_switch_hwm_rebases" not in source
     assert "rebase_accounting" not in source
+
+
+def test_concurrency_import_scan_sees_imports_but_not_words():
+    assert _concurrency_imports('"""threading concurrent"""\n# Thread\n') == []
+    for src in ("import threading", "import concurrent.futures",
+                "from concurrent.futures import ThreadPoolExecutor",
+                "from concurrent import futures", "import multiprocessing as mp",
+                "from threading import Thread"):
+        assert _concurrency_imports(src), src
 
 
 def test_scheduler_tick_reads_state_but_never_writes_it():

@@ -11,7 +11,7 @@ from agentic_fx.core.contracts import (
 )
 from agentic_fx.core.market_hours import is_friday_after
 from agentic_fx.core.sizing import SizeResult, SizingError, compute_size
-from agentic_fx.core.accounting import drawdown_pct
+from agentic_fx.core.accounting import drawdown_kill_reached, drawdown_pct
 from agentic_fx.core.timeutil import as_utc
 
 
@@ -192,7 +192,7 @@ def evaluate(intent: TradeIntent, ctx: GateContext,
     # kill switch (ラッチ・現在 DD は独立に判定し、両方該当時は両方を列挙する)
     if ctx.kill_switch_latched:
         reasons.append("kill switch latched")
-    if drawdown_pct(ctx.equity, ctx.hwm) >= risk.drawdown_kill_pct:
+    if drawdown_kill_reached(ctx.equity, ctx.hwm, risk.drawdown_kill_pct):
         reasons.append(
             f"kill switch: drawdown {drawdown_pct(ctx.equity, ctx.hwm):.2f}% "
             f">= {risk.drawdown_kill_pct}%")

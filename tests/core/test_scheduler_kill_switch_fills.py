@@ -181,6 +181,68 @@ def test_drawdown_stop_ends_when_the_drawdown_recovers(tmp_path):
     assert _status(env, oid) == "open"
 
 
+def test_drawdown_hold_and_resume_are_each_recorded_once(tmp_path):
+    env = Env(tmp_path)
+    _set_equity(env, 970_000.0)
+    env.place_limit(price=148.20)
+    _tick(env, 1)
+    _tick(env, 2)
+    assert _events(env).count("drawdown_fill_hold") == 1
+    text = (tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "新規の約定を止める (注文は維持)" in text
+    assert "3.00%" in text and "2.0%" in text
+    assert "drawdown_fill_resumed" not in _events(env)
+    _set_equity(env, 1_000_000.0)
+    _tick(env, 3)
+    _tick(env, 4)
+    assert _events(env).count("drawdown_fill_resumed") == 1
+    assert _events(env).count("drawdown_fill_hold") == 1
+    _set_equity(env, 970_000.0)
+    _tick(env, 5)
+    assert _events(env).count("drawdown_fill_hold") == 2
+
+
+def test_no_drawdown_activity_when_below_threshold_from_the_start(tmp_path):
+    env = Env(tmp_path)
+    env.place_limit(price=148.20)
+    _tick(env)
+    assert not [e for e in _events(env) if e.startswith("drawdown_fill")]
+
+
+def test_drawdown_activity_failure_does_not_stop_the_hold(tmp_path, monkeypatch):
+    env = Env(tmp_path)
+    _set_equity(env, 970_000.0)
+    oid = env.place_limit(price=148.20)
+    real_write = env.sched.activity.write
+
+    def write(category, event, text, **kw):
+        if event == "drawdown_fill_hold":
+            raise OSError("log full")
+        return real_write(category, event, text, **kw)
+
+    monkeypatch.setattr(env.sched.activity, "write", write)
+    _tick(env)
+    assert _status(env, oid) == "pending_fill"
+    _tick(env, 2)
+    assert _status(env, oid) == "pending_fill"
+
+
+def test_drawdown_flag_is_kept_when_the_account_is_unknown(tmp_path, monkeypatch):
+    env = Env(tmp_path)
+    _set_equity(env, 970_000.0)
+    env.place_limit(price=148.20)
+    _tick(env, 1)
+    assert env.sched._drawdown_fill_hold is True
+    real_account = accounting.current_account
+    monkeypatch.setattr(accounting, "current_account", lambda conn, now: None)
+    _tick(env, 2)
+    assert env.sched._drawdown_fill_hold is True
+    assert "drawdown_fill_resumed" not in _events(env)
+    monkeypatch.setattr(accounting, "current_account", real_account)
+    _tick(env, 3)
+    assert _events(env).count("drawdown_fill_hold") == 1
+
+
 def test_drawdown_stop_still_runs_exits_and_does_not_write_state(tmp_path):
     env = Env(tmp_path)
     _set_equity(env, 970_000.0)
@@ -262,6 +324,46 @@ def test_unavailable_activity_is_recorded_once_per_outage_and_recovers(tmp_path)
         _release(fd)
     assert _status(env, second) == "pending_fill"
     assert _events(env).count("kill_switch_fill_guard_unavailable") == 2
+
+
+def test_restored_activity_is_written_once_when_state_is_readable_again(
+        tmp_path):
+    env = Env(tmp_path)
+    env.place_limit(price=148.20)
+    _tick(env, 1)
+    assert "kill_switch_fill_guard_restored" not in _events(env)
+    fd = _contend(env)
+    try:
+        _tick(env, 2)
+    finally:
+        _release(fd)
+    _tick(env, 3)
+    _tick(env, 4)
+    names = _events(env)
+    assert names.count("kill_switch_fill_guard_unavailable") == 1
+    assert names.count("kill_switch_fill_guard_restored") == 1
+    assert "state を読めた — 約定判定を再開" in (
+        tmp_path / "a.log").read_text(encoding="utf-8")
+
+
+def test_restored_activity_failure_does_not_stop_the_fill(tmp_path, monkeypatch):
+    env = Env(tmp_path)
+    oid = env.place_limit(price=148.20)
+    fd = _contend(env)
+    try:
+        _tick(env, 1)
+    finally:
+        _release(fd)
+    real_write = env.sched.activity.write
+
+    def write(category, event, text, **kw):
+        if event == "kill_switch_fill_guard_restored":
+            raise OSError("log full")
+        return real_write(category, event, text, **kw)
+
+    monkeypatch.setattr(env.sched.activity, "write", write)
+    _tick(env, 2)
+    assert _status(env, oid) == "open"
 
 
 @pytest.mark.parametrize("exc", [

@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from agentic_fx.core.accounting import (
-    current_account, daily_start_equity, drawdown_pct, record_snapshot,
+    current_account, daily_start_equity, drawdown_kill_reached, drawdown_pct, record_snapshot,
 )
 from agentic_fx.store import snapshots
 from agentic_fx.store.db import connect, init_db
@@ -43,6 +43,15 @@ def test_drawdown_pct():
     assert drawdown_pct(98.0, 100.0) == 2.0
     assert drawdown_pct(100.0, 100.0) == 0.0
     assert drawdown_pct(1.0, 0.0) == 0.0
+
+
+def test_drawdown_kill_reached_stops_on_equal_and_ignores_nonpositive_hwm():
+    assert drawdown_kill_reached(98.0, 100.0, 2.0) is True
+    assert drawdown_kill_reached(98.1, 100.0, 2.0) is False
+    assert drawdown_kill_reached(97.0, 100.0, 2.0) is True
+    assert drawdown_kill_reached(1.0, 0.0, 2.0) is False
+    assert drawdown_kill_reached(1.0, -5.0, 2.0) is False
+    assert drawdown_kill_reached(150.0, 100.0, 2.0) is False
 
 
 def test_daily_start_equity(tmp_path):

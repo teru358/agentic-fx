@@ -99,6 +99,7 @@ class Scheduler:
                  writer_admission: WriterAdmission | None = None) -> None:
         self.conn = conn
         self._fill_guard_unavailable = False
+        self._drawdown_fill_hold = False
         self.executor = executor
         self.settings = settings
         self.state = state_store
@@ -290,12 +291,14 @@ class Scheduler:
             account = accounting.current_account(self.conn, now)
             fills_allowed = (fills_allowed and account is not None
                              and account[0] > 0)
-            if account is not None and account[0] > 0 and (
-                    accounting.drawdown_pct(account[0], account[1])
-                    >= self.settings.risk.drawdown_kill_pct):
-                # 予約約定では gate を再実行しないため、現在 DD が閾値以上の
-                # 間は約定だけを止める (取消もラッチ書込みもしない)。
-                fills_allowed = False
+            if account is not None and account[0] > 0:
+                reached = accounting.drawdown_kill_reached(
+                    account[0], account[1], self.settings.risk.drawdown_kill_pct)
+                if reached:
+                    # 予約約定では gate を再実行しないため、現在 DD が閾値以上の
+                    # 間は約定だけを止める (取消もラッチ書込みもしない)。
+                    fills_allowed = False
+                self._note_drawdown_fill_hold(reached, account[0], account[1])
             if account is None:
                 self._cancel_all_pending(
                     now, reason="account_unknown",
@@ -1307,7 +1310,15 @@ class Scheduler:
         if projected is None:
             self._note_fill_guard_unavailable("state を読めない")
             return False
-        self._fill_guard_unavailable = False
+        if self._fill_guard_unavailable:
+            self._fill_guard_unavailable = False
+            try:
+                self.activity.write(
+                    Category.SYSTEM, "kill_switch_fill_guard_restored",
+                    "state を読めた — 約定判定を再開")
+            except Exception as e:  # noqa: BLE001 — 観測は best effort
+                _log.warning("fill guard restored activity failed: %s",
+                             safe_error_text(e))
         if not projected.kill_switch_latched:
             return True
         try:
@@ -1319,6 +1330,27 @@ class Scheduler:
             text = safe_error_text(e)
             _log.warning("kill switch pending cancel failed: %s", text)
         return False
+
+    def _note_drawdown_fill_hold(self, reached: bool, equity: float,
+                                 hwm: float) -> None:
+        if reached == self._drawdown_fill_hold:
+            return
+        self._drawdown_fill_hold = reached
+        pct = accounting.drawdown_pct(equity, hwm)
+        threshold = self.settings.risk.drawdown_kill_pct
+        if reached:
+            event = "drawdown_fill_hold"
+            text = (f"DD {pct:.2f}% が閾値 {threshold}% 以上 — "
+                    "新規の約定を止める (注文は維持)")
+        else:
+            event = "drawdown_fill_resumed"
+            text = (f"DD {pct:.2f}% が閾値 {threshold}% 未満へ戻った — "
+                    "約定判定を再開")
+        try:
+            self.activity.write(Category.SYSTEM, event, text)
+        except Exception as e:  # noqa: BLE001 — 観測は best effort
+            _log.warning("drawdown fill hold activity failed: %s",
+                         safe_error_text(e))
 
     def _note_fill_guard_unavailable(self, text: str) -> None:
         if self._fill_guard_unavailable:
