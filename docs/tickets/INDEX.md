@@ -1,9 +1,9 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 175 件。完了分は closed/。
+未完了: 176 件。完了分は closed/。
 
-## 実装中 (6)
+## 実装中 (5)
 
 ### 不具合 (3)
 
@@ -13,12 +13,11 @@
 | [history-import-stops-at-first-conflict](open/history-import-stops-at-first-conflict.md) | 中 | 2026-11-13 | history import は食い違う足 1 本で partial 停止し後続を取り込まない |
 | [status-history-hidden-while-daemon-runs](open/status-history-hidden-while-daemon-runs.md) | 中 | 2026-11-13 | daemon 稼働中は評価用履歴の状態を見る面が無い |
 
-### 機能 (2)
+### 機能 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [killswitch-reset-hwm-rebase](open/killswitch-reset-hwm-rebase.md) | 高 | 2026-11-13 | kill switch の手動解除で HWM を付け直す明示操作が無い |
-| [web-layout-tabs](open/web-layout-tabs.md) | 中 | 2026-11-15 | 同梱 web の各画面をタブに分け、plugin と improve の表を並べ替え可能にする |
 
 ### 保守 (1)
 
@@ -78,9 +77,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (151)
+## 設計待ち (153)
 
-### 不具合 (80)
+### 不具合 (81)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -115,6 +114,7 @@
 | [plugin-inherited-filter-test-hits-fingerprint-selftest-first](open/plugin-inherited-filter-test-hits-fingerprint-selftest-first.md) | 中 | 2026-11-07 | 継承 seccomp filter の拒否 test が fingerprint 自己試験の失敗を先に返す |
 | [improve-eval-window-reference-availability](open/improve-eval-window-reference-availability.md) | 中 | 2026-11-09 | 参照系列を宣言した候補の評価区間に、参照の履歴が無い先頭の足が入る |
 | [reference-daily-session-completeness](open/reference-daily-session-completeness.md) | 中 | 2026-11-14 | 非24時間銘柄の1d参照を取引セッションに沿って確定する |
+| [killswitch-latch-pending-limit-fills](open/killswitch-latch-pending-limit-fills.md) | 中 | 2026-11-16 | kill switch のラッチ中も未約定の指値が約定する |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
 | [tier-a-directive-ignored](open/tier-a-directive-ignored.md) | 中 |  | 自己テストの連続失敗の警告が無視され続け、止める仕組みが無い |
@@ -165,7 +165,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (42)
+### 機能 (43)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -181,6 +181,7 @@
 | [multi-input-indicator-relations](open/multi-input-indicator-relations.md) | 中 | 2026-10-31 | 多入力 indicator: 2 銘柄の生系列から関係 (相関・スプレッド・β) を指標として計算する |
 | [improve-runner-choice](open/improve-runner-choice.md) | 中 | 2026-11-08 | 改善の実行ごとに backend / model の候補を選べるようにする |
 | [web-https-for-writes](open/web-https-for-writes.md) | 中 | 2026-11-08 | 同梱 web を HTTPS で動かし LAN から書込めるようにする |
+| [killswitch-reset-implicit-generation-and-dd-preview](open/killswitch-reset-implicit-generation-and-dd-preview.md) | 中 | 2026-11-16 | kill switch の解除で世代の入力を不要にし、確認画面に現在の DD と再ラッチの予告を出す |
 | [improve-targeted-run](open/improve-targeted-run.md) | 低 | 2026-09-12 | 現状は `improve add <text>` + 引数なし `improve` で LLM が open から自分… |
 | [pine-script-to-plugin](open/pine-script-to-plugin.md) | 低 | 2026-09-12 | Pine script を plugin に変換する手段が無い |
 | [indicator-reference-oracle-gate](open/indicator-reference-oracle-gate.md) | 低 | 2026-09-15 | indicator の正しさを確かめる門が無い |

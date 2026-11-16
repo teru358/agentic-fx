@@ -20,6 +20,7 @@ sys.path.insert(0, str(AFX_OPS))
 
 from afx_ops.api_client import Reply  # noqa: E402
 from afx_ops.web import render as web_render  # noqa: E402
+from afx_ops.web import tabs  # noqa: E402
 from afx_ops.web.request import Request, handle_request  # noqa: E402
 
 NAME = "sma_cross"
@@ -41,12 +42,20 @@ class ServiceClient:
         return Reply(200, data, None)
 
 
-def _page(env, approval_id) -> str:
-    response = handle_request(Request("GET", f"/approvals/{approval_id}", {}),
-                              ServiceClient(env.service()))
+def _tab_page(env, approval_id, tab, client=None) -> str:
+    response = handle_request(Request("GET", f"/approvals/{approval_id}", {"tab": tab}),
+                              client or ServiceClient(env.service()))
     assert response.status == 200
     assert len(response.body) < L.WEB_PAGE_BYTES
     return response.body.decode()
+
+
+def _page(env, approval_id, tab=None) -> str:
+    """tab を渡せばその 1 タブ、渡さなければ全タブの本文を連結したもの (漏れの否定の検査用)。"""
+    if tab is not None:
+        return _tab_page(env, approval_id, tab)
+    return "\n".join(_tab_page(env, approval_id, name)
+                     for name in tabs.tab_names(tabs.APPROVAL_DETAIL))
 
 
 def _scenario(env, plugin_py, config, old_py="x = 1\n", old_cfg=OLD_CFG, **payload):
@@ -63,8 +72,11 @@ def test_ac12_real_page_has_five_sections_and_the_twelve_digit_hashes(ops_env):
     approval_id, old_hash, new_hash = _scenario(
         ops_env, "x = 2\n", "kind: strategy\nparams:\n  period: 10\n")
     page = _page(ops_env, approval_id)
-    assert re.findall(r"<h2>(.*?)</h2>", page) == [
-        "概要", "params の差分", "成績", "申告 (agent の申告・未検証)", "変更 diff"]
+    sections = {name: re.findall(r"<h2>(.*?)</h2>", _page(ops_env, approval_id, name))
+                for name in tabs.tab_names(tabs.APPROVAL_DETAIL)}
+    assert sections == {"overview": ["概要"], "result": ["成績"],
+                        "change": ["params の差分", "変更 diff"],
+                        "claims": ["申告 (agent の申告・未検証)"]}
     assert f"<dt>候補</dt><dd>{new_hash[:12]}</dd>" in page
     assert f"<dt>比較対象</dt><dd>{old_hash[:12]}</dd>" in page
     assert "<dt>params.period</dt><dd>14 → 10</dd>" in page
@@ -135,11 +147,8 @@ def test_ac12_real_chain_with_markup_heavy_files_stays_under_64_kib(ops_env):
     approval_id, _, _ = _scenario(
         ops_env, big, cfg, old_cfg=old_cfg,
         agent_claims={"summary": bomb * 20, "selection_rationale": bomb * 20})
-    response = handle_request(Request("GET", f"/approvals/{approval_id}", {}),
-                              ServiceClient(ops_env.service()))
-    body = response.body
-    assert len(body) < L.WEB_PAGE_BYTES and b"Output clipped" not in body
-    page = body.decode()
+    page = _page(ops_env, approval_id)
+    assert "Output clipped" not in page
     assert "行省略)" in page and "holdout" in page
 
 
@@ -149,10 +158,9 @@ def test_ac12_service_failure_of_change_keeps_the_detail_page(ops_env):
     class Down(ServiceClient):
         def approval_change(self, approval_id):
             raise OSError("daemon down")
-    response = handle_request(Request("GET", f"/approvals/{approval_id}", {}),
-                              Down(ops_env.service()))
-    assert response.status == 200
-    assert L.REASON_TEXT[L.UNAVAILABLE] in response.body.decode()
+    page = "\n".join(_tab_page(ops_env, approval_id, name, Down(ops_env.service()))
+                      for name in tabs.tab_names(tabs.APPROVAL_DETAIL))
+    assert L.REASON_TEXT[L.UNAVAILABLE] in page
 
 
 def test_ac13_web_constants_match_the_daemon_definitions():
