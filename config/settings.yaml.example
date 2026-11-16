@@ -1,5 +1,5 @@
 # agentic-fx 設定 (このファイルを settings.yaml にコピーして編集。新キー追加時は両方を同期)
-schema_version: 5  # [init] settings の版。`afx init` が移行する
+schema_version: 6  # [init] settings の版。`afx init` が移行する
 display_timezone: Asia/Tokyo  # [init] 画面に出す時刻と週次改善の時刻 (improve_at) に効く。変えると次回の改善が数時間前後する。Asia/Tokyo のような地域名で書く (JST・EST・Etc/GMT-9 は不可)。保存は常に UTC、市場境界は NY 固定で変更不可
 account_currency: JPY         # [init] 利用者の基準通貨。損益・リスクの表現と換算に使う。取引可能ペアを制限するものではない (設計書 §5)。実取引では MT5 口座通貨が真で、起動時に照合する
 
@@ -43,6 +43,7 @@ backtest:                      # コア所有 (§6) — holdout_months の変更
   initial_balance: 1000000
   eval_source: "none"          # [init] 評価用 history source。MT5 bridge をつなげたら "mt5"
   base_interval: "1m"          # [init] バックテスト基底足。1m/5m/15m。ライブの datafeed.intervals とは別軸
+  history_sync: {auto_enabled: true, lookback_days: 7}  # 評価用履歴の同期 (eval_source: mt5 のときだけ働く。省略時はこの既定値)。auto_enabled=false で daemon の自動取得だけを止める (手動の afx history sync は常に使える。自動取得は取得前提の受入・自己計測を満たした環境だけで動く)。lookback_days は手動同期の後ろ窓の日数 (始端は E - lookback_days 日、2〜31)
 
 llama_swap:
   base_url: "http://localhost:8080/v1"  # [init]
@@ -53,6 +54,7 @@ datafeed:
   # primary: yfinance   # 省略時は enabled が 1 個ならそれ。複数 source を enabled にするなら必須
   # fallbacks: []   # primary が不通のときだけ順に試す源。既定は無し (無言の切替をしない)
   yfinance:   {enabled: true}  # [init]
+  # mt5.history_executor_url: 履歴取得専用の別 bridge の URL (省略時は null。bridge_url へは fallback しない。URL は表示・ログに出ない)
   mt5:        {enabled: false, bridge_url: "http://localhost:8812"}  # [init]
   twelvedata: {enabled: false}  # [init]
   freshness_max_min: 20       # これより古い quote/bar は不健全扱い

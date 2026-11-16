@@ -2,7 +2,7 @@
 
 日付: 2026-11-14。対象: `status-history-hidden-while-daemon-runs` / `history-import-stops-at-first-conflict`。
 状態: C2.2。2026-11-14 利用者承認 (C2.1)、遮断器の既知除外を技術判断で追加。実装中。関連原本仕様・コードの変更は task とする。
-基準: 設計レビュー opus 1 周目と terra の閉鎖確認 2 回 (非公開の記録)。参照: 段1a `docs/superpowers/specs/2026-11-11-backtest-history-freshness-guard-design.md`、同期の設計 (段 2・3、レビュー中)、評価区間の設計 (レビュー中)。
+基準: 設計レビュー opus 1 周目と terra の閉鎖確認 2 回 (非公開の記録)。参照: 段1a `docs/superpowers/specs/2026-11-11-backtest-history-freshness-guard-design.md`、同期の設計 C5 `docs/superpowers/specs/2026-11-14-backtest-history-sync-design.md` (段 2 は実装済み、段 3 は未着手)、評価区間の設計 (レビュー中)。
 
 ## 1. 動作目線
 
@@ -50,7 +50,7 @@ unknown の DB 接続は **URI `mode=ro` を強制し、sidecar の有無にか�
 
 | 現在の主判定 | 履歴ブロック内の案内 |
 |---|---|
-| stale / gap | 不足 pair・範囲の確認、`afx history import`、その後 `afx status` |
+| stale / gap | 不足 pair・範囲の確認、daemon を止めて `afx history import` (初回・holdout より古い履歴) か `afx history sync` (holdout 内の更新・穴修復)、その後 `afx status`。`afx ctl history sync` は段 3 の導入後だけ案内する (同期 C5 §1.2) |
 | unavailable | 固定理由に沿う設定/DB/no-bars の確認と status 再実行。一律 import は案内しない |
 | ready | `next:` なし。参照の0本日があっても同じ |
 | not configured | 設定状態を表示。一律 import/再評価は案内しない |
@@ -109,7 +109,7 @@ C0の「配備4 strategy版」と評価区間C2の「strategy名2件」は単位
 
 **検査尾の判定契約も本節が所有する。** 同期は追記範囲と同時に、同じ系列・epochの既存区間を検査尾として事前固定し取得する。初期契約は直前2開場時間相当の確定格子を基本とし、足幅wで `K = ceil(2時間/w)` を計算する (1m=120本、5m=24本、15m=8本)。時間をそのまま120本と読み替えない。暦/no-barsで除外した格子、新規行、欠落応答を実際の重複数に数えない。実重複 `N_overlap >= K` かつ `N_test >= 2` を比較可能性の最低条件とする。既知異値は比較尾の存在には数えるが、遮断の分母には入れない。Kは系列正当性の証明ではなく初期の検査量である。
 
-基本尾に既存行が足りない場合は、取得結果を見る**前**にDBの既存key・暦・固定規則から選んだ検査用既存区間を同じgenerationへ追加できる。追加区間・上限・全要求数をadmission前に固定する。結果のC_newや割合を見て正常行を後から足し、通るまで窓を広げる行為は禁止。新規2件の高率異値を見た後の追加取得は別の調査であり、その遮断を解除しない。日窓/batch単位の分割で判定をリセットしない。検査行と書込対象のkeyは重複除去し、seenは一観測一回とする。
+基本尾に既存行が足りない場合は、取得結果を見る**前**にDBの既存key・暦・固定規則から選んだ検査用既存区間を同じgenerationへ追加できる。追加区間・上限・全要求数をadmission前に固定する。結果のC_newや割合を見て正常行を後から足し、通るまで窓を広げる行為は禁止。新規2件の高率異値を見た後の追加取得は別の調査であり、その遮断を解除しない。日窓/batch単位の分割で判定をリセットしない。検査行と書込対象のkeyは重複除去し、seenは一観測一回とする。検査用既存区間は同期ではBより前 (評価区間の外側) のkeyを含んでよい。この区間は比較・監査専用で、既存行が無い足は応答にあっても新規挿入せず、既存行はunchanged/conflictとして遮断の分母 (N_test・C_new) と監査に数える。
 
 同期のrecent・catchup・gap修復は、実重複が最低条件を満たさなければ **`deferred(reason=inspection_insufficient)`「検査不足」** と明示し、当該generationの履歴/監査0件、cursorを進めない。既知だけでN_test=0の場合も同じ。既に遮断条件に当たるなら検査不足へ格下げせず遮断とする。元々比較元のない初回手動importは `comparison_unavailable` を明示した導入として許すが、同期や比較可能な手動再実行の迂回路にはしない。手動もC_newの割合判定を外さず、同じ入力・epoch・digestの再実行では既知のseen更新と表示が続く。
 
@@ -134,7 +134,8 @@ N=0や新規異値1件だけでは系列ずれを検出できない。bridge の
 | `state` | TEXT NOT NULL DEFAULT `open`、CHECK `open/kept/replaced/superseded` |
 | `first_seen_at, last_seen_at` | TEXT NOT NULL、注入したUTC clock。最初は同値 |
 | `seen_count` | INTEGER NOT NULL DEFAULT 1、CHECK >=1 |
-| `first_run_id, last_run_id` | nullable TEXT。手動importはNULL、同期導入後もFKは張らない。参照先runの最小identityをtombstoneとして保持し論理参照を保つ (SQLite ALTERでのFK後付けを前提にしない) |
+| `first_run_id, last_run_id` | nullable TEXT。手動importはNULL (最後の観測の識別であり、置換の証明には使わない)、同期導入後もFKは張らない。参照先runの最小identityをtombstoneとして保持し論理参照を保つ (SQLite ALTERでのFK後付けを前提にしない) |
+| `bridge_verified_run_id` | nullable TEXT。検査尾の判定 (遮断・検査不足) を通過して確定した MT5 取得 (sync) の run だけが、衝突の upsert と同じ transaction で設定する。再観測のたびに上書きし、検証を伴わない観測 (手動import等) は NULL に戻す。置換の証明に使う列で、`last_run_id` は証明に使わない。旧い記録・手動importの記録は NULL で、同epoch・同digestを sync で再観測して確定すれば付く。参照先runの最小identityは series 詳細のGCからも守る。既存DBへは ALTER ADD COLUMN で足す |
 | `resolved_at, resolved_by, resolution_action, reason_ref, revision_id` | nullable。人間操作の監査用予約列。actionは `keep_existing/replace_with_incoming/supersede` の固定語、価格や自由理由はagentに渡さない |
 
 UNIQUE は **`(source, interval, symbol, bar_time, history_epoch, existing_digest, incoming_digest)`**。同epoch内ではr1の6成分案と同じ同一性であり、epochを加えるのはrepair前の記録が修復後の別足を指さないため (M10)。r1の6成分だけの案はこの点で修正採用する。値の組が変われば別記録、epochが変わっても別記録。originはkeyに入れず、手動と同期の同一観測をまとめる。
@@ -223,7 +224,7 @@ import/syncの語彙は次を共有し、別名のpartial成功を作らない�
 | 衝突完走 | 非衝突行と全衝突記録をbatchごとに確定、rc=3 |
 | repair/置換の監査失敗 | その履歴変更transaction全体rollback。旧epochと記録の整合を維持 |
 
-配備順は新schema/core/表示を導入→daemon再起動→manual import。稼働中旧daemonの下で新importだけ先行させない。runbookと公開変更履歴にDukascopyのrc変更、取得失敗0件への変更、部分確定時の再実行を明記する。Dukascopy実機疎通はr1時点で接続元の制限が報告されており、本改訂でも未確認。偽fetchの受入と実機の確認を混同しない。
+配備順は新schema/core/表示を導入し、schema 導入のために再起動→daemon停止→manual import→再起動 (同期 C5 §1.2・§3)。稼働中の daemon の下では import しない (取得前の instance lock が拒否する)。稼働中旧daemonの下で新importだけ先行させない。runbookと公開変更履歴にDukascopyのrc変更、取得失敗0件への変更、部分確定時の再実行を明記する。Dukascopy実機疎通はr1時点で接続元の制限が報告されており、本改訂でも未確認。偽fetchの受入と実機の確認を混同しない。
 
 ## 4. test・受入
 
@@ -271,6 +272,9 @@ import/syncの語彙は次を共有し、別名のpartial成功を作らない�
 | 2026-11-14 | C2.1 | §2.5a に stage の期限到達時の処理 (未確定 batch の rollback、prefix と cursor の維持、lease 解放、`stage_expired`、次 cycle で suffix を新 generation で再取得) と受入を追加 | terra の C2 閉鎖確認 Minor 1 | — |
 | 2026-11-14 | C2.2 | C_new/C_known・N_test、表示と遮断の分離、小N維持、足幅別検査尾と検査不足、段1 T3正本、rc/FK整合 | 同期r2 I-4を利用者指定のsol推奨で閉鎖、m12/m14/m18追随 | — (未commit) |
 | 2026-11-14 | C2.3 | §2.3 の同期への参照を同期 C5 へ。T4 の `ImportConflictError` の記述を廃止済みの実態へ。time repair は mutation lease と WriterAdmission の順に参加し、移動元・移動先の open 記録の supersede を同じ transaction で行う (T5) | 段1a・UTC 時刻規則 spec の食い違い訂正 (T6)、repair の実装 | — |
+| 2026-11-15 | C2.4 | 衝突に `bridge_verified_run_id` を足し、replace_with_incoming を sync の検証済み取得で最後に観測された記録に限る (§2.4)。手動importの記録は NULL で keep は可・replace は拒否、手動importの証明対応は後続 | 置換の根拠を origin ラベルだけにしない (正本C2付録E) | — (未commit) |
+| 2026-11-15 | C2.5 | §2.3 の同期の検査用既存区間はBより前のkeyを含んでよく、比較・監査専用 (欠落足は挿入しない) とする。§2.5a の事前固定とprefix除外は不変 | 同期 C5.5 と整合 | — (未commit) |
+| 2026-11-15 | C2.6 | 参照先を同期 C5 に追随 (ヘッダ、§1.3 の stale / gap 案内に停止中の `afx history sync` を併記、ctl は段 3 の導入後)、§3 の配備順を「schema 導入で再起動 → daemon 停止 → manual import → 再起動」に、T2 の相互参照を C5 §1.3/§2.8 へ。`history_sync` スロットは同期の永続表の観測で埋まった (評価区間 `eval_window` は未収集のまま) | 同期 段 2 の表示・運用原本の実装 | — (未commit) |
 
 ## 6. 短い task 表
 
@@ -279,7 +283,7 @@ import/syncの語彙は次を共有し、別名のpartial成功を作らない�
 | 順 | task / 対象 | 完了条件 |
 |---|---|---|
 | T1 | locked契約: `status.py`, `store/db.py`, `tests/test_status_locks.py`, observer関連test、cli-surface spec §6.1/golden/AC-18、`docs/operations/first-run-acceptance.md:172` | unknownのみ履歴読取・ro強制、他保持者6行維持、timezoneと固定理由、helper docstringも整合 |
-| T2 | DTO/参照/案内: `status_history.py` と関連test、段1a §7、`docs/operations/reevaluate-deployed-after-history-repair.md` §7手順3、同期C2 §1.3/§2.8、評価区間C2 §2.5との接点 | watch正本、見出し、空文言/期待値、条件付きnext、再評価は具体的結果から案内、共通スロットの所有権を明示 |
+| T2 | DTO/参照/案内: `status_history.py` と関連test、段1a §7、`docs/operations/reevaluate-deployed-after-history-repair.md` §7手順3、同期C5 §1.3/§2.8、評価区間C2 §2.5との接点 | watch正本、見出し、空文言/期待値、条件付きnext、再評価は具体的結果から案内、共通スロットの所有権を明示 |
 | T3 | schema/core: `store/db.py`, `store/ohlcv.py`, 新 `store/history_conflicts.py`, schema/旧DB fixture/`TABLE_NAMES` test | 最終形、二段判定、epoch付きUNIQUE/upsert、closed state維持、agent隔離 |
 | T4 | import両source/CLI: `backtest/mt5_import.py`, Dukascopy `importer.py`, `cli.py`, import test、共通mutation lease | 操作・系列別全取得→遮断→batch、rc/進捗/再実行・stage寿命・generation/cursor、例外契約変更。`ImportConflictError` の廃止と docstring/全利用箇所の除去 (実装済み)、mt5末尾「1回の短いtransaction」コメント、ohlcvの古い件数だけ/窓分割前提コメントを更新または廃止 |
 | T5 | repair: `backtest/time_repair.py`, `core/history_epoch.py`との契約、修復test | 同じlease、移動元/先のsupersede原子性、既存epoch/no-op/backupの意味を維持 |

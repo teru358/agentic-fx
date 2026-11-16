@@ -1021,3 +1021,14 @@ def test_import_mt5_accepts_a_period_exactly_at_the_limit(tmp_path, monkeypatch)
     r = import_mt5(conn, "USDJPY", H, H + timedelta(minutes=100), base_url="http://x",
                    fetch=lambda url: {"symbol": "USDJPY", "interval": "1m", "bars": []})
     assert r.inserted == 0
+
+
+@pytest.mark.parametrize(('symbol', 'encoded'), [
+    ('#US500', '%23US500'), ('US 30', 'US%2030'),
+    ('A/B', 'A%2FB'), ('A?B', 'A%3FB'), ('A+B', 'A%2BB'),
+])
+def test_symbol_is_encoded_as_one_url_path_segment(symbol, encoded):
+    url = mt5_import._window_url('http://bridge', symbol, H, H + timedelta(hours=1), '1m')
+    parsed = urlsplit(url)
+    assert parsed.path == '/ohlcv/' + encoded
+    assert parse_qs(parsed.query)['interval'] == ['1m']

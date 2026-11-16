@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import yaml
 from dotenv import load_dotenv
 from pydantic import (
-    BaseModel, ConfigDict, Field, StrictBool, StrictInt, ValidationError,
+    BaseModel, ConfigDict, Field, SecretStr, StrictBool, StrictInt, ValidationError,
     field_validator, model_validator,
 )
 
@@ -29,7 +29,9 @@ MAX_STORED_DECISION_INTERVAL_MIN = 240
 
 
 class ConfigError(Exception):
-    pass
+    def __init__(self, message, *, validation_errors=None):
+        super().__init__(message)
+        self.validation_errors = validation_errors
 
 
 class _Strict(BaseModel):
@@ -154,6 +156,31 @@ class SourceToggle(_Strict):
     bridge_url: str | None = None
 
 
+class Mt5Settings(SourceToggle):
+    """MT5。`history_executor_url` は履歴取得専用の別 bridge の URL (既定 null)。
+
+    URL は秘密として扱い、表示・ログ・repr・dump (worker への handshake を含む) に出さない。`bridge_url` への
+    fallback はしない: 未設定なら履歴取得の実行先は無い。"""
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    history_executor_url: SecretStr | None = Field(default=None, exclude=True)
+
+    @field_validator("history_executor_url")
+    @classmethod
+    def _http_url(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        raw = value.get_secret_value().strip()
+        if not raw.startswith(("http://", "https://")):
+            raise ValueError("datafeed.mt5.history_executor_url must be an http(s) URL")
+        return SecretStr(raw)
+
+    def history_executor(self) -> str | None:
+        """履歴取得の実行先 URL。未設定なら None (`bridge_url` で代替しない)。"""
+        url = self.history_executor_url
+        return None if url is None else url.get_secret_value()
+
+
 class OutageSettings(_Strict):
     flat_stall_max_sec: int = Field(default=1800, ge=0)
     ready_confirm_ticks: int = Field(default=3, ge=1)
@@ -162,7 +189,7 @@ class OutageSettings(_Strict):
 
 class DatafeedSettings(_Strict):
     yfinance: SourceToggle
-    mt5: SourceToggle
+    mt5: Mt5Settings
     twelvedata: SourceToggle
     primary: str
     # primary が不通のときだけ、この順に試す明示 fallback。既定は無し
@@ -485,11 +512,21 @@ class ApiSettings(_Strict):
     shutdown_join_sec: float = Field(default=5.0, gt=0)
 
 
+class HistorySyncSettings(_Strict):
+    """評価用履歴の同期。省略時はこの既定で動く (旧 settings にキー行を足さない)。
+
+    `lookback_days` は手動同期の後ろ窓の長さ (日数、始端は E - lookback_days 日)。
+    """
+    auto_enabled: bool = True
+    lookback_days: int = Field(default=7, ge=2, le=31)
+
+
 class BacktestSettings(_Strict):
     holdout_months: int = Field(ge=1)
     initial_balance: float = Field(gt=0)
     eval_source: str = "none"
     base_interval: str = "1m"
+    history_sync: HistorySyncSettings = Field(default_factory=HistorySyncSettings)
 
     @model_validator(mode="after")
     def _history_dataset_is_valid(self):
@@ -845,12 +882,30 @@ def load_settings(path: Path) -> Settings:
     return load_settings_text(path.read_text(encoding="utf-8"))
 
 
+def format_settings_validation_error(error: ValidationError, raw: object) -> str:
+    """Format settings errors without exposing a configured history executor URL."""
+    datafeed = raw.get("datafeed") if isinstance(raw, dict) else None
+    mt5 = datafeed.get("mt5") if isinstance(datafeed, dict) else None
+    if not isinstance(mt5, dict) or mt5.get("history_executor_url") is None:
+        return str(error)
+    return "\n".join(
+        f"{'.'.join(map(str, item['loc'])) or '<root>'}: {item['msg']}"
+        for item in error.errors(include_input=False))
+
+
 def load_settings_text(text: str) -> Settings:
     """Validate settings already read from a stable source snapshot."""
     try:
         raw = yaml.safe_load(text) or {}
         return Settings.model_validate(raw)
     except ValidationError as e:
-        raise ConfigError(str(e)) from e
+        message = format_settings_validation_error(e, raw)
+        details = e.errors(include_input=False)
+        errors = tuple((item["loc"], item["msg"], item["type"]) for item in details)
+        datafeed = raw.get("datafeed") if isinstance(raw, dict) else None
+        mt5 = datafeed.get("mt5") if isinstance(datafeed, dict) else None
+        if not isinstance(mt5, dict) or mt5.get("history_executor_url") is None:
+            raise ConfigError(message, validation_errors=errors) from e
     except yaml.YAMLError as e:
         raise ConfigError(f"invalid YAML: {e}") from e
+    raise ConfigError(message, validation_errors=errors) from None

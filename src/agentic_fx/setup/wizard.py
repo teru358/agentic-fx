@@ -122,7 +122,10 @@ _BRIDGE_GUIDE = (
     "  4. afx を動かすマシンから `curl <URL>/health` で `\"mt5_connected\": true` を確認する。",
     "  5. bridge にキーを設定したなら、afx 側の `.env` に `MT5_BRIDGE_API_KEY=<同じ値>` を書く。",
     "  6. `afx init` を再実行し、価格源で「使う・動いている」を選ぶ (接続試験が記録される)。",
-    "  7. 履歴を取り込む: `uv run afx history import --source mt5 --symbol USDJPY --from <開始日> --to <終了日> --interval 5m`。",
+    "  7. 履歴を取り込む (daemon を止めて実行): 主 pair と参照 (`datafeed.watch_symbols`) の全銘柄を同じ開始日から、"
+    "`backtest.base_interval` の足幅で 1 銘柄ずつ `uv run afx history import --source mt5 --symbol <銘柄> "
+    "--from <開始日> --to <終了日> --interval <base_interval>`。主だけ古く入れると参照が評価から外れ得ます。"
+    "以後の holdout 内の更新と穴修復は停止中の `uv run afx history sync` です。",
     "この手順は `afx ctl status` と起動画面にも出し続けます。",
 )
 _ATTENTION = (

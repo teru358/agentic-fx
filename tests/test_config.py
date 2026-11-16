@@ -1240,10 +1240,10 @@ def test_econ_section_is_optional_and_defaults_to_the_window_rule():
     assert s.econ.signal_capacity_daily_max == 5
 
 
-def test_example_states_the_econ_window_defaults_and_the_schema_stays_v5():
+def test_example_states_the_econ_window_defaults_and_the_schema_is_v6():
     import yaml
     raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
-    assert raw["schema_version"] == CURRENT_SCHEMA_VERSION == 5
+    assert raw["schema_version"] == CURRENT_SCHEMA_VERSION == 6
     assert raw["econ"] == {"window": {"importance_min": 3, "before_min": 30,
                                       "after_min": 15}}
     s = load_settings(EXAMPLE)
@@ -1329,3 +1329,109 @@ def test_friday_swing_cutoff_limit_is_derived_from_rollover_and_margin():
     assert fx_time.FRIDAY_SWING_CUTOFF_LIMIT_NY == (
         rollover - fx_time.SWING_CUTOFF_MARGIN).time()
     assert fx_time.FRIDAY_SWING_CUTOFF_LIMIT_NY.hour == 16
+
+
+# ---- datafeed.mt5.history_executor_url ------------------------------------------
+
+def _mt5_raw(**mt5):
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["datafeed"]["mt5"] = {"enabled": False, "bridge_url": "http://bridge.invalid", **mt5}
+    return raw
+
+
+def test_history_executor_url_defaults_to_none_and_never_falls_back_to_bridge_url():
+    s = load_settings(EXAMPLE)
+    assert s.datafeed.mt5.history_executor_url is None
+    assert s.datafeed.mt5.bridge_url and s.datafeed.mt5.history_executor() is None
+
+
+def test_history_executor_url_accepts_an_http_url_and_rejects_other_values():
+    mt5 = Settings.model_validate(_mt5_raw(history_executor_url="http://exec.invalid:8813")
+                                  ).datafeed.mt5
+    assert mt5.history_executor() == "http://exec.invalid:8813"
+    for bad in ("ftp://x", "exec.invalid", ""):
+        with pytest.raises(ValidationError):
+            Settings.model_validate(_mt5_raw(history_executor_url=bad))
+
+
+def test_history_executor_url_is_not_shown_in_repr_str_dump_or_json():
+    canary = "http://" + "exec-" + "canary.invalid:8813"
+    s = Settings.model_validate(_mt5_raw(history_executor_url=canary))
+    for text in (repr(s), str(s), repr(s.datafeed.mt5), s.datafeed.mt5.model_dump_json(),
+                 str(s.model_dump()), s.model_dump_json()):
+        assert canary not in text
+    assert s.datafeed.mt5.history_executor() == canary
+
+
+def test_history_executor_url_is_excluded_from_the_settings_dump_sent_to_workers():
+    import json
+    canary = "http://" + "exec-" + "canary.invalid:8813"
+    s = Settings.model_validate(_mt5_raw(history_executor_url=canary))
+    dumped = s.model_dump()
+    assert "history_executor_url" not in dumped["datafeed"]["mt5"]
+    assert canary not in json.dumps(dumped)
+
+@pytest.mark.parametrize('kind', ['scheme', 'type', 'space'])
+def test_history_executor_validation_errors_hide_input(kind):
+    import yaml
+    from agentic_fx.config import Mt5Settings, ConfigError, load_settings_text
+    canary = 'secret-' + 'canary-429'
+    bad = {'scheme': 'ftp://user:' + canary + '@host/x',
+           'type': int('829' + '374'), 'space': ' ftp://user:' + canary + '@host/x '}[kind]
+    marker = str(bad) if kind == 'type' else canary
+    with pytest.raises(ValidationError) as direct:
+        Mt5Settings.model_validate({'history_executor_url': bad})
+    assert marker not in str(direct.value)
+    with pytest.raises(ConfigError) as nested:
+        load_settings_text(yaml.safe_dump(_mt5_raw(history_executor_url=bad)))
+    for item in (nested.value, nested.value.__cause__, nested.value.__context__):
+        assert marker not in str(item)
+        assert marker[:8] not in str(item)
+
+@pytest.mark.parametrize('kind', ['field', 'other', 'model'])
+def test_secret_is_absent_from_all_settings_error_links(kind):
+    import yaml
+    from agentic_fx.config import ConfigError, load_settings_text
+    canary = 'secret' + '87'
+    raw = _mt5_raw(history_executor_url='https://user:' + canary + '@host/x')
+    if kind == 'field':
+        raw['datafeed']['mt5']['history_executor_url'] = 'ftp://user:' + canary + '@host/x'
+    elif kind == 'other':
+        raw['risk'] = 123
+    else:
+        raw = {'datafeed': {'mt5': {'history_executor_url':
+               canary}}}
+    with pytest.raises(ConfigError) as exc:
+        load_settings_text(yaml.safe_dump(raw))
+    if kind == 'model':
+        assert 'primary_source_required' in str(exc.value)
+    for item in (exc.value, exc.value.__cause__, exc.value.__context__):
+        assert canary not in str(item)
+        assert canary[:8] not in str(item)
+
+
+def test_settings_error_without_secret_keeps_original_validation_display():
+    import yaml
+    from agentic_fx.config import ConfigError, load_settings_text
+    raw = _mt5_raw()
+    raw['risk'] = 123
+    with pytest.raises(ValidationError) as expected:
+        Settings.model_validate(raw)
+    with pytest.raises(ConfigError) as actual:
+        load_settings_text(yaml.safe_dump(raw))
+    assert str(actual.value) == str(expected.value)
+
+
+def test_settings_secret_error_reports_location_without_input():
+    import yaml
+    from agentic_fx.config import ConfigError, load_settings_text
+    canary = 'secret' + '87'
+    raw = _mt5_raw(history_executor_url='https://user:' + canary + '@host/x')
+    raw['risk'] = 123
+    with pytest.raises(ConfigError) as exc:
+        load_settings_text(yaml.safe_dump(raw))
+    assert 'risk:' in str(exc.value)
+    assert 'input_value' not in str(exc.value)
+    assert canary not in str(exc.value)
+    assert canary[:8] not in str(exc.value)

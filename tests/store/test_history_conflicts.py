@@ -79,9 +79,9 @@ def test_fresh_ddl_has_final_shape(tmp_path):
         "existing_json", "incoming_json", "existing_digest", "incoming_digest",
         "origin", "last_origin", "state", "first_seen_at", "last_seen_at",
         "seen_count", "first_run_id", "last_run_id", "resolved_at", "resolved_by",
-        "resolution_action", "reason_ref", "revision_id"]
+        "resolution_action", "reason_ref", "revision_id", "bridge_verified_run_id"]
     for name in ("first_run_id", "last_run_id", "resolved_at", "resolved_by",
-                 "resolution_action", "reason_ref", "revision_id"):
+                 "resolution_action", "reason_ref", "revision_id", "bridge_verified_run_id"):
         assert cols[name]["notnull"] == 0, name
     for name in ("source", "interval", "symbol", "bar_time", "history_epoch",
                  "existing_json", "incoming_json", "existing_digest",
@@ -140,6 +140,30 @@ def test_old_db_without_table_gains_it_and_second_init_is_noop(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM data_migrations").fetchone()[0] == before_epoch
     assert not conn.execute(
         "SELECT 1 FROM sqlite_master WHERE name LIKE '%schema_version%'").fetchone()
+
+
+def test_a_db_with_the_old_conflict_table_gains_a_null_proof_column_and_keeps_its_records(tmp_path):
+    path = tmp_path / "old.db"
+    conn = connect(path)
+    init_db(conn)
+    _seed(conn, [_row(0)])
+    _apply(conn, _cls(conn, [_row(0, close=148.15)]))
+    # 証明列を持たない旧い形に戻す
+    conn.execute("ALTER TABLE history_conflicts DROP COLUMN bridge_verified_run_id")
+    conn.commit()
+    assert "bridge_verified_run_id" not in {
+        r["name"] for r in conn.execute("PRAGMA table_info(history_conflicts)")}
+    before = [{k: v for k, v in r.items() if k != "bridge_verified_run_id"} for r in _records(conn)]
+    conn.close()
+
+    conn = connect(path)
+    init_db(conn)
+    rows = _records(conn)
+    assert [{k: v for k, v in r.items() if k != "bridge_verified_run_id"} for r in rows] == before
+    assert [r["bridge_verified_run_id"] for r in rows] == [None]
+    sql = conn.execute("SELECT name, sql FROM sqlite_master ORDER BY name").fetchall()
+    init_db(conn)
+    assert conn.execute("SELECT name, sql FROM sqlite_master ORDER BY name").fetchall() == sql
 
 
 # ---- digest / 二段判定 -----------------------------------------------------
