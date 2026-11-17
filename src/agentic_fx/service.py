@@ -1119,7 +1119,6 @@ def _startup_watch_symbols(settings, ctx: StartupContext):
     if (not ctx.query_bridge or not watch or settings.datafeed.primary != "mt5"
             or ctx.findings is None):
         return settings
-    import httpx
     from agentic_fx.setup import checks
 
     key = ctx.bridge_api_key

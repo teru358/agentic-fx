@@ -573,7 +573,7 @@ def test_slot_follows_waiting_holding_completed_and_blocks_other_ids(monkeypatch
     _configure(monkeypatch, client)
     out: dict = {}
 
-    t = threading.Thread(target=lambda: out.update(first=_history("req-1")))
+    t = threading.Thread(target=lambda: out.update({"first": _history("req-1")}))
     t.start()
     assert mt5.entered.wait(10)
 
@@ -607,7 +607,7 @@ def test_slot_reads_waiting_while_the_lock_is_held_by_someone_else(monkeypatch):
     _configure(monkeypatch, client)
     out: dict = {}
     client._lock.acquire()
-    t = threading.Thread(target=lambda: out.update(r=_history("req-w")))
+    t = threading.Thread(target=lambda: out.update({"r": _history("req-w")}))
     t.start()
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
@@ -726,7 +726,7 @@ def test_the_documented_launch_is_a_single_process_with_an_app_object(monkeypatc
     import uvicorn
 
     seen = {}
-    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: seen.update(app=app, **kw))
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: seen.update({"app": app, **kw}))
     monkeypatch.setattr(server, "load_settings", lambda: SimpleNamespace(host="127.0.0.1", port=8812))
     server.main()
     assert seen["app"] is server.app
