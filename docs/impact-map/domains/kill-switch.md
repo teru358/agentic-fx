@@ -244,7 +244,7 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 - **D09**（F28–F31、K-CONSUME）配送と status は独立し、実通知の成功は未確認。bot health の運用確認は [関連 ticket](../../tickets/closed/bot-gateway-disconnect-is-silent.md) を参照。
 - **D10**（F131、F134、K-REBASE）付け直しに累積の切下げ上限・回数上限・HWM の下限は無く、累積は ledger の表示と警告 (現在の閾値の 3 倍超) だけで扱う。PaperBroker の本件に限る設計裁定であり、実口座 broker を導入するときは硬い上限が必須要件となり、満たすまで実口座の付け直しを有効にしない。
 - **D11**（F134、F142、F146、K-REBASE）COMMIT 自体の停止は時間の上限を保証せず、COMMIT の例外は結果不明 (outcome_unknown) として自動では再送しない。成立の確認は status と ledger で人が行う。
-- **D12**（F174、F176、K-PENDING-STOP）解消済み。ラッチ中と、ラッチ前の DD 閾値以上の間にも予約指値が約定していた (scheduler の約定経路が state と DD を見なかった)。[指値の ticket](../../tickets/open/killswitch-latch-pending-limit-fills.md)。
+- **D12**（F174、F176、K-PENDING-STOP）解消済み。ラッチ中と、ラッチ前の DD 閾値以上の間にも予約指値が約定していた (scheduler の約定経路が state と DD を見なかった)。[指値の ticket](../../tickets/closed/killswitch-latch-pending-limit-fills.md)。
 - **D13**（F177、K-PENDING-STOP）取消の途中で CANCELLED への DB 遷移が失敗した行は CANCELLING に残り、再走査されず予約を占有する。broker の rejected による PROTECTION_PENDING も進める走査が無い。取消理由に共通で [滞留 ticket](../../tickets/open/cancel-stall-in-cancelling-state.md) で扱う。CANCELLING への遷移前の DB 失敗の直後 (次の tick より前) に reset され価格が届けば、残った PENDING_FILL は約定しうる。
 - **D14**（F174、K-PENDING-STOP）発動から解除まで一度も開場 tick が走らない短い latch は取消の観測外。state file の消失は既定 AppState (clear) として読まれ、gate と同じく検出しない ([世代 floor の ticket](../../tickets/open/killswitch-generation-floor-on-state-recreate.md))。同期 file I/O 自体の時間上限は保証しない。
 
@@ -346,7 +346,7 @@ status の marker 投影と StateStore の全分岐一致は未確認。
 
 変更時は gate の理由文字列、store の marker/raw、ops と shell の入口、event schema、bot/notify の cursor、status/activity、replay artifact と比較 metric を別々に照合する。literal 索引は callback や引数伝播を証明しない。`ops:guard_version` は宣言された literal だが、guard event schema の version と結び付くことは未確認である。
 
-[指値の ticket](../../tickets/open/killswitch-latch-pending-limit-fills.md) で scheduler の約定経路 (F174–F184、K-LATCH-WRITERS、K-PENDING-STOP、D12–D14、E79–E90) を code と同じ commit で追加し、変わった anchor は照合記録を更新した。
+[指値の ticket](../../tickets/closed/killswitch-latch-pending-limit-fills.md) で scheduler の約定経路 (F174–F184、K-LATCH-WRITERS、K-PENDING-STOP、D12–D14、E79–E90) を code と同じ commit で追加し、変わった anchor は照合記録を更新した。
 
 基準 `160f1e47` と作業 tree の `src/`・`afx-ops/` 差分が空であることを確認した (C4 の `0dbcb27f` からこの基準までの差は HWM の file だけ)。source の読取による下書きであり、test、独立 oracle、実通知は未実施。頁セルは凍結表の critical 行を被覆宣言で全件対応づけたが、宣言は存在の照合で意味の証明ではなく、F39 以降と HWM の F131–F163 は source 読取りのみで test を実行していない。status と StateStore の全分岐比較、reset crash 統合 test の網羅は未確認。
 

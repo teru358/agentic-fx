@@ -1,16 +1,15 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 175 件。完了分は closed/。
+未完了: 174 件。完了分は closed/。
 
-## 実装中 (4)
+## 実装中 (3)
 
-### 不具合 (2)
+### 不具合 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [live-confirmed-bars-into-history](open/live-confirmed-bars-into-history.md) | 高 | 2026-09-21 | backtest の履歴が自動で更新されず、評価が古い入力で通る |
-| [killswitch-latch-pending-limit-fills](open/killswitch-latch-pending-limit-fills.md) | 中 | 2026-11-16 | kill switch のラッチ中も未約定の指値が約定する |
 
 ### 機能 (1)
 

@@ -1,6 +1,6 @@
 # kill switch ラッチ中の未約定指値 — 設計 C0.2
 
-対象: [ticket](../../tickets/open/killswitch-latch-pending-limit-fills.md)。source 確認: branch `kslimit`、HEAD `f11f7358`（C0.1）。設計レビュー 1・2 周目の採用全件を反映した提案であり、実装済み動作とは区別する。
+対象: [ticket](../../tickets/closed/killswitch-latch-pending-limit-fills.md)。source 確認: branch `kslimit`、HEAD `f11f7358`（C0.1）。設計レビュー 1・2 周目の採用全件を反映した提案であり、実装済み動作とは区別する。
 
 ## 1. 起きる動作と決定
 
@@ -167,7 +167,8 @@ status の既存 kill_switch／pending 投影と web の activity 描画を使�
 | 2026-11-16 | C0 | A 推奨、最終 fill guard、取消要求回復、replay 比較・影響地図・test 要件を設計 | ラッチ中の予約指値による新規建玉を停止する | 41915a59 |
 | 2026-11-16 | C0.1 | 1 周目の採用全件を反映。writer 契約、一度の読取、DD 停止、取消と読取障害の分離、限定再評価、理由表示と台帳を整理 | source 全数と裁定に合わせて過剰な同期／永続化を除く | f11f7358 |
 | 2026-11-16 | C0.2 | 2 周目の採用全件を反映。DD 停止の再評価範囲、旧保存物の判定限界、一度の非 blocking 読取、snapshot 鮮度／rebase 契約と test 要件、fills_allowed 初期化の注意を追加 | latch 数 0 の漏れと lock 待ちによる保護処理遅延を除き、既存 source の契約に揃える | fed370dc |
-| 2026-11-16 | C0.2 | 閉鎖確認 (指摘なし) の後、利用者が承認 | 実装へ進む | (実装と同じ commit) |
+| 2026-11-16 | C0.2 | 閉鎖確認 (指摘なし) の後、利用者が承認 | 実装へ進む | b86d502e |
+| 2026-11-17 | C0.2 | 実装の是正で、全取消の列挙・activity の例外を隔離し、DD 停止と state 読取の復旧を activity に記録し、DD 判定を risk gate と共有の述語にした (§3・§6 の範囲内の追加) | 実装レビューの採用 | 実装 branch |
 
 ## 逸脱・未完
 
