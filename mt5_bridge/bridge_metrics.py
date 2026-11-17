@@ -54,9 +54,14 @@ class RequestMetrics:
     hold_total: float = 0.0
     wait_max: float = 0.0
     hold_max: float = 0.0
-    in_lock: bool = False
+    depth: int = 0
+    failed: bool = False
     history_request_id: str | None = None
     authorized: bool = False
+
+    @property
+    def in_lock(self) -> bool:
+        return self.depth > 0
 
     def record(self, wait: float, hold: float) -> None:
         self.acquisitions += 1
@@ -83,26 +88,47 @@ def unbind_metrics(token: contextvars.Token) -> None:
     _current.reset(token)
 
 
+def _tick(metrics: RequestMetrics) -> float | None:
+    """時計を読む。失敗は業務処理へ出さず、要求の集計に計測失敗として残す。"""
+    try:
+        return _clock()
+    except Exception:  # noqa: BLE001
+        metrics.failed = True
+        return None
+
+
 @contextmanager
 def timed_lock(lock):
     """`lock` を取り、待ち・占有を現在の要求の集計へ足す。要求の外では何も記録しない。
 
-    lock の型には依存しない (context manager として使えればよい)。
+    lock の型には依存しない (context manager として使えればよい)。占有の終端は lock の
+    解放の後で、集計もその後に行う。計測の例外は業務処理へ出さず `failed` に残す。
     """
     metrics = _current.get()
     if metrics is None:
         with lock:
             yield
         return
-    t_wait = _clock()
-    with lock:
-        t_hold = _clock()
-        metrics.in_lock = True
-        try:
+    t_wait = _tick(metrics)
+    t_hold = None
+    entered = False
+    try:
+        with lock:
+            t_hold = _tick(metrics)
+            metrics.depth += 1
+            entered = True
             yield
-        finally:
-            metrics.in_lock = False
-            metrics.record(t_hold - t_wait, _clock() - t_hold)
+    finally:
+        if entered:
+            metrics.depth -= 1
+            t_end = _tick(metrics)
+            if t_wait is None or t_hold is None or t_end is None:
+                metrics.failed = True
+            else:
+                try:
+                    metrics.record(t_hold - t_wait, t_end - t_hold)
+                except Exception:  # noqa: BLE001
+                    metrics.failed = True
 
 
 def _ms(seconds: float) -> str:
@@ -110,7 +136,7 @@ def _ms(seconds: float) -> str:
 
 
 def lock_headers(metrics: RequestMetrics | None) -> list[tuple[str, str]]:
-    if metrics is None:
+    if metrics is None or metrics.failed:
         return [(H_LOCK_STATE, "unavailable")]
     if metrics.acquisitions == 0:
         return [
@@ -174,8 +200,13 @@ class HistorySlot:
 
     def complete(self, entry: _Entry) -> None:
         """全 native 呼出しと lock 解放の後で呼ぶ。この後だけ completed に見える。"""
-        entry.wait_ms = _ms(entry.metrics.wait_total)
-        entry.hold_ms = _ms(entry.metrics.hold_total)
+        # 計測に失敗した要求は数値を出さない (0 と読ませない)。数値の欠落が計測不能の印。
+        try:
+            if not entry.metrics.failed:
+                entry.wait_ms = _ms(entry.metrics.wait_total)
+                entry.hold_ms = _ms(entry.metrics.hold_total)
+        except Exception:  # noqa: BLE001
+            entry.wait_ms = entry.hold_ms = ""
         entry.completed = True
 
     def snapshot(self) -> list[tuple[str, str]]:
@@ -183,10 +214,10 @@ class HistorySlot:
         if entry is None:
             return [(H_HISTORY_STATE, "none")]
         if entry.completed:
-            return [
-                (H_HISTORY_ID, entry.request_id), (H_HISTORY_STATE, "completed"),
-                (H_HISTORY_WAIT, entry.wait_ms), (H_HISTORY_HOLD, entry.hold_ms),
-            ]
+            out = [(H_HISTORY_ID, entry.request_id), (H_HISTORY_STATE, "completed")]
+            if entry.wait_ms and entry.hold_ms:
+                out += [(H_HISTORY_WAIT, entry.wait_ms), (H_HISTORY_HOLD, entry.hold_ms)]
+            return out
         state = "holding" if entry.metrics.in_lock else "waiting"
         return [(H_HISTORY_ID, entry.request_id), (H_HISTORY_STATE, state)]
 

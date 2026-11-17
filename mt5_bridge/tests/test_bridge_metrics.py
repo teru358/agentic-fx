@@ -739,3 +739,254 @@ def test_uvicorn_refuses_several_workers_for_an_app_object():
 
     with pytest.raises(SystemExit):
         uvicorn.run(server.app, host="127.0.0.1", port=0, workers=2)
+
+
+# ── 計測の失敗を業務処理から隔離 ──────────────────────────────────
+
+def _fault_clock(monkeypatch, fail_at):
+    """`fail_at` 回目の時計取得で例外にする (1 始まり)。"""
+    state = {"n": 0}
+
+    def clock():
+        state["n"] += 1
+        if state["n"] == fail_at:
+            raise RuntimeError("clock fault")
+        return float(state["n"])
+
+    monkeypatch.setattr(bridge_metrics, "_clock", clock)
+
+
+def _break_record(monkeypatch):
+    def record(self, wait, hold):
+        raise RuntimeError("record fault")
+
+    monkeypatch.setattr(bridge_metrics.RequestMetrics, "record", record)
+
+
+_FAULTS = {
+    "clock_before_acquire": lambda mp: _fault_clock(mp, 1),
+    "clock_after_acquire": lambda mp: _fault_clock(mp, 2),
+    "clock_at_release": lambda mp: _fault_clock(mp, 3),
+    "record": _break_record,
+}
+
+
+@pytest.mark.parametrize("fault", sorted(_FAULTS))
+def test_measurement_fault_leaves_the_business_response_byte_identical(monkeypatch, fault):
+    _configure(monkeypatch, _real_client())
+    baseline = _call("GET", "/symbols")
+    _FAULTS[fault](monkeypatch)
+    client = server._client
+    status, hdr, body = _call("GET", "/symbols")
+    assert (status, body) == (baseline[0], baseline[2])
+    assert _h(hdr, "X-Bridge-Lock-State") == "unavailable"
+    assert not client._lock.locked()
+
+
+@pytest.mark.parametrize("fault", sorted(_FAULTS))
+def test_measurement_fault_keeps_native_exceptions_and_lock_release(monkeypatch, fault):
+    client = _real_client()
+    _FAULTS[fault](monkeypatch)
+    metrics = bridge_metrics.RequestMetrics()
+    token = bridge_metrics.bind_metrics(metrics)
+    try:
+        with pytest.raises(RuntimeError, match="native"):
+            with client._timed_lock():
+                raise RuntimeError("native")
+    finally:
+        bridge_metrics.unbind_metrics(token)
+    assert not client._lock.locked()
+    assert metrics.failed
+
+
+@pytest.mark.parametrize("fault", sorted(_FAULTS))
+def test_measurement_fault_never_leaves_zero_numbers_in_the_history_slot(monkeypatch, fault):
+    mt5 = _FakeMt5()
+    _configure(monkeypatch, _real_client(mt5))
+    _FAULTS[fault](monkeypatch)
+    status, hdr, _ = _history("req-1")
+    assert status == 200
+    assert _h(hdr, "X-Bridge-History-State") == "completed"
+    assert _h(hdr, "X-Bridge-History-Wait-Ms") is None
+    assert _h(hdr, "X-Bridge-History-Hold-Ms") is None
+    snap = dict(bridge_metrics.history_slot.snapshot())
+    assert snap["X-Bridge-History-State"] == "completed"
+    assert "X-Bridge-History-Hold-Ms" not in snap
+    assert mt5.copy_calls == 1
+
+
+# ── 占有計測の境界 ────────────────────────────────────────────────
+
+def test_hold_includes_time_spent_releasing_the_lock(monkeypatch):
+    now = {"t": 0.0}
+    monkeypatch.setattr(bridge_metrics, "_clock", lambda: now["t"])
+
+    class _SlowRelease:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            now["t"] += 5.0
+            return False
+
+    metrics = bridge_metrics.RequestMetrics()
+    token = bridge_metrics.bind_metrics(metrics)
+    try:
+        with bridge_metrics.timed_lock(_SlowRelease()):
+            now["t"] += 1.0
+    finally:
+        bridge_metrics.unbind_metrics(token)
+    assert metrics.hold_total == pytest.approx(6.0)
+
+
+def test_holding_state_lasts_until_the_lock_is_released(monkeypatch):
+    seen = []
+    metrics = bridge_metrics.RequestMetrics()
+
+    class _Probe:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            seen.append(metrics.in_lock)
+            return False
+
+    token = bridge_metrics.bind_metrics(metrics)
+    try:
+        with bridge_metrics.timed_lock(_Probe()):
+            pass
+    finally:
+        bridge_metrics.unbind_metrics(token)
+    assert seen == [True] and not metrics.in_lock
+
+
+def test_reentrant_lock_keeps_holding_until_the_outermost_release():
+    seen = []
+    metrics = bridge_metrics.RequestMetrics()
+    lock = threading.RLock()
+    token = bridge_metrics.bind_metrics(metrics)
+    try:
+        with bridge_metrics.timed_lock(lock):
+            with bridge_metrics.timed_lock(lock):
+                seen.append(metrics.in_lock)
+            seen.append(metrics.in_lock)
+        seen.append(metrics.in_lock)
+    finally:
+        bridge_metrics.unbind_metrics(token)
+    assert seen == [True, True, False]
+    assert metrics.acquisitions == 2
+
+
+# ── 認証済みの想定外 500 ──────────────────────────────────────────
+
+class _PingBreaks(_ErrClient):
+    def ping(self):
+        raise ZeroDivisionError("x")
+
+
+def _unexpected(monkeypatch, headers):
+    _configure(monkeypatch, _PingBreaks(exc=ZeroDivisionError("x")), api_key="k-1")
+    bridge_metrics.history_slot.admit("req-s", bridge_metrics.RequestMetrics())
+    hdrs = [(k.lower().encode(), v.encode()) for k, v in headers.items()]
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+             "method": "GET", "scheme": "http", "path": "/health", "raw_path": b"/health",
+             "query_string": b"", "headers": hdrs, "client": ("127.0.0.1", 1),
+             "server": ("127.0.0.1", 8812), "root_path": ""}
+    sent: list[dict] = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(msg):
+        sent.append(msg)
+
+    with pytest.raises(ZeroDivisionError):
+        asyncio.run(server.app(scope, receive, send))
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    assert start["status"] == 500
+    return {k.decode().lower(): v.decode() for k, v in start["headers"]}
+
+
+def test_authenticated_unexpected_500_carries_the_slot(monkeypatch):
+    hdr = _unexpected(monkeypatch, {"X-Bridge-Api-Key": "k-1"})
+    assert _h(hdr, "X-Bridge-History-Request-Id") == "req-s"
+    assert _h(hdr, "X-Bridge-History-State") == "waiting"
+    assert _h(hdr, "X-Bridge-Error-Code") == "internal_error"
+
+
+def test_unauthenticated_unexpected_500_has_no_slot(monkeypatch):
+    for headers in ({}, {"X-Bridge-Api-Key": "wrong"}):
+        hdr = _unexpected(monkeypatch, headers)
+        assert not any(k.startswith("x-bridge-history") for k in hdr)
+        assert _h(hdr, "X-Bridge-Error-Code") == "internal_error"
+
+
+# ── native 実行中の切断・取消し ───────────────────────────────────
+
+def _drive_history_with_disconnect(monkeypatch, mt5, *, mode):
+    """native を止めたまま、`mode` (disconnect | cancel) を起こす。"""
+    result: dict = {}
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+             "method": "GET", "scheme": "http", "path": "/ohlcv/USDJPY",
+             "raw_path": b"/ohlcv/USDJPY", "query_string": _OHLCV_QUERY.encode(),
+             "headers": [(b"x-bridge-history-request-id", b"req-1")],
+             "client": ("127.0.0.1", 1), "server": ("127.0.0.1", 8812), "root_path": ""}
+
+    async def run():
+        gone = asyncio.Event()
+        sent: list = []
+
+        async def receive():
+            if mode == "disconnect":
+                await gone.wait()
+                return {"type": "http.disconnect"}
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(msg):
+            sent.append(msg)
+
+        task = asyncio.ensure_future(server.app(scope, receive, send))
+        loop = asyncio.get_running_loop()
+        assert await loop.run_in_executor(None, mt5.entered.wait, 10)
+        result["during"] = dict(bridge_metrics.history_slot.snapshot())
+        if mode == "disconnect":
+            gone.set()
+        else:
+            task.cancel()
+        await asyncio.sleep(0.2)
+        result["after_gone"] = dict(bridge_metrics.history_slot.snapshot())
+        result["calls_after_gone"] = mt5.copy_calls
+        other = await loop.run_in_executor(None, lambda: _history("req-2"))
+        same = await loop.run_in_executor(None, lambda: _history("req-1"))
+        result["other"], result["same"] = other, same
+        result["calls_after_retries"] = mt5.copy_calls
+        mt5.release.set()
+        try:
+            await task
+        except BaseException:  # noqa: BLE001
+            pass
+        for _ in range(200):
+            snap = dict(bridge_metrics.history_slot.snapshot())
+            if snap["X-Bridge-History-State"] == "completed":
+                break
+            await asyncio.sleep(0.05)
+        result["final"] = snap
+
+    asyncio.run(run())
+    return result
+
+
+@pytest.mark.parametrize("mode", ["disconnect", "cancel"])
+def test_disconnect_while_native_runs_keeps_the_slot_open_until_release(monkeypatch, mode):
+    mt5 = _FakeMt5()
+    mt5.release = threading.Event()
+    _configure(monkeypatch, _real_client(mt5))
+    r = _drive_history_with_disconnect(monkeypatch, mt5, mode=mode)
+    assert r["during"]["X-Bridge-History-State"] == "holding"
+    assert r["after_gone"]["X-Bridge-History-State"] == "holding"
+    assert r["other"][0] == 409 and _h(r["other"][1], "X-Bridge-Error-Code") == "history_request_busy"
+    assert r["same"][0] == 409
+    assert r["calls_after_retries"] == 1 == r["calls_after_gone"]
+    assert r["final"]["X-Bridge-History-State"] == "completed"
+    assert r["final"]["X-Bridge-History-Request-Id"] == "req-1"
+    assert mt5.copy_calls == 1

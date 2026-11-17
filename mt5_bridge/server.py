@@ -370,7 +370,8 @@ async def _unexpected_error(request: Request, exc: Exception):
 
     metrics = request.scope.get(_METRICS_SCOPE_KEY)
     headers = dict(bridge_metrics.response_headers(
-        metrics, error_code="internal_error", include_slot=False,
+        metrics, error_code="internal_error",
+        include_slot=bool(getattr(metrics, "authorized", False)),
     ))
     return PlainTextResponse("Internal Server Error", status_code=500, headers=headers)
 
