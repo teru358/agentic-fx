@@ -520,3 +520,13 @@ def history_guard_fake(request, monkeypatch):
 
     monkeypatch.setattr(hh, "evaluate_history", fake_evaluate)
     yield fake
+
+
+@pytest.fixture(autouse=True)
+def _reset_bridge_observer():
+    """bridge の受動観測の記録先 (process 内の状態) をテストの間で持ち越さない。"""
+    from agentic_fx.datafeed import bridge_observe
+
+    bridge_observe.reset()
+    yield
+    bridge_observe.reset()

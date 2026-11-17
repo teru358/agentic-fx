@@ -23,6 +23,7 @@ from agentic_fx.datafeed.price_provider import _SPECS
 from agentic_fx.datafeed.closed_bars import normalize_closed_range
 from agentic_fx.core.contracts import Bar
 from agentic_fx._safe_error import safe_error_text
+from agentic_fx.datafeed import bridge_observe
 from agentic_fx.datafeed.sources import (
     BridgeTimeRuleMismatch, BridgeTimeUnverified, _mt5_headers,
     _raise_mt5_time_rule_error)
@@ -48,7 +49,7 @@ def _default_fetch(url: str) -> dict:
     `bars: []` の 200 で返る実測仕様) — 素通しで raise する。
     URL・ヘッダ (API キー) はログに出さない。
     """
-    resp = httpx.get(url, headers=_mt5_headers(), timeout=30)
+    resp = bridge_observe.bridge_get(url, headers=_mt5_headers(), timeout=30)
     _raise_mt5_time_rule_error(resp)
     return resp.json()
 

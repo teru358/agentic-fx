@@ -1138,6 +1138,8 @@ def main(*, build_runner: Callable[..., Any] | None = None) -> None:
 
         from agentic_fx.config import Settings
         settings = Settings.model_validate(settings_dict)
+        from agentic_fx.datafeed import bridge_observe
+        bridge_observe.set_default_caller("mission")
 
         # R2/B6 (設計書 §2.2): trade worker は handshake の credentials を
         # os.environ へ setenv する — datafeed コード (price_provider.py/

@@ -212,12 +212,12 @@ _BRIDGE_WINDOWS = (
 
 
 def _bridge_check(conn: sqlite3.Connection, bridge_url: str, fetch=None) -> dict[str, Any]:
-    import httpx
+    from agentic_fx.datafeed import bridge_observe
     from agentic_fx.datafeed.sources import _mt5_headers
     def get(path: str, params=None):
         if fetch is not None:
             return fetch(path, params or {})
-        response = httpx.get(bridge_url.rstrip("/") + path, params=params,
+        response = bridge_observe.bridge_get(bridge_url.rstrip("/") + path, params=params,
                              headers=_mt5_headers(), timeout=30)
         response.raise_for_status()
         return response.json()

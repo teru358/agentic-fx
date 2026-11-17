@@ -47,7 +47,7 @@ from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.core.scheduler import TICK_INTERVAL_SEC, Scheduler
 from agentic_fx.core.supervisor import MissionSupervisor, SubmitResult
 from agentic_fx.core.writer_admission import WriterAdmission
-from agentic_fx.datafeed import cache_window, sources
+from agentic_fx.datafeed import bridge_observe, cache_window, sources
 from agentic_fx.datafeed.ingest import Ingest
 from agentic_fx.datafeed.outage import IngestTickReport, OutageStateMachine
 from agentic_fx.datafeed.planner import RequirementPlanner, startup_disposition
@@ -1124,7 +1124,7 @@ def _startup_watch_symbols(settings, ctx: StartupContext):
 
     key = ctx.bridge_api_key
     listing = checks.list_bridge_symbols(
-        settings.datafeed.mt5.bridge_url or "", fetch=ctx.bridge_fetch or httpx.get, timeout=5,
+        settings.datafeed.mt5.bridge_url or "", fetch=ctx.bridge_fetch or bridge_observe.bridge_get, timeout=5,
         headers={"X-Bridge-Api-Key": key} if key else {})
     if listing.result != "ok":
         ctx.findings.append(Finding("watch_symbols_unchecked", listing.reason_code.value
@@ -2445,14 +2445,15 @@ def _scheduler_tick_once(app: App) -> None:
     deferred な通知はフラグの外で走る。
     """
     writer = getattr(app, "writer_admission", None)
-    if writer is None:
-        _scheduler_tick_body(app)
-        return
-    writer.tick_started()
-    try:
-        _scheduler_tick_body(app)
-    finally:
-        writer.tick_finished()
+    with bridge_observe.caller_scope("tick"):
+        if writer is None:
+            _scheduler_tick_body(app)
+            return
+        writer.tick_started()
+        try:
+            _scheduler_tick_body(app)
+        finally:
+            writer.tick_finished()
 
 
 def _writer_scope(app: App):

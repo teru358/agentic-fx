@@ -46,7 +46,7 @@ from agentic_fx.core.mission_ceiling import worker_ceiling
 from agentic_fx.core.scheduler import (
     DAILY_AT_RE, WEEKLY_AT_RE, latest_scheduled_occurrence, scheduled_period,
 )
-from agentic_fx.datafeed import sources
+from agentic_fx.datafeed import bridge_observe, sources
 from agentic_fx.datafeed import news_probe
 from agentic_fx.display_tz import is_region_name
 from agentic_fx.store import news_sources
@@ -914,7 +914,8 @@ def _bridge_check(sess: _Session, a: Answers, url: str) -> CheckResult:
     headers = _bridge_key_headers(sess, a, url)
     if a.bridge_key == "yes" and not _may_send_bridge_key(url):
         sess.say("平文 http には鍵を送りません。鍵なしで /health を試します。")
-    return checks.check_bridge(url, a.pairs[0], fetch=sess.deps.fetch, headers=headers,
+    return checks.check_bridge(url, a.pairs[0], fetch=bridge_observe.observed(sess.deps.fetch),
+                               headers=headers,
                                now=sess.deps.now)
 
 
@@ -1069,7 +1070,7 @@ def _stage3_watch_symbols(sess: _Session, st: _Start, a: Answers, url: str) -> N
 
     一覧を取れないときは理由を示して質問を飛ばし、現在の値は変えない (`a.watch_symbols` は None のまま)。
     """
-    listing = checks.list_bridge_symbols(url, fetch=sess.deps.fetch,
+    listing = checks.list_bridge_symbols(url, fetch=bridge_observe.observed(sess.deps.fetch),
                                          headers=_bridge_key_headers(sess, a, url), now=sess.deps.now)
     if listing.result != "ok":
         reason = listing.reason_code.value if listing.reason_code else "connect_error"
