@@ -1377,7 +1377,12 @@ class Scheduler:
         `reason` は orders.close_reason に載る (取消理由が activity と DB の
         両方で区別できるよう、原因ごとに別の値を渡す)。
         """
-        pending = orders.list_by_status(self.conn, S.PENDING_FILL)
+        try:
+            pending = orders.list_by_status(self.conn, S.PENDING_FILL)
+        except Exception as e:  # noqa: BLE001 — 列挙の失敗で資金保護を止めない
+            _log.warning("cancel_all_pending enumeration failed (%s): %s",
+                         reason, safe_error_text(e))
+            return
         if pending:
             try:
                 self.activity.write(

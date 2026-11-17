@@ -288,3 +288,69 @@ def test_scheduler_tick_reads_state_but_never_writes_it():
                     ast.unparse(node.func.value) not in
                     {"self.state", "self.executor.state"})
     assert used <= {"load", "shared_guard", "_monotonic"}
+
+
+_WRITER_NAMES = {"update", "confirm_latched", "reset_kill_switch"}
+# bound method を呼出さずに持ち回る箇所の許可一覧 (scope, 名前)。現状は無い。
+_ALLOWED_WRITER_ALIASES: set = set()
+
+
+class _AliasScan(ast.NodeVisitor):
+    """書込みメソッドの属性参照のうち、直接の呼出しの func でないものを集める。"""
+
+    def __init__(self, rel):
+        self.rel = rel
+        self.names = []
+        self.found = []
+
+    def _scope(self, node):
+        self.names.append(node.name)
+        self.generic_visit(node)
+        self.names.pop()
+
+    visit_FunctionDef = _scope
+    visit_AsyncFunctionDef = _scope
+    visit_ClassDef = _scope
+
+    def visit_Call(self, node):
+        if isinstance(node.func, ast.Attribute):
+            # func 自体は呼出し位置なので別名ではない。receiver 側と引数は見る。
+            self.visit(node.func.value)
+        else:
+            self.visit(node.func)
+        for arg in node.args:
+            self.visit(arg)
+        for kw in node.keywords:
+            self.visit(kw.value)
+
+    def visit_Attribute(self, node):
+        if node.attr in _WRITER_NAMES:
+            self.found.append((self.rel, ".".join(self.names), node.attr))
+        self.generic_visit(node)
+
+
+def _writer_aliases(source, rel="x.py"):
+    scan = _AliasScan(rel)
+    scan.visit(ast.parse(source))
+    return scan.found
+
+
+def test_writer_methods_are_never_held_as_bound_method_aliases():
+    found = []
+    for path in _files():
+        if not path.relative_to(REPO).as_posix().startswith("src/agentic_fx"):
+            continue
+        found.extend(_writer_aliases(path.read_text(encoding="utf-8"),
+                                     path.relative_to(REPO).as_posix()))
+    assert _bag(found) == _bag(_ALLOWED_WRITER_ALIASES)
+
+
+def test_alias_scan_sees_assignment_argument_and_return_but_not_calls():
+    for src in ("setter = state.update",
+                "setter = a.b().update",
+                "f(x.confirm_latched)",
+                "def g():\n    return s.reset_kill_switch",
+                "d = {'k': s.update}"):
+        assert _writer_aliases(src), src
+    assert _writer_aliases("state.update(a=1)") == []
+    assert _writer_aliases("a.update.b(1)") != []

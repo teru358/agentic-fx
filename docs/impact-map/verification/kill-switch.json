@@ -118,12 +118,12 @@
  },
  {
   "anchor": "src/agentic_fx/core/scheduler.py::Scheduler._cancel_all_pending",
-  "date": "2026-11-16",
-  "evidence": "tests/core/test_scheduler_kill_switch_fills.py::test_cancel_error_activity_failure_does_not_stop_later_cancels",
-  "hash": "627ff013de22599b06291c099177731f40f4db2d7287bff2ea337a953df0d4b6",
+  "date": "2026-11-17",
+  "evidence": "tests/core/test_scheduler_kill_switch_fills.py::test_enumeration_failure_while_latched_and_account_unknown_still_runs_exits",
+  "hash": "28024f1ee936ea7e612cbb80da51395224505787546ec808f4477ff836d42567",
   "method": "python-3.13:ast.dump(annotate_fields=True,include_attributes=False):v1",
-  "reason": "contract_unchanged",
-  "source_sha": "43d515e9d8be60edc053c2c0aafa6c6f84578410"
+  "reason": "relation_changed_page_updated",
+  "source_sha": "e2b3cc55790db33b962841467c929e57bee62c60"
  },
  {
   "anchor": "src/agentic_fx/core/scheduler.py::Scheduler._fills_allowed_by_state",

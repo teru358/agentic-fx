@@ -708,3 +708,52 @@ def test_state_store_is_the_real_store_with_the_clock_used_for_the_deadline(
     env = Env(tmp_path)
     assert isinstance(env.sched.state, StateStore)
     assert callable(env.sched.state._monotonic)
+
+
+def _break_enumeration_in_cancel_all(monkeypatch, *, from_call=1):
+    """_cancel_all_pending からの列挙を from_call 回目から落とす。"""
+    import sys
+    real = orders.list_by_status
+    seen = []
+
+    def list_by_status(conn, *args, **kwargs):
+        if sys._getframe(1).f_code.co_name == "_cancel_all_pending":
+            seen.append(1)
+            if len(seen) >= from_call:
+                raise RuntimeError("db read")
+        return real(conn, *args, **kwargs)
+
+    monkeypatch.setattr(orders, "list_by_status", list_by_status)
+    return seen
+
+
+def _sl_fixture(env, monkeypatch):
+    open_id = _swing_open(env)
+    pending = env.place_limit(price=148.20)
+    env.bars["USDJPY"] = _bar(WED + timedelta(minutes=1), o=148.0, h=148.05,
+                              l=147.5, c=147.6)
+    monkeypatch.setattr(accounting, "current_account", lambda *a, **k: None)
+    return open_id, pending
+
+
+def test_enumeration_failure_while_latched_and_account_unknown_still_runs_exits(
+        tmp_path, monkeypatch):
+    env = Env(tmp_path)
+    open_id, pending = _sl_fixture(env, monkeypatch)
+    _latch(env)
+    calls = _break_enumeration_in_cancel_all(monkeypatch, from_call=2)
+    env.sched.tick(WED + timedelta(minutes=2))
+    assert len(calls) == 2
+    assert orders.get(env.conn, open_id)["close_reason"] == "sl"
+    assert _status(env, pending) == "cancelled"
+
+
+def test_enumeration_failure_with_account_unknown_alone_still_runs_exits(
+        tmp_path, monkeypatch):
+    env = Env(tmp_path)
+    open_id, pending = _sl_fixture(env, monkeypatch)
+    calls = _break_enumeration_in_cancel_all(monkeypatch)
+    env.sched.tick(WED + timedelta(minutes=2))
+    assert calls
+    assert orders.get(env.conn, open_id)["close_reason"] == "sl"
+    assert _status(env, pending) == "pending_fill"
