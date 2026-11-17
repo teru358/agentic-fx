@@ -38,6 +38,20 @@ AUTH_REJECTION_CODES = frozenset({
     "auth_invalid", "order_key_required", "local_only_forbidden",
 })
 
+# 応答の error code の固定集合。記録・集計はこの集合の値だけを通す。
+ERROR_CODES = frozenset({
+    "auth_invalid", "order_key_required", "local_only_forbidden",
+    "route_not_found", "method_not_allowed", "request_validation_failed",
+    "internal_error", "mt5_not_connected", "runtime_not_initialized",
+    "symbol_unavailable", "tick_unavailable", "history_copy_failed",
+    "quote_failed", "history_failed", "order_failed",
+    "time_rule_mismatch", "time_rule_unverified",
+    "history_request_busy", "history_request_duplicate", "history_request_id_invalid",
+    "invalid_range", "invalid_request", "invalid_timestamp", "closed_deal_not_found",
+    "soft_halted", "preflight_rejected", "preflight_error", "order_rejected",
+    "modify_no_fields", "modify_failed", "close_failed", "resume_refused",
+})
+
 _HISTORY_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 

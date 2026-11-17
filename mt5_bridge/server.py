@@ -23,6 +23,7 @@ from starlette.responses import JSONResponse
 from admin_models import AdminStatus, HaltRequest
 from config import BridgeSettings, is_loopback_host, load_settings
 import bridge_metrics
+import request_log
 from mt5_client import Mt5Client, PreflightError, TimeRuleUnavailableError
 from ohlcv_models import OhlcvBar, OhlcvResponse
 from order_models import (
@@ -195,7 +196,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:  # noqa: BLE001
         logger.error(f"MT5 connect failed at startup: {e}")
         # ブリッジ自体は起動を続行 (heartbeat に "connected=false" を返すため)
-    yield
+    request_log.request_log.start(_LOG_DIR / "bridge-metrics.jsonl")
+    try:
+        yield
+    finally:
+        request_log.request_log.stop()
     if _client is not None:
         _client.disconnect()
 
@@ -329,6 +334,21 @@ def _metrics_headers(metrics, *, error_code: str | None, emit_error_code: bool) 
     )
 
 
+def _record_request(scope, status: int, code: str | None, extra: list) -> None:
+    """1 要求 1 行の記録。enqueue だけで待たず、失敗は応答へ出さない。"""
+    try:
+        caller = None
+        for key, value in scope.get("headers", []):
+            if key == b"x-afx-caller":
+                caller = value
+        row = request_log.build_row(
+            caller_raw=caller, path=scope.get("path", ""), status=status,
+            error_code=code, headers=extra)
+        request_log.request_log.emit(row)
+    except Exception:  # noqa: BLE001
+        return
+
+
 def _with_metrics(scope, message, metrics) -> list:
     headers = list(message.get("headers", []))
     present = {k.lower() for k, _ in headers}
@@ -341,6 +361,7 @@ def _with_metrics(scope, message, metrics) -> list:
         code = _fallback_error_code(scope, message["status"])
     extra = _metrics_headers(
         metrics, error_code=code, emit_error_code=code_name not in present)
+    _record_request(scope, message["status"], code, extra)
     for name, value in extra:
         if name.lower().encode() not in present:
             headers.append((name.encode(), value.encode("latin-1")))
@@ -381,8 +402,10 @@ async def _unexpected_error(request: Request, exc: Exception):
     from starlette.responses import PlainTextResponse
 
     metrics = request.scope.get(_METRICS_SCOPE_KEY)
-    headers = dict(_metrics_headers(
-        metrics, error_code="internal_error", emit_error_code=True))
+    extra = _metrics_headers(
+        metrics, error_code="internal_error", emit_error_code=True)
+    _record_request(request.scope, 500, "internal_error", extra)
+    headers = dict(extra)
     return PlainTextResponse("Internal Server Error", status_code=500, headers=headers)
 
 # 発注・管理書き込み系。認証は router 単位で付ける (個別 decorator には付けない)
