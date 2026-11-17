@@ -163,7 +163,7 @@ bridge は `America/New_York` の DST 規則と「サーバ時刻 = NY 壁時計
 
 ### 要求ごとの構造化記録
 
-`logs/bridge-metrics.jsonl` に、1 要求 1 行の JSON を書く (応答の body・detail・status・header は変えない)。要求の処理は標準 logging の QueueHandler に積むだけで、書込みを待たない。queue が詰まったら行を捨て、次に書けた行の `dropped_before` に欠落数を載せる。記録の失敗は応答に影響しない。
+`logs/bridge-metrics/YYYY-MM-DD.jsonl` (UTC の日付) に、1 要求 1 行の JSON を書く (応答の body・detail・status・header は変えない)。要求の処理は有界 queue に積むだけで、書込みは daemon thread の writer が行い、要求は待たない。queue が詰まったら行を捨て、次に書けた行の `dropped_before` に欠落数を載せる。記録の失敗は応答に影響しない。
 
 | 欄 | 内容 |
 |---|---|
@@ -175,11 +175,9 @@ bridge は `America/New_York` の DST 規則と「サーバ時刻 = NY 壁時計
 | `lock_state` `wait_ms` `hold_ms` `wait_max_ms` `hold_max_ms` `acquisitions` | MT5 lock の状態と、1 要求内の待ち・占有の合計・最大・取得回数 (`unavailable` のときは数値なし) |
 | `history_state` | 履歴専用 slot の状態 (`none` `waiting` `holding` `completed`)。認証に失敗した応答では `null`。ID は書かない |
 
-URL・API キー・生の header・boot id の生値・価格・履歴の ID は書かない。file は `0600` で作り、既存の file の権限が緩ければ開くときに `0600` へ直す。symlink と通常でない file は開かない。
+URL・API キー・生の header・boot id の生値・価格・履歴の ID は書かない。POSIX では dir を `0700`、file を `0600` で作り、既存の権限が緩ければ開くときに直す。symlink と通常でない file は開かない。POSIX 専用の仕組みが無い OS (Wine 上の Windows Python) では通常の追記 open で書く。
 
-保持: UTC 0 時に日次でローテーションし、14 世代 (`bridge-metrics.jsonl.YYYY-MM-DD`) だけ残す。集計は daemon 側の記録と合わせて `scripts/bridge_metrics_report.py --bridge-file <この file> --client-file <logs/bridge-metrics/client.jsonl>` で出す (client 側は daemon の `client.jsonl` と CLI の `client-cli.jsonl` に分かれ、`--client-file` を省くと両方とローテーション済みを読む)。
-
-既知の限界: 同時に動く CLI 2 本が深夜 (UTC 0 時) をまたぐと、`client-cli.jsonl` の日替わり (前日分の改名・古い世代の削除) が競合しうる。daemon と CLI は file を分けているので互いには影響しない。
+保持: 日付入りの file へ追記するだけで改名しない。writer が日付の変わり目に、14 日を超えた `YYYY-MM-DD.jsonl` の通常 file だけを消す (他の名前・dir・symlink は残す)。停止は期限付きで、MT5 の切断を先に行う。集計は daemon 側の記録と合わせて `scripts/bridge_metrics_report.py --bridge-dir <この dir> --client-dir <logs/bridge-metrics>` で出す (client 側は daemon の `client-YYYY-MM-DD.jsonl` と CLI の `client-cli-YYYY-MM-DD.jsonl` に分かれ、`--client-dir` を省くと `<root>/logs/bridge-metrics` の両方を読む)。
 
 ## トラブルシュート
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """bridge の要求ごとの記録 (bridge 側) と client 側の観測を集計する。
 
-bridge 側 file (`logs/bridge-metrics.jsonl` と日付つきのローテーション済み) と client 側 file
-(`logs/bridge-metrics/client.jsonl` と CLI 用の `client-cli.jsonl`、それぞれ同様) を別々に、endpoint x caller ごとに件数・lock の
+bridge 側 (`mt5_bridge/logs/bridge-metrics/YYYY-MM-DD.jsonl`) と client 側
+(`logs/bridge-metrics/client-YYYY-MM-DD.jsonl` と CLI 用の `client-cli-YYYY-MM-DD.jsonl`) を別々に、endpoint x caller ごとに件数・lock の
 待ち/占有の p50/p95/最大・timeout と失敗の件数・lock state 別の件数・欠落率で出す。期間は
 各行の ts (UTC) で絞る。金曜の閉場の 1 時間前から閉場までの行は別の表にする。閉場は
 `agentic_fx.core.market_hours` の開から閉への実際の境界で判定する (休日は境界にならない)。
@@ -110,26 +110,27 @@ def summarize(rows: list[dict]) -> dict[tuple[str, str], dict[str, Any]]:
     return out
 
 
-def _source_files(base: Path) -> list[Path]:
-    """書込み中の file と、`<名前>.YYYY-MM-DD` のローテーション済み file。"""
-    pattern = re.compile(re.escape(base.name) + r"\.\d{4}-\d{2}-\d{2}")
+def _source_files(directory: Path, prefixes: tuple[str, ...]) -> list[Path]:
+    """`<prefix>YYYY-MM-DD.jsonl` の形の通常 file (日付順)。"""
+    patterns = [re.compile(re.escape(prefix) + r"\d{4}-\d{2}-\d{2}\.jsonl") for prefix in prefixes]
     try:
-        names = sorted(p for p in base.parent.iterdir() if pattern.fullmatch(p.name))
+        return sorted(p for p in directory.iterdir()
+                      if any(pattern.fullmatch(p.name) for pattern in patterns)
+                      and p.is_file() and not p.is_symlink())
     except OSError:
-        names = []
-    return names + [base]
+        return []
 
 
-def load_rows(base: Path | list[Path], start: date, end: date) -> tuple[list[dict], int]:
+def load_rows(directory: Path, prefixes: tuple[str, ...], start: date,
+              end: date) -> tuple[list[dict], int]:
     """行の ts が [start 0:00Z, end の翌日 0:00Z) のものだけを返す。読めない行は件数に数える。
 
-    `base` は書込み中の file (複数可)。それぞれのローテーション済みも読む。"""
+    `directory` の中の `<prefix>YYYY-MM-DD.jsonl` を `prefixes` のぶんだけ読む。"""
     lower = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
     upper = datetime(end.year, end.month, end.day, tzinfo=timezone.utc) + timedelta(days=1)
     rows: list[dict] = []
     bad = 0
-    bases = base if isinstance(base, list) else [base]
-    for path in [p for one in bases for p in _source_files(one)]:
+    for path in _source_files(directory, prefixes):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -186,8 +187,9 @@ def _date_arg(text: str) -> date:
         raise argparse.ArgumentTypeError("YYYY-MM-DD で指定してください") from None
 
 
-def _side(label: str, base: Path | list[Path], start: date, end: date) -> dict[str, Any]:
-    rows, bad = load_rows(base, start, end)
+def _side(label: str, directory: Path, prefixes: tuple[str, ...], start: date,
+          end: date) -> dict[str, Any]:
+    rows, bad = load_rows(directory, prefixes, start, end)
     return {"label": label, "rows": rows, "bad": bad,
             "overall": summarize(rows), "friday": summarize(friday_close_rows(rows))}
 
@@ -195,11 +197,11 @@ def _side(label: str, base: Path | list[Path], start: date, end: date) -> dict[s
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="bridge の記録 (bridge 側・client 側) の集計")
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="作業 root")
-    parser.add_argument("--bridge-file", type=Path, default=None,
-                        help="bridge 側の file (既定: <root>/mt5_bridge/logs/bridge-metrics.jsonl)")
-    parser.add_argument("--client-file", type=Path, action="append", default=None,
-                        help="client 側の file (複数指定可。既定: <root>/logs/bridge-metrics/ の "
-                             "client.jsonl と client-cli.jsonl)")
+    parser.add_argument("--bridge-dir", type=Path, default=None,
+                        help="bridge 側の記録 dir (既定: <root>/mt5_bridge/logs/bridge-metrics)")
+    parser.add_argument("--client-dir", type=Path, default=None,
+                        help="client 側の記録 dir (既定: <root>/logs/bridge-metrics。"
+                             "client-*.jsonl と client-cli-*.jsonl を読む)")
     today = datetime.now(timezone.utc).date()
     parser.add_argument("--from", dest="start", type=_date_arg, default=today - timedelta(days=7),
                         help="開始日 (UTC、既定は 7 日前)")
@@ -209,12 +211,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.start > args.end:
         parser.error("--from は --to 以前にしてください")
-    bridge_file = args.bridge_file or args.root / "mt5_bridge" / "logs" / "bridge-metrics.jsonl"
-    metrics_dir = args.root / "logs" / "bridge-metrics"
-    client_file = args.client_file or [metrics_dir / "client.jsonl",
-                                       metrics_dir / "client-cli.jsonl"]
-    sides = {"bridge": _side("bridge 側", bridge_file, args.start, args.end),
-             "client": _side("client 側", client_file, args.start, args.end)}
+    bridge_dir = args.bridge_dir or args.root / "mt5_bridge" / "logs" / "bridge-metrics"
+    client_dir = args.client_dir or args.root / "logs" / "bridge-metrics"
+    sides = {"bridge": _side("bridge 側", bridge_dir, ("",), args.start, args.end),
+             "client": _side("client 側", client_dir, ("client-", "client-cli-"),
+                             args.start, args.end)}
     if args.json:
         print(json.dumps({
             "from": args.start.isoformat(), "to": args.end.isoformat(),

@@ -196,15 +196,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:  # noqa: BLE001
         logger.error(f"MT5 connect failed at startup: {e}")
         # ブリッジ自体は起動を続行 (heartbeat に "connected=false" を返すため)
-    request_log.request_log.start(_LOG_DIR / "bridge-metrics.jsonl")
+    request_log.request_log.start(_LOG_DIR / "bridge-metrics")
     try:
         yield
     finally:
         try:
-            request_log.request_log.stop()
-        finally:
             if _client is not None:
                 _client.disconnect()
+        finally:
+            request_log.request_log.stop()
 
 
 # ── 認証 (api_key 設定時のみ強制) ────────────────────────────────────

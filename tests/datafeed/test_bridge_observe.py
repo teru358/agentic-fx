@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import logging.handlers
+import logging
 import os
+import queue
 import stat
 import subprocess
 import sys
@@ -20,6 +21,10 @@ from agentic_fx.datafeed import bridge_observe, sources
 BOOT = "0123456789abcdef"
 SLOT_ID = "req-abc.123"
 URL = "http://bridge.example.invalid:8812"
+
+
+def _today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 def _root(tmp_path: Path) -> Path:
@@ -206,7 +211,7 @@ def test_history_headers_and_ids_are_not_recorded_on_the_client(monkeypatch, tmp
     bridge_observe.bridge_get(f"{URL}/health")
     (row,) = _rows(root)
     assert set(row) == _CLIENT_KEYS
-    text = (root / "logs" / "bridge-metrics" / "client-cli.jsonl").read_text()
+    text = (root / "logs" / "bridge-metrics" / f"client-cli-{_today()}.jsonl").read_text()
     assert SLOT_ID not in text and BOOT not in text and "history" not in text
 
 
@@ -343,7 +348,7 @@ def test_file_is_client_jsonl_under_logs_with_private_mode(monkeypatch, tmp_path
     bridge_observe.bridge_get(f"{URL}/health")
     _rows(root)
     (path,) = (root / "logs" / "bridge-metrics").iterdir()
-    assert path.name == "client-cli.jsonl"
+    assert path.name == f"client-cli-{_today()}.jsonl"
     assert (path.stat().st_mode & 0o777) == 0o600
     assert path.read_text().endswith("\n") and len(path.read_text().splitlines()) == 1
     assert len(path.read_bytes()) < 1024
@@ -353,35 +358,44 @@ def test_existing_file_with_a_loose_mode_is_made_private_on_open(monkeypatch, tm
     root = _root(tmp_path)
     directory = root / "logs" / "bridge-metrics"
     directory.mkdir()
-    (directory / "client-cli.jsonl").write_text("")
-    (directory / "client-cli.jsonl").chmod(0o666)
+    existing = directory / f"client-cli-{_today()}.jsonl"
+    existing.write_text("")
+    existing.chmod(0o666)
     bridge_observe.configure(root, "cli")
     _patch_get(monkeypatch, _response(f"{URL}/health", headers=_headers()))
     bridge_observe.bridge_get(f"{URL}/health")
     assert len(_rows(root)) == 1
-    assert stat.S_IMODE((directory / "client-cli.jsonl").stat().st_mode) == 0o600
+    assert stat.S_IMODE(existing.stat().st_mode) == 0o600
 
 
-def test_writer_is_a_queue_in_front_of_a_midnight_utc_rotation_of_14_files(tmp_path):
+def test_writer_is_a_bounded_queue_and_a_daemon_thread_outside_the_logging_module(tmp_path):
     bridge_observe.configure(_root(tmp_path), "cli")
-    handler = bridge_observe.file_handler()
-    assert isinstance(handler, logging.handlers.TimedRotatingFileHandler)
-    assert handler.when == "MIDNIGHT" and handler.utc is True and handler.backupCount == 14
-    assert isinstance(bridge_observe.queue_handler(), logging.handlers.QueueHandler)
+    writer = bridge_observe._sink.writer
+    assert isinstance(writer.queue, queue.Queue) and writer.queue.maxsize > 0
+    assert writer._thread.daemon is True and writer._thread.is_alive()
+    assert logging.getLogger("bridge.observe.client").handlers == []
+
+
+def _block_writer(gate):
+    """writer の書込みを gate で止め、最初の 1 行を掴むまで待てる Event を返す。"""
+    writer = bridge_observe._sink.writer
+    real_append = writer._append
+    entered = threading.Event()
+
+    def slow_append(day, line):
+        entered.set()
+        assert gate.wait(20)
+        real_append(day, line)
+
+    writer._append = slow_append
+    return entered
 
 
 def test_the_call_only_enqueues_and_never_waits_for_a_blocked_writer(monkeypatch, tmp_path):
     root = _root(tmp_path)
     bridge_observe.configure(root, "cli", queue_size=3)
     gate = threading.Event()
-    handler = bridge_observe.file_handler()
-    real_emit = handler.emit
-
-    def slow_emit(record):
-        assert gate.wait(20)
-        real_emit(record)
-
-    handler.emit = slow_emit
+    _block_writer(gate)
     sentinel = _response(f"{URL}/health", headers=_headers())
     _patch_get(monkeypatch, sentinel)
     try:
@@ -403,7 +417,7 @@ def test_a_fifo_at_the_log_path_does_not_block_the_call_or_the_shutdown(monkeypa
     root = _root(tmp_path)
     directory = root / "logs" / "bridge-metrics"
     directory.mkdir()
-    os.mkfifo(directory / "client-cli.jsonl")
+    os.mkfifo(directory / f"client-cli-{_today()}.jsonl")
     bridge_observe.configure(root, "cli")
     sentinel = _response(f"{URL}/health", headers=_headers())
     _patch_get(monkeypatch, sentinel)
@@ -418,23 +432,22 @@ def test_nothing_is_written_outside_the_log_directory(monkeypatch, tmp_path):
     root = _root(tmp_path)
     outside = tmp_path / "outside"
     outside.mkdir()
-    (outside / "client-cli.jsonl").write_text("keep")
+    (outside / "keep.txt").write_text("keep")
     (root / "logs" / "bridge-metrics").symlink_to(outside)
     bridge_observe.configure(root, "cli")
     _patch_get(monkeypatch, _response(f"{URL}/health", headers=_headers()))
     bridge_observe.bridge_get(f"{URL}/health")
     bridge_observe.flush()
-    assert (outside / "client-cli.jsonl").read_text() == "keep"
-    assert sorted(p.name for p in outside.iterdir()) == ["client-cli.jsonl"]
+    assert sorted(p.name for p in outside.iterdir()) == ["keep.txt"]
     bridge_observe.reset()
     (root / "logs" / "bridge-metrics").unlink()
     directory = root / "logs" / "bridge-metrics"
     directory.mkdir()
-    (directory / "client-cli.jsonl").symlink_to(outside / "client-cli.jsonl")
+    (directory / f"client-cli-{_today()}.jsonl").symlink_to(outside / "keep.txt")
     bridge_observe.configure(root, "cli")
     bridge_observe.bridge_get(f"{URL}/health")
     bridge_observe.flush()
-    assert (outside / "client-cli.jsonl").read_text() == "keep"
+    assert (outside / "keep.txt").read_text() == "keep"
 
 
 def test_observed_fetch_wrapper_records_injected_fetch(tmp_path):
@@ -458,46 +471,79 @@ def test_observed_fetch_wrapper_records_injected_fetch(tmp_path):
     assert _rows(root)[1]["failure"] == "connect"
 
 
-def test_rotated_files_beyond_14_days_are_removed_and_nothing_else(tmp_path):
+def test_only_own_files_beyond_14_days_are_removed_at_the_day_change(tmp_path):
     root = _root(tmp_path)
     directory = root / "logs" / "bridge-metrics"
     directory.mkdir()
     day = datetime(2026, 1, 1)
-    for index in range(20):
-        (directory / f"client-cli.jsonl.{(day + timedelta(days=index)):%Y-%m-%d}").write_text("x\n")
-    for name in ("notes.txt", "client-cli.jsonl.bak", "2026-01-01.jsonl", "other.jsonl.2026-01-01"):
+    for prefix in ("client-cli-", "client-"):
+        for index in range(40):
+            (directory / f"{prefix}{(day + timedelta(days=index)):%Y-%m-%d}.jsonl").write_text("x\n")
+    for name in ("notes.txt", "client-cli-2026-01-01.jsonl.bak", "2026-01-01.jsonl",
+                 "other-2026-01-01.jsonl", "client-cli-2026-01-01.jsonl.2026-01-01"):
         (directory / name).write_text("keep")
     (directory / "sub").mkdir()
+    (directory / "client-cli-2025-01-02.jsonl").mkdir()
     outside = tmp_path / "outside.jsonl"
     outside.write_text("keep")
-    (directory / "client-cli.jsonl.2025-01-01").symlink_to(outside)
+    (directory / "client-cli-2025-01-01.jsonl").symlink_to(outside)
     bridge_observe.configure(root, "cli")
-    bridge_observe.file_handler().doRollover()
+    bridge_observe._sink.emit({"ts": "2026-02-10T00:00:00.000Z"})
     bridge_observe.flush()
-    rotated = sorted(p.name for p in directory.glob("client-cli.jsonl.2???-??-??"))
-    assert len(rotated) <= 14
-    assert "client-cli.jsonl.2026-01-01" not in rotated and "client-cli.jsonl.2025-01-01" not in rotated
-    for name in ("notes.txt", "client-cli.jsonl.bak", "2026-01-01.jsonl", "other.jsonl.2026-01-01"):
+    own = sorted(p.name for p in directory.glob("client-cli-2026-??-??.jsonl"))
+    assert own[0] == "client-cli-2026-01-27.jsonl" and "client-cli-2026-01-26.jsonl" not in own
+    assert "client-cli-2026-02-10.jsonl" in own
+    assert (directory / "client-2026-01-01.jsonl").exists()
+    for name in ("notes.txt", "client-cli-2026-01-01.jsonl.bak", "2026-01-01.jsonl",
+                 "other-2026-01-01.jsonl", "client-cli-2026-01-01.jsonl.2026-01-01"):
         assert (directory / name).read_text() == "keep"
-    assert (directory / "sub").is_dir()
+    assert (directory / "sub").is_dir() and (directory / "client-cli-2025-01-02.jsonl").is_dir()
+    assert (directory / "client-cli-2025-01-01.jsonl").is_symlink()
     assert outside.read_text() == "keep"
 
 
-def test_the_day_change_in_utc_rolls_the_file_over(monkeypatch, tmp_path):
+def test_rows_after_midnight_go_to_the_new_days_file_and_nothing_is_renamed(tmp_path):
     root = _root(tmp_path)
     directory = root / "logs" / "bridge-metrics"
-    directory.mkdir()
-    current = directory / "client-cli.jsonl"
-    current.write_text('{"ts":"old"}\n')
-    two_days_ago = time.time() - 2 * 86400
-    os.utime(current, (two_days_ago, two_days_ago))
+    bridge_observe.configure(root, "cli")
+    for ts in ("2026-11-16T23:59:59.999Z", "2026-11-17T00:00:00.001Z", "2026-11-17T08:00:00.000Z"):
+        bridge_observe._sink.emit({"ts": ts})
+    bridge_observe.flush()
+    assert sorted(p.name for p in directory.iterdir()) == [
+        "client-cli-2026-11-16.jsonl", "client-cli-2026-11-17.jsonl"]
+    assert len((directory / "client-cli-2026-11-16.jsonl").read_text().splitlines()) == 1
+    assert len((directory / "client-cli-2026-11-17.jsonl").read_text().splitlines()) == 2
+
+
+@pytest.mark.parametrize("missing", [
+    ("O_NOFOLLOW",), ("O_NOFOLLOW", "O_NONBLOCK", "geteuid", "fchmod"),
+])
+def test_rows_are_written_where_the_posix_only_attributes_do_not_exist(
+        monkeypatch, tmp_path, missing):
+    root = _root(tmp_path)
+    for name in missing:
+        monkeypatch.delattr(os, name, raising=False)
     bridge_observe.configure(root, "cli")
     _patch_get(monkeypatch, _response(f"{URL}/health", headers=_headers()))
     bridge_observe.bridge_get(f"{URL}/health")
-    bridge_observe.flush()
-    stamp = datetime.fromtimestamp(two_days_ago, timezone.utc).strftime("%Y-%m-%d")
-    assert (directory / f"client-cli.jsonl.{stamp}").read_text() == '{"ts":"old"}\n'
-    assert len(current.read_text().splitlines()) == 1
+    assert len(_rows(root)) == 1
+
+
+def test_reset_returns_within_its_deadline_while_a_write_never_returns(monkeypatch, tmp_path):
+    root = _root(tmp_path)
+    bridge_observe.configure(root, "cli", queue_size=2)
+    gate = threading.Event()
+    entered = _block_writer(gate)
+    _patch_get(monkeypatch, _response(f"{URL}/health", headers=_headers()))
+    try:
+        bridge_observe.bridge_get(f"{URL}/health")
+        assert entered.wait(10)
+        sink = bridge_observe._sink
+        started = time.monotonic()
+        sink.stop(timeout=0.3)
+        assert time.monotonic() - started < 2
+    finally:
+        gate.set()
 
 
 def test_every_bridge_request_carries_the_caller_label_even_when_unconfigured(
@@ -725,31 +771,17 @@ def test_caller_label_is_added_to_headers_of_any_mapping_shape_without_losing_ke
     assert pairs == [("X-Api-Key", "k-secret")]
 
 
-def _block_writer(sink_handler, gate):
-    """writer を gate で止め、最初の 1 行を掴むまで待てる Event を返す。"""
-    real_emit = sink_handler.emit
-    entered = threading.Event()
-
-    def slow_emit(record):
-        entered.set()
-        assert gate.wait(20)
-        real_emit(record)
-
-    sink_handler.emit = slow_emit
-    return entered
-
-
 def test_stopping_with_a_full_queue_neither_raises_nor_hangs(tmp_path):
     root = _root(tmp_path)
     bridge_observe.configure(root, "cli", queue_size=2)
     gate = threading.Event()
-    entered = _block_writer(bridge_observe.file_handler(), gate)
+    entered = _block_writer(gate)
     sink = bridge_observe._sink
     sink.emit({"ts": "t"})
     assert entered.wait(10)
     for _ in range(8):
         sink.emit({"ts": "t"})
-    assert sink._queue.full()
+    assert sink.writer.queue.full()
     timer = threading.Timer(0.3, gate.set)
     timer.start()
     try:
@@ -762,13 +794,13 @@ def test_stopping_with_a_full_queue_neither_raises_nor_hangs(tmp_path):
 
 def _two_concurrent_emits(sink):
     barrier = threading.Barrier(2, timeout=5)
-    real = sink._logger.info
+    real = sink.writer.submit
 
     def waiting(*args, **kwargs):
         barrier.wait()
-        real(*args, **kwargs)
+        return real(*args, **kwargs)
 
-    sink._logger.info = waiting
+    sink.writer.submit = waiting
     threads = [threading.Thread(target=sink.emit, args=({"ts": "t"},)) for _ in range(2)]
     for thread in threads:
         thread.start()
@@ -792,7 +824,7 @@ def test_a_dropped_row_hands_back_the_drops_it_was_carrying(tmp_path):
     root = _root(tmp_path)
     bridge_observe.configure(root, "cli", queue_size=1)
     gate = threading.Event()
-    _block_writer(bridge_observe.file_handler(), gate)
+    _block_writer(gate)
     sink = bridge_observe._sink
     try:
         for _ in range(12):
@@ -857,9 +889,10 @@ def test_cli_and_daemon_write_to_separate_files(monkeypatch, tmp_path):
     bridge_observe.bridge_get(f"{URL}/health")
     bridge_observe.flush()
     directory = root / "logs" / "bridge-metrics"
-    assert sorted(p.name for p in directory.iterdir()) == ["client-cli.jsonl", "client.jsonl"]
-    assert json.loads((directory / "client-cli.jsonl").read_text())["caller"] == "cli"
-    assert json.loads((directory / "client.jsonl").read_text())["caller"] == "unknown"
+    assert sorted(p.name for p in directory.iterdir()) == [
+        f"client-{_today()}.jsonl", f"client-cli-{_today()}.jsonl"]
+    assert json.loads((directory / f"client-cli-{_today()}.jsonl").read_text())["caller"] == "cli"
+    assert json.loads((directory / f"client-{_today()}.jsonl").read_text())["caller"] == "unknown"
 
 
 def test_the_metrics_directory_is_private_when_created_and_when_it_already_exists(

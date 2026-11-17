@@ -2,6 +2,7 @@
 import fcntl
 import json
 import os
+import threading
 import time
 from datetime import timedelta
 
@@ -285,8 +286,9 @@ def test_lock_contention_stops_only_the_fill_and_never_waits(
             return real_flock(f, op)
 
         monkeypatch.setattr(state_module.fcntl, "flock", counting)
+        ticking = threading.get_ident()
         monkeypatch.setattr(state_module.time, "sleep",
-                            lambda s: sleeps.append(s))
+                            lambda s: sleeps.append((threading.get_ident(), s)))
         env.bars["USDJPY"] = _bar(WED, o=148.0, h=148.05, l=147.5, c=147.6)
         started = time.monotonic()
         env.sched.tick(WED + timedelta(minutes=1))
@@ -295,11 +297,44 @@ def test_lock_contention_stops_only_the_fill_and_never_waits(
         _release(fd)
     nb = [op for op in calls if op & fcntl.LOCK_NB]
     assert len(nb) == 1 and nb[0] & fcntl.LOCK_SH
-    assert sleeps == []
+    assert [s for ident, s in sleeps if ident == ticking] == []
     assert _status(env, oid) == "pending_fill"
     assert orders.get(env.conn, oid)["close_reason"] is None
     assert orders.get(env.conn, open_id)["close_reason"] == "sl"
     assert _events(env).count("kill_switch_fill_guard_unavailable") == 1
+
+
+def test_sleeps_of_other_threads_are_not_counted_as_the_ticks_wait(
+        tmp_path, monkeypatch):
+    env = Env(tmp_path)
+    oid = env.place_limit(price=148.20)
+    _swing_open(env)
+    fd = _contend(env)
+    stop = threading.Event()
+    sleeps = []
+    ticking = threading.get_ident()
+    monkeypatch.setattr(state_module.time, "sleep",
+                        lambda s: sleeps.append((threading.get_ident(), s)))
+
+    def background():
+        while not stop.is_set():
+            state_module.time.sleep(0.001)
+            stop.wait(0.001)
+
+    thread = threading.Thread(target=background)
+    thread.start()
+    deadline = time.monotonic() + 5
+    while not sleeps and time.monotonic() < deadline:
+        stop.wait(0.001)
+    try:
+        env.bars["USDJPY"] = _bar(WED, o=148.0, h=148.05, l=147.5, c=147.6)
+        env.sched.tick(WED + timedelta(minutes=1))
+    finally:
+        stop.set()
+        thread.join()
+        _release(fd)
+    assert sleeps and all(ident != ticking for ident, _ in sleeps)
+    assert _status(env, oid) == "pending_fill"
 
 
 def test_unavailable_activity_is_recorded_once_per_outage_and_recovers(tmp_path):

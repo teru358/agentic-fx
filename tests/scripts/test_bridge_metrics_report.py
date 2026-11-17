@@ -30,10 +30,9 @@ def _row(ts: str, *, caller="tick", route="/ohlcv/{symbol}", status=200, lock_st
     }
 
 
-def _write(base: Path, suffix: str | None, rows: list[dict], extra: list[str] | None = None) -> Path:
-    """`base` (書込み中の file) または `base.<日付>` (ローテーション済み) に行を書く。"""
-    base.parent.mkdir(parents=True, exist_ok=True)
-    path = base if suffix is None else base.with_name(f"{base.name}.{suffix}")
+def _write(path: Path, rows: list[dict], extra: list[str] | None = None) -> Path:
+    """`path` (日付入りの file) に行を書く。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
     lines = [json.dumps(r) for r in rows] + (extra or [])
     path.write_text("\n".join(lines) + "\n")
     return path
@@ -138,32 +137,35 @@ def test_friday_window_agrees_with_the_calendar_for_every_friday_of_a_year():
         day += timedelta(days=7)
 
 
-def test_load_rows_reads_rotated_files_and_filters_by_the_row_timestamp(tmp_path):
-    base = tmp_path / "bridge-metrics.jsonl"
-    _write(base, "2026-11-09", [_row("2026-11-09T23:59:59.999Z"), _row("2026-11-10T00:00:00.000Z")],
+def test_load_rows_reads_dated_files_and_filters_by_the_row_timestamp(tmp_path):
+    _write(tmp_path / "2026-11-09.jsonl",
+           [_row("2026-11-09T23:59:59.999Z"), _row("2026-11-10T00:00:00.000Z")],
            extra=["not json", "[1]", '{"ts": 5}'])
-    _write(base, "2026-11-10", [_row("2026-11-10T12:00:00.000Z")])
-    _write(base, None, [_row("2026-11-11T23:59:59.999Z"), _row("2026-11-12T00:00:00.000Z")])
-    (tmp_path / "bridge-metrics.jsonl.bak").write_text(json.dumps(_row("2026-11-10T01:00:00.000Z")))
+    _write(tmp_path / "2026-11-10.jsonl", [_row("2026-11-10T12:00:00.000Z")])
+    _write(tmp_path / "2026-11-11.jsonl",
+           [_row("2026-11-11T23:59:59.999Z"), _row("2026-11-12T00:00:00.000Z")])
+    (tmp_path / "2026-11-10.jsonl.bak").write_text(json.dumps(_row("2026-11-10T01:00:00.000Z")))
     (tmp_path / "unrelated.jsonl").write_text(json.dumps(_row("2026-11-10T01:00:00.000Z")))
-    rows, bad = report.load_rows(base, date(2026, 11, 10), date(2026, 11, 11))
+    (tmp_path / "client-2026-11-10.jsonl").write_text(json.dumps(_row("2026-11-10T01:00:00.000Z")))
+    rows, bad = report.load_rows(tmp_path, ("",), date(2026, 11, 10), date(2026, 11, 11))
     assert sorted(r["ts"] for r in rows) == [
         "2026-11-10T00:00:00.000Z", "2026-11-10T12:00:00.000Z", "2026-11-11T23:59:59.999Z"]
     assert bad == 3
 
 
-def test_load_rows_of_a_missing_file_is_empty(tmp_path):
-    assert report.load_rows(tmp_path / "none.jsonl", date(2026, 11, 10), date(2026, 11, 11)) == ([], 0)
+def test_load_rows_of_a_missing_directory_is_empty(tmp_path):
+    assert report.load_rows(tmp_path / "none", ("",), date(2026, 11, 10),
+                            date(2026, 11, 11)) == ([], 0)
 
 
 def _both(tmp_path: Path) -> tuple[Path, Path]:
-    bridge = tmp_path / "bridge" / "bridge-metrics.jsonl"
-    client = tmp_path / "logs" / "bridge-metrics" / "client.jsonl"
-    _write(bridge, None, [
+    bridge = tmp_path / "bridge" / "bridge-metrics"
+    client = tmp_path / "logs" / "bridge-metrics"
+    _write(bridge / "2026-11-13.jsonl", [
         _row("2026-11-13T10:00:00.000Z"),
         _row("2026-11-13T21:30:00.000Z", caller="cli", route="/ohlcv/{symbol}"),
     ])
-    _write(client, None, [
+    _write(client / "client-2026-11-13.jsonl", [
         _row("2026-11-13T10:00:00.000Z"),
         _row("2026-11-13T21:30:00.000Z", failure="timeout", status=None, lock_state="missing"),
         _row("2026-11-13T21:31:00.000Z", failure="timeout", status=None, lock_state="missing"),
@@ -171,9 +173,9 @@ def _both(tmp_path: Path) -> tuple[Path, Path]:
     return bridge, client
 
 
-def test_main_aggregates_the_bridge_file_and_the_client_file_separately(tmp_path, capsys):
+def test_main_aggregates_the_bridge_dir_and_the_client_dir_separately(tmp_path, capsys):
     bridge, client = _both(tmp_path)
-    args = ["--bridge-file", str(bridge), "--client-file", str(client),
+    args = ["--bridge-dir", str(bridge), "--client-dir", str(client),
             "--from", "2026-11-13", "--to", "2026-11-13"]
     assert report.main(args) == 0
     out = capsys.readouterr().out
@@ -188,7 +190,7 @@ def test_main_aggregates_the_bridge_file_and_the_client_file_separately(tmp_path
 
 
 def test_main_defaults_to_the_root_layout_and_survives_missing_files(tmp_path, capsys):
-    _write(tmp_path / "logs" / "bridge-metrics" / "client.jsonl", None,
+    _write(tmp_path / "logs" / "bridge-metrics" / "client-2026-11-13.jsonl",
            [_row("2026-11-13T10:00:00.000Z")])
     assert report.main(["--root", str(tmp_path), "--from", "2026-11-13", "--to", "2026-11-13",
                         "--json"]) == 0
@@ -223,17 +225,17 @@ def test_script_uses_only_the_standard_library_and_the_market_calendar():
 
 def test_dropped_before_is_summed_in_its_own_column_apart_from_the_lock_header_loss(
         tmp_path, capsys):
-    bridge = tmp_path / "bridge" / "bridge-metrics.jsonl"
+    bridge = tmp_path / "bridge" / "bridge-metrics"
     rows = [_row("2026-11-13T10:00:00.000Z"),
             {**_row("2026-11-13T10:00:01.000Z"), "dropped_before": 3},
             {**_row("2026-11-13T10:00:02.000Z"), "dropped_before": 4},
             {**_row("2026-11-13T10:00:03.000Z"), "dropped_before": "x"}]
-    _write(bridge, None, rows)
+    _write(bridge / "2026-11-13.jsonl", rows)
     summary = report.summarize(rows)
     (stat,) = summary.values()
     assert stat["dropped_records"] == 7
     assert stat["missing_rate"] == 0
-    args = ["--bridge-file", str(bridge), "--client-file", str(tmp_path / "none.jsonl"),
+    args = ["--bridge-dir", str(bridge), "--client-dir", str(tmp_path / "none"),
             "--from", "2026-11-13", "--to", "2026-11-13"]
     assert report.main(args) == 0
     out = capsys.readouterr().out
@@ -243,13 +245,13 @@ def test_dropped_before_is_summed_in_its_own_column_apart_from_the_lock_header_l
     assert data["bridge"]["overall"][0]["dropped_records"] == 7
 
 
-def test_client_side_reads_the_daemon_and_cli_files_with_their_rotated_copies(tmp_path, capsys):
+def test_client_side_reads_the_daemon_and_cli_files_of_every_day(tmp_path, capsys):
     directory = tmp_path / "logs" / "bridge-metrics"
-    _write(directory / "client.jsonl", None, [_row("2026-11-13T10:00:00.000Z")])
-    _write(directory / "client.jsonl", "2026-11-12", [_row("2026-11-12T10:00:00.000Z")])
-    _write(directory / "client-cli.jsonl", None,
+    _write(directory / "client-2026-11-13.jsonl", [_row("2026-11-13T10:00:00.000Z")])
+    _write(directory / "client-2026-11-12.jsonl", [_row("2026-11-12T10:00:00.000Z")])
+    _write(directory / "client-cli-2026-11-13.jsonl",
            [_row("2026-11-13T11:00:00.000Z", caller="cli")])
-    _write(directory / "client-cli.jsonl", "2026-11-12",
+    _write(directory / "client-cli-2026-11-12.jsonl",
            [_row("2026-11-12T11:00:00.000Z", caller="cli")])
     assert report.main(["--root", str(tmp_path), "--from", "2026-11-12", "--to", "2026-11-13",
                         "--json"]) == 0

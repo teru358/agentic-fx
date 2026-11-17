@@ -1,20 +1,21 @@
 """bridge の要求ごとの構造化記録 (1 要求 1 行の JSON) のテスト。
 
-記録は標準 logging の QueueHandler + QueueListener + TimedRotatingFileHandler で書く。
-要求の処理は enqueue だけで待たず、記録の失敗は応答に影響させない。
+記録は有界 queue と daemon thread の writer が、UTC 日付入りの file へ追記する。
+要求の処理は queue への put_nowait だけで待たず、記録の失敗は応答に影響させない。
 """
 from __future__ import annotations
 
 import asyncio
 import json
-import logging.handlers
+import logging
 import os
+import queue
 import re
 import stat
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -84,9 +85,13 @@ def configured(monkeypatch):
     monkeypatch.setattr(bridge_metrics, "history_slot", bridge_metrics.HistorySlot())
 
 
+def _today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
 @pytest.fixture
 def log(tmp_path):
-    path = tmp_path / "logs" / "bridge-metrics.jsonl"
+    path = tmp_path / "logs" / "bridge-metrics"
     path.parent.mkdir()
     sink = request_log.RequestLog()
     request_log.request_log = sink
@@ -95,12 +100,13 @@ def log(tmp_path):
     sink.stop()
 
 
+def _text(path):
+    return "".join(item.read_text() for item in sorted(path.glob("*.jsonl")))
+
+
 def _rows(sink, path):
     sink.flush()
-    out = []
-    for item in sorted(path.parent.glob(path.name + "*")):
-        out += [json.loads(line) for line in item.read_text().splitlines()]
-    return out
+    return [json.loads(line) for line in _text(path).splitlines()]
 
 
 _ALL_KEYS = {
@@ -119,7 +125,8 @@ def test_each_request_writes_one_json_line_with_the_fixed_fields(configured, log
     assert row["lock_state"] in {"measured", "not_locked", "unavailable"}
     assert row["error_code"] is None
     assert datetime.strptime(row["ts"], "%Y-%m-%dT%H:%M:%S.%fZ")
-    assert path.read_text().count("\n") == 1
+    assert _text(path).count("\n") == 1
+    assert [item.name for item in path.iterdir()] == [f"{_today()}.jsonl"]
 
 
 @pytest.mark.parametrize("value,expected", [
@@ -154,7 +161,7 @@ def test_route_is_a_fixed_shape_and_raw_path_is_never_written(configured, log, p
     _call("GET", path_in, {"X-Bridge-Api-Key": _API_KEY}, query="token=abc123&x=1")
     (row,) = _rows(sink, path)
     assert row["route"] == route
-    text = path.read_text()
+    text = _text(path)
     for forbidden in ("EURUSD", "12345", "secret-looking", "token=", "abc123", _API_KEY):
         assert forbidden not in text
 
@@ -207,7 +214,7 @@ def test_lock_figures_and_history_state_are_recorded_without_ids(configured, log
           query="from=2026-06-30T00:00:00Z&to=2026-06-30T06:00:00Z&interval=1h")
     (row,) = _rows(sink, path)
     assert row["history_state"] in {"none", "waiting", "holding", "completed"}
-    text = path.read_text()
+    text = _text(path)
     assert "req-secret" not in text and bridge_metrics.BOOT_ID not in text
 
 
@@ -216,7 +223,8 @@ def test_no_secret_header_or_price_reaches_the_file(configured, log, monkeypatch
     monkeypatch.setattr(server, "_client", _Client())
     _call("GET", "/quote/EURUSD", {"X-Bridge-Api-Key": _API_KEY, "X-Afx-Caller": "tick",
                                    "Authorization": "Bearer abc"})
-    text = path.read_text()
+    sink.flush()
+    text = _text(path)
     for forbidden in (_API_KEY, "1.2345", "Bearer", "http", "127.0.0.1", "X-Bridge"):
         assert forbidden not in text
 
@@ -234,7 +242,7 @@ def test_responses_are_identical_with_and_without_the_log(configured, tmp_path, 
     monkeypatch.setattr(server, "_client", _Client())
     headers = {"X-Bridge-Api-Key": _API_KEY, "X-Afx-Caller": "cli"}
     before = _call("GET", "/quote/EURUSD", headers)
-    path = tmp_path / "bridge-metrics.jsonl"
+    path = tmp_path / "bridge-metrics"
     sink = request_log.RequestLog()
     monkeypatch.setattr(request_log, "request_log", sink)
     sink.start(path)
@@ -246,57 +254,105 @@ def test_responses_are_identical_with_and_without_the_log(configured, tmp_path, 
     assert sorted(k for k, _ in before[1]) == sorted(k for k, _ in after[1])
 
 
-def test_file_handler_is_a_midnight_utc_rotation_of_14_files_behind_a_queue(log):
+def test_writer_is_a_bounded_queue_and_a_daemon_thread_outside_the_logging_module(log):
     sink, path = log
-    handler = sink.file_handler
-    assert isinstance(handler, logging.handlers.TimedRotatingFileHandler)
-    assert handler.when == "MIDNIGHT" and handler.utc is True and handler.backupCount == 14
-    assert isinstance(sink.queue_handler, logging.handlers.QueueHandler)
-    assert isinstance(sink.listener, logging.handlers.QueueListener)
+    writer = sink._writer
+    assert isinstance(writer.queue, queue.Queue) and writer.queue.maxsize > 0
+    assert writer._thread.daemon is True and writer._thread.is_alive()
+    assert logging.getLogger("bridge.request_log").handlers == []
 
 
-def test_files_beyond_the_14_day_retention_do_not_remain(log):
+def _row_at(ts):
+    return {"ts": ts, "caller": "tick"}
+
+
+def test_rows_after_midnight_go_to_the_new_days_file_and_nothing_is_renamed(log):
     sink, path = log
+    sink.emit(_row_at("2026-11-16T23:59:59.999Z"))
+    sink.emit(_row_at("2026-11-17T00:00:00.001Z"))
+    sink.emit(_row_at("2026-11-17T08:00:00.000Z"))
     sink.flush()
+    assert sorted(item.name for item in path.iterdir()) == ["2026-11-16.jsonl", "2026-11-17.jsonl"]
+    assert len((path / "2026-11-16.jsonl").read_text().splitlines()) == 1
+    assert len((path / "2026-11-17.jsonl").read_text().splitlines()) == 2
+
+
+def test_only_own_files_beyond_14_days_are_removed_at_the_day_change(log):
+    sink, path = log
+    path.mkdir(exist_ok=True)
     day = datetime(2026, 1, 1)
-    for index in range(20):
-        (path.parent / f"{path.name}.{(day + timedelta(days=index)):%Y-%m-%d}").write_text("x\n")
-    (path.parent / "other.txt").write_text("keep")
-    sink.file_handler.doRollover()
-    kept = sorted(p.name for p in path.parent.glob(path.name + ".*"))
-    assert len(kept) <= 14
-    assert f"{path.name}.2026-01-01" not in kept
-    assert (path.parent / "other.txt").read_text() == "keep"
+    for index in range(40):
+        (path / f"{(day + timedelta(days=index)):%Y-%m-%d}.jsonl").write_text("x\n")
+    for name in ("notes.txt", "2026-01-01.jsonl.bak", "client-2026-01-01.jsonl",
+                 "2026-01-01.jsonl.2026-01-01"):
+        (path / name).write_text("keep")
+    (path / "sub").mkdir()
+    outside = path.parent / "outside.jsonl"
+    outside.write_text("keep")
+    (path / "2025-01-01.jsonl").symlink_to(outside)
+    (path / "2025-01-02.jsonl").mkdir()
+    sink.emit(_row_at("2026-02-10T00:00:00.000Z"))
+    sink.flush()
+    kept = sorted(item.name for item in path.glob("2026-??-??.jsonl"))
+    assert kept[0] == "2026-01-27.jsonl" and "2026-01-26.jsonl" not in kept
+    assert "2026-02-10.jsonl" in kept
+    for name in ("notes.txt", "2026-01-01.jsonl.bak", "client-2026-01-01.jsonl",
+                 "2026-01-01.jsonl.2026-01-01"):
+        assert (path / name).read_text() == "keep"
+    assert (path / "sub").is_dir() and (path / "2025-01-02.jsonl").is_dir()
+    assert (path / "2025-01-01.jsonl").is_symlink() and outside.read_text() == "keep"
+
+
+@pytest.mark.parametrize("missing", [
+    ("O_NOFOLLOW",), ("O_NOFOLLOW", "O_NONBLOCK", "geteuid", "fchmod"),
+])
+def test_rows_are_written_where_the_posix_only_attributes_do_not_exist(
+        configured, tmp_path, monkeypatch, missing):
+    for name in missing:
+        monkeypatch.delattr(os, name, raising=False)
+    path = tmp_path / "bridge-metrics"
+    sink = request_log.RequestLog()
+    sink.start(path)
+    try:
+        sink.emit({"ts": "t"})
+        sink.flush()
+        assert len(_text(path).splitlines()) == 1
+    finally:
+        sink.stop()
 
 
 def test_new_and_existing_files_are_private(configured, tmp_path):
-    path = tmp_path / "bridge-metrics.jsonl"
+    path = tmp_path / "bridge-metrics"
     sink = request_log.RequestLog()
     sink.start(path)
     try:
         sink.emit({"ts": "t"})
         sink.flush()
-        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        (item,) = path.iterdir()
+        assert stat.S_IMODE(item.stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.stat().st_mode) == 0o700
     finally:
         sink.stop()
-    path.chmod(0o666)
+    item.chmod(0o666)
+    path.chmod(0o755)
     sink = request_log.RequestLog()
     sink.start(path)
     try:
         sink.emit({"ts": "t"})
         sink.flush()
-        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(item.stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.stat().st_mode) == 0o700
     finally:
         sink.stop()
 
 
-def test_nothing_is_written_outside_the_log_file(configured, tmp_path):
+def test_nothing_is_written_outside_the_log_directory(configured, tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
     target = outside / "target.txt"
     target.write_text("keep")
-    link = tmp_path / "bridge-metrics.jsonl"
-    link.symlink_to(target)
+    link = tmp_path / "bridge-metrics"
+    link.symlink_to(outside)
     sink = request_log.RequestLog()
     sink.start(link)
     try:
@@ -304,14 +360,12 @@ def test_nothing_is_written_outside_the_log_file(configured, tmp_path):
         sink.flush()
     finally:
         sink.stop()
-    assert target.read_text() == "keep"
-    old = tmp_path / "bridge-metrics.jsonl.2020-01-01"
-    old.symlink_to(target)
-    assert old.is_symlink()
-    other = tmp_path / "second.jsonl"
-    other.write_text("")
+    assert target.read_text() == "keep" and sorted(p.name for p in outside.iterdir()) == ["target.txt"]
+    link.unlink()
+    link.mkdir()
+    (link / f"{_today()}.jsonl").symlink_to(target)
     sink = request_log.RequestLog()
-    sink.start(other)
+    sink.start(link)
     try:
         sink.emit({"ts": "t"})
         sink.flush()
@@ -322,8 +376,9 @@ def test_nothing_is_written_outside_the_log_file(configured, tmp_path):
 
 def test_a_fifo_at_the_log_path_blocks_neither_the_request_nor_the_shutdown(
         configured, tmp_path, monkeypatch):
-    path = tmp_path / "bridge-metrics.jsonl"
-    os.mkfifo(path)
+    path = tmp_path / "bridge-metrics"
+    path.mkdir()
+    os.mkfifo(path / f"{_today()}.jsonl")
     sink = request_log.RequestLog()
     monkeypatch.setattr(request_log, "request_log", sink)
     sink.start(path)
@@ -340,7 +395,7 @@ def test_a_failing_log_never_changes_the_response(configured, tmp_path, monkeypa
     monkeypatch.setattr(server, "_client", _Client())
     headers = {"X-Bridge-Api-Key": _API_KEY}
     baseline = _call("GET", "/quote/EURUSD", headers)
-    missing = tmp_path / "no-such-dir" / "bridge-metrics.jsonl"
+    missing = tmp_path / "no-such-dir" / "bridge-metrics"
     sink = request_log.RequestLog()
     monkeypatch.setattr(request_log, "request_log", sink)
     sink.start(missing)
@@ -361,18 +416,12 @@ def test_a_failing_log_never_changes_the_response(configured, tmp_path, monkeypa
 
 def test_a_blocked_writer_never_makes_a_request_wait_and_drops_are_counted(
         configured, tmp_path, monkeypatch):
-    path = tmp_path / "bridge-metrics.jsonl"
+    path = tmp_path / "bridge-metrics"
     sink = request_log.RequestLog()
     monkeypatch.setattr(request_log, "request_log", sink)
     sink.start(path, queue_size=3)
     gate = threading.Event()
-    real_emit = sink.file_handler.emit
-
-    def slow_emit(record):
-        assert gate.wait(20)
-        real_emit(record)
-
-    sink.file_handler.emit = slow_emit
+    _block_writer(sink, gate)
     try:
         started = time.monotonic()
         for _ in range(12):
@@ -393,10 +442,10 @@ def test_a_blocked_writer_never_makes_a_request_wait_and_drops_are_counted(
 def test_emit_before_start_and_after_stop_is_a_no_op(tmp_path):
     sink = request_log.RequestLog()
     sink.emit({"ts": "t"})
-    sink.start(tmp_path / "a.jsonl")
+    sink.start(tmp_path / "a")
     sink.stop()
     sink.emit({"ts": "t"})
-    assert not (tmp_path / "a.jsonl").exists() or (tmp_path / "a.jsonl").read_text() == ""
+    assert not (tmp_path / "a").exists() or list((tmp_path / "a").iterdir()) == []
 
 
 def test_lifespan_starts_the_log_under_logs_and_stops_it(configured, tmp_path, monkeypatch):
@@ -433,22 +482,25 @@ def test_lifespan_starts_the_log_under_logs_and_stops_it(configured, tmp_path, m
 
     asyncio.run(run())
     assert not request_log.request_log.active
-    (line,) = (logs / "bridge-metrics.jsonl").read_text().splitlines()
+    (written,) = (logs / "bridge-metrics").iterdir()
+    assert written.name == f"{_today()}.jsonl"
+    (line,) = written.read_text().splitlines()
     assert json.loads(line)["caller"] == "cli"
-    assert stat.S_IMODE((logs / "bridge-metrics.jsonl").stat().st_mode) == 0o600
+    assert stat.S_IMODE(written.stat().st_mode) == 0o600
 
 
 def _block_writer(sink, gate):
-    """writer を gate で止め、最初の 1 行を掴むまで待てる Event を返す。"""
-    real_emit = sink.file_handler.emit
+    """writer の書込みを gate で止め、最初の 1 行を掴むまで待てる Event を返す。"""
+    writer = sink._writer
+    real_append = writer._append
     entered = threading.Event()
 
-    def slow_emit(record):
+    def slow_append(day, line):
         entered.set()
         assert gate.wait(20)
-        real_emit(record)
+        real_append(day, line)
 
-    sink.file_handler.emit = slow_emit
+    writer._append = slow_append
     return entered
 
 
@@ -457,12 +509,12 @@ def _fill_queue(sink, entered):
     assert entered.wait(10)
     for _ in range(8):
         sink.emit({"ts": "t"})
-    assert sink._queue.full()
+    assert sink._writer.queue.full()
 
 
 def test_stopping_with_a_full_queue_neither_raises_nor_hangs(tmp_path):
     sink = request_log.RequestLog()
-    sink.start(tmp_path / "a.jsonl", queue_size=2)
+    sink.start(tmp_path / "a", queue_size=2)
     gate = threading.Event()
     _fill_queue(sink, _block_writer(sink, gate))
     timer = threading.Timer(0.3, gate.set)
@@ -473,6 +525,20 @@ def test_stopping_with_a_full_queue_neither_raises_nor_hangs(tmp_path):
         gate.set()
         timer.join()
     assert not sink.active
+
+
+def test_stop_returns_within_its_deadline_while_a_write_never_returns(tmp_path):
+    sink = request_log.RequestLog()
+    sink.start(tmp_path / "a", queue_size=2)
+    gate = threading.Event()
+    _fill_queue(sink, _block_writer(sink, gate))
+    try:
+        started = time.monotonic()
+        sink.stop(timeout=0.3)
+        assert time.monotonic() - started < 2
+        assert not sink.active
+    finally:
+        gate.set()
 
 
 def test_lifespan_disconnects_mt5_even_when_the_log_queue_is_full(configured, tmp_path, monkeypatch):
@@ -502,31 +568,35 @@ def test_lifespan_disconnects_mt5_even_when_the_log_queue_is_full(configured, tm
     monkeypatch.setattr(server, "Mt5Client", FakeClient)
     sink = request_log.RequestLog()
     original_start = sink.start
+    original_stop = sink.stop
     sink.start = lambda path: original_start(path, queue_size=2)
     monkeypatch.setattr(request_log, "request_log", sink)
     gate = threading.Event()
 
     async def run():
         async with server.lifespan(server.app):
+            sink.stop = lambda *args, **kwargs: (
+                events.append("stop"), original_stop(*args, **kwargs))
             _fill_queue(sink, _block_writer(sink, gate))
-            threading.Timer(0.3, gate.set).start()
 
+    started = time.monotonic()
     try:
         asyncio.run(run())
     finally:
         gate.set()
-    assert events == ["disconnect"]
+    assert events == ["disconnect", "stop"]
+    assert time.monotonic() - started < 10
 
 
 def _two_concurrent_emits(sink):
     barrier = threading.Barrier(2, timeout=5)
-    real = sink._logger.info
+    real = sink._writer.submit
 
     def waiting(*args, **kwargs):
         barrier.wait()
-        real(*args, **kwargs)
+        return real(*args, **kwargs)
 
-    sink._logger.info = waiting
+    sink._writer.submit = waiting
     threads = [threading.Thread(target=sink.emit, args=({"ts": "t"},)) for _ in range(2)]
     for thread in threads:
         thread.start()
@@ -545,7 +615,7 @@ def test_concurrent_emits_report_each_drop_once(log):
 
 
 def test_a_dropped_row_hands_back_the_drops_it_was_carrying(tmp_path):
-    path = tmp_path / "a.jsonl"
+    path = tmp_path / "a"
     sink = request_log.RequestLog()
     sink.start(path, queue_size=1)
     gate = threading.Event()

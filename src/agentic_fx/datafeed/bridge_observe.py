@@ -1,10 +1,10 @@
 """bridge への HTTP 呼出しの client 側の受動観測。
 
 応答の `X-Bridge-*` header と client から見た経過時間・timeout・接続失敗の種別を、1 要求 1 行で
-`<root>/logs/bridge-metrics/` の下へ書く (daemon は `client.jsonl`、CLI は `client-cli.jsonl`。
-process の種類ごとに file を分け、深夜の日替わりで前日分を互いに消し合わない)。書込みは標準 logging の QueueHandler への
-enqueue だけで、呼出しは待たない (詰まったら捨てて欠落数を数える)。日次ローテーション
-(UTC 0 時、14 世代) は TimedRotatingFileHandler に任せる。呼出しの戻り値・例外・本文・timeout には
+`<root>/logs/bridge-metrics/` の下へ書く (daemon は `client-YYYY-MM-DD.jsonl`、CLI は
+`client-cli-YYYY-MM-DD.jsonl`。UTC の日付入りの file へ追記だけで、改名しない)。呼出しは有界 queue への
+put_nowait だけで待たない (詰まったら捨てて欠落数を数える)。書込みと 14 日を超えた自分の名前の形の
+file の削除は、daemon thread の writer が行う。停止は期限付き。呼出しの戻り値・例外・本文・timeout には
 触れない。観測の失敗は握り、header が読めない値は 0 にせず `lock_state` を `missing` /
 `unavailable` にして数値を欠落させる。
 
@@ -17,16 +17,15 @@ from __future__ import annotations
 import atexit
 import contextvars
 import json
-import logging
-import logging.handlers
 import math
 import os
 import queue
+import re
 import stat
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 from urllib.parse import urlsplit
@@ -37,9 +36,11 @@ CALLERS = ("tick", "mission", "cli", "unknown")
 CALLER_HEADER = "X-Afx-Caller"
 RETENTION_DAYS = 14
 METRICS_DIR_PARTS = ("logs", "bridge-metrics")
-FILE_NAME = "client.jsonl"
-CLI_FILE_NAME = "client-cli.jsonl"
+FILE_PREFIX = "client-"
+CLI_FILE_PREFIX = "client-cli-"
 DEFAULT_QUEUE_SIZE = 2048
+STOP_TIMEOUT_S = 2.0
+_DAY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 # bridge protocol の固定 error code (mt5_bridge/bridge_metrics.py の ERROR_CODES と同じ集合)。
 ERROR_CODES = frozenset({
@@ -79,7 +80,7 @@ def configure(root: Path, default_caller: str = "unknown",
     if previous is not None:
         previous.stop()
     sink = _Sink.open(Path(root).joinpath(*METRICS_DIR_PARTS), queue_size,
-                      CLI_FILE_NAME if default_caller == "cli" else FILE_NAME)
+                      CLI_FILE_PREFIX if default_caller == "cli" else FILE_PREFIX)
     with _lock:
         _sink = sink
 
@@ -112,16 +113,6 @@ def flush() -> None:
 def dropped() -> int:
     sink = _sink
     return sink.dropped if sink is not None else 0
-
-
-def file_handler() -> logging.handlers.TimedRotatingFileHandler | None:
-    sink = _sink
-    return sink.file_handler if sink is not None else None
-
-
-def queue_handler() -> logging.handlers.QueueHandler | None:
-    sink = _sink
-    return sink.queue_handler if sink is not None else None
 
 
 def current_caller() -> str:
@@ -252,107 +243,158 @@ def _failure_kind(exc: BaseException) -> str:
 
 # ── 書込み ────────────────────────────────────────────────────────
 
-def _private_directory(directory: Path) -> None:
-    """記録先 dir を 0700 で作り、既にあれば 0700 に直す (symlink は辿らない)。"""
-    try:
-        directory.mkdir(mode=0o700)
-    except FileExistsError:
-        pass
-    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        info = os.fstat(fd)
-        if info.st_uid != os.geteuid():
-            raise OSError("log directory is not owned by this user")
-        if stat.S_IMODE(info.st_mode) != 0o700:
-            os.fchmod(fd, 0o700)
-    finally:
-        os.close(fd)
+def _day_of(row: dict[str, Any]) -> str:
+    """行の ts と同じ時刻から file の日付を作る (ts が読めないときだけ現在の UTC)。"""
+    ts = row.get("ts")
+    if isinstance(ts, str) and _DAY_RE.fullmatch(ts[:10]):
+        return ts[:10]
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-class _PrivateRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
-    """0600 の通常ファイルだけを開く。symlink は辿らず、他人の file・通常でない file は拒否する。"""
+class _DailyWriter:
+    """有界 queue と daemon thread の writer。UTC 日付入りの file へ追記し、古い file を消す。"""
 
-    def _open(self):
-        directory = Path(self.baseFilename).parent
-        logs = directory.parent
-        if logs.is_symlink() or not logs.is_dir() or directory.is_symlink():
-            raise OSError("log directory is not a plain directory under an existing logs")
-        _private_directory(directory)
-        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
-        fd = os.open(self.baseFilename, flags, 0o600)
+    def __init__(self, directory: Path, prefix: str, queue_size: int) -> None:
+        self.directory = directory
+        self.prefix = prefix
+        self.queue: queue.Queue = queue.Queue(maxsize=queue_size)
+        self._pattern = re.compile(re.escape(prefix) + r"(\d{4}-\d{2}-\d{2})\.jsonl")
+        self._stopping = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="bridge-observe", daemon=True)
+        self._fd: int | None = None
+        self._fd_day: str | None = None
+        self._purged_day: str | None = None
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def submit(self, day: str, line: str) -> bool:
+        """待たずに積む。満杯なら False。"""
+        try:
+            self.queue.put_nowait((day, line))
+            return True
+        except queue.Full:
+            return False
+
+    def flush(self, timeout: float = 10.0) -> None:
+        """積まれた行が処理されるまで期限付きで待つ (試験・終了用。呼出しの経路からは使わない)。"""
+        deadline = time.monotonic() + timeout
+        while self.queue.unfinished_tasks and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+    def stop(self, timeout: float) -> None:
+        """終了を伝えて期限付きで待つ。期限を過ぎたら待たずに戻る。"""
+        self._stopping.set()
+        self._thread.join(timeout)
+
+    def _run(self) -> None:
+        try:
+            while True:
+                try:
+                    day, line = self.queue.get(timeout=0.2)
+                except queue.Empty:
+                    if self._stopping.is_set():
+                        return
+                    continue
+                try:
+                    if day != self._purged_day:
+                        self._purged_day = day
+                        self._purge(day)
+                    self._append(day, line)
+                except Exception:  # noqa: BLE001 - 観測の失敗は握る
+                    self._close()
+                finally:
+                    self.queue.task_done()
+        finally:
+            self._close()
+
+    def _close(self) -> None:
+        fd, self._fd, self._fd_day = self._fd, None, None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _append(self, day: str, line: str) -> None:
+        if self._fd is None or self._fd_day != day:
+            self._close()
+            self._fd = self._open(day)
+            self._fd_day = day
+        data = (line + "\n").encode("utf-8")
+        while data:
+            data = data[os.write(self._fd, data):]
+
+    def _ensure_directory(self) -> None:
+        """記録先 dir を作る (親の `logs` が無ければ作らない)。POSIX では 0700。"""
+        try:
+            self.directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        if self.directory.is_symlink() or not self.directory.is_dir():
+            raise OSError("log directory is not a plain directory")
+        if hasattr(os, "geteuid"):
+            info = self.directory.stat()
+            if info.st_uid != os.geteuid():
+                raise OSError("log directory is not owned by this user")
+            if stat.S_IMODE(info.st_mode) != 0o700:
+                os.chmod(self.directory, 0o700)
+
+    def _open(self, day: str) -> int:
+        self._ensure_directory()
+        flags = (os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+        fd = os.open(self.directory / f"{self.prefix}{day}.jsonl", flags, 0o600)
         try:
             info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
-                raise OSError("log file is not a regular file owned by this user")
-            if stat.S_IMODE(info.st_mode) != 0o600:
+            if not stat.S_ISREG(info.st_mode):
+                raise OSError("log file is not a regular file")
+            if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+                raise OSError("log file is not owned by this user")
+            if hasattr(os, "fchmod") and stat.S_IMODE(info.st_mode) != 0o600:
                 os.fchmod(fd, 0o600)
-            os.set_blocking(fd, True)
-            return os.fdopen(fd, "a", encoding=self.encoding or "utf-8")
+            if flags & getattr(os, "O_NONBLOCK", 0):
+                os.set_blocking(fd, True)
+            return fd
         except BaseException:
             os.close(fd)
             raise
 
-    def handleError(self, record):  # noqa: N802 - 記録の失敗は呼出しへ出さない
-        return
-
-
-def _stop_listener(listener: logging.handlers.QueueListener, q: queue.Queue) -> None:
-    """queue が満杯でも listener を止める。止めるために、積まれた未書込みの行を捨てる。"""
-    for _ in range(10_000):
+    def _purge(self, today: str) -> None:
+        """14 日を超えた自分の名前の形の通常 file だけを消す。他の名前・dir・symlink は残す。"""
         try:
-            listener.stop()
+            limit = date.fromisoformat(today) - timedelta(days=RETENTION_DAYS)
+            entries = list(os.scandir(self.directory))
+        except (OSError, ValueError):
             return
-        except queue.Full:
+        for entry in entries:
+            found = self._pattern.fullmatch(entry.name)
+            if found is None:
+                continue
             try:
-                q.get_nowait()
-                q.task_done()
-            except queue.Empty:
-                pass
-
-
-class _DropQueueHandler(logging.handlers.QueueHandler):
-    """満杯のとき待たずに捨てて、欠落数を数える。"""
-
-    def __init__(self, q: queue.Queue, owner: "_Sink") -> None:
-        super().__init__(q)
-        self._owner = owner
-
-    def enqueue(self, record):
-        try:
-            self.queue.put_nowait(record)
-        except queue.Full:
-            self._owner.count_drop(getattr(record, "dropped_reported", 0))
-
-    def handleError(self, record):  # noqa: N802
-        return
+                if date.fromisoformat(found.group(1)) < limit and entry.is_file(
+                        follow_symlinks=False):
+                    os.unlink(entry.path)
+            except (OSError, ValueError):
+                continue
 
 
 class _Sink:
-    """記録先 1 つ分。呼出し側は emit (enqueue だけ) しか使わない。"""
+    """記録先 1 つ分。呼出し側は emit (put_nowait だけ) しか使わない。"""
 
-    def __init__(self, q: queue.Queue, handler: _PrivateRotatingFileHandler) -> None:
+    def __init__(self, writer: _DailyWriter) -> None:
         self._guard = threading.Lock()
         self._dropped = 0
         self._reported = 0
-        self._queue = q
-        self.file_handler = handler
-        self.queue_handler = _DropQueueHandler(q, self)
-        self._logger = logging.Logger("bridge.observe.client", logging.INFO)
-        self._logger.propagate = False
-        self._logger.addHandler(self.queue_handler)
-        self.listener = logging.handlers.QueueListener(q, handler, respect_handler_level=False)
+        self.writer = writer
         self._stopped = False
 
     @classmethod
-    def open(cls, directory: Path, queue_size: int, file_name: str = FILE_NAME) -> "_Sink | None":
+    def open(cls, directory: Path, queue_size: int, prefix: str = FILE_PREFIX) -> "_Sink | None":
         """記録先 dir は最初の 1 行を書くときに作る (`logs` が実在の dir のときだけ)。"""
         try:
-            handler = _PrivateRotatingFileHandler(
-                str(directory / file_name), when="midnight", utc=True,
-                backupCount=RETENTION_DAYS, encoding="utf-8", delay=True)
-            handler.setFormatter(logging.Formatter("%(message)s"))
-            sink = cls(queue.Queue(maxsize=queue_size), handler)
-            sink.listener.start()
+            sink = cls(_DailyWriter(directory, prefix, queue_size))
+            sink.writer.start()
         except Exception:  # noqa: BLE001 - 記録先を作れなくても呼出しは動く
             return None
         atexit.register(sink.stop)
@@ -374,23 +416,23 @@ class _Sink:
             self._reported += pending
         if pending > 0:
             row = {**row, "dropped_before": pending}
-        self._logger.info(json.dumps(row, separators=(",", ":"), ensure_ascii=True),
-                          extra={"dropped_reported": pending})
+        line = json.dumps(row, separators=(",", ":"), ensure_ascii=True)
+        if not self.writer.submit(_day_of(row), line):
+            self.count_drop(pending)
 
     def flush(self) -> None:
         if not self._stopped:
-            self._queue.join()
+            self.writer.flush()
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = STOP_TIMEOUT_S) -> None:
         if self._stopped:
             return
         self._stopped = True
         try:
-            _stop_listener(self.listener, self._queue)
+            self.writer.stop(timeout)
         except Exception:  # noqa: BLE001 - 停止の失敗で呼出しや終了を止めない
             pass
         finally:
-            self.file_handler.close()
             atexit.unregister(self.stop)
 
 
