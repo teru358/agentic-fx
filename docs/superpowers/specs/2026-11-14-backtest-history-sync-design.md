@@ -307,6 +307,7 @@ rollbackは新コードのうちにauto_enabled=falseへ変更して再起動し
 | 2026-11-15 | C5.4 | 日別run集計の永続表 `history_sync_daily` を明記 (run終了と同transactionで加算、二重に数えない) | series詳細の90日GC後も日別を復元できるようにする | — (未commit) |
 | 2026-11-15 | C5.5 | 検査尾の候補を `[B,c)` に限る制限を撤廃し、始端がBのときもBより前の既存keyから尾を選ぶ。尾は比較・監査だけに使い、尾の欠落足は挿入しない | `max(B,E-D日)` と `[B,c)` 制限が両立せず、lookbackがBに届く設定と境界日のgapが進めなかった | — (未commit) |
 | 2026-11-15 | C5.6 | §1.3 に段2のstatusの固定表示 (effective disabled、自己計測/worker、参照の疑いの新旧detail、`eval_window` 未収集、3b未対応の情報行) を明記。HB C2.6・段1a C2.5・wizard案内と同時に原本を追随 | T3 (表示・運用原本) の実装 | — (未commit) |
+| 2026-11-17 | C5.7 | T4 の基準線の記録先を明記 (指揮者決定)。主記録は bridge 側の要求ごとの構造化記録 (`mt5_bridge/logs/bridge-metrics.jsonl`、caller は daemon・Mission・CLI が固定ラベルの request header `X-Afx-Caller` で送る、標準 logging の queue と UTC 日次ローテーション 14 日)。daemon 側は client から見た経過・timeout・接続失敗だけを同じ方式で `logs/bridge-metrics/client.jsonl` に書く。集計は `scripts/bridge_metrics_report.py` | 設計が記録先を定めていなかった。daemon 側の自前の file 書込みは取引の経路を同期 I/O で止めうる (実装レビュー 1 周目)、Mission 子 process は Landlock で logs に書けない | 実装 branch |
 
 ## 6. 短い task 表
 
