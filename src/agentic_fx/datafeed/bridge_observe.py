@@ -1,26 +1,31 @@
-"""bridge への HTTP 呼出しの受動観測。
+"""bridge への HTTP 呼出しの client 側の受動観測。
 
-応答の `X-Bridge-*` header を読んで 1 要求 1 行を `<root>/logs/bridge-metrics/` へ追記する。
-呼出しの戻り値・例外・本文・timeout には触れない。観測の失敗 (header の欠落・不正、
-書込みの失敗) は握り、呼出しの結果へ出さない。header が読めない値は 0 にせず、
-`lock_state` を `missing` / `unavailable` にして数値を欠落させる。
+応答の `X-Bridge-*` header と client から見た経過時間・timeout・接続失敗の種別を、1 要求 1 行で
+`<root>/logs/bridge-metrics/client.jsonl` へ書く。書込みは標準 logging の QueueHandler への
+enqueue だけで、呼出しは待たない (詰まったら捨てて欠落数を数える)。日次ローテーション
+(UTC 0 時、14 世代) は TimedRotatingFileHandler に任せる。呼出しの戻り値・例外・本文・timeout には
+触れない。観測の失敗は握り、header が読めない値は 0 にせず `lock_state` を `missing` /
+`unavailable` にして数値を欠落させる。
 
+bridge への要求には固定ラベルの `X-Afx-Caller` を常に付ける (bridge 側の記録が呼出し元を分ける)。
 記録先は `configure` で root を渡した process だけ。未設定なら何もしない。
-行には URL・host・port・生の header・口座・価格・秘密を書かない。boot id と履歴 slot の ID は
-短い hash だけを残す。
+行には URL・host・port・生の header・口座・価格・秘密・boot id・履歴 slot の ID を書かない。
 """
 from __future__ import annotations
 
+import atexit
 import contextvars
-import hashlib
 import json
+import logging
+import logging.handlers
 import math
 import os
-import re
+import queue
+import stat
 import threading
 import time
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 from urllib.parse import urlsplit
@@ -28,37 +33,52 @@ from urllib.parse import urlsplit
 import httpx
 
 CALLERS = ("tick", "mission", "cli", "unknown")
+CALLER_HEADER = "X-Afx-Caller"
 RETENTION_DAYS = 14
 METRICS_DIR_PARTS = ("logs", "bridge-metrics")
+FILE_NAME = "client.jsonl"
+DEFAULT_QUEUE_SIZE = 2048
 
-_FILE_NAME = re.compile(r"^(\d{4})-(\d{2})-(\d{2})\.jsonl$")
-_TOKEN = re.compile(r"^[a-z0-9_]{1,64}$")
-_OPAQUE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
-_VERSION = re.compile(r"^[0-9]{1,3}$")
+# bridge protocol の固定 error code (mt5_bridge/bridge_metrics.py の ERROR_CODES と同じ集合)。
+ERROR_CODES = frozenset({
+    "auth_invalid", "order_key_required", "local_only_forbidden",
+    "route_not_found", "method_not_allowed", "request_validation_failed",
+    "internal_error", "mt5_not_connected", "runtime_not_initialized",
+    "symbol_unavailable", "tick_unavailable", "history_copy_failed",
+    "quote_failed", "history_failed", "order_failed",
+    "time_rule_mismatch", "time_rule_unverified",
+    "history_request_busy", "history_request_duplicate", "history_request_id_invalid",
+    "invalid_range", "invalid_request", "invalid_timestamp", "closed_deal_not_found",
+    "soft_halted", "preflight_rejected", "preflight_error", "order_rejected",
+    "modify_no_fields", "modify_failed", "close_failed", "resume_refused",
+})
 _LOCK_STATES = frozenset({"measured", "not_locked", "unavailable"})
-_SLOT_STATES = frozenset({"none", "waiting", "holding", "completed"})
 _MAX_MS = 1.0e9
 _MAX_COUNT = 1_000_000
 
 _monotonic: Callable[[], float] = time.monotonic
 
 _lock = threading.Lock()
-_sink: Path | None = None
+_sink: "_Sink | None" = None
 _default_caller = "unknown"
-_pruned_day: date | None = None
 _caller_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "bridge_observe_caller", default=None)
 
 
-def configure(root: Path, default_caller: str = "unknown") -> None:
+def configure(root: Path, default_caller: str = "unknown",
+              queue_size: int = DEFAULT_QUEUE_SIZE) -> None:
     """この process の記録先 root と、scope の外で使う caller を決める。"""
-    global _sink, _default_caller, _pruned_day
+    global _sink, _default_caller
     if default_caller not in CALLERS:
         raise ValueError("bridge observe caller must be one of the fixed labels")
     with _lock:
-        _sink = Path(root).joinpath(*METRICS_DIR_PARTS)
+        previous, _sink = _sink, None
         _default_caller = default_caller
-        _pruned_day = None
+    if previous is not None:
+        previous.stop()
+    sink = _Sink.open(Path(root).joinpath(*METRICS_DIR_PARTS), queue_size)
+    with _lock:
+        _sink = sink
 
 
 def set_default_caller(label: str) -> None:
@@ -71,11 +91,34 @@ def set_default_caller(label: str) -> None:
 
 
 def reset() -> None:
-    global _sink, _default_caller, _pruned_day
+    global _sink, _default_caller
     with _lock:
-        _sink = None
+        previous, _sink = _sink, None
         _default_caller = "unknown"
-        _pruned_day = None
+    if previous is not None:
+        previous.stop()
+
+
+def flush() -> None:
+    """積まれた行が書かれるまで待つ (試験・終了用。呼出しの経路からは使わない)。"""
+    sink = _sink
+    if sink is not None:
+        sink.flush()
+
+
+def dropped() -> int:
+    sink = _sink
+    return sink.dropped if sink is not None else 0
+
+
+def file_handler() -> logging.handlers.TimedRotatingFileHandler | None:
+    sink = _sink
+    return sink.file_handler if sink is not None else None
+
+
+def queue_handler() -> logging.handlers.QueueHandler | None:
+    sink = _sink
+    return sink.queue_handler if sink is not None else None
 
 
 def current_caller() -> str:
@@ -125,10 +168,6 @@ def route_of(url: str) -> str:
 
 # ── header の読取 ─────────────────────────────────────────────────
 
-def _hash(value: str) -> str:
-    return hashlib.sha256(value.encode()).hexdigest()[:12]
-
-
 def _header(headers: Any, name: str) -> str | None:
     value = headers.get(name)
     return value if isinstance(value, str) else None
@@ -153,28 +192,28 @@ def _count(text: str | None) -> int | None:
     return value if value <= _MAX_COUNT else None
 
 
-def _empty_row(caller: str, route: str, elapsed_ms: float) -> dict[str, Any]:
+def _empty_row(caller: str, route: str, elapsed_ms: float, timeout: Any) -> dict[str, Any]:
     return {
         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
         "caller": caller, "route": route, "status": None, "error_code": None,
-        "metrics_version": None, "boot_hash": None, "lock_state": "missing",
+        "lock_state": "missing",
         "wait_ms": None, "hold_ms": None, "wait_max_ms": None, "hold_max_ms": None,
-        "acquisitions": None, "elapsed_ms": round(elapsed_ms, 3), "failure": None,
-        "history_state": None, "history_id_hash": None,
-        "history_wait_ms": None, "history_hold_ms": None,
+        "acquisitions": None, "elapsed_ms": round(elapsed_ms, 3),
+        "timeout_s": _timeout_seconds(timeout), "failure": None,
     }
 
 
+def _timeout_seconds(timeout: Any) -> float | None:
+    value = getattr(timeout, "read", timeout)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) and value >= 0 else None
+
+
 def _fill_from_headers(row: dict[str, Any], headers: Any) -> None:
-    version = _header(headers, "X-Bridge-Metrics-Version")
-    if version is not None and _VERSION.fullmatch(version):
-        row["metrics_version"] = version
-    boot = _header(headers, "X-Bridge-Boot-Id")
-    if boot is not None and _OPAQUE.fullmatch(boot):
-        row["boot_hash"] = _hash(boot)
     code = _header(headers, "X-Bridge-Error-Code")
-    if code is not None and _TOKEN.fullmatch(code):
-        row["error_code"] = code
+    if code is not None:
+        row["error_code"] = code if code in ERROR_CODES else "unknown"
     state = _header(headers, "X-Bridge-Lock-State")
     if state is None:
         row["lock_state"] = "missing"
@@ -196,15 +235,6 @@ def _fill_from_headers(row: dict[str, Any], headers: Any) -> None:
             row["lock_state"] = state
             (row["wait_ms"], row["hold_ms"], row["wait_max_ms"], row["hold_max_ms"],
              row["acquisitions"]) = numbers
-    slot = _header(headers, "X-Bridge-History-State")
-    if slot is not None and slot in _SLOT_STATES:
-        row["history_state"] = slot
-        slot_id = _header(headers, "X-Bridge-History-Request-Id")
-        if slot_id is not None and _OPAQUE.fullmatch(slot_id):
-            row["history_id_hash"] = _hash(slot_id)
-        if slot == "completed":
-            row["history_wait_ms"] = _ms(_header(headers, "X-Bridge-History-Wait-Ms"))
-            row["history_hold_ms"] = _ms(_header(headers, "X-Bridge-History-Hold-Ms"))
 
 
 def _failure_kind(exc: BaseException) -> str:
@@ -219,55 +249,127 @@ def _failure_kind(exc: BaseException) -> str:
 
 # ── 書込み ────────────────────────────────────────────────────────
 
-def prune(directory: Path, today: date) -> None:
-    """保持期間を過ぎた `YYYY-MM-DD.jsonl` だけを消す。他の名前・symlink・dir は触らない。"""
-    cutoff = today - timedelta(days=RETENTION_DAYS - 1)
-    try:
-        entries = list(os.scandir(directory))
-    except OSError:
-        return
-    for entry in entries:
-        match = _FILE_NAME.fullmatch(entry.name)
-        if match is None:
-            continue
+class _PrivateRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
+    """0600 の通常ファイルだけを開く。symlink は辿らず、他人の file・通常でない file は拒否する。"""
+
+    def _open(self):
+        directory = Path(self.baseFilename).parent
+        logs = directory.parent
+        if logs.is_symlink() or not logs.is_dir() or directory.is_symlink():
+            raise OSError("log directory is not a plain directory under an existing logs")
+        directory.mkdir(exist_ok=True)
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+        fd = os.open(self.baseFilename, flags, 0o600)
         try:
-            day = date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
-            if day >= cutoff or entry.is_symlink() or not entry.is_file(follow_symlinks=False):
-                continue
-            os.unlink(entry.path)
-        except (ValueError, OSError):
-            continue
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                raise OSError("log file is not a regular file owned by this user")
+            if stat.S_IMODE(info.st_mode) != 0o600:
+                os.fchmod(fd, 0o600)
+            os.set_blocking(fd, True)
+            return os.fdopen(fd, "a", encoding=self.encoding or "utf-8")
+        except BaseException:
+            os.close(fd)
+            raise
 
-
-def _append(row: dict[str, Any]) -> None:
-    global _pruned_day
-    directory = _sink
-    if directory is None:
+    def handleError(self, record):  # noqa: N802 - 記録の失敗は呼出しへ出さない
         return
-    logs = directory.parent
-    if not logs.is_dir():
+
+
+class _DropQueueHandler(logging.handlers.QueueHandler):
+    """満杯のとき待たずに捨てて、欠落数を数える。"""
+
+    def __init__(self, q: queue.Queue, owner: "_Sink") -> None:
+        super().__init__(q)
+        self._owner = owner
+
+    def enqueue(self, record):
+        try:
+            self.queue.put_nowait(record)
+        except queue.Full:
+            self._owner.count_drop()
+        else:
+            self._owner.mark_reported(getattr(record, "dropped_reported", 0))
+
+    def handleError(self, record):  # noqa: N802
         return
-    today = datetime.now(timezone.utc).date()
-    directory.mkdir(exist_ok=True)
-    with _lock:
-        need_prune = _pruned_day != today
-        _pruned_day = today
-    if need_prune:
-        prune(directory, today)
-    line = (json.dumps(row, separators=(",", ":"), ensure_ascii=True) + "\n").encode()
-    fd = os.open(directory / f"{today.isoformat()}.jsonl",
-                 os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    try:
-        os.write(fd, line)
-    finally:
-        os.close(fd)
 
 
-def _record(url: str, started: float, response: Any, exc: BaseException | None) -> None:
-    try:
-        if _sink is None:
+class _Sink:
+    """記録先 1 つ分。呼出し側は emit (enqueue だけ) しか使わない。"""
+
+    def __init__(self, q: queue.Queue, handler: _PrivateRotatingFileHandler) -> None:
+        self._guard = threading.Lock()
+        self._dropped = 0
+        self._reported = 0
+        self._queue = q
+        self.file_handler = handler
+        self.queue_handler = _DropQueueHandler(q, self)
+        self._logger = logging.Logger("bridge.observe.client", logging.INFO)
+        self._logger.propagate = False
+        self._logger.addHandler(self.queue_handler)
+        self.listener = logging.handlers.QueueListener(q, handler, respect_handler_level=False)
+        self._stopped = False
+
+    @classmethod
+    def open(cls, directory: Path, queue_size: int) -> "_Sink | None":
+        """記録先 dir は最初の 1 行を書くときに作る (`logs` が実在の dir のときだけ)。"""
+        try:
+            handler = _PrivateRotatingFileHandler(
+                str(directory / FILE_NAME), when="midnight", utc=True,
+                backupCount=RETENTION_DAYS, encoding="utf-8", delay=True)
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            sink = cls(queue.Queue(maxsize=queue_size), handler)
+            sink.listener.start()
+        except Exception:  # noqa: BLE001 - 記録先を作れなくても呼出しは動く
+            return None
+        atexit.register(sink.stop)
+        return sink
+
+    @property
+    def dropped(self) -> int:
+        return self._dropped
+
+    def count_drop(self) -> None:
+        with self._guard:
+            self._dropped += 1
+
+    def mark_reported(self, count: int) -> None:
+        if count:
+            with self._guard:
+                self._reported += count
+
+    def emit(self, row: dict[str, Any]) -> None:
+        with self._guard:
+            pending = self._dropped - self._reported
+            if pending > 0:
+                row = {**row, "dropped_before": pending}
+        self._logger.info(json.dumps(row, separators=(",", ":"), ensure_ascii=True),
+                          extra={"dropped_reported": max(pending, 0)})
+
+    def flush(self) -> None:
+        if not self._stopped:
+            self._queue.join()
+
+    def stop(self) -> None:
+        if self._stopped:
             return
-        row = _empty_row(current_caller(), route_of(url), (_monotonic() - started) * 1000.0)
+        self._stopped = True
+        try:
+            self.listener.stop()
+        finally:
+            self.file_handler.close()
+            atexit.unregister(self.stop)
+
+
+def _record(url: str, started: float, response: Any, exc: BaseException | None,
+            timeout: Any) -> None:
+    try:
+        sink = _sink
+        if sink is None:
+            return
+        row = _empty_row(current_caller(), route_of(url),
+                         (_monotonic() - started) * 1000.0, timeout)
         if exc is not None:
             row["failure"] = _failure_kind(exc)
         else:
@@ -278,23 +380,32 @@ def _record(url: str, started: float, response: Any, exc: BaseException | None) 
                 _fill_from_headers(row, response.headers)
             except Exception:  # noqa: BLE001
                 row["lock_state"] = "missing"
-        _append(row)
+        sink.emit(row)
     except Exception:  # noqa: BLE001 - 観測は呼出しの結果に影響させない
         return
 
 
 # ── 呼出し ────────────────────────────────────────────────────────
 
+def _with_caller(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """呼出し元のラベルを request header に足した kwargs を返す (渡された dict は変えない)。"""
+    headers = kwargs.get("headers")
+    merged = dict(headers) if isinstance(headers, dict) else {}
+    merged[CALLER_HEADER] = current_caller()
+    return {**kwargs, "headers": merged}
+
+
 def observed(fetch: Callable[..., Any]) -> Callable[..., Any]:
-    """`fetch(url, **kwargs)` を観測つきにして返す。戻り値・例外・引数は変えない。"""
+    """`fetch(url, **kwargs)` を観測つきにして返す。戻り値・例外は変えない。"""
     def call(url: str, *args: Any, **kwargs: Any) -> Any:
         started = _monotonic()
+        kwargs = _with_caller(kwargs)
         try:
             response = fetch(url, *args, **kwargs)
         except BaseException as exc:
-            _record(url, started, None, exc)
+            _record(url, started, None, exc, kwargs.get("timeout"))
             raise
-        _record(url, started, response, None)
+        _record(url, started, response, None, kwargs.get("timeout"))
         return response
     return call
 
@@ -302,10 +413,11 @@ def observed(fetch: Callable[..., Any]) -> Callable[..., Any]:
 def bridge_get(url: str, *args: Any, **kwargs: Any) -> Any:
     """`httpx.get` を観測つきで呼ぶ (bridge 向け)。"""
     started = _monotonic()
+    kwargs = _with_caller(kwargs)
     try:
         response = httpx.get(url, *args, **kwargs)
     except BaseException as exc:
-        _record(url, started, None, exc)
+        _record(url, started, None, exc, kwargs.get("timeout"))
         raise
-    _record(url, started, response, None)
+    _record(url, started, response, None, kwargs.get("timeout"))
     return response

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-import hashlib
+import importlib.util
 import json
+import logging.handlers
 import os
+import stat
 import subprocess
 import sys
 import threading
-from datetime import date, datetime, timedelta, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -25,11 +28,12 @@ def _root(tmp_path: Path) -> Path:
 
 
 def _rows(root: Path) -> list[dict]:
+    bridge_observe.flush()
     directory = root / "logs" / "bridge-metrics"
     out: list[dict] = []
     if not directory.is_dir():
         return out
-    for path in sorted(directory.glob("*.jsonl")):
+    for path in sorted(directory.glob("client.jsonl*")):
         for line in path.read_text().splitlines():
             out.append(json.loads(line))
     return out
@@ -68,6 +72,12 @@ def _patch_get(monkeypatch, response=None, exc=None):
     return calls
 
 
+_CLIENT_KEYS = {
+    "ts", "caller", "route", "status", "error_code", "lock_state", "wait_ms", "hold_ms",
+    "wait_max_ms", "hold_max_ms", "acquisitions", "elapsed_ms", "timeout_s", "failure",
+}
+
+
 def test_measured_response_is_recorded_without_url_or_raw_ids(monkeypatch, tmp_path):
     root = _root(tmp_path)
     bridge_observe.configure(root, "cli")
@@ -79,14 +89,13 @@ def test_measured_response_is_recorded_without_url_or_raw_ids(monkeypatch, tmp_p
     assert row["caller"] == "cli"
     assert row["route"] == "/ohlcv/{symbol}"
     assert row["status"] == 200
-    assert row["metrics_version"] == "1"
     assert row["lock_state"] == "measured"
     assert row["wait_ms"] == 12.5 and row["hold_ms"] == 40.25
     assert row["wait_max_ms"] == 7.0 and row["hold_max_ms"] == 30.0
     assert row["acquisitions"] == 3
-    assert row["boot_hash"] == hashlib.sha256(BOOT.encode()).hexdigest()[:12]
     assert row["failure"] is None
-    assert row["elapsed_ms"] >= 0
+    assert row["elapsed_ms"] >= 0 and row["timeout_s"] == 3
+    assert set(row) == _CLIENT_KEYS
     text = json.dumps(row)
     for secret in (BOOT, "bridge.example", "8812", "EURUSD", "from"):
         assert secret not in text
@@ -98,8 +107,10 @@ def test_return_value_and_arguments_pass_through_unchanged(monkeypatch, tmp_path
     url = f"{URL}/health"
     sentinel = _response(url, headers=_headers())
     calls = _patch_get(monkeypatch, sentinel)
-    assert bridge_observe.bridge_get(url, headers={"k": "v"}, timeout=7) is sentinel
-    assert calls == [(url, {"headers": {"k": "v"}, "timeout": 7})]
+    given = {"k": "v"}
+    assert bridge_observe.bridge_get(url, headers=given, timeout=7) is sentinel
+    assert calls == [(url, {"headers": {"k": "v", "X-Afx-Caller": "cli"}, "timeout": 7})]
+    assert given == {"k": "v"}
 
 
 def test_missing_headers_are_recorded_as_missing_not_zero(monkeypatch, tmp_path):
@@ -109,7 +120,6 @@ def test_missing_headers_are_recorded_as_missing_not_zero(monkeypatch, tmp_path)
     bridge_observe.bridge_get(f"{URL}/health")
     (row,) = _rows(root)
     assert row["lock_state"] == "missing"
-    assert row["metrics_version"] is None and row["boot_hash"] is None
     for key in ("wait_ms", "hold_ms", "wait_max_ms", "hold_max_ms", "acquisitions"):
         assert row[key] is None
 
@@ -157,40 +167,47 @@ def test_unknown_lock_state_value_is_unavailable(monkeypatch, tmp_path):
     assert _rows(root)[0]["lock_state"] == "unavailable"
 
 
-def test_error_code_is_kept_only_when_a_fixed_token(monkeypatch, tmp_path):
+def test_error_code_is_kept_only_when_in_the_protocol_allowlist(monkeypatch, tmp_path):
     root = _root(tmp_path)
     bridge_observe.configure(root, "cli")
     url = f"{URL}/ohlcv/X"
-    _patch_get(monkeypatch, _response(url, 404, _headers(**{"X-Bridge-Error-Code": "symbol_unavailable"})))
-    bridge_observe.bridge_get(url)
-    _patch_get(monkeypatch, _response(url, 404, _headers(**{"X-Bridge-Error-Code": "http://secret/x?k=1"})))
-    bridge_observe.bridge_get(url)
-    first, second = _rows(root)
-    assert first["status"] == 404 and first["error_code"] == "symbol_unavailable"
-    assert second["error_code"] is None
-    assert "secret" not in json.dumps(second)
+    secret_shaped = "k" * 20 + "4f2a"
+    for code in ("symbol_unavailable", "http://secret/x?k=1", "12345678", secret_shaped,
+                 "not_a_protocol_code"):
+        _patch_get(monkeypatch, _response(url, 404, _headers(**{"X-Bridge-Error-Code": code})))
+        bridge_observe.bridge_get(url)
+    rows = _rows(root)
+    assert [r["error_code"] for r in rows] == [
+        "symbol_unavailable", "unknown", "unknown", "unknown", "unknown"]
+    assert rows[0]["status"] == 404
+    assert "secret" not in json.dumps(rows) and secret_shaped not in json.dumps(rows)
 
 
-def test_history_slot_state_and_hashed_id(monkeypatch, tmp_path):
+def test_error_code_allowlist_is_the_bridge_protocol_set():
+    path = Path(__file__).resolve().parents[2] / "mt5_bridge" / "bridge_metrics.py"
+    spec = importlib.util.spec_from_file_location("bridge_protocol_for_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        protocol = module.ERROR_CODES
+    finally:
+        sys.modules.pop(spec.name, None)
+    assert bridge_observe.ERROR_CODES == protocol
+
+
+def test_history_headers_and_ids_are_not_recorded_on_the_client(monkeypatch, tmp_path):
     root = _root(tmp_path)
     bridge_observe.configure(root, "cli")
     _patch_get(monkeypatch, _response(f"{URL}/health", headers=_headers(**{
         "X-Bridge-History-Request-Id": SLOT_ID, "X-Bridge-History-State": "completed",
         "X-Bridge-History-Wait-Ms": "1.000", "X-Bridge-History-Hold-Ms": "2.000"})))
     bridge_observe.bridge_get(f"{URL}/health")
-    _patch_get(monkeypatch, _response(f"{URL}/health", headers=_headers(**{
-        "X-Bridge-History-State": "none"})))
-    bridge_observe.bridge_get(f"{URL}/health")
-    _patch_get(monkeypatch, _response(f"{URL}/health", headers=_headers(**{
-        "X-Bridge-History-Request-Id": SLOT_ID, "X-Bridge-History-State": "bogus"})))
-    bridge_observe.bridge_get(f"{URL}/health")
-    done, none, bogus = _rows(root)
-    assert done["history_state"] == "completed"
-    assert done["history_id_hash"] == hashlib.sha256(SLOT_ID.encode()).hexdigest()[:12]
-    assert done["history_wait_ms"] == 1.0 and done["history_hold_ms"] == 2.0
-    assert SLOT_ID not in json.dumps(done)
-    assert none["history_state"] == "none" and none["history_id_hash"] is None
-    assert bogus["history_state"] is None and bogus["history_id_hash"] is None
+    (row,) = _rows(root)
+    assert set(row) == _CLIENT_KEYS
+    text = (root / "logs" / "bridge-metrics" / "client.jsonl").read_text()
+    assert SLOT_ID not in text and BOOT not in text and "history" not in text
 
 
 @pytest.mark.parametrize("url,route", [
@@ -319,16 +336,105 @@ def test_logs_directory_is_never_created(monkeypatch, tmp_path):
     assert not (tmp_path / "logs").exists()
 
 
-def test_file_is_utc_dated_jsonl_with_private_mode(monkeypatch, tmp_path):
+def test_file_is_client_jsonl_under_logs_with_private_mode(monkeypatch, tmp_path):
     root = _root(tmp_path)
     bridge_observe.configure(root, "cli")
     _patch_get(monkeypatch, _response(f"{URL}/health", headers=_headers()))
     bridge_observe.bridge_get(f"{URL}/health")
+    _rows(root)
     (path,) = (root / "logs" / "bridge-metrics").iterdir()
-    assert path.name == datetime.now(timezone.utc).strftime("%Y-%m-%d") + ".jsonl"
+    assert path.name == "client.jsonl"
     assert (path.stat().st_mode & 0o777) == 0o600
     assert path.read_text().endswith("\n") and len(path.read_text().splitlines()) == 1
     assert len(path.read_bytes()) < 1024
+
+
+def test_existing_file_with_a_loose_mode_is_made_private_on_open(monkeypatch, tmp_path):
+    root = _root(tmp_path)
+    directory = root / "logs" / "bridge-metrics"
+    directory.mkdir()
+    (directory / "client.jsonl").write_text("")
+    (directory / "client.jsonl").chmod(0o666)
+    bridge_observe.configure(root, "cli")
+    _patch_get(monkeypatch, _response(f"{URL}/health", headers=_headers()))
+    bridge_observe.bridge_get(f"{URL}/health")
+    assert len(_rows(root)) == 1
+    assert stat.S_IMODE((directory / "client.jsonl").stat().st_mode) == 0o600
+
+
+def test_writer_is_a_queue_in_front_of_a_midnight_utc_rotation_of_14_files(tmp_path):
+    bridge_observe.configure(_root(tmp_path), "cli")
+    handler = bridge_observe.file_handler()
+    assert isinstance(handler, logging.handlers.TimedRotatingFileHandler)
+    assert handler.when == "MIDNIGHT" and handler.utc is True and handler.backupCount == 14
+    assert isinstance(bridge_observe.queue_handler(), logging.handlers.QueueHandler)
+
+
+def test_the_call_only_enqueues_and_never_waits_for_a_blocked_writer(monkeypatch, tmp_path):
+    root = _root(tmp_path)
+    bridge_observe.configure(root, "cli", queue_size=3)
+    gate = threading.Event()
+    handler = bridge_observe.file_handler()
+    real_emit = handler.emit
+
+    def slow_emit(record):
+        assert gate.wait(20)
+        real_emit(record)
+
+    handler.emit = slow_emit
+    sentinel = _response(f"{URL}/health", headers=_headers())
+    _patch_get(monkeypatch, sentinel)
+    try:
+        started = time.monotonic()
+        for _ in range(12):
+            assert bridge_observe.bridge_get(f"{URL}/health") is sentinel
+        assert time.monotonic() - started < 5
+        assert bridge_observe.dropped() >= 6
+        gate.set()
+        bridge_observe.flush()
+        bridge_observe.bridge_get(f"{URL}/health")
+        rows = _rows(root)
+        assert sum(r.get("dropped_before", 0) for r in rows) == bridge_observe.dropped()
+    finally:
+        gate.set()
+
+
+def test_a_fifo_at_the_log_path_does_not_block_the_call_or_the_shutdown(monkeypatch, tmp_path):
+    root = _root(tmp_path)
+    directory = root / "logs" / "bridge-metrics"
+    directory.mkdir()
+    os.mkfifo(directory / "client.jsonl")
+    bridge_observe.configure(root, "cli")
+    sentinel = _response(f"{URL}/health", headers=_headers())
+    _patch_get(monkeypatch, sentinel)
+    started = time.monotonic()
+    assert bridge_observe.bridge_get(f"{URL}/health") is sentinel
+    bridge_observe.flush()
+    bridge_observe.reset()
+    assert time.monotonic() - started < 10
+
+
+def test_nothing_is_written_outside_the_log_directory(monkeypatch, tmp_path):
+    root = _root(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "client.jsonl").write_text("keep")
+    (root / "logs" / "bridge-metrics").symlink_to(outside)
+    bridge_observe.configure(root, "cli")
+    _patch_get(monkeypatch, _response(f"{URL}/health", headers=_headers()))
+    bridge_observe.bridge_get(f"{URL}/health")
+    bridge_observe.flush()
+    assert (outside / "client.jsonl").read_text() == "keep"
+    assert sorted(p.name for p in outside.iterdir()) == ["client.jsonl"]
+    bridge_observe.reset()
+    (root / "logs" / "bridge-metrics").unlink()
+    directory = root / "logs" / "bridge-metrics"
+    directory.mkdir()
+    (directory / "client.jsonl").symlink_to(outside / "client.jsonl")
+    bridge_observe.configure(root, "cli")
+    bridge_observe.bridge_get(f"{URL}/health")
+    bridge_observe.flush()
+    assert (outside / "client.jsonl").read_text() == "keep"
 
 
 def test_observed_fetch_wrapper_records_injected_fetch(tmp_path):
@@ -352,38 +458,59 @@ def test_observed_fetch_wrapper_records_injected_fetch(tmp_path):
     assert _rows(root)[1]["failure"] == "connect"
 
 
-def test_prune_removes_only_old_dated_jsonl(tmp_path):
+def test_rotated_files_beyond_14_days_are_removed_and_nothing_else(tmp_path):
     root = _root(tmp_path)
     directory = root / "logs" / "bridge-metrics"
     directory.mkdir()
-    today = date(2026, 11, 17)
-    old = (today - timedelta(days=14)).isoformat() + ".jsonl"
-    edge = (today - timedelta(days=13)).isoformat() + ".jsonl"
-    for name in (old, edge, today.isoformat() + ".jsonl", "2026-01-01.jsonl",
-                 "notes.txt", "2026-01-01.jsonl.bak", "2026-13-45.jsonl"):
-        (directory / name).write_text("x\n")
-    (directory / "sub.jsonl").mkdir()
+    day = datetime(2026, 1, 1)
+    for index in range(20):
+        (directory / f"client.jsonl.{(day + timedelta(days=index)):%Y-%m-%d}").write_text("x\n")
+    for name in ("notes.txt", "client.jsonl.bak", "2026-01-01.jsonl", "other.jsonl.2026-01-01"):
+        (directory / name).write_text("keep")
+    (directory / "sub").mkdir()
     outside = tmp_path / "outside.jsonl"
     outside.write_text("keep")
-    (directory / "2025-01-01.jsonl").symlink_to(outside)
-    bridge_observe.prune(directory, today)
-    remaining = sorted(p.name for p in directory.iterdir())
-    assert old not in remaining and "2026-01-01.jsonl" not in remaining
-    assert edge in remaining and today.isoformat() + ".jsonl" in remaining
-    assert "notes.txt" in remaining and "2026-01-01.jsonl.bak" in remaining
-    assert "2026-13-45.jsonl" in remaining and "sub.jsonl" in remaining
+    (directory / "client.jsonl.2025-01-01").symlink_to(outside)
+    bridge_observe.configure(root, "cli")
+    bridge_observe.file_handler().doRollover()
+    bridge_observe.flush()
+    rotated = sorted(p.name for p in directory.glob("client.jsonl.2???-??-??"))
+    assert len(rotated) <= 14
+    assert "client.jsonl.2026-01-01" not in rotated and "client.jsonl.2025-01-01" not in rotated
+    for name in ("notes.txt", "client.jsonl.bak", "2026-01-01.jsonl", "other.jsonl.2026-01-01"):
+        assert (directory / name).read_text() == "keep"
+    assert (directory / "sub").is_dir()
     assert outside.read_text() == "keep"
 
 
-def test_prune_runs_when_the_day_changes(monkeypatch, tmp_path):
+def test_the_day_change_in_utc_rolls_the_file_over(monkeypatch, tmp_path):
     root = _root(tmp_path)
     directory = root / "logs" / "bridge-metrics"
     directory.mkdir()
-    (directory / "2020-01-01.jsonl").write_text("x\n")
+    current = directory / "client.jsonl"
+    current.write_text('{"ts":"old"}\n')
+    two_days_ago = time.time() - 2 * 86400
+    os.utime(current, (two_days_ago, two_days_ago))
     bridge_observe.configure(root, "cli")
     _patch_get(monkeypatch, _response(f"{URL}/health", headers=_headers()))
     bridge_observe.bridge_get(f"{URL}/health")
-    assert not (directory / "2020-01-01.jsonl").exists()
+    bridge_observe.flush()
+    stamp = datetime.fromtimestamp(two_days_ago, timezone.utc).strftime("%Y-%m-%d")
+    assert (directory / f"client.jsonl.{stamp}").read_text() == '{"ts":"old"}\n'
+    assert len(current.read_text().splitlines()) == 1
+
+
+def test_every_bridge_request_carries_the_caller_label_even_when_unconfigured(
+        monkeypatch, tmp_path):
+    calls = _patch_get(monkeypatch, _response(f"{URL}/health", headers=_headers()))
+    bridge_observe.bridge_get(f"{URL}/health", headers={"X-Bridge-Api-Key": "x"})
+    assert calls[0][1]["headers"] == {"X-Bridge-Api-Key": "x", "X-Afx-Caller": "unknown"}
+    bridge_observe.set_default_caller("mission")
+    bridge_observe.bridge_get(f"{URL}/health")
+    assert calls[1][1]["headers"] == {"X-Afx-Caller": "mission"}
+    with bridge_observe.caller_scope("tick"):
+        bridge_observe.bridge_get(f"{URL}/health")
+    assert calls[2][1]["headers"] == {"X-Afx-Caller": "tick"}
 
 
 def test_concurrent_threads_and_processes_append_whole_lines(tmp_path):

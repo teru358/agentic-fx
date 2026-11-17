@@ -170,7 +170,7 @@ def test_the_bridge_key_is_sent_to_symbols_like_to_health(tmp_path):
     io = ScriptedWizardIO(responder=fresh_responder(("bridge 側で API キー", "1")))
     assert run_wizard(root, io, deps) == 0, io.text
     headers = [kwargs.get("headers") for url, kwargs in fetch.calls if url.endswith("/symbols")]
-    assert headers == [{"X-Bridge-Api-Key": "KEYVALUE-1"}]
+    assert headers == [{"X-Bridge-Api-Key": "KEYVALUE-1", "X-Afx-Caller": "unknown"}]
     assert "KEYVALUE-1" not in io.text
 
 

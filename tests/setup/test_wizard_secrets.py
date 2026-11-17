@@ -82,7 +82,8 @@ def test_a_bridge_key_in_the_env_file_is_used_for_the_check_and_seen_as_present(
     io = ScriptedWizardIO(responder=fresh_responder(("bridge 側で API キー", "1")))
     assert run_wizard(root, io, deps) == 0, io.text
     health = [kwargs for url, kwargs in fetch.calls if url.endswith("/health")]
-    assert health and health[0]["headers"] == {"X-Bridge-Api-Key": "SECRET-MARK-2"}
+    assert health and health[0]["headers"] == {"X-Bridge-Api-Key": "SECRET-MARK-2",
+                                               "X-Afx-Caller": "unknown"}
     assert "MT5_BRIDGE_API_KEY (あり)" in io.text
     assert "SECRET-MARK-2" not in io.text
 

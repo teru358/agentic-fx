@@ -100,7 +100,7 @@ class _PrivateRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
     """0600 の通常ファイルだけを開く。symlink は辿らず、他人の file・通常でない file は拒否する。"""
 
     def _open(self):
-        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
         fd = os.open(self.baseFilename, flags, 0o600)
         try:
             info = os.fstat(fd)
@@ -108,6 +108,7 @@ class _PrivateRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
                 raise OSError("log file is not a regular file owned by this user")
             if stat.S_IMODE(info.st_mode) != 0o600:
                 os.fchmod(fd, 0o600)
+            os.set_blocking(fd, True)
             return os.fdopen(fd, "a", encoding=self.encoding or "utf-8")
         except BaseException:
             os.close(fd)

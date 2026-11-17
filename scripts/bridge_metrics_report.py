@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""`logs/bridge-metrics/` の観測行を集計する (標準ライブラリのみ)。
+"""bridge の要求ごとの記録 (bridge 側) と client 側の観測を集計する。
 
-endpoint x caller ごとに件数・lock の待ち/占有の p50/p95/最大・timeout と失敗の件数・
-lock state 別の件数・欠落率を出す。金曜の閉場の 1 時間前から閉場までの行は別の表にする。
+bridge 側 file (`logs/bridge-metrics.jsonl` と日付つきのローテーション済み) と client 側 file
+(`logs/bridge-metrics/client.jsonl` と同様) を別々に、endpoint x caller ごとに件数・lock の
+待ち/占有の p50/p95/最大・timeout と失敗の件数・lock state 別の件数・欠落率で出す。期間は
+各行の ts (UTC) で絞る。金曜の閉場の 1 時間前から閉場までの行は別の表にする。閉場は
+`agentic_fx.core.market_hours` の開から閉への実際の境界で判定する (休日は境界にならない)。
 read-only。bridge には何も要求しない。
 """
 from __future__ import annotations
@@ -10,11 +13,18 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+try:
+    from agentic_fx.core import market_hours
+except ImportError:  # リポジトリから直接実行するとき
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from agentic_fx.core import market_hours
 
 FRIDAY_WINDOW = timedelta(hours=1)
 
@@ -37,18 +47,16 @@ def _parse_ts(text: Any) -> datetime | None:
         return None
 
 
-def _nth_sunday(year: int, month: int, nth: int) -> date:
-    first = date(year, month, 1)
-    offset = (6 - first.weekday()) % 7
-    return first + timedelta(days=offset + 7 * (nth - 1))
-
-
 def friday_close_utc(day: date) -> datetime | None:
-    """金曜の閉場 (NY 17:00)。米国の夏時間は 21:00Z、冬時間は 22:00Z。金曜以外は None。"""
+    """金曜に市場が開から閉へ変わる UTC 時刻。金曜でない日・休日で既に閉場の日は None。"""
     if day.weekday() != 4:
         return None
-    summer = _nth_sunday(day.year, 3, 2) <= day < _nth_sunday(day.year, 11, 1)
-    return datetime(day.year, day.month, day.day, 21 if summer else 22, 0, tzinfo=timezone.utc)
+    for hour in (21, 22):
+        edge = datetime(day.year, day.month, day.day, hour, 0, tzinfo=timezone.utc)
+        if (market_hours.is_market_open(edge - timedelta(microseconds=1))
+                and not market_hours.is_market_open(edge)):
+            return edge
+    return None
 
 
 def friday_close_rows(rows: list[dict]) -> list[dict]:
@@ -97,13 +105,23 @@ def summarize(rows: list[dict]) -> dict[tuple[str, str], dict[str, Any]]:
     return out
 
 
-def load_rows(directory: Path, start: date, end: date) -> tuple[list[dict], int]:
+def _source_files(base: Path) -> list[Path]:
+    """書込み中の file と、`<名前>.YYYY-MM-DD` のローテーション済み file。"""
+    pattern = re.compile(re.escape(base.name) + r"\.\d{4}-\d{2}-\d{2}")
+    try:
+        names = sorted(p for p in base.parent.iterdir() if pattern.fullmatch(p.name))
+    except OSError:
+        names = []
+    return names + [base]
+
+
+def load_rows(base: Path, start: date, end: date) -> tuple[list[dict], int]:
+    """行の ts が [start 0:00Z, end の翌日 0:00Z) のものだけを返す。読めない行は件数に数える。"""
+    lower = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
+    upper = datetime(end.year, end.month, end.day, tzinfo=timezone.utc) + timedelta(days=1)
     rows: list[dict] = []
     bad = 0
-    day = start
-    while day <= end:
-        path = directory / f"{day.isoformat()}.jsonl"
-        day += timedelta(days=1)
+    for path in _source_files(base):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -116,10 +134,12 @@ def load_rows(directory: Path, start: date, end: date) -> tuple[list[dict], int]
             except ValueError:
                 bad += 1
                 continue
-            if not isinstance(row, dict) or _parse_ts(row.get("ts")) is None:
+            moment = _parse_ts(row.get("ts")) if isinstance(row, dict) else None
+            if moment is None:
                 bad += 1
                 continue
-            rows.append(row)
+            if lower <= moment < upper:
+                rows.append(row)
     return rows, bad
 
 
@@ -158,9 +178,19 @@ def _date_arg(text: str) -> date:
         raise argparse.ArgumentTypeError("YYYY-MM-DD で指定してください") from None
 
 
+def _side(label: str, base: Path, start: date, end: date) -> dict[str, Any]:
+    rows, bad = load_rows(base, start, end)
+    return {"label": label, "rows": rows, "bad": bad,
+            "overall": summarize(rows), "friday": summarize(friday_close_rows(rows))}
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="bridge 受動観測の集計")
+    parser = argparse.ArgumentParser(description="bridge の記録 (bridge 側・client 側) の集計")
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="作業 root")
+    parser.add_argument("--bridge-file", type=Path, default=None,
+                        help="bridge 側の file (既定: <root>/mt5_bridge/logs/bridge-metrics.jsonl)")
+    parser.add_argument("--client-file", type=Path, default=None,
+                        help="client 側の file (既定: <root>/logs/bridge-metrics/client.jsonl)")
     today = datetime.now(timezone.utc).date()
     parser.add_argument("--from", dest="start", type=_date_arg, default=today - timedelta(days=7),
                         help="開始日 (UTC、既定は 7 日前)")
@@ -170,19 +200,25 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.start > args.end:
         parser.error("--from は --to 以前にしてください")
-    rows, bad = load_rows(args.root / "logs" / "bridge-metrics", args.start, args.end)
-    overall = summarize(rows)
-    friday = summarize(friday_close_rows(rows))
+    bridge_file = args.bridge_file or args.root / "mt5_bridge" / "logs" / "bridge-metrics.jsonl"
+    client_file = args.client_file or args.root / "logs" / "bridge-metrics" / "client.jsonl"
+    sides = {"bridge": _side("bridge 側", bridge_file, args.start, args.end),
+             "client": _side("client 側", client_file, args.start, args.end)}
     if args.json:
-        print(json.dumps({"from": args.start.isoformat(), "to": args.end.isoformat(),
-                          "rows": len(rows), "bad_lines": bad,
-                          "overall": _as_list(overall), "friday_close": _as_list(friday)},
-                         ensure_ascii=False, indent=2))
+        print(json.dumps({
+            "from": args.start.isoformat(), "to": args.end.isoformat(),
+            **{key: {"rows": len(side["rows"]), "bad_lines": side["bad"],
+                     "overall": _as_list(side["overall"]),
+                     "friday_close": _as_list(side["friday"])}
+               for key, side in sides.items()}},
+            ensure_ascii=False, indent=2))
         return 0
-    print(f"期間 {args.start.isoformat()} 〜 {args.end.isoformat()} (UTC)、行 {len(rows)}、"
-          f"読めない行 {bad}")
-    print("\n".join(_table("全体", overall)))
-    print("\n".join(_table("金曜閉場 (閉場の 1 時間前から閉場まで)", friday)))
+    print(f"期間 {args.start.isoformat()} 〜 {args.end.isoformat()} (UTC)")
+    for side in sides.values():
+        print(f"\n# {side['label']}: 行 {len(side['rows'])}、読めない行 {side['bad']}")
+        print("\n".join(_table(f"{side['label']} 全体", side["overall"])))
+        print("\n".join(_table(f"{side['label']} 金曜閉場 (閉場の 1 時間前から閉場まで)",
+                              side["friday"])))
     return 0
 
 

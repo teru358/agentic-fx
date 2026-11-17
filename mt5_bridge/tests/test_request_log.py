@@ -320,6 +320,22 @@ def test_nothing_is_written_outside_the_log_file(configured, tmp_path):
     assert target.read_text() == "keep"
 
 
+def test_a_fifo_at_the_log_path_blocks_neither_the_request_nor_the_shutdown(
+        configured, tmp_path, monkeypatch):
+    path = tmp_path / "bridge-metrics.jsonl"
+    os.mkfifo(path)
+    sink = request_log.RequestLog()
+    monkeypatch.setattr(request_log, "request_log", sink)
+    sink.start(path)
+    started = time.monotonic()
+    try:
+        assert _call("GET", "/health")[0] == 200
+        sink.flush()
+    finally:
+        sink.stop()
+    assert time.monotonic() - started < 10
+
+
 def test_a_failing_log_never_changes_the_response(configured, tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_client", _Client())
     headers = {"X-Bridge-Api-Key": _API_KEY}

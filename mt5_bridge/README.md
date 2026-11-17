@@ -161,6 +161,24 @@ bridge は `America/New_York` の DST 規則と「サーバ時刻 = NY 壁時計
 
 `logs/bridge.log` にローテーション付きで出力される (5MB × 6 世代)。ファイルに入るのは bridge 自身のログ (MT5 接続・切断・起動メッセージ等)。HTTP アクセスログは標準出力にだけ出る。
 
+### 要求ごとの構造化記録
+
+`logs/bridge-metrics.jsonl` に、1 要求 1 行の JSON を書く (応答の body・detail・status・header は変えない)。要求の処理は標準 logging の QueueHandler に積むだけで、書込みを待たない。queue が詰まったら行を捨て、次に書けた行の `dropped_before` に欠落数を載せる。記録の失敗は応答に影響しない。
+
+| 欄 | 内容 |
+|---|---|
+| `ts` | UTC の時刻 (要求ごとに 1 回だけ取る) |
+| `caller` | request header `X-Afx-Caller` を固定集合 `tick` `mission` `cli` と照合した値。他の値・欠落は `unknown` |
+| `route` | endpoint の形 (`/quote/{symbol}` `/positions/{ticket}/modify` など)。生の path・query は書かない。未知の path は `/other` |
+| `status` | HTTP status |
+| `error_code` | 失敗応答の固定 code。固定の集合に無い値は `unknown`、無ければ `null` |
+| `lock_state` `wait_ms` `hold_ms` `wait_max_ms` `hold_max_ms` `acquisitions` | MT5 lock の状態と、1 要求内の待ち・占有の合計・最大・取得回数 (`unavailable` のときは数値なし) |
+| `history_state` | 履歴専用 slot の状態 (`none` `waiting` `holding` `completed`)。認証に失敗した応答では `null`。ID は書かない |
+
+URL・API キー・生の header・boot id の生値・価格・履歴の ID は書かない。file は `0600` で作り、既存の file の権限が緩ければ開くときに `0600` へ直す。symlink と通常でない file は開かない。
+
+保持: UTC 0 時に日次でローテーションし、14 世代 (`bridge-metrics.jsonl.YYYY-MM-DD`) だけ残す。集計は daemon 側の記録と合わせて `scripts/bridge_metrics_report.py --bridge-file <この file> --client-file <logs/bridge-metrics/client.jsonl>` で出す。
+
 ## トラブルシュート
 
 | 症状 | 原因 / 対処 |
