@@ -16,6 +16,8 @@ from datetime import date, datetime, time as wall_time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import bridge_metrics
+
 logger = logging.getLogger(__name__)
 
 
@@ -191,6 +193,14 @@ class ClosedDeal:
     reason: str
 
 
+class Mt5ClientError(RuntimeError):
+    """固定の error code を持つ RuntimeError。メッセージと型の互換は RuntimeError のまま。"""
+
+    def __init__(self, message: str, *, error_code: str) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+
+
 class PreflightError(Exception):
     """order pre-flight 検証の失敗 (symbol 不可 / tick 無し / 証拠金不足)。
 
@@ -236,6 +246,10 @@ class Mt5Client:
         self._mismatch_latched = False
         self._last_time_rule_state = "unverified"
 
+    def _timed_lock(self):
+        """`_lock` を取り、要求ごとの集計へ待ち・占有を足す (`_lock` の型には依存しない)。"""
+        return bridge_metrics.timed_lock(self._lock)
+
     def connect(self) -> None:
         """MT5 ターミナルを起動 (or 既起動なら attach) し、必要なときだけログインする。
 
@@ -247,7 +261,7 @@ class Mt5Client:
         唯一の経路。別口座 / 未ログインのときは従来どおり login() を試みる。
         """
         self._mt5 = _import_mt5()
-        with self._lock:
+        with self._timed_lock():
             if not self._mt5.initialize():
                 err = self._mt5.last_error()
                 raise RuntimeError(f"MT5 initialize() failed: {err}")
@@ -268,7 +282,7 @@ class Mt5Client:
         logger.info(f"MT5 connected: login={self._login} server={self._server}")
 
     def disconnect(self) -> None:
-        with self._lock:
+        with self._timed_lock():
             if self._mt5 is not None and self._connected:
                 self._mt5.shutdown()
                 self._connected = False
@@ -282,7 +296,7 @@ class Mt5Client:
         if not self._connected:
             return False
         try:
-            with self._lock:
+            with self._timed_lock():
                 info = self._mt5.terminal_info()
             return info is not None
         except Exception:  # noqa: BLE001
@@ -296,7 +310,7 @@ class Mt5Client:
 
     def get_server_time(self) -> dict:
         """Return rule-derived server time and the latest measurement evidence."""
-        with self._lock:
+        with self._timed_lock():
             now = self._now()
             self._maybe_measure_locked(now)
             state = self._time_rule_state_locked(now)
@@ -396,7 +410,7 @@ class Mt5Client:
             raise TimeRuleUnavailableError(f"time_rule_{state}")
 
     def time_rule_status(self) -> tuple[str, str | None]:
-        with self._lock:
+        with self._timed_lock():
             now = self._now()
             state = self._time_rule_state_locked(now)
             measured_at = (None if self._measured_at is None else
@@ -417,7 +431,7 @@ class Mt5Client:
         return int(tick.time)
 
     def get_account(self) -> AccountInfo:
-        with self._lock:
+        with self._timed_lock():
             return self._get_account_locked()
 
     def _get_account_locked(self) -> AccountInfo:
@@ -438,13 +452,19 @@ class Mt5Client:
         )
 
     def get_quote(self, symbol: str) -> Quote:
-        with self._lock:
+        with self._timed_lock():
             # symbol_info_tick がスプレッド込みの最新 bid/ask を返す
             if not self._mt5.symbol_select(symbol, True):
-                raise RuntimeError(f"symbol_select({symbol}) failed: {self._mt5.last_error()}")
+                raise Mt5ClientError(
+                    f"symbol_select({symbol}) failed: {self._mt5.last_error()}",
+                    error_code="symbol_unavailable",
+                )
             tick = self._mt5.symbol_info_tick(symbol)
             if tick is None:
-                raise RuntimeError(f"symbol_info_tick({symbol}) failed: {self._mt5.last_error()}")
+                raise Mt5ClientError(
+                    f"symbol_info_tick({symbol}) failed: {self._mt5.last_error()}",
+                    error_code="tick_unavailable",
+                )
             info = self._mt5.symbol_info(symbol)
             spread = int(info.spread) if info is not None else 0
             now = self._now()
@@ -467,15 +487,17 @@ class Mt5Client:
         import time as _time
         from datetime import datetime, timezone
 
-        with self._lock:
+        with self._timed_lock():
             if not self._mt5.symbol_select(symbol, True):
-                raise RuntimeError(
-                    f"symbol_select({symbol}) failed: {self._mt5.last_error()}"
+                raise Mt5ClientError(
+                    f"symbol_select({symbol}) failed: {self._mt5.last_error()}",
+                    error_code="symbol_unavailable",
                 )
             tick = self._mt5.symbol_info_tick(symbol)
             if tick is None:
-                raise RuntimeError(
-                    f"symbol_info_tick({symbol}) failed: {self._mt5.last_error()}"
+                raise Mt5ClientError(
+                    f"symbol_info_tick({symbol}) failed: {self._mt5.last_error()}",
+                    error_code="tick_unavailable",
                 )
             fill_price = float(tick.ask if side == "buy" else tick.bid)
         ticket = _time.time_ns() // 1_000  # μs 解像度の擬似 ticket
@@ -504,7 +526,7 @@ class Mt5Client:
 
         close_price = 0.0
         if symbol:
-            with self._lock:
+            with self._timed_lock():
                 tick = self._mt5.symbol_info_tick(symbol)
             if tick is not None:
                 close_price = float((tick.bid + tick.ask) / 2)
@@ -518,7 +540,7 @@ class Mt5Client:
         }
 
     def get_positions(self) -> list[Position]:
-        with self._lock:
+        with self._timed_lock():
             positions = self._mt5.positions_get()
             now = self._now()
             self._maybe_measure_locked(now)
@@ -545,7 +567,7 @@ class Mt5Client:
         server-side SL/TP で position が消えた後の reconciliation で、検知時点の
         current price ではなく MT5 の実決済価格・実現損益を使うための参照。
         """
-        with self._lock:
+        with self._timed_lock():
             try:
                 deals = self._mt5.history_deals_get(position=ticket)
             except TypeError:
@@ -595,7 +617,7 @@ class Mt5Client:
         )
 
     def get_symbols(self) -> list[str]:
-        with self._lock:
+        with self._timed_lock():
             symbols = self._mt5.symbols_get()
         if symbols is None:
             return []
@@ -636,11 +658,12 @@ class Mt5Client:
         if tf_attr is None:
             raise ValueError(f"unsupported interval: {interval}")
 
-        with self._lock:
+        with self._timed_lock():
             tf = getattr(self._mt5, tf_attr)
             if not self._mt5.symbol_select(symbol, True):
-                raise RuntimeError(
-                    f"symbol_select({symbol}) failed: {self._mt5.last_error()}"
+                raise Mt5ClientError(
+                    f"symbol_select({symbol}) failed: {self._mt5.last_error()}",
+                    error_code="symbol_unavailable",
                 )
 
             now = self._now()
@@ -657,8 +680,9 @@ class Mt5Client:
                     utc_to_server_epoch(date_to.astimezone(timezone.utc)), timezone.utc),
             )
             if rates is None:
-                raise RuntimeError(
-                    f"copy_rates_range failed: {self._mt5.last_error()}"
+                raise Mt5ClientError(
+                    f"copy_rates_range failed: {self._mt5.last_error()}",
+                    error_code="history_copy_failed",
                 )
 
             bars: list[dict] = []
@@ -684,7 +708,7 @@ class Mt5Client:
         self, symbol: str, side: str, volume_lots: float, price: float,
     ) -> float:
         """MT5 内蔵関数で必要証拠金を計算 (口座通貨建て、通貨換算込み)。"""
-        with self._lock:
+        with self._timed_lock():
             return self._calc_required_margin_locked(symbol, side, volume_lots, price)
 
     def _calc_required_margin_locked(
@@ -721,7 +745,7 @@ class Mt5Client:
 
         片方だけ指定された場合、未指定側は現在ポジションの値を保持する。
         """
-        with self._lock:
+        with self._timed_lock():
             positions = self._mt5.positions_get(ticket=ticket)
             if not positions:
                 raise RuntimeError(f"position {ticket} not found")
@@ -759,7 +783,7 @@ class Mt5Client:
         """MT5 のポジションをクローズ。symbol/volume/type は positions_get から取得。"""
         from datetime import datetime, timezone
 
-        with self._lock:
+        with self._timed_lock():
             positions = self._mt5.positions_get(ticket=ticket)
             if not positions:
                 raise RuntimeError(f"position {ticket} not found")
@@ -807,7 +831,7 @@ class Mt5Client:
         """live 発注前の証拠金チェック (symbol_select→tick→margin→free_margin) を
         lock 下で実行する。問題があれば PreflightError。price は margin 計算専用
         (place_order_live が自前で tick を取り直すため戻さない)。"""
-        with self._lock:
+        with self._timed_lock():
             if not self._mt5.symbol_select(symbol, True):
                 raise PreflightError(f"symbol {symbol} not available", http_status=404)
             tick = self._mt5.symbol_info_tick(symbol)
@@ -835,15 +859,17 @@ class Mt5Client:
         """MT5 へ実発注。retcode 解釈は呼出側 (server.py) で行う。"""
         from datetime import datetime, timezone
 
-        with self._lock:
+        with self._timed_lock():
             if not self._mt5.symbol_select(symbol, True):
-                raise RuntimeError(
-                    f"symbol_select({symbol}) failed: {self._mt5.last_error()}"
+                raise Mt5ClientError(
+                    f"symbol_select({symbol}) failed: {self._mt5.last_error()}",
+                    error_code="symbol_unavailable",
                 )
             tick = self._mt5.symbol_info_tick(symbol)
             if tick is None:
-                raise RuntimeError(
-                    f"symbol_info_tick({symbol}) failed: {self._mt5.last_error()}"
+                raise Mt5ClientError(
+                    f"symbol_info_tick({symbol}) failed: {self._mt5.last_error()}",
+                    error_code="tick_unavailable",
                 )
             price = float(tick.ask if side == "buy" else tick.bid)
 

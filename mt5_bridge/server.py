@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import hmac
 import logging
 import secrets
 import time
@@ -22,6 +23,7 @@ from starlette.responses import JSONResponse
 
 from admin_models import AdminStatus, HaltRequest
 from config import BridgeSettings, is_loopback_host, load_settings
+import bridge_metrics
 from mt5_client import Mt5Client, PreflightError, TimeRuleUnavailableError
 from ohlcv_models import OhlcvBar, OhlcvResponse
 from order_models import (
@@ -148,6 +150,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _hdr(code: str) -> dict[str, str]:
+    """HTTPException に載せる固定 error code。body・detail・status は変えない。"""
+    return {bridge_metrics.H_ERROR_CODE: code}
+
+
+def _code(exc: Exception, default: str) -> dict[str, str]:
+    return _hdr(getattr(exc, "error_code", default))
+
+
 # ── 起動時にロードする singleton ────────────────────────────────────
 
 _settings: BridgeSettings | None = None
@@ -201,6 +212,7 @@ def require_api_key(x_bridge_api_key: str | None = Header(default=None)) -> None
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid or missing X-Bridge-Api-Key",
+            headers=_hdr("auth_invalid"),
         )
 
 
@@ -233,8 +245,94 @@ class LocalOnlyWithoutKeyMiddleware:
             await send({"type": "websocket.close", "code": 1008})
             return
         await JSONResponse(
-            {"detail": LOCAL_ONLY_DETAIL}, status_code=status.HTTP_403_FORBIDDEN
+            {"detail": LOCAL_ONLY_DETAIL}, status_code=status.HTTP_403_FORBIDDEN,
+            headers=_hdr("local_only_forbidden"),
         )(scope, receive, send)
+
+
+HISTORY_BUSY_DETAIL = "history request in flight: another history request has not completed"
+HISTORY_DUPLICATE_DETAIL = "history request already accepted: the same request id is not executed again"
+HISTORY_ID_INVALID_DETAIL = "invalid X-Bridge-History-Request-Id"
+
+_METRICS_SCOPE_KEY = "bridge_metrics"
+
+
+def _fallback_error_code(scope, status_code: int) -> str | None:
+    """handler が code を付けなかった応答 (未知 route など) の固定 code。"""
+    if status_code == 404 and "endpoint" not in scope:
+        return "route_not_found"
+    if status_code == 405:
+        return "method_not_allowed"
+    if status_code == 422:
+        return "request_validation_failed"
+    return None
+
+
+def _request_is_authorized(headers) -> bool:
+    """履歴 slot の詳細を載せてよい要求か。キー不要の構成か、正しいキーを提示した要求だけ。"""
+    if _settings is None or not _settings.auth_required:
+        return True
+    key = headers.get(b"x-bridge-api-key")
+    return key is not None and hmac.compare_digest(key, _settings.api_key.encode())
+
+
+class MetricsMiddleware:
+    """全 http 応答へ受動計測 header を付ける純粋な ASGI middleware。
+
+    body・detail・status は触らない。最も外側に置き、LocalOnlyWithoutKeyMiddleware の 403 や
+    経路解決前の 404 も覆う。要求ごとの集計を ContextVar に載せ、thread pool の handler へ渡す。
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        raw = {k: v for k, v in scope.get("headers", [])}
+        metrics = bridge_metrics.RequestMetrics()
+        history_id = raw.get(b"x-bridge-history-request-id")
+        if history_id is not None:
+            metrics.history_request_id = history_id.decode("latin-1")
+        try:
+            metrics.authorized = _request_is_authorized(raw)
+        except Exception:  # noqa: BLE001
+            metrics.authorized = False
+        scope[_METRICS_SCOPE_KEY] = metrics
+
+        async def send_with_metrics(message):
+            if message["type"] == "http.response.start":
+                message = {**message, "headers": _with_metrics(scope, message, metrics)}
+            await send(message)
+
+        token = bridge_metrics.bind_metrics(metrics)
+        try:
+            await self.app(scope, receive, send_with_metrics)
+        finally:
+            bridge_metrics.unbind_metrics(token)
+
+
+def _with_metrics(scope, message, metrics) -> list:
+    headers = list(message.get("headers", []))
+    present = {k.lower() for k, _ in headers}
+    code_name = bridge_metrics.H_ERROR_CODE.lower().encode()
+    code = None
+    for k, v in headers:
+        if k.lower() == code_name:
+            code = v.decode("latin-1")
+    if code is None:
+        code = _fallback_error_code(scope, message["status"])
+    extra = bridge_metrics.response_headers(
+        metrics, error_code=code if code_name not in present else None,
+        include_slot=metrics.authorized,
+    )
+    if code is not None and code_name in present and code in bridge_metrics.AUTH_REJECTION_CODES:
+        extra = [(k, v) for k, v in extra if not k.startswith("X-Bridge-History-")]
+    for name, value in extra:
+        if name.lower().encode() not in present:
+            headers.append((name.encode(), value.encode("latin-1")))
+    return headers
 
 
 ORDER_KEY_REQUIRED_DETAIL = "発注系は API キーが必要"
@@ -246,6 +344,7 @@ def require_order_api_key(x_bridge_api_key: str | None = Header(default=None)) -
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=ORDER_KEY_REQUIRED_DETAIL,
+            headers=_hdr("order_key_required"),
         )
     require_api_key(x_bridge_api_key)
 
@@ -261,6 +360,19 @@ app = FastAPI(
     openapi_url=None,
 )
 app.add_middleware(LocalOnlyWithoutKeyMiddleware)
+app.add_middleware(MetricsMiddleware)   # 最も外側 (後に足したものが外側)
+
+
+@app.exception_handler(Exception)
+async def _unexpected_error(request: Request, exc: Exception):
+    """想定外の例外。既定の 500 応答と同じ本文のまま、計測 header だけ付ける。"""
+    from starlette.responses import PlainTextResponse
+
+    metrics = request.scope.get(_METRICS_SCOPE_KEY)
+    headers = dict(bridge_metrics.response_headers(
+        metrics, error_code="internal_error", include_slot=False,
+    ))
+    return PlainTextResponse("Internal Server Error", status_code=500, headers=headers)
 
 # 発注・管理書き込み系。認証は router 単位で付ける (個別 decorator には付けない)
 order_router = APIRouter(dependencies=[Depends(require_order_api_key)])
@@ -301,7 +413,7 @@ def health():
 @app.get("/account", dependencies=[Depends(require_api_key)])
 def account():
     if _client is None or not _client.is_connected:
-        raise HTTPException(503, "MT5 not connected")
+        raise HTTPException(503, "MT5 not connected", headers=_hdr("mt5_not_connected"))
     return asdict(_client.get_account())
 
 
@@ -314,26 +426,26 @@ def server_time():
     両方の時計、測定値、検査の状態をここから覗ける。
     """
     if _client is None or not _client.is_connected:
-        raise HTTPException(503, "MT5 not connected")
+        raise HTTPException(503, "MT5 not connected", headers=_hdr("mt5_not_connected"))
     return _client.get_server_time()
 
 
 @app.get("/quote/{symbol}", dependencies=[Depends(require_api_key)])
 def quote(symbol: str):
     if _client is None or not _client.is_connected:
-        raise HTTPException(503, "MT5 not connected")
+        raise HTTPException(503, "MT5 not connected", headers=_hdr("mt5_not_connected"))
     try:
         return asdict(_client.get_quote(symbol))
     except TimeRuleUnavailableError as e:
-        raise HTTPException(503, e.detail)
+        raise HTTPException(503, e.detail, headers=_hdr(e.detail))
     except RuntimeError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404, str(e), headers=_code(e, "quote_failed"))
 
 
 @app.get("/positions", dependencies=[Depends(require_api_key)])
 def positions():
     if _client is None or not _client.is_connected:
-        raise HTTPException(503, "MT5 not connected")
+        raise HTTPException(503, "MT5 not connected", headers=_hdr("mt5_not_connected"))
     return [asdict(p) for p in _client.get_positions()]
 
 
@@ -341,17 +453,18 @@ def positions():
          dependencies=[Depends(require_api_key)])
 def closed_deal(ticket: int):
     if _client is None or not _client.is_connected:
-        raise HTTPException(503, "MT5 not connected")
+        raise HTTPException(503, "MT5 not connected", headers=_hdr("mt5_not_connected"))
     deal = _client.get_closed_deal(ticket)
     if deal is None:
-        raise HTTPException(404, f"closed deal not found for ticket={ticket}")
+        raise HTTPException(404, f"closed deal not found for ticket={ticket}",
+                            headers=_hdr("closed_deal_not_found"))
     return ClosedDealResponse(**asdict(deal))
 
 
 @app.get("/symbols", dependencies=[Depends(require_api_key)])
 def symbols():
     if _client is None or not _client.is_connected:
-        raise HTTPException(503, "MT5 not connected")
+        raise HTTPException(503, "MT5 not connected", headers=_hdr("mt5_not_connected"))
     return _client.get_symbols()
 
 
@@ -370,25 +483,45 @@ def ohlcv(
     """
     from datetime import datetime as _dt
 
+    metrics = bridge_metrics.current_metrics()
+    history_id = metrics.history_request_id if metrics is not None else None
+    if history_id is not None and not bridge_metrics.valid_history_request_id(history_id):
+        raise HTTPException(400, HISTORY_ID_INVALID_DETAIL,
+                            headers=_hdr("history_request_id_invalid"))
+
     if _client is None or not _client.is_connected:
-        raise HTTPException(503, "MT5 not connected")
+        raise HTTPException(503, "MT5 not connected", headers=_hdr("mt5_not_connected"))
     try:
         date_from = _dt.fromisoformat(from_.replace("Z", "+00:00"))
         date_to = _dt.fromisoformat(to.replace("Z", "+00:00"))
     except ValueError as e:
-        raise HTTPException(400, f"invalid timestamp: {e}")
+        raise HTTPException(400, f"invalid timestamp: {e}", headers=_hdr("invalid_timestamp"))
 
     if date_to <= date_from:
-        raise HTTPException(400, "to must be after from")
+        raise HTTPException(400, "to must be after from", headers=_hdr("invalid_range"))
 
+    # 履歴専用 slot: native 取得の前に登録し、全 native 呼出しと lock 解放の後だけ完了にする。
+    # この thread は HTTP の切断に関わらず最後まで走るので、追跡は切断で消えない。
+    entry = None
+    if history_id is not None:
+        verdict, entry = bridge_metrics.history_slot.admit(history_id, metrics)
+        if verdict == bridge_metrics.HistorySlot.DUPLICATE:
+            raise HTTPException(409, HISTORY_DUPLICATE_DETAIL,
+                                headers=_hdr("history_request_duplicate"))
+        if verdict == bridge_metrics.HistorySlot.BUSY:
+            raise HTTPException(409, HISTORY_BUSY_DETAIL,
+                                headers=_hdr("history_request_busy"))
     try:
         bars_raw = _client.copy_rates_range(symbol, interval, date_from, date_to)
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e), headers=_hdr("invalid_request"))
     except TimeRuleUnavailableError as e:
-        raise HTTPException(503, e.detail)
+        raise HTTPException(503, e.detail, headers=_hdr(e.detail))
     except RuntimeError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404, str(e), headers=_code(e, "history_failed"))
+    finally:
+        if entry is not None:
+            bridge_metrics.history_slot.complete(entry)
 
     return OhlcvResponse(
         symbol=symbol,
@@ -410,9 +543,9 @@ _RETCODE_RATE_LIMIT = 10024   # TOO_MANY_REQUESTS → 100ms backoff + 1 回再�
 @order_router.post("/order", response_model=OrderResponse)
 def place_order(req: OrderRequest):
     if _client is None or not _client.is_connected:
-        raise HTTPException(503, "MT5 not connected")
+        raise HTTPException(503, "MT5 not connected", headers=_hdr("mt5_not_connected"))
     if _runtime is None:
-        raise HTTPException(503, "runtime not initialized")
+        raise HTTPException(503, "runtime not initialized", headers=_hdr("runtime_not_initialized"))
 
     # 経路 1: hard halt or 通常 DRY_RUN モード → DRY_RUN パス
     if _runtime.dry_run:
@@ -423,7 +556,7 @@ def place_order(req: OrderRequest):
             )
             return OrderResponse(**result)
         except RuntimeError as e:
-            raise HTTPException(404, str(e))
+            raise HTTPException(404, str(e), headers=_code(e, "order_failed"))
 
     # 経路 2: soft halt 中 → 423 Locked
     if _runtime.soft_halted:
@@ -431,6 +564,7 @@ def place_order(req: OrderRequest):
             423,
             "bridge is soft-halted, new orders rejected. "
             "POST /admin/resume to clear halt.",
+            headers=_hdr("soft_halted"),
         )
 
     # 経路 3: live mode
@@ -440,9 +574,9 @@ def place_order(req: OrderRequest):
             req.symbol, req.side, req.volume_lots, margin_buffer=1.05,
         )
     except PreflightError as e:
-        raise HTTPException(e.http_status, str(e))
+        raise HTTPException(e.http_status, str(e), headers=_hdr("preflight_rejected"))
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(500, f"pre-flight check failed: {e}")
+        raise HTTPException(500, f"pre-flight check failed: {e}", headers=_hdr("preflight_error"))
 
     # ── 発注 + retry (REQUOTE/PRICE_CHANGED 1 回、TOO_MANY_REQUESTS は 100ms backoff) ──
     last_result: dict | None = None
@@ -455,7 +589,7 @@ def place_order(req: OrderRequest):
                 deviation_points=_settings.deviation_points,
             )
         except RuntimeError as e:
-            raise HTTPException(500, str(e))
+            raise HTTPException(500, str(e), headers=_code(e, "order_failed"))
 
         retcode = last_result["retcode"]
         if retcode in (_RETCODE_DONE, _RETCODE_PARTIAL):
@@ -482,17 +616,18 @@ def place_order(req: OrderRequest):
         409,
         f"order rejected: retcode={last_result['retcode']} "
         f"comment={last_result.get('comment_response', '')}",
+        headers=_hdr("order_rejected"),
     )
 
 
 @order_router.post("/positions/{ticket}/modify", response_model=ModifyPositionResponse)
 def modify_position(ticket: int, req: ModifyPositionRequest):
     if req.sl is None and req.tp is None:
-        raise HTTPException(400, "sl or tp must be provided")
+        raise HTTPException(400, "sl or tp must be provided", headers=_hdr("modify_no_fields"))
     if _client is None or not _client.is_connected:
-        raise HTTPException(503, "MT5 not connected")
+        raise HTTPException(503, "MT5 not connected", headers=_hdr("mt5_not_connected"))
     if _runtime is None:
-        raise HTTPException(503, "runtime not initialized")
+        raise HTTPException(503, "runtime not initialized", headers=_hdr("runtime_not_initialized"))
 
     # SL/TP modify は既存ポジションのリスク低減用途なので soft halt 中も許可する。
     try:
@@ -502,29 +637,29 @@ def modify_position(ticket: int, req: ModifyPositionRequest):
             result = _client.modify_position_live(ticket, sl=req.sl, tp=req.tp)
         return ModifyPositionResponse(**result)
     except RuntimeError as e:
-        raise HTTPException(409, str(e))
+        raise HTTPException(409, str(e), headers=_hdr("modify_failed"))
 
 
 @order_router.post("/positions/{ticket}/close", response_model=ClosePositionResponse)
 def close_position(ticket: int, symbol: str | None = None):
     if _client is None or not _client.is_connected:
-        raise HTTPException(503, "MT5 not connected")
+        raise HTTPException(503, "MT5 not connected", headers=_hdr("mt5_not_connected"))
     if _runtime is None:
-        raise HTTPException(503, "runtime not initialized")
+        raise HTTPException(503, "runtime not initialized", headers=_hdr("runtime_not_initialized"))
 
     if _runtime.dry_run:
         try:
             result = _client.close_position_dry_run(ticket, symbol=symbol)
             return ClosePositionResponse(**result)
         except RuntimeError as e:
-            raise HTTPException(500, str(e))
+            raise HTTPException(500, str(e), headers=_hdr("close_failed"))
 
     # close は soft halt 中も実行可能 (既存ポジ管理のため)
     try:
         result = _client.close_position_live(ticket)
         return ClosePositionResponse(**result)
     except RuntimeError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404, str(e), headers=_hdr("close_failed"))
 
 
 # ── 管理エンドポイント (Phase 3b: 2-tier halt) ────────────────────────
@@ -542,7 +677,7 @@ def _build_admin_status() -> AdminStatus:
 @order_router.post("/admin/halt", response_model=AdminStatus)
 def admin_halt(req: HaltRequest):
     if _runtime is None:
-        raise HTTPException(503, "runtime not initialized")
+        raise HTTPException(503, "runtime not initialized", headers=_hdr("runtime_not_initialized"))
     if req.mode == "hard":
         _runtime.hard_halt(reason=req.reason)
     else:
@@ -553,10 +688,10 @@ def admin_halt(req: HaltRequest):
 @order_router.post("/admin/resume", response_model=AdminStatus)
 def admin_resume():
     if _runtime is None:
-        raise HTTPException(503, "runtime not initialized")
+        raise HTTPException(503, "runtime not initialized", headers=_hdr("runtime_not_initialized"))
     ok, msg = _runtime.resume()
     if not ok:
-        raise HTTPException(403, msg)
+        raise HTTPException(403, msg, headers=_hdr("resume_refused"))
     return _build_admin_status()
 
 
@@ -564,7 +699,7 @@ def admin_resume():
          dependencies=[Depends(require_api_key)])
 def admin_status():
     if _runtime is None:
-        raise HTTPException(503, "runtime not initialized")
+        raise HTTPException(503, "runtime not initialized", headers=_hdr("runtime_not_initialized"))
     return _build_admin_status()
 
 

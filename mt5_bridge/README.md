@@ -51,6 +51,28 @@ afx の価格取得だけが目的なら、API キーなしでも動く (発注�
 - API キーを設定すると、全 endpoint (`/health` 以外。キーを設定済みなら `/health` は接続元を問わず開いている) が `X-Bridge-Api-Key` ヘッダを要求する。
 - この bridge には認可や rate limit の仕組みは無い。インターネットには公開しないこと。
 
+## 計測 header と履歴専用 slot
+
+全ての応答 (成功、エラー、401・403、未知の path を含む) に、body・detail・status を変えない受動計測の header が付く (protocol v1)。
+
+| header | 意味 |
+|---|---|
+| `X-Bridge-Metrics-Version` | protocol の版 (`1`) |
+| `X-Bridge-Boot-Id` | process 起動ごとの opaque 値。口座に由来しない。process が再起動すると変わる |
+| `X-Bridge-Lock-State` | `measured` (MT5 の lock を 1 回以上取った) / `not_locked` / `unavailable` (計測できなかった。0 と読まない) |
+| `X-Bridge-Lock-Wait-Ms` `-Hold-Ms` `-Acquisitions` | 1 要求内の全取得の合計待ち・合計占有・回数 |
+| `X-Bridge-Lock-Wait-Max-Ms` `-Hold-Max-Ms` | 1 回の取得の最大の待ち・占有 |
+| `X-Bridge-Error-Code` | 失敗応答の固定 code (`symbol_unavailable` `history_copy_failed` `route_not_found` `time_rule_mismatch` など)。detail の文字列は従来のまま |
+
+履歴専用 slot: `/ohlcv` の要求が `X-Bridge-History-Request-Id` (英数字と `._-`、128 文字まで) を持つとき、bridge は単一の slot に登録する。
+
+- native の取得の前に登録し、全 native 呼出しと lock の解放が終わった後だけ `completed` にする。HTTP が切れても追跡は続く。
+- slot は次の履歴要求まで保持する。header の無い要求は上書きしない。
+- 完了前に別の ID の履歴要求が来ると、native を実行せず 409 で拒否する。同じ ID の再送も実行しない (409)。
+- 状態は lock を取らずに読まれ、認証済みの既存応答 (API キー設定時は正しいキーを提示した要求) の header に載る: `X-Bridge-History-Request-Id` / `-State` (`waiting` `holding` `completed` `none`) / `-Wait-Ms` `-Hold-Ms` (`completed` のときだけ)。認証に失敗した応答には載せない。
+
+boot id と slot は process の中に持つので、bridge は 1 process で動かす (`uv run python server.py`)。app を object で渡す起動のため、uvicorn は複数 worker を拒否する。
+
 ## 配備 (upgrade)
 
 時刻規則を持つ版へ上げるときの手順。MT5 ターミナルは止めない (再ログインに OTP が要るため)。
