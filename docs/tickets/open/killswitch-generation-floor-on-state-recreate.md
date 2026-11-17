@@ -25,3 +25,4 @@ init と wizard が既存の state を引き継ぐ契約は保ったまま、sta
 ## 経緯
 
 - 2026-11-14: 起票。
+- 2026-11-16: 状態: 設計待ち — state ファイルの消失は検出されない: StateStore の読取はファイルが無いと既定の AppState (latched=False) を返し、risk gate (Executor の state.load) と scheduler の約定停止判定 (killswitch-latch-pending-limit-fills) の両方が clear として扱う。稼働中の消失を検出する読み方は、世代 floor と合わせてここで扱う (scheduler だけを厳格にすると gate と非対称になるため、同件では入れなかった)

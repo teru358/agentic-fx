@@ -112,7 +112,7 @@
 | [plugin-inherited-filter-test-hits-fingerprint-selftest-first](open/plugin-inherited-filter-test-hits-fingerprint-selftest-first.md) | 中 | 2026-11-07 | 継承 seccomp filter の拒否 test が fingerprint 自己試験の失敗を先に返す |
 | [improve-eval-window-reference-availability](open/improve-eval-window-reference-availability.md) | 中 | 2026-11-09 | 参照系列を宣言した候補の評価区間に、参照の履歴が無い先頭の足が入る |
 | [reference-daily-session-completeness](open/reference-daily-session-completeness.md) | 中 | 2026-11-14 | 非24時間銘柄の1d参照を取引セッションに沿って確定する |
-| [killswitch-latch-pending-limit-fills](open/killswitch-latch-pending-limit-fills.md) | 中 | 2026-11-16 | kill switch のラッチ中も未約定の指値が約定する |
+| [cancel-stall-in-cancelling-state](open/cancel-stall-in-cancelling-state.md) | 中 | 2026-11-16 | 取消の途中で DB 遷移に失敗した注文が CANCELLING に残り予約を占有する |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
 | [tier-a-directive-ignored](open/tier-a-directive-ignored.md) | 中 |  | 自己テストの連続失敗の警告が無視され続け、止める仕組みが無い |

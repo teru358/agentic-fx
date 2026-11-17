@@ -96,6 +96,13 @@ def test_drawdown_triggers_kill():
     assert any("kill" in x for x in r.reasons)
 
 
+def test_drawdown_reason_at_exact_threshold_and_text_unchanged():
+    r = evaluate(_intent(), _ctx(equity=980_000.0), RISK)  # DD 2.00% == 閾値
+    assert "kill switch: drawdown 2.00% >= 2.0%" in r.reasons
+    r = evaluate(_intent(), _ctx(equity=980_100.0), RISK)
+    assert not any("drawdown" in x for x in r.reasons)
+
+
 @pytest.mark.parametrize("equity", [979_000.0, 995_000.0])
 @pytest.mark.parametrize("latched", [False, True])
 def test_capital_protection_does_not_depend_on_the_winter_rollover(equity, latched):

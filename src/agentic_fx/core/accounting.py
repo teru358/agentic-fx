@@ -47,6 +47,11 @@ def drawdown_pct(equity: float, hwm: float) -> float:
     return max(0.0, (hwm - equity) / hwm * 100.0)
 
 
+def drawdown_kill_reached(equity: float, hwm: float, kill_pct: float) -> bool:
+    """現在 DD が kill 閾値以上か (一致で停止)。"""
+    return drawdown_pct(equity, hwm) >= kill_pct
+
+
 def daily_start_snapshot(conn: sqlite3.Connection, now: datetime,
                          day_start: datetime, *,
                          max_age_hours: float = 48.0

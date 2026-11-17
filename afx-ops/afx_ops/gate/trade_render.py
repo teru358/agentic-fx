@@ -32,6 +32,7 @@ _REASONS = {
     "rate_unavailable": "換算レート不明",
     "account_unknown": "口座情報なし",
     "equity_nonpositive": "残高が正でない",
+    "kill_switch": "kill switch による取消",
 }
 UNKNOWN_REASON = "理由は表示できません"
 AMOUNTS = ("absolute", "relative")

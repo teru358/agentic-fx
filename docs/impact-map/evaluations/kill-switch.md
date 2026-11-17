@@ -270,3 +270,21 @@ T3 の二件の確認で source を読んで頁の記述と合っていること
 
 「無関係」41 件を source で読み直し、配送の開始・継続・停止・復旧に効くものを移した。gateway・poll の開始前の処理 (prepare の `_load_and_invalidate`、起動 reconcile の `_fetch`・`_find_posted`) と、同じ poll 周回を止め得る承認表示の処理 (`_edit`・`_send_approval`・`_update_display_locked`・`_repost_locked`) は、恒久拒否・state 失敗で bot 全体が止まり、一時失敗の再試行が配送の開始を待たせるため「関連・既存」に移した。`write_snapshot` の前処理 (`_remove_stale_temps`) も cursor の保存の失敗分類に効くので移した。結果は無関係 27 / 関連・既存 143 / 更新 14 / 情報項目 1。F172 (起動 reconcile)・F173 (poll_once) を足した。この裁き直しの経過時間は操作と編集を含む約 10 分で、全件の意味の照合の費用としては扱わない。
 
+
+## T3 二件目の同 commit 実地試験: ラッチ中の未約定指値 (§6.4)
+
+[指値の ticket](../../tickets/closed/killswitch-latch-pending-limit-fills.md) (scheduler の約定経路に state と DD の停止を足す変更) で、code と頁を同じ commit に入れ、閉鎖束 (a)〜(e) を実行した。
+
+- (設計 C0、§6.1) 指揮者が頁と literal 逆引きで予定 symbol を照合し、scheduler が `kill_switch_latched` を読まないこと、頁に約定経路が無いことを確かめてから、守る K と禁止経路の二行を実装 brief に渡した。設計の予定台帳 (F・K・D・手動辺) は設計書 §7。
+- (e) 同 commit: 実装の commit に頁と照合記録の更新を `--fixup` で重ね、是正のたびに同じ commit (または是正の commit) に頁を入れた。関係を変えない是正は `contract_unchanged` で付け直した。
+- (a) 新 tree の extract (終了コード 0) と check: 是正のたびに check が変わった anchor を stale として出し (例: 全取消の例外隔離で `_cancel_all_pending`、DD 判定の共有で `risk_gate.py::evaluate`)、source を読んで照合記録を付け直した。最終の check は終了コード 0 で、人が読む項目は E13 の ambiguous の 1 件だけ (T2 の裁定のまま)。web のタブ化と履歴の同期で古くなっていた 2 anchor (`web/render.py::render_status`、`status.py::collect_status`) も、この確認で source を読み直して付け直した。
+- (b) affected: base を main に取った候補 10 項目 (literal 3・symbol_changed 1・unmapped 5・ambiguous 1) と、是正ごとの候補を全件裁いた。unmapped の新 symbol は頁の anchor に入れた。
+- (c) 判定: root の core・backtest・store・loops・scripts・service・ops・integration・acceptance と root 直下、afx-ops 全体を実行した (既知の実 CLI の 1 件を除き緑)。
+- (d) F・K・D と例外: F174–F184、K-LATCH-WRITERS・K-PENDING-STOP と K-REPLAY の追記、D12–D14、E79–E90。
+- **見落とし**: 指揮者の初回の頁差分は、設計 §7 の予定台帳のうち 3 系統 (保存 run から比較表示への辺、`close_reason` の永続化から通知までの伝播、tick と open が同じ core_lock の下にあるという配線) を落とした。地図を見ない独立初読を先に保存し、その後の整合レビューで頁差分を読ませたところ、3 系統と取消結果の列挙の不足 (計 4 件) を全部拾えた。独立初読は code の欠陥 2 件を別に出した。
+- **レビューの経過**: 設計は opus・sol・terra の 3 周、実装は codex 1 周目 (独立初読 + 地図整合)、`/code-review high` (9 件中 4 採用)、閉鎖確認 2 回 (1 回目に中 2 件、2 回目に指摘なし)。
+- evaluate (凍結表は変えない): 頁セル 310 行は TP 310 / FN 0 / U 0 (critical 208 / 208)、機械セル critical 81 / 81、FN 0、U 0。FP は頁セル 42 (不変)、機械セル 86 → 103。増えた分は今回の追加 (新 resource と anchor) による凍結後の追加で、凍結表の symbol への FP の増加は無い。
+
+## T3 の結論
+
+二件目の同 commit の実地試験を満たした。T3 を閉じる。工程への組み込み (設計 §6.3 の review-process への差込みと §6.5 の CLAUDE.md の二行) は、この結果を添えて利用者に提示する。所見: 同 commit の更新そのものは手順として回るが、指揮者が書く頁差分は予定台帳からの写し漏れが出る。地図を見ない独立初読の後に頁差分を読ませる整合レビューを、閉鎖束の一部として残す。
