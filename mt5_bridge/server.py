@@ -8,7 +8,6 @@
 """
 from __future__ import annotations
 
-import hmac
 import logging
 import secrets
 import time
@@ -203,12 +202,24 @@ async def lifespan(app: FastAPI):
 
 # ── 認証 (api_key 設定時のみ強制) ────────────────────────────────────
 
+def _api_key_matches(raw_key: bytes | None) -> bool:
+    """提示された API キー (header の生 byte) が設定と一致するか。判定はここだけ。"""
+    if _settings is None or not _settings.auth_required:
+        return True
+    return raw_key is not None and secrets.compare_digest(raw_key, _settings.api_key.encode())
+
+
 def require_api_key(x_bridge_api_key: str | None = Header(default=None)) -> None:
     if _settings is None or not _settings.auth_required:
         return
-    if x_bridge_api_key is None or not secrets.compare_digest(
-        x_bridge_api_key.encode(), _settings.api_key.encode()
-    ):
+    metrics = bridge_metrics.current_metrics()
+    if metrics is not None:
+        # middleware が同じ関数で同じ生 byte に下した判定を、そのまま使う
+        ok = metrics.authorized
+    else:
+        ok = _api_key_matches(
+            None if x_bridge_api_key is None else x_bridge_api_key.encode("latin-1"))
+    if not ok:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid or missing X-Bridge-Api-Key",
@@ -269,11 +280,8 @@ def _fallback_error_code(scope, status_code: int) -> str | None:
 
 
 def _request_is_authorized(headers) -> bool:
-    """履歴 slot の詳細を載せてよい要求か。キー不要の構成か、正しいキーを提示した要求だけ。"""
-    if _settings is None or not _settings.auth_required:
-        return True
-    key = headers.get(b"x-bridge-api-key")
-    return key is not None and hmac.compare_digest(key, _settings.api_key.encode())
+    """業務の認証を通る要求か。履歴 slot の詳細を載せてよいかも、この判定で決まる。"""
+    return _api_key_matches(headers.get(b"x-bridge-api-key"))
 
 
 class MetricsMiddleware:
@@ -313,6 +321,14 @@ class MetricsMiddleware:
             bridge_metrics.unbind_metrics(token)
 
 
+def _metrics_headers(metrics, *, error_code: str | None, emit_error_code: bool) -> list:
+    """応答に付ける計測 header の組み立て口。slot の可否 (認証済みか・認証拒否 code か) もここで決まる。"""
+    return bridge_metrics.response_headers(
+        metrics, error_code=error_code, emit_error_code=emit_error_code,
+        include_slot=bool(getattr(metrics, "authorized", False)),
+    )
+
+
 def _with_metrics(scope, message, metrics) -> list:
     headers = list(message.get("headers", []))
     present = {k.lower() for k, _ in headers}
@@ -323,12 +339,8 @@ def _with_metrics(scope, message, metrics) -> list:
             code = v.decode("latin-1")
     if code is None:
         code = _fallback_error_code(scope, message["status"])
-    extra = bridge_metrics.response_headers(
-        metrics, error_code=code if code_name not in present else None,
-        include_slot=metrics.authorized,
-    )
-    if code is not None and code_name in present and code in bridge_metrics.AUTH_REJECTION_CODES:
-        extra = [(k, v) for k, v in extra if not k.startswith("X-Bridge-History-")]
+    extra = _metrics_headers(
+        metrics, error_code=code, emit_error_code=code_name not in present)
     for name, value in extra:
         if name.lower().encode() not in present:
             headers.append((name.encode(), value.encode("latin-1")))
@@ -369,10 +381,8 @@ async def _unexpected_error(request: Request, exc: Exception):
     from starlette.responses import PlainTextResponse
 
     metrics = request.scope.get(_METRICS_SCOPE_KEY)
-    headers = dict(bridge_metrics.response_headers(
-        metrics, error_code="internal_error",
-        include_slot=bool(getattr(metrics, "authorized", False)),
-    ))
+    headers = dict(_metrics_headers(
+        metrics, error_code="internal_error", emit_error_code=True))
     return PlainTextResponse("Internal Server Error", status_code=500, headers=headers)
 
 # 発注・管理書き込み系。認証は router 単位で付ける (個別 decorator には付けない)

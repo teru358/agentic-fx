@@ -921,6 +921,79 @@ def test_unauthenticated_unexpected_500_has_no_slot(monkeypatch):
         assert _h(hdr, "X-Bridge-Error-Code") == "internal_error"
 
 
+# ── 認証の判定と header 組み立ての一本化 ──────────────────────────
+
+def _call_raw_key(key_bytes, path="/symbols"):
+    hdrs = [] if key_bytes is None else [(b"x-bridge-api-key", key_bytes)]
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+             "method": "GET", "scheme": "http", "path": path, "raw_path": path.encode(),
+             "query_string": b"", "headers": hdrs, "client": ("127.0.0.1", 1),
+             "server": ("127.0.0.1", 8812), "root_path": ""}
+    sent: list[dict] = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(msg):
+        sent.append(msg)
+
+    asyncio.run(server.app(scope, receive, send))
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    return start["status"], {k.decode().lower(): v.decode("latin-1") for k, v in start["headers"]}
+
+
+@pytest.mark.parametrize("api_key", ["k-1", "ключ-é"])
+def test_business_auth_and_slot_attachment_always_agree(monkeypatch, api_key):
+    _configure(monkeypatch, _ErrClient(), api_key=api_key)
+    bridge_metrics.history_slot.admit("req-a", bridge_metrics.RequestMetrics())
+    candidates = [
+        api_key.encode(), api_key.encode("latin-1", "ignore"), b"wrong", b"", None,
+        api_key.encode()[:-1], api_key.encode() + b"x",
+    ]
+    for raw in candidates:
+        status, hdr = _call_raw_key(raw)
+        assert (status == 200) == ("x-bridge-history-state" in hdr), raw
+    assert _call_raw_key(api_key.encode())[0] == 200
+    assert _call_raw_key(b"wrong")[0] == 401
+    assert _call_raw_key(None)[0] == 401
+
+
+class _AuthCodeRaisingClient(_ErrClient):
+    def __init__(self, code):
+        super().__init__()
+        self._code = code
+
+    def get_symbols(self):
+        raise server.HTTPException(status_code=403, detail="x", headers=server._hdr(self._code))
+
+
+@pytest.mark.parametrize("code,has_slot", [
+    ("auth_invalid", False), ("order_key_required", False),
+    ("local_only_forbidden", False), ("symbol_unavailable", True),
+])
+def test_handler_chosen_code_decides_whether_an_authorized_response_carries_the_slot(
+        monkeypatch, code, has_slot):
+    _configure(monkeypatch, _AuthCodeRaisingClient(code), api_key="k-1")
+    bridge_metrics.history_slot.admit("req-h", bridge_metrics.RequestMetrics())
+    status, hdr = _call_raw_key(b"k-1")
+    assert status == 403
+    assert _h(hdr, "X-Bridge-Error-Code") == code
+    assert ("x-bridge-history-state" in hdr) is has_slot
+
+
+def test_response_headers_drops_the_slot_for_a_rejection_code_even_without_emitting_it(monkeypatch):
+    monkeypatch.setattr(bridge_metrics, "history_slot", bridge_metrics.HistorySlot())
+    bridge_metrics.history_slot.admit("req-r", bridge_metrics.RequestMetrics())
+    out = dict(bridge_metrics.response_headers(
+        None, error_code="auth_invalid", include_slot=True, emit_error_code=False))
+    assert bridge_metrics.H_ERROR_CODE not in out
+    assert not any(k.startswith("X-Bridge-History-") for k in out)
+    out = dict(bridge_metrics.response_headers(
+        None, error_code="symbol_unavailable", include_slot=True, emit_error_code=False))
+    assert bridge_metrics.H_ERROR_CODE not in out
+    assert out["X-Bridge-History-State"] == "waiting"
+
+
 # ── native 実行中の切断・取消し ───────────────────────────────────
 
 def _drive_history_with_disconnect(monkeypatch, mt5, *, mode):

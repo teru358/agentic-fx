@@ -227,15 +227,19 @@ history_slot = HistorySlot()
 
 def response_headers(
     metrics: RequestMetrics | None, *, error_code: str | None,
-    include_slot: bool,
+    include_slot: bool, emit_error_code: bool = True,
 ) -> list[tuple[str, str]]:
-    """応答に付ける計測 header 一式。失敗しても例外を外へ出さない。"""
+    """応答に付ける計測 header 一式。失敗しても例外を外へ出さない。
+
+    error_code は slot の可否の判定に常に使う。emit_error_code=False は、応答が既に
+    同じ code の header を持つときに重複して付けないための指定。
+    """
     out: list[tuple[str, str]] = [(H_VERSION, PROTOCOL_VERSION), (H_BOOT_ID, BOOT_ID)]
     try:
         out += lock_headers(metrics)
     except Exception:  # noqa: BLE001
         out.append((H_LOCK_STATE, "unavailable"))
-    if error_code is not None:
+    if error_code is not None and emit_error_code:
         out.append((H_ERROR_CODE, error_code))
     if include_slot and error_code not in AUTH_REJECTION_CODES:
         try:

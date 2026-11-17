@@ -69,6 +69,8 @@ afx の価格取得だけが目的なら、API キーなしでも動く (発注�
 - native の取得の前に登録し、全 native 呼出しと lock の解放が終わった後だけ `completed` にする。HTTP が切れても追跡は続く。
 - slot は次の履歴要求まで保持する。header の無い要求は上書きしない。
 - 完了前に別の ID の履歴要求が来ると、native を実行せず 409 で拒否する。同じ ID の再送も実行しない (409)。
+- ID は要求ごとに新しく作る。同じ ID の再送は完了後も 409 になる (再試行にも新しい ID を使う)。
+- `waiting` は「登録済みで未完、まだ MT5 の lock を持っていない」状態。lock を持った後が `holding`。
 - 状態は lock を取らずに読まれ、認証済みの既存応答 (API キー設定時は正しいキーを提示した要求) の header に載る: `X-Bridge-History-Request-Id` / `-State` (`waiting` `holding` `completed` `none`) / `-Wait-Ms` `-Hold-Ms` (`completed` のときだけ)。認証に失敗した応答には載せない。
 
 boot id と slot は process の中に持つので、bridge は 1 process で動かす (`uv run python server.py`)。app を object で渡す起動のため、uvicorn は複数 worker を拒否する。
