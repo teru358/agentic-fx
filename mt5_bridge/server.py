@@ -200,9 +200,11 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        request_log.request_log.stop()
-    if _client is not None:
-        _client.disconnect()
+        try:
+            request_log.request_log.stop()
+        finally:
+            if _client is not None:
+                _client.disconnect()
 
 
 # ── 認証 (api_key 設定時のみ強制) ────────────────────────────────────

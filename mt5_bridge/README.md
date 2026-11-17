@@ -177,7 +177,9 @@ bridge は `America/New_York` の DST 規則と「サーバ時刻 = NY 壁時計
 
 URL・API キー・生の header・boot id の生値・価格・履歴の ID は書かない。file は `0600` で作り、既存の file の権限が緩ければ開くときに `0600` へ直す。symlink と通常でない file は開かない。
 
-保持: UTC 0 時に日次でローテーションし、14 世代 (`bridge-metrics.jsonl.YYYY-MM-DD`) だけ残す。集計は daemon 側の記録と合わせて `scripts/bridge_metrics_report.py --bridge-file <この file> --client-file <logs/bridge-metrics/client.jsonl>` で出す。
+保持: UTC 0 時に日次でローテーションし、14 世代 (`bridge-metrics.jsonl.YYYY-MM-DD`) だけ残す。集計は daemon 側の記録と合わせて `scripts/bridge_metrics_report.py --bridge-file <この file> --client-file <logs/bridge-metrics/client.jsonl>` で出す (client 側は daemon の `client.jsonl` と CLI の `client-cli.jsonl` に分かれ、`--client-file` を省くと両方とローテーション済みを読む)。
+
+既知の限界: 同時に動く CLI 2 本が深夜 (UTC 0 時) をまたぐと、`client-cli.jsonl` の日替わり (前日分の改名・古い世代の削除) が競合しうる。daemon と CLI は file を分けているので互いには影響しない。
 
 ## トラブルシュート
 

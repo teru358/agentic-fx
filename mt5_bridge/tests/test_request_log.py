@@ -436,3 +436,136 @@ def test_lifespan_starts_the_log_under_logs_and_stops_it(configured, tmp_path, m
     (line,) = (logs / "bridge-metrics.jsonl").read_text().splitlines()
     assert json.loads(line)["caller"] == "cli"
     assert stat.S_IMODE((logs / "bridge-metrics.jsonl").stat().st_mode) == 0o600
+
+
+def _block_writer(sink, gate):
+    """writer を gate で止め、最初の 1 行を掴むまで待てる Event を返す。"""
+    real_emit = sink.file_handler.emit
+    entered = threading.Event()
+
+    def slow_emit(record):
+        entered.set()
+        assert gate.wait(20)
+        real_emit(record)
+
+    sink.file_handler.emit = slow_emit
+    return entered
+
+
+def _fill_queue(sink, entered):
+    sink.emit({"ts": "t"})
+    assert entered.wait(10)
+    for _ in range(8):
+        sink.emit({"ts": "t"})
+    assert sink._queue.full()
+
+
+def test_stopping_with_a_full_queue_neither_raises_nor_hangs(tmp_path):
+    sink = request_log.RequestLog()
+    sink.start(tmp_path / "a.jsonl", queue_size=2)
+    gate = threading.Event()
+    _fill_queue(sink, _block_writer(sink, gate))
+    timer = threading.Timer(0.3, gate.set)
+    timer.start()
+    try:
+        sink.stop()
+    finally:
+        gate.set()
+        timer.join()
+    assert not sink.active
+
+
+def test_lifespan_disconnects_mt5_even_when_the_log_queue_is_full(configured, tmp_path, monkeypatch):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    monkeypatch.setattr(server, "_LOG_DIR", logs)
+    settings = server.BridgeSettings(
+        mt5_login=1, mt5_password="x", mt5_server="t", host="127.0.0.1", port=8812,
+        api_key="", dry_run=True, halt_state_path=str(tmp_path / "halt.flag"),
+        filling_mode="IOC", deviation_points=30, server_time_symbol="USDJPY")
+    monkeypatch.setattr(server, "load_settings", lambda: settings)
+    events: list[str] = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def connect(self):
+            pass
+
+        def disconnect(self):
+            events.append("disconnect")
+
+        def ping(self):
+            return False
+
+    monkeypatch.setattr(server, "Mt5Client", FakeClient)
+    sink = request_log.RequestLog()
+    original_start = sink.start
+    sink.start = lambda path: original_start(path, queue_size=2)
+    monkeypatch.setattr(request_log, "request_log", sink)
+    gate = threading.Event()
+
+    async def run():
+        async with server.lifespan(server.app):
+            _fill_queue(sink, _block_writer(sink, gate))
+            threading.Timer(0.3, gate.set).start()
+
+    try:
+        asyncio.run(run())
+    finally:
+        gate.set()
+    assert events == ["disconnect"]
+
+
+def _two_concurrent_emits(sink):
+    barrier = threading.Barrier(2, timeout=5)
+    real = sink._logger.info
+
+    def waiting(*args, **kwargs):
+        barrier.wait()
+        real(*args, **kwargs)
+
+    sink._logger.info = waiting
+    threads = [threading.Thread(target=sink.emit, args=({"ts": "t"},)) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+
+
+def test_concurrent_emits_report_each_drop_once(log):
+    sink, path = log
+    for _ in range(5):
+        sink._count_drop()
+    _two_concurrent_emits(sink)
+    rows = _rows(sink, path)
+    assert len(rows) == 2
+    assert sum(r.get("dropped_before", 0) for r in rows) == sink.dropped == 5
+
+
+def test_a_dropped_row_hands_back_the_drops_it_was_carrying(tmp_path):
+    path = tmp_path / "a.jsonl"
+    sink = request_log.RequestLog()
+    sink.start(path, queue_size=1)
+    gate = threading.Event()
+    _block_writer(sink, gate)
+    try:
+        for _ in range(12):
+            sink.emit({"ts": "t"})
+        gate.set()
+        sink.flush()
+        sink.emit({"ts": "t"})
+        rows = _rows(sink, path)
+        assert sum(r.get("dropped_before", 0) for r in rows) == sink.dropped
+    finally:
+        gate.set()
+        sink.stop()
+
+
+@pytest.mark.parametrize("path,route", [
+    ("/health/", "/health"), ("/quote/EURUSD/", "/quote/{symbol}"),
+    ("/positions/1/close/", "/positions/{ticket}/close"), ("/", "/other"),
+])
+def test_a_trailing_slash_does_not_change_the_route(path, route):
+    assert request_log.route_of(path) == route

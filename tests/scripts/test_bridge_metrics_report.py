@@ -219,3 +219,40 @@ def test_script_uses_only_the_standard_library_and_the_market_calendar():
                 if isinstance(node, ast.ImportFrom) and node.module
                 and node.module.split(".")[0] == "agentic_fx"}
     assert imported == {"agentic_fx.core"} or imported == {"agentic_fx.core.market_hours"}
+
+
+def test_dropped_before_is_summed_in_its_own_column_apart_from_the_lock_header_loss(
+        tmp_path, capsys):
+    bridge = tmp_path / "bridge" / "bridge-metrics.jsonl"
+    rows = [_row("2026-11-13T10:00:00.000Z"),
+            {**_row("2026-11-13T10:00:01.000Z"), "dropped_before": 3},
+            {**_row("2026-11-13T10:00:02.000Z"), "dropped_before": 4},
+            {**_row("2026-11-13T10:00:03.000Z"), "dropped_before": "x"}]
+    _write(bridge, None, rows)
+    summary = report.summarize(rows)
+    (stat,) = summary.values()
+    assert stat["dropped_records"] == 7
+    assert stat["missing_rate"] == 0
+    args = ["--bridge-file", str(bridge), "--client-file", str(tmp_path / "none.jsonl"),
+            "--from", "2026-11-13", "--to", "2026-11-13"]
+    assert report.main(args) == 0
+    out = capsys.readouterr().out
+    assert "記録の欠落" in out and "欠落率" in out
+    assert report.main(args + ["--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["bridge"]["overall"][0]["dropped_records"] == 7
+
+
+def test_client_side_reads_the_daemon_and_cli_files_with_their_rotated_copies(tmp_path, capsys):
+    directory = tmp_path / "logs" / "bridge-metrics"
+    _write(directory / "client.jsonl", None, [_row("2026-11-13T10:00:00.000Z")])
+    _write(directory / "client.jsonl", "2026-11-12", [_row("2026-11-12T10:00:00.000Z")])
+    _write(directory / "client-cli.jsonl", None,
+           [_row("2026-11-13T11:00:00.000Z", caller="cli")])
+    _write(directory / "client-cli.jsonl", "2026-11-12",
+           [_row("2026-11-12T11:00:00.000Z", caller="cli")])
+    assert report.main(["--root", str(tmp_path), "--from", "2026-11-12", "--to", "2026-11-13",
+                        "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["client"]["rows"] == 4
+    assert {g["caller"] for g in data["client"]["overall"]} == {"tick", "cli"}

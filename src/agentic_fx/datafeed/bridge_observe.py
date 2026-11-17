@@ -1,7 +1,8 @@
 """bridge への HTTP 呼出しの client 側の受動観測。
 
 応答の `X-Bridge-*` header と client から見た経過時間・timeout・接続失敗の種別を、1 要求 1 行で
-`<root>/logs/bridge-metrics/client.jsonl` へ書く。書込みは標準 logging の QueueHandler への
+`<root>/logs/bridge-metrics/` の下へ書く (daemon は `client.jsonl`、CLI は `client-cli.jsonl`。
+process の種類ごとに file を分け、深夜の日替わりで前日分を互いに消し合わない)。書込みは標準 logging の QueueHandler への
 enqueue だけで、呼出しは待たない (詰まったら捨てて欠落数を数える)。日次ローテーション
 (UTC 0 時、14 世代) は TimedRotatingFileHandler に任せる。呼出しの戻り値・例外・本文・timeout には
 触れない。観測の失敗は握り、header が読めない値は 0 にせず `lock_state` を `missing` /
@@ -27,7 +28,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Mapping
 from urllib.parse import urlsplit
 
 import httpx
@@ -37,6 +38,7 @@ CALLER_HEADER = "X-Afx-Caller"
 RETENTION_DAYS = 14
 METRICS_DIR_PARTS = ("logs", "bridge-metrics")
 FILE_NAME = "client.jsonl"
+CLI_FILE_NAME = "client-cli.jsonl"
 DEFAULT_QUEUE_SIZE = 2048
 
 # bridge protocol の固定 error code (mt5_bridge/bridge_metrics.py の ERROR_CODES と同じ集合)。
@@ -76,7 +78,8 @@ def configure(root: Path, default_caller: str = "unknown",
         _default_caller = default_caller
     if previous is not None:
         previous.stop()
-    sink = _Sink.open(Path(root).joinpath(*METRICS_DIR_PARTS), queue_size)
+    sink = _Sink.open(Path(root).joinpath(*METRICS_DIR_PARTS), queue_size,
+                      CLI_FILE_NAME if default_caller == "cli" else FILE_NAME)
     with _lock:
         _sink = sink
 
@@ -145,7 +148,7 @@ _SIMPLE_ROUTES = frozenset({
 
 
 def route_of(url: str) -> str:
-    """URL から固定の route 名を作る。生の path・query・host は残さない。"""
+    """URL から固定の route 名を作る。生の path・query・host は残さず、末尾の `/` は無視する。"""
     try:
         path = urlsplit(str(url)).path
     except Exception:  # noqa: BLE001
@@ -249,6 +252,23 @@ def _failure_kind(exc: BaseException) -> str:
 
 # ── 書込み ────────────────────────────────────────────────────────
 
+def _private_directory(directory: Path) -> None:
+    """記録先 dir を 0700 で作り、既にあれば 0700 に直す (symlink は辿らない)。"""
+    try:
+        directory.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != os.geteuid():
+            raise OSError("log directory is not owned by this user")
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+
+
 class _PrivateRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
     """0600 の通常ファイルだけを開く。symlink は辿らず、他人の file・通常でない file は拒否する。"""
 
@@ -257,7 +277,7 @@ class _PrivateRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
         logs = directory.parent
         if logs.is_symlink() or not logs.is_dir() or directory.is_symlink():
             raise OSError("log directory is not a plain directory under an existing logs")
-        directory.mkdir(exist_ok=True)
+        _private_directory(directory)
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
         fd = os.open(self.baseFilename, flags, 0o600)
         try:
@@ -276,6 +296,20 @@ class _PrivateRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
         return
 
 
+def _stop_listener(listener: logging.handlers.QueueListener, q: queue.Queue) -> None:
+    """queue が満杯でも listener を止める。止めるために、積まれた未書込みの行を捨てる。"""
+    for _ in range(10_000):
+        try:
+            listener.stop()
+            return
+        except queue.Full:
+            try:
+                q.get_nowait()
+                q.task_done()
+            except queue.Empty:
+                pass
+
+
 class _DropQueueHandler(logging.handlers.QueueHandler):
     """満杯のとき待たずに捨てて、欠落数を数える。"""
 
@@ -287,9 +321,7 @@ class _DropQueueHandler(logging.handlers.QueueHandler):
         try:
             self.queue.put_nowait(record)
         except queue.Full:
-            self._owner.count_drop()
-        else:
-            self._owner.mark_reported(getattr(record, "dropped_reported", 0))
+            self._owner.count_drop(getattr(record, "dropped_reported", 0))
 
     def handleError(self, record):  # noqa: N802
         return
@@ -312,11 +344,11 @@ class _Sink:
         self._stopped = False
 
     @classmethod
-    def open(cls, directory: Path, queue_size: int) -> "_Sink | None":
+    def open(cls, directory: Path, queue_size: int, file_name: str = FILE_NAME) -> "_Sink | None":
         """記録先 dir は最初の 1 行を書くときに作る (`logs` が実在の dir のときだけ)。"""
         try:
             handler = _PrivateRotatingFileHandler(
-                str(directory / FILE_NAME), when="midnight", utc=True,
+                str(directory / file_name), when="midnight", utc=True,
                 backupCount=RETENTION_DAYS, encoding="utf-8", delay=True)
             handler.setFormatter(logging.Formatter("%(message)s"))
             sink = cls(queue.Queue(maxsize=queue_size), handler)
@@ -330,22 +362,20 @@ class _Sink:
     def dropped(self) -> int:
         return self._dropped
 
-    def count_drop(self) -> None:
+    def count_drop(self, carried: int = 0) -> None:
+        """捨てた行を数える。その行が載せていた欠落数は未報告へ戻す。"""
         with self._guard:
             self._dropped += 1
-
-    def mark_reported(self, count: int) -> None:
-        if count:
-            with self._guard:
-                self._reported += count
+            self._reported -= carried
 
     def emit(self, row: dict[str, Any]) -> None:
         with self._guard:
-            pending = self._dropped - self._reported
-            if pending > 0:
-                row = {**row, "dropped_before": pending}
+            pending = max(self._dropped - self._reported, 0)
+            self._reported += pending
+        if pending > 0:
+            row = {**row, "dropped_before": pending}
         self._logger.info(json.dumps(row, separators=(",", ":"), ensure_ascii=True),
-                          extra={"dropped_reported": max(pending, 0)})
+                          extra={"dropped_reported": pending})
 
     def flush(self) -> None:
         if not self._stopped:
@@ -356,7 +386,9 @@ class _Sink:
             return
         self._stopped = True
         try:
-            self.listener.stop()
+            _stop_listener(self.listener, self._queue)
+        except Exception:  # noqa: BLE001 - 停止の失敗で呼出しや終了を止めない
+            pass
         finally:
             self.file_handler.close()
             atexit.unregister(self.stop)
@@ -390,8 +422,20 @@ def _record(url: str, started: float, response: Any, exc: BaseException | None,
 def _with_caller(kwargs: dict[str, Any]) -> dict[str, Any]:
     """呼出し元のラベルを request header に足した kwargs を返す (渡された dict は変えない)。"""
     headers = kwargs.get("headers")
-    merged = dict(headers) if isinstance(headers, dict) else {}
-    merged[CALLER_HEADER] = current_caller()
+    label = current_caller()
+    if headers is None:
+        merged: Any = {CALLER_HEADER: label}
+    elif isinstance(headers, httpx.Headers):
+        merged = httpx.Headers(headers)
+        merged[CALLER_HEADER] = label
+    elif isinstance(headers, Mapping):
+        merged = dict(headers)
+        merged[CALLER_HEADER] = label
+    else:
+        try:
+            merged = [*headers, (CALLER_HEADER, label)]
+        except TypeError:
+            return kwargs
     return {**kwargs, "headers": merged}
 
 

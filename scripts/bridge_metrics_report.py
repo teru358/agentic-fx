@@ -2,7 +2,7 @@
 """bridge の要求ごとの記録 (bridge 側) と client 側の観測を集計する。
 
 bridge 側 file (`logs/bridge-metrics.jsonl` と日付つきのローテーション済み) と client 側 file
-(`logs/bridge-metrics/client.jsonl` と同様) を別々に、endpoint x caller ごとに件数・lock の
+(`logs/bridge-metrics/client.jsonl` と CLI 用の `client-cli.jsonl`、それぞれ同様) を別々に、endpoint x caller ごとに件数・lock の
 待ち/占有の p50/p95/最大・timeout と失敗の件数・lock state 別の件数・欠落率で出す。期間は
 各行の ts (UTC) で絞る。金曜の閉場の 1 時間前から閉場までの行は別の表にする。閉場は
 `agentic_fx.core.market_hours` の開から閉への実際の境界で判定する (休日は境界にならない)。
@@ -100,7 +100,12 @@ def summarize(rows: list[dict]) -> dict[tuple[str, str], dict[str, Any]]:
         out[key] = {
             "count": len(items), "timeouts": timeouts, "failures": failures,
             "http_errors": http_errors, "lock_states": dict(states),
-            "missing_rate": lost / len(items), "wait_ms": _stats(waits), "hold_ms": _stats(holds),
+            "missing_rate": lost / len(items),
+            "dropped_records": sum(int(i["dropped_before"]) for i in items
+                                   if isinstance(i.get("dropped_before"), int)
+                                   and not isinstance(i["dropped_before"], bool)
+                                   and i["dropped_before"] > 0),
+            "wait_ms": _stats(waits), "hold_ms": _stats(holds),
         }
     return out
 
@@ -115,13 +120,16 @@ def _source_files(base: Path) -> list[Path]:
     return names + [base]
 
 
-def load_rows(base: Path, start: date, end: date) -> tuple[list[dict], int]:
-    """行の ts が [start 0:00Z, end の翌日 0:00Z) のものだけを返す。読めない行は件数に数える。"""
+def load_rows(base: Path | list[Path], start: date, end: date) -> tuple[list[dict], int]:
+    """行の ts が [start 0:00Z, end の翌日 0:00Z) のものだけを返す。読めない行は件数に数える。
+
+    `base` は書込み中の file (複数可)。それぞれのローテーション済みも読む。"""
     lower = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
     upper = datetime(end.year, end.month, end.day, tzinfo=timezone.utc) + timedelta(days=1)
     rows: list[dict] = []
     bad = 0
-    for path in _source_files(base):
+    bases = base if isinstance(base, list) else [base]
+    for path in [p for one in bases for p in _source_files(one)]:
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -153,7 +161,7 @@ def _table(title: str, summary: dict[tuple[str, str], dict[str, Any]]) -> list[s
         lines.append("0 件")
         return lines
     lines.append("route / caller | 件数 | wait p50/p95/max (ms) | hold p50/p95/max (ms) | "
-                 "timeout | 失敗 | http>=400 | lock state | 欠落率")
+                 "timeout | 失敗 | http>=400 | lock state | 欠落率 (lock header) | 記録の欠落 (捨てた行)")
     for (route, caller), s in sorted(summary.items()):
         wait, hold = s["wait_ms"], s["hold_ms"]
         states = ",".join(f"{k}={v}" for k, v in sorted(s["lock_states"].items()))
@@ -162,7 +170,7 @@ def _table(title: str, summary: dict[tuple[str, str], dict[str, Any]]) -> list[s
             f"{_fmt(wait['p50'])}/{_fmt(wait['p95'])}/{_fmt(wait['max'])} | "
             f"{_fmt(hold['p50'])}/{_fmt(hold['p95'])}/{_fmt(hold['max'])} | "
             f"{s['timeouts']} | {s['failures']} | {s['http_errors']} | {states} | "
-            f"{s['missing_rate'] * 100:.1f}%")
+            f"{s['missing_rate'] * 100:.1f}% | {s['dropped_records']}")
     return lines
 
 
@@ -178,7 +186,7 @@ def _date_arg(text: str) -> date:
         raise argparse.ArgumentTypeError("YYYY-MM-DD で指定してください") from None
 
 
-def _side(label: str, base: Path, start: date, end: date) -> dict[str, Any]:
+def _side(label: str, base: Path | list[Path], start: date, end: date) -> dict[str, Any]:
     rows, bad = load_rows(base, start, end)
     return {"label": label, "rows": rows, "bad": bad,
             "overall": summarize(rows), "friday": summarize(friday_close_rows(rows))}
@@ -189,8 +197,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="作業 root")
     parser.add_argument("--bridge-file", type=Path, default=None,
                         help="bridge 側の file (既定: <root>/mt5_bridge/logs/bridge-metrics.jsonl)")
-    parser.add_argument("--client-file", type=Path, default=None,
-                        help="client 側の file (既定: <root>/logs/bridge-metrics/client.jsonl)")
+    parser.add_argument("--client-file", type=Path, action="append", default=None,
+                        help="client 側の file (複数指定可。既定: <root>/logs/bridge-metrics/ の "
+                             "client.jsonl と client-cli.jsonl)")
     today = datetime.now(timezone.utc).date()
     parser.add_argument("--from", dest="start", type=_date_arg, default=today - timedelta(days=7),
                         help="開始日 (UTC、既定は 7 日前)")
@@ -201,7 +210,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.start > args.end:
         parser.error("--from は --to 以前にしてください")
     bridge_file = args.bridge_file or args.root / "mt5_bridge" / "logs" / "bridge-metrics.jsonl"
-    client_file = args.client_file or args.root / "logs" / "bridge-metrics" / "client.jsonl"
+    metrics_dir = args.root / "logs" / "bridge-metrics"
+    client_file = args.client_file or [metrics_dir / "client.jsonl",
+                                       metrics_dir / "client-cli.jsonl"]
     sides = {"bridge": _side("bridge 側", bridge_file, args.start, args.end),
              "client": _side("client 側", client_file, args.start, args.end)}
     if args.json:

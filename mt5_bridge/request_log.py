@@ -46,7 +46,9 @@ def caller_of(raw: bytes | None) -> str:
 
 
 def route_of(path: str) -> str:
-    """path から固定の route 名を作る。生の path は残さない。"""
+    """path から固定の route 名を作る。生の path は残さない。末尾の `/` は無視する。"""
+    if path.endswith("/") and len(path) > 1:
+        path = path.rstrip("/")
     if path in _SIMPLE_ROUTES:
         return path
     parts = path.split("/")
@@ -118,6 +120,20 @@ class _PrivateRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
         return
 
 
+def _stop_listener(listener: logging.handlers.QueueListener, q: queue.Queue) -> None:
+    """queue が満杯でも listener を止める。止めるために、積まれた未書込みの行を捨てる。"""
+    for _ in range(10_000):
+        try:
+            listener.stop()
+            return
+        except queue.Full:
+            try:
+                q.get_nowait()
+                q.task_done()
+            except queue.Empty:
+                pass
+
+
 class _DropQueueHandler(logging.handlers.QueueHandler):
     """満杯のとき待たずに捨てて、欠落数を数える。"""
 
@@ -129,9 +145,7 @@ class _DropQueueHandler(logging.handlers.QueueHandler):
         try:
             self.queue.put_nowait(record)
         except queue.Full:
-            self._owner._count_drop()
-        else:
-            self._owner._mark_reported(getattr(record, "dropped_reported", 0))
+            self._owner._count_drop(getattr(record, "dropped_reported", 0))
 
     def handleError(self, record):  # noqa: N802
         return
@@ -158,14 +172,11 @@ class RequestLog:
     def dropped(self) -> int:
         return self._dropped
 
-    def _count_drop(self) -> None:
+    def _count_drop(self, carried: int = 0) -> None:
+        """捨てた行を数える。その行が載せていた欠落数は未報告へ戻す。"""
         with self._guard:
             self._dropped += 1
-
-    def _mark_reported(self, count: int) -> None:
-        if count:
-            with self._guard:
-                self._reported += count
+            self._reported -= carried
 
     def start(self, path: Path, queue_size: int = DEFAULT_QUEUE_SIZE) -> None:
         self.stop()
@@ -198,6 +209,7 @@ class RequestLog:
 
     def stop(self) -> None:
         sink, self._logger = self._logger, None
+        q = self._queue
         listener, self.listener = self.listener, None
         handler, self.file_handler = self.file_handler, None
         self.queue_handler = None
@@ -206,7 +218,9 @@ class RequestLog:
             return
         try:
             if listener is not None:
-                listener.stop()
+                _stop_listener(listener, q)
+        except Exception:  # noqa: BLE001 - 停止の失敗で bridge の終了を止めない
+            pass
         finally:
             if handler is not None:
                 handler.close()
@@ -224,11 +238,12 @@ class RequestLog:
             return
         try:
             with self._guard:
-                pending = self._dropped - self._reported
-                if pending > 0:
-                    row = {**row, "dropped_before": pending}
+                pending = max(self._dropped - self._reported, 0)
+                self._reported += pending
+            if pending > 0:
+                row = {**row, "dropped_before": pending}
             sink.info(json.dumps(row, separators=(",", ":"), ensure_ascii=True),
-                      extra={"dropped_reported": max(pending, 0)})
+                      extra={"dropped_reported": pending})
         except Exception:  # noqa: BLE001
             return
 
