@@ -1,16 +1,16 @@
 ---
 id: code-impact-map
 title: コードから読み取る現状の影響地図 (機械索引・契約表・領域頁) を docs/ に置く
-status: 実装中
+status: 見送り
 priority: 高
 kind: 保守
 opened: 2026-11-14
-closed: null
+closed: 2026-11-17
 related: [auto-killswitch-latch-emits-no-event, bot-gateway-disconnect-is-silent]
 ---
 # [code-impact-map] コードから読み取る現状の影響地図 (機械索引・契約表・領域頁) を docs/ に置く
 
-**状態**: 実装中 / **優先**: 高 / **種別**: 保守
+**状態**: 見送り / **優先**: 高 / **種別**: 保守
 
 ## 現象
 
@@ -30,3 +30,4 @@ related: [auto-killswitch-latch-emits-no-event, bot-gateway-disconnect-is-silent
 - 2026-11-15: 状態: 実装中 — T2 (照合記録 verify・check・affected・副 anchor・固有例外台帳と直呼び検査・非 critical の頁補完) を閉鎖。レビューは codex 1 周目 (Important 6・Minor 1)、閉鎖確認 3 回、/code-review high (10 件中 7 採用・3 却下)、閉鎖確認 2 回。次は T3 (C4 の遡及運用確認と HWM の運用確認)
 - 2026-11-15: 状態: 実装中 — T3 (C4 の遡及運用確認・HWM の運用確認・頁の更新・照合記録 43 anchor・C4 185 項目の個別裁定表) は実施したが、設計 §6.4 の二件目の同 commit の実地試験 (関係を変える code と頁が実際に同 commit で更新されたことの確認) が未達のため未閉鎖。HWM は頁の無い branch で実装されたので満たせない。次の通常チケット (kill switch 領域を触るもの) で同 commit 更新と閉鎖束 (§6.4 (a)〜(e)) を実行して確認するまで T3 は開いたまま。
 - 2026-11-17: 状態: 実装中 — T3 を閉鎖: 二件目の同 commit の実地試験を killswitch-latch-pending-limit-fills で満たした (閉鎖束 (a)〜(e)、記録は docs/impact-map/evaluations/kill-switch.md)。指揮者の頁差分は設計の予定台帳から 3 系統を落とし、地図を見ない独立初読の後の整合レビューで全部拾えた。次は工程への組み込みの提示 (利用者の判断) と T4 (領域拡張)
+- 2026-11-17: 見送り理由 — 2026-11-17 利用者裁定で地図作成を中止。T3 の同 commit 実地試験では地図が見つけたコードの欠陥は 0 件 (欠陥はすべて地図なしのレビューと grep で出た)、地図との整合レビューが拾ったのは頁自身の書き漏れだった。kill switch の頁だけでは大半の改修で参照されず、全領域の網羅は 2〜3 週間と毎チケットの維持費に見合わない。目的 (重複の防止・source 検索の軽量化) は別の方式で検討する。作った資源 (docs/impact-map/、scripts/impact_map.py、tests/scripts/test_impact_map*.py) はそのまま残すが、頁は今後保守しない

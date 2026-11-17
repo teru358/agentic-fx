@@ -1,9 +1,9 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 174 件。完了分は closed/。
+未完了: 173 件。完了分は closed/。
 
-## 実装中 (3)
+## 実装中 (2)
 
 ### 不具合 (1)
 
@@ -16,12 +16,6 @@
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [killswitch-reset-hwm-rebase](open/killswitch-reset-hwm-rebase.md) | 高 | 2026-11-13 | kill switch の手動解除で HWM を付け直す明示操作が無い |
-
-### 保守 (1)
-
-| id | 優先 | 起票 | 概要 |
-|---|---|---|---|
-| [code-impact-map](open/code-impact-map.md) | 高 | 2026-11-14 | コードから読み取る現状の影響地図 (機械索引・契約表・領域頁) を docs/ に置く |
 
 ## 実装待ち (12)
 
