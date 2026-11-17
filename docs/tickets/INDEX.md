@@ -1,21 +1,15 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 174 件。完了分は closed/。
+未完了: 173 件。完了分は closed/。
 
-## 実装中 (2)
+## 実装中 (1)
 
 ### 不具合 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [live-confirmed-bars-into-history](open/live-confirmed-bars-into-history.md) | 高 | 2026-09-21 | backtest の履歴が自動で更新されず、評価が古い入力で通る |
-
-### 機能 (1)
-
-| id | 優先 | 起票 | 概要 |
-|---|---|---|---|
-| [killswitch-reset-hwm-rebase](open/killswitch-reset-hwm-rebase.md) | 高 | 2026-11-13 | kill switch の手動解除で HWM を付け直す明示操作が無い |
 
 ## 実装待ち (12)
 
