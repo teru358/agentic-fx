@@ -155,7 +155,7 @@ def test_kill_switch_and_autopilot_are_marked_by_class_only_when_on():
     on = handle_request(Request("GET", "/", {}), ReadClient(status={
         "kill_switch": {"latched": True, "generation": 2}, "autopilot": True})).body.decode()
     assert '<dt class="danger">kill_switch</dt><dd class="danger">' in on
-    assert '<dt class="warn">autopilot</dt><dd class="warn">' in on
+    assert "autopilot</dt>" not in on and '<span class="st warn">△ ON</span>' in on
     off = handle_request(Request("GET", "/", {}), ReadClient(status={
         "kill_switch": {"latched": False}, "autopilot": False})).body.decode()
     # 表示の dl の中には、印の class を入れない (印はカードにだけ出る)
@@ -178,10 +178,12 @@ def test_log_and_activity_show_the_newest_lines_of_a_long_window():
         assert "entry-049" not in html and "entry-000" not in html, path
 
 
-def test_the_plugins_pages_link_to_the_approvals_that_the_nav_no_longer_shows():
+def test_the_plugins_list_band_links_to_the_approvals_and_no_page_repeats_the_link_paragraph():
+    page = handle_request(Request("GET", "/plugins", {}), ReadClient()).body.decode()
+    assert '<a href="/approvals">承認待ち</a>' in page
     for path in ("/plugins", "/plugins/rsi"):
         page = handle_request(Request("GET", path, {}), ReadClient()).body.decode()
-        assert '<a href="/approvals">' in page.split("</nav>", 1)[1], path
+        assert "Pending approvals" not in page.split("</nav>", 1)[1], path
 
 
 # --- CSS の token・配色・大きさ ------------------------------------------------------

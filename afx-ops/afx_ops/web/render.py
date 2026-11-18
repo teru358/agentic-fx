@@ -100,8 +100,8 @@ def _nav(current: str | None) -> str:
 _EMPHASIS = {"kill_switch": "danger", "autopilot": "warn"}
 
 # server DTO の新 field を表示面へ自動的に広げないための allowlist。
-STATUS_FIELDS = frozenset({"mode", "autopilot", "kill_switch", "equity", "balance", "pnl",
-                           "performance", "orders", "mission", "health", "data", "jobs"})
+STATUS_FIELDS = frozenset({"mode", "autopilot", "kill_switch", "equity", "balance", "orders",
+                           "mission", "health", "data"})
 APPROVAL_FIELDS = frozenset({"id", "kind", "name", "content_hash", "created_at"})
 JOURNAL_FIELDS = frozenset({"approval_id", "name", "phase"})
 DETAIL_FIELDS = frozenset({"id", "kind", "status", "in_sample", "holdout", "payload_sha256",
@@ -203,8 +203,8 @@ def _page(title: str, body: str, tz: str | None = None, *, current: str | None =
 # Status の概要の群と、群の中の並び。allowlist (STATUS_FIELDS) と同じ集合を並べる
 STATUS_GROUPS = (
     ("安全", ("kill_switch", "health", "autopilot")),
-    ("資金", ("equity", "balance", "pnl", "performance")),
-    ("稼働", ("mode", "mission", "data", "orders", "jobs")),
+    ("資金", ("equity", "balance")),
+    ("稼働", ("mode", "mission", "data", "orders")),
 )
 
 
@@ -224,11 +224,25 @@ def _status_cards(data: Mapping[str, object]) -> str:
         ("data", marked("data", marks.classify_data))])
 
 
+def _cards_cover(data: Mapping[str, object]) -> set[str]:
+    """カードが同じ内容を出していて、dl の行を省いてよい key。異常・不明・型違いは含めない。"""
+    covered = set()
+    if "kill_switch" in data and marks.classify_kill_switch(data["kill_switch"])[0] == marks.OK:
+        covered.add("kill_switch")
+    if "health" in data and marks.classify_health(data["health"])[0] == marks.OK:
+        covered.add("health")
+    if type(data.get("autopilot")) is bool:
+        covered.add("autopilot")
+    covered |= {key for key in ("mode", "equity", "balance") if key in data and _text(data[key])}
+    return covered
+
+
 def _status_overview(data: Mapping[str, object], tz: str) -> str:
     parts = [_status_cards(data)]
+    covered = _cards_cover(data)
     for title, keys in STATUS_GROUPS:
         rows = _pairs(data, STATUS_FIELDS, nested_allowed=NESTED_FIELDS, emphasis=_EMPHASIS,
-                      tz=tz, order=keys)
+                      tz=tz, order=[key for key in keys if key not in covered])
         if rows:
             parts.append(f"<section><h2>{title}</h2>{rows}</section>")
     return "".join(parts)
@@ -309,6 +323,8 @@ _CAPACITY_KEYS = ("signal_daily", "signal_producer", "signal_override", "rows",
                   "slice_bytes_stale", "measure_outcome", "measure_elapsed_sec",
                   "used_bytes", "byte_capacity", "byte_level", "base_bytes",
                   "bytes_per_row", "db_bytes", "wal_bytes", "free_bytes", "level")
+# used_bytes の内訳で、異常の合図にならない行
+_CAPACITY_BREAKDOWN = frozenset({"base_bytes", "bytes_per_row", "db_bytes", "wal_bytes"})
 _MEASURE_OUTCOMES = ("ok", "aborted", "failed")
 _OTHER_KIND = "other"
 _ECON_WORD = re.compile(r"[A-Za-z0-9_.:-]{1,64}\Z")
@@ -349,6 +365,11 @@ def _calendar_section(data: Mapping[str, object]) -> str:
     return "<section><h2>Economic calendar</h2>" + _rows(pairs) + "</section>"
 
 
+def _is_zero(*values: object) -> bool:
+    """全部が整数の 0 のときだけ真。欠損・None・bool・文字列・負は 0 と読まない。"""
+    return all(type(value) is int and value == 0 for value in values)
+
+
 def _count_text(value: object) -> str:
     return _num(value) if type(value) is int else "-"
 
@@ -375,14 +396,18 @@ def _econ_section(data: Mapping[str, object], tz: str = "UTC") -> str:
     abandoned = econ.get("abandoned")
     if type(abandoned) is dict:
         total, day = _dict(abandoned.get("total")), _dict(abandoned.get("latest_day"))
+        # 0 と読めた行は出さない。欠損・型違い (「-」)・0 でない値の行は必ず出す
         for reason in ECON_ABANDON_REASONS:
-            pairs.append((f"abandoned {reason} (latest day / total)",
-                          f"{_count_text(day.get(reason))} / {_count_text(total.get(reason))}"))
+            if not _is_zero(day.get(reason), total.get(reason)):
+                pairs.append((f"abandoned {reason} (latest day / total)",
+                              f"{_count_text(day.get(reason))} / {_count_text(total.get(reason))}"))
         cleanup = _dict(abandoned.get("cleanup"))
-        pairs.append(("abandoned ineligible_cleanup (latest day / total)",
-                      f"{_count_text(cleanup.get('latest_day'))} / {_count_text(cleanup.get('total'))}"))
-        pairs.append(("abandoned legacy_unknown (total)",
-                      _count_text(abandoned.get("legacy_unknown_total"))))
+        if not _is_zero(cleanup.get("latest_day"), cleanup.get("total")):
+            pairs.append(("abandoned ineligible_cleanup (latest day / total)",
+                          f"{_count_text(cleanup.get('latest_day'))} / {_count_text(cleanup.get('total'))}"))
+        if not _is_zero(abandoned.get("legacy_unknown_total")):
+            pairs.append(("abandoned legacy_unknown (total)",
+                          _count_text(abandoned.get("legacy_unknown_total"))))
     else:
         pairs.append(("abandoned", "unavailable"))
     missions = econ.get("missions_latest_day")
@@ -405,6 +430,8 @@ def _econ_section(data: Mapping[str, object], tz: str = "UTC") -> str:
     capacity = econ.get("slice_capacity")
     if type(capacity) is dict:
         for key in _CAPACITY_KEYS:
+            if key in _CAPACITY_BREAKDOWN:
+                continue
             value = capacity.get(key)
             if key.endswith("_level") or key == "level":
                 shown = _word(value, _LEVELS)
@@ -507,12 +534,33 @@ def _detail_link(item: dict) -> str:
     return f'<p><a href="{path}">Details #{approval_id}</a></p>'
 
 
+_APPROVAL_COLUMNS = ("id", "kind", "name", "created_at", "content_hash")
+
+
+def _approval_row(item: Mapping[str, object], tz: str) -> str:
+    """承認待ちの 1 行。欠けた値・型違いは「-」。hash は先頭 12 文字。"""
+    approval_id = item.get("id")
+    link = _detail_link(item)
+    if link:
+        first = f'<a href="/approvals/{approval_id}">#{approval_id}</a>'
+    else:
+        first = _text(approval_id) or "-"
+    digest = item.get("content_hash")
+    digest = digest[:12] if type(digest) is str else digest
+    created = item.get("created_at")
+    cells = [first, _text(item.get("kind")) or "-", _text(item.get("name")) or "-",
+             _time_text(created, tz) if type(created) is str and created else "-",
+             _text(digest) or "-"]
+    return "<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>"
+
+
 def render_approvals(data: Mapping[str, object]) -> bytes:
     approvals = data.get("approvals")
     entries = approvals if isinstance(approvals, list) else []
     tz = zone_of(data)
-    body = "".join("<section>" + _detail_link(item) + _pairs(item, APPROVAL_FIELDS, tz=tz) + "</section>"
-                   for item in entries[:MAX_ITEMS] if type(item) is dict)
+    rows = [_approval_row(item, tz) for item in entries[:MAX_ITEMS] if type(item) is dict]
+    body = ("<section><table><thead><tr>" + "".join(f"<th>{name}</th>" for name in _APPROVAL_COLUMNS)
+            + "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></section>") if rows else ""
     journals = data.get("open_journals")
     if isinstance(journals, list):
         body += "".join("<section>" + _pairs(item, JOURNAL_FIELDS, tz=tz) + "</section>"

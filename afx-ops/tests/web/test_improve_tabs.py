@@ -71,7 +71,7 @@ def test_the_detail_bar_marks_the_current_tab_and_keeps_the_nav_paragraph_above_
         ("/improve/7?tab=overview", "", "概要"), ("/improve/7?tab=agent", "", "agent"),
         ("/improve/7?tab=result", ' aria-current="page"', "成績"),
         ("/improve/7?tab=handoff", "", "申し送り")]
-    assert page.index('<a href="/improve">Improve (一覧)</a>') < page.index('<nav class="tabs">')
+    assert "Improve (一覧)" not in page  # 上部の nav に同じ先がある
 
 
 def test_a_missing_tab_and_the_default_tab_give_the_same_body():
@@ -264,7 +264,7 @@ def test_without_a_sort_the_daemon_order_is_kept_and_no_header_is_marked():
     page = text_of("/improve", client=Client(listing={"runs": sortable_runs(), "has_more": False}))
     assert order_of(page) == [1, 2, 3, 4, 5, 6]
     assert "▲" not in page and "▼" not in page
-    assert "新しい順に並べています" in page
+    assert "新しい順に並べています" not in page
 
 
 def test_zero_is_a_value_and_a_bool_or_a_naive_time_is_not():

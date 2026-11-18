@@ -305,8 +305,7 @@ def _sources_note(sources: object) -> str:
 
 def _header_section(data: Mapping[str, object]) -> str:
     listing = pick(data, LISTING_FIELDS)
-    parts = ['<p><a href="/approvals">承認待ちの一覧 (Pending approvals)</a></p>',
-             _sources_note(listing.get("sources"))]
+    parts = [_sources_note(listing.get("sources"))]
     unknown = listing.get("unknown_submissions")
     if type(unknown) is int and unknown > 0:
         parts.append("<p>indicator の依存を記録していない古い strategy の提出: "
@@ -482,8 +481,7 @@ def render_plugin(data: Mapping[str, object], tab: str = "overview",
     route_name = name
     name = row.get("name")
     shown = name if type(name) is str and render._NAME.match(name) else "-"
-    nav = '<p><a href="/plugins">Plugins</a> / <a href="/approvals">Pending approvals</a></p>'
     body = DETAIL_TAB_SECTIONS[tab](row, entity, admission, data, tz) or "<p>なし</p>"
     link_name = route_name if type(route_name) is str and render._NAME.match(route_name) else shown
     bar = tabs.bar(tabs.PLUGIN_DETAIL, tab, at=f"/plugins/{link_name}")
-    return render._page(f"Plugin {shown}", body, tz, current="/plugins", tabs=nav + bar)
+    return render._page(f"Plugin {shown}", body, tz, current="/plugins", tabs=bar)

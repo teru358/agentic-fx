@@ -100,11 +100,11 @@ def test_a_daemon_reply_that_is_not_a_clean_200_is_502(reply):
 def test_control_characters_become_spaces_in_shown_values():
     page = handle_request(Request("GET", "/", {}), Recorder(data={"mode": "a\x01b\x7f c"})).body.decode()
 
-    assert "<dd>a b  c</dd>" in page
+    assert "<strong>mode</strong>a b  c</div>" in page
 
 
 def test_list_values_are_capped_at_50_items():
-    data = {"jobs": [f"j{i}" for i in range(60)]}
+    data = {"orders": [f"j{i}" for i in range(60)]}
     page = handle_request(Request("GET", "/", {}), Recorder(data=data)).body.decode()
 
     assert page.count("<li>") == 50
@@ -124,9 +124,9 @@ def test_approval_links_are_capped_at_50():
     data = {"approvals": [{"id": i} for i in range(1, 61)]}
     page = handle_request(Request("GET", "/approvals", {}), Recorder(data=data)).body.decode()
 
-    assert page.count("Details #") == 50
-    assert "Details #50" in page
-    assert "Details #51" not in page
+    assert page.count('<a href="/approvals/') == 50
+    assert '<a href="/approvals/50">#50</a>' in page
+    assert "/approvals/51" not in page
 
 
 def test_an_oversized_page_is_replaced_by_the_clipped_notice():

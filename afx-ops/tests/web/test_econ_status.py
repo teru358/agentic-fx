@@ -69,13 +69,13 @@ def test_status_page_shows_every_econ_item_with_its_value():
                        ("signal_override", "120"), ("rows", "80"),
                        ("row_capacity", "100"), ("row_level", "warn"),
                        ("slice_bytes", "7000"), ("used_bytes", "400000"),
-                       ("byte_level", "ok"), ("base_bytes", "348160"),
-                       ("bytes_per_row", "177"), ("db_bytes", "11"), ("wal_bytes", "12"),
-                       ("free_bytes", "13"), ("level", "warn"),
+                       ("byte_level", "ok"), ("free_bytes", "13"), ("level", "warn"),
                        ("slice_bytes_measured_at", "2026-11-06 01:02:03 +00:00"),
                        ("capacity_override_below_producer", "True")):
         assert cells[f"slice {key}"] == value, key
     assert cells["slice capacity warning"] == "warn"
+    for key in ("base_bytes", "bytes_per_row", "db_bytes", "wal_bytes"):
+        assert f"slice {key}" not in cells, key
 
 
 def test_status_page_says_unmeasured_bytes():

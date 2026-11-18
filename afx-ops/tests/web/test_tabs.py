@@ -42,7 +42,7 @@ def headings(page, level="h2"):
 
 
 STATUS_SECTIONS = {
-    "overview": ["安全", "資金", "稼働"],
+    "overview": ["安全", "稼働"],
     "bot": ["Bot"],
     "econ": ["Economic calendar", "Economic signal"],
     "reaction": ["Economic reactions"],
@@ -86,8 +86,8 @@ def test_the_status_overview_orders_rows_by_group_not_alphabetically():
     page = get("/")[0].body.decode()
     keys = re.findall(r"<dt[^>]*>([a-z_]+)</dt>", page)
     top = [key for key in keys if key in render.STATUS_FIELDS]
-    assert top == ["kill_switch", "health", "autopilot", "equity", "balance",
-                   "mode", "mission", "data", "orders"]
+    # 平常のカードが写す autopilot・equity・balance・mode の行は出ない。健全と読めない値の行は残る
+    assert top == ["kill_switch", "health", "mission", "data", "orders"]
 
 
 def test_the_group_table_and_the_allowlist_hold_the_same_keys():
@@ -97,7 +97,8 @@ def test_the_group_table_and_the_allowlist_hold_the_same_keys():
 
 
 def test_a_group_without_values_has_no_heading_and_empty_values_make_no_row():
-    page = get("/", {}, Client({"mode": "paper", "pnl": None, "performance": ""}))[0].body.decode()
+    page = get("/", {}, Client({"mode": "paper", "mission": {"loop": "x"}, "pnl": None,
+                                "performance": ""}))[0].body.decode()
     assert headings(page) == ["稼働"]
     assert "pnl" not in page and "performance" not in page
 
@@ -106,7 +107,9 @@ def test_the_emphasis_is_kept_in_the_overview():
     status = {"kill_switch": {"latched": True}, "autopilot": True}
     page = get("/", {}, Client(status))[0].body.decode()
     assert '<dt class="danger">kill_switch</dt><dd class="danger">' in page
-    assert '<dt class="warn">autopilot</dt><dd class="warn">' in page
+    # autopilot の注意は印 (カード) に置き換わり、行は出ない
+    assert '<dt class="warn">autopilot</dt>' not in page and "<dt>autopilot</dt>" not in page
+    assert '<span class="st warn">△ ON</span>' in page
 
 
 @pytest.mark.parametrize("path,query", [

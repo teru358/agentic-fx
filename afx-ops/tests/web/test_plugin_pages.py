@@ -204,7 +204,7 @@ def test_the_detail_lists_versions_and_the_approval_history_with_links_and_user_
     assert oldest[3:5] == ["人の提出", "-"] and oldest[-1] == "2026-11-01 09:00:02 +09:00"
     pending = re.search(r"<h2>承認待ち</h2>(.*?)</section>", html, re.S).group(1)
     assert '<a href="/approvals/4">#4</a>' in pending
-    assert '<a href="/approvals">' in body_of(html)
+    assert "Pending approvals" not in body_of(html)
 
 
 def test_a_history_cut_by_the_daemon_says_how_many_there_are():

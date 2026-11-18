@@ -277,7 +277,7 @@ def _more_note(fetched: int, shown: int, has_more: bool, limit: int, sort: str |
 
 def _intro(fetched: int, sort: str | None, direction: str | None) -> str:
     if sort is None:
-        return "<p>終了した改善 mission を新しい順に並べています。run の番号から要約を開けます。</p>"
+        return ""
     effective = direction or SORT_COLUMNS[sort].first
     return (f"<p>取得した最新 {fetched} 件を {SORT_LABEL[sort]} の {DIRECTION_TEXT[effective]} "
             "で並べています。run の番号から要約を開けます。</p>")
@@ -528,7 +528,6 @@ def render_improve_detail(data: Mapping[str, object], tab: str = "overview",
     items = pick(summary.get("items"), ITEM_FIELDS) if state == "ok" else {}
     own = row.get("id")
     shown = own if type(own) is int and own >= 1 else "-"
-    nav = '<p><a href="/improve">Improve (一覧)</a> / <a href="/plugins">Plugins</a></p>'
     bar = tabs.bar(tabs.IMPROVE_DETAIL, tab, at=f"/improve/{run_id if run_id is not None else shown}")
     if not snapshot:
         sections = {"overview": _section("概要", f"<p>{NO_TERMINAL_TEXT}</p>")}
@@ -549,4 +548,4 @@ def render_improve_detail(data: Mapping[str, object], tab: str = "overview",
             "handoff": _handoff_section(items),
         }
     body = sections.get(tab) or "<p>なし</p>"
-    return render._page(f"Improve #{shown}", body, tz, current="/improve", tabs=nav + bar)
+    return render._page(f"Improve #{shown}", body, tz, current="/improve", tabs=bar)
