@@ -1,7 +1,7 @@
 ---
 id: indicator-forward-response-evaluation
 title: 指標の計算値を数学的な計算にかけ、通貨ペアの傾向を改善 agent に見せる分析の道具
-status: 裁定待ち
+status: 設計待ち
 priority: 中
 kind: 機能
 opened: 2026-11-18
@@ -10,7 +10,7 @@ related: [multi-input-indicator-relations, strategy-attribution-and-shadow-evalu
 ---
 # [indicator-forward-response-evaluation] 指標とその変換が将来の値動きとどう関係するかを測り、改善 agent に返す
 
-**状態**: 裁定待ち / **優先**: 中 / **種別**: 機能
+**状態**: 設計待ち / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -42,3 +42,4 @@ related: [multi-input-indicator-relations, strategy-attribution-and-shadow-evalu
 - 2026-11-18: 状態: 裁定待ち — 考慮事項ごとの対処案 (11-18、fable と sol、報告 tmp/review-indeval/considerations-r1-{fable,sol}.md 非公開)。一致: 設計の前に第 0 段 (人間側で 1 回の一括試算、配備済み指標 × 列挙した見方 × h、USDJPY 1h、隔離 worker・閉場中・DB 読取専用、費用は ask/bid と spread 欠損を捨てる、slippage は感度) を置き、合否の基準を結果を見る前に凍結する。第 1 版は既存 analyze_for_agent の新しい kind で、区分の応答・向きの宣言・累積の試行台帳 (mission で戻さない、鍵は指標の hash・params・見方・h・データの版)。次周には試行済みの印だけを渡す。評価は関門にせず承認画面の根拠に出す。signal_shadow の診断は人間向けの後続 (50 行・9 日で標本が足りない)。相違: 確認用の期間 (sol は第 1 版で新設しない、fable は in-sample の内側を暦日で凍結し第 0 段の集団の符号の再現と人間向けの表示だけに使う)、多重比較 (sol は週ブロック再標本化 + Holm、fable は値動きを日単位でずらした帰無分布と残存数の比較)。fable が実測で見つけた事実: in-sample の区間に経済指標の履歴が無い (econ_events は 2026-08-23 から)、backtest の replay は経済指標の回避帯を適用しない、スワップはどこでも計算していない (paper の orders も全件 0)
 - 2026-11-18: 関連: [multi-input-indicator-relations, strategy-attribution-and-shadow-evaluation, weekly-plugin-inventory-notice, improve-context-family-attempt-summary, reference-symbols-as-indicator-inputs, web-ui-charts-equity-indicators, multi-timeframe-indicator-deps, improve-objective-filtered-signal-quality] — 利用者の方針 (11-18): テストは最低限の関門で、テストで利益を出せないものは本番で厳しい (必要条件として扱う)。経済指標の回避帯は運用者の選択で許可もできるので、backtest が回避帯を適用しないことは欠陥として扱わない。スワップは考慮しない。spread は backtest と同じく履歴の spread で残す (外すとテストが最低線として働かない)。slippage など、それ以上の費用の作り込みはしない
 - 2026-11-18: 題名: 指標の計算値を数学的な計算にかけ、通貨ペアの傾向を改善 agent に見せる分析の道具 — 利用者が目的を明言 (11-18): 「目的は戦略改善でできることを増やす。指標をチャートに通したときに返す値をモデルに渡して通貨ペアの傾向を見える化する。返す値を数学的計算に投げられるようにする」。中心は当たりを判定する仕組みではなく、改善 agent が使う分析の道具。将来の値動きとの関係の評価は機能の 1 つ。指揮者の確認中: (1) 「モデル」は改善 agent か (取引判断 LLM にも渡すか)、(2) 第 0 段の一括試算を前提から外し、道具として設計に進むか。道具でも残る制約: 本番と同じ tail(max_bars) の意味で系列を作る、agent には要約を返す (計算はコード側)、見せるのは in-sample だけで holdout は隠し試行を記録する
+- 2026-11-18: 状態: 設計待ち — 利用者裁定 (11-18): まず改善 agent に実装し、様子を見て取引判断 LLM へ展開する。取引判断 LLM へは後続で、少数の決まった加工値 (履歴の中での位置・傾き) を渡し、採否の記録と影の約定で前後を比べて続けるか決める (指揮者の推奨)。設計はまだ行わない (利用者)

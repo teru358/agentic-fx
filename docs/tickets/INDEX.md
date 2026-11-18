@@ -46,7 +46,7 @@
 | [subprocess-allowlist-by-line-number](open/subprocess-allowlist-by-line-number.md) | 低 | 2026-09-18 | subprocess の stdin 方針テストが行番号固定で壊れやすい |
 | [switch-ops-r2b-low-unpinned](open/switch-ops-r2b-low-unpinned.md) | 低 | 2026-09-20 | 版ディレクトリ検証の変異 3 本が未 pin、テスト名に旧版の名残 |
 
-## 裁定待ち (7)
+## 裁定待ち (6)
 
 ### 不具合 (2)
 
@@ -55,12 +55,11 @@
 | [improve-catchup-runs-at-startup](open/improve-catchup-runs-at-startup.md) | 低 | 2026-09-20 | 起動直後に改善 mission が自動起動する (catch-up と推定) |
 | [mt5-import-window-before-data-start](open/mt5-import-window-before-data-start.md) | 低 |  | --from がデータ開始より前だと importer が停止する |
 
-### 機能 (4)
+### 機能 (3)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [escape-probe-manual-measurement](open/escape-probe-manual-measurement.md) | 中 | 2026-10-04 | 改善 agent の檻からの脱出可否を人手で実測する |
-| [indicator-forward-response-evaluation](open/indicator-forward-response-evaluation.md) | 中 | 2026-11-18 | 指標の計算値を数学的な計算にかけ、通貨ペアの傾向を改善 agent に見せる分析の道具 |
 | [legacy-e2e-ttl](open/legacy-e2e-ttl.md) | 低 |  | llama-swap の TTL 120 秒で mission 中にモデルが unload される |
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 
@@ -70,7 +69,7 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (155)
+## 設計待ち (156)
 
 ### 不具合 (82)
 
@@ -159,7 +158,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (43)
+### 機能 (44)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -176,6 +175,7 @@
 | [improve-runner-choice](open/improve-runner-choice.md) | 中 | 2026-11-08 | 改善の実行ごとに backend / model の候補を選べるようにする |
 | [web-https-for-writes](open/web-https-for-writes.md) | 中 | 2026-11-08 | 同梱 web を HTTPS で動かし LAN から書込めるようにする |
 | [killswitch-reset-implicit-generation-and-dd-preview](open/killswitch-reset-implicit-generation-and-dd-preview.md) | 中 | 2026-11-16 | kill switch の解除で世代の入力を不要にし、確認画面に現在の DD と再ラッチの予告を出す |
+| [indicator-forward-response-evaluation](open/indicator-forward-response-evaluation.md) | 中 | 2026-11-18 | 指標の計算値を数学的な計算にかけ、通貨ペアの傾向を改善 agent に見せる分析の道具 |
 | [improve-targeted-run](open/improve-targeted-run.md) | 低 | 2026-09-12 | 現状は `improve add <text>` + 引数なし `improve` で LLM が open から自分… |
 | [pine-script-to-plugin](open/pine-script-to-plugin.md) | 低 | 2026-09-12 | Pine script を plugin に変換する手段が無い |
 | [indicator-reference-oracle-gate](open/indicator-reference-oracle-gate.md) | 低 | 2026-09-15 | indicator の正しさを確かめる門が無い |
