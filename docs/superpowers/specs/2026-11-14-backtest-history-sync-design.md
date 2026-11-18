@@ -141,6 +141,8 @@ holdout全scanは起動時・日次・明示rescan・no-bars/holdout_months/data
 
 この段階は新しい要求を出さず、金曜閉場を含む1週間の基準線を取る。endpoint別に加え固定callerラベルtick / mission / cli / unknownを集計し、個人識別値を記録しない。Mission子processの`/ohlcv`、`repair-time` plan (24窓+server-time)、`check/init`はrequest admission外の競合利用者として含める。保持者を断定せず、このCLI群の稼働中利用を基準線とtimeout帰属で計上する。endpoint別待ち/占有p95/最大、tick/quote/close遅延・timeout/ingest失敗、計測負荷・欠落を確認する。T5で停止中手動の追記120格子/尾最大180格子/閉場跨ぎを測り、占有上限・p95規則・追加遅延・自己計測時間と標本数を版付きで確定する。仮のp95 10ms/最大50msは採用しない。目標未確定なら3a取得0。
 
+記録先 (C5.8): 主記録は bridge 側 `mt5_bridge/logs/bridge-metrics/YYYY-MM-DD.jsonl`、daemon 側は client から見た経過・timeout・接続失敗を `logs/bridge-metrics/client-YYYY-MM-DD.jsonl` (CLI は `client-cli-YYYY-MM-DD.jsonl`) に書く。日付は UTC で行の時刻と同じ。要求の経路は有界 queue への非待機投入だけで、書込みは logging に登録しない daemon thread の writer が行い、満杯は捨てて次の行に欠落数を載せる。追記のみで改名せず、writer が日付の変わり目に 14 日を超えた自分の名前の形の通常 file だけを消す。停止は期限付き (既定 2 秒) で、bridge は MT5 の切断を記録の停止より先に行う。POSIX では file 0600・dir 0700、POSIX 専用の呼出しが無い OS (Windows / Wine) では通常の追記で書く。集計は `scripts/bridge_metrics_report.py --bridge-dir … --client-dir …`。
+
 **自己計測lifecycle**: (1) 基準機のA8合格後、(2) 各環境でdaemonが初回とboot id変更・形状/設定/受入規則変更のたびに有界な受動→能動自己計測を自動開始する。取得前提が揃う場合の自動再計測に人の操作を要求しない。1つのboot/形状で1 campaign、試行上限・期間・標本数・再試行間隔はT5で固定し、上限終了後はcapacity_not_acceptedで待つ (無制限probeなし)。既存応答でboot変更を認識する。auto無効中の自動能動計測は0、明示selftestは可。能動部分は通常の3a操作として正本coreで足/監査/cursorを確定し、同じ2N予算・間隔・tick admission・閉場予約・毎要求監視を適用する。計測用の捨て取得/別経路は作らない。未合格時は能動自己計測以外の定期取得0。ただし未初期化cursor・24開場時間超の遅れ・事前固定尾不足では通常3a操作を作れず、campaign/clear-stopも進めない。statusとCLI結果に該当理由、未処理範囲と「停止中の手動同期の後に再実行」を出し、自動回復を保証しない。
 
 `afx ctl history selftest` は同campaignへの明示CHANGEで、auto無効/自動campaign不合格時も使える。永続停止中は `--clear-stop` を明示しなければ取得を始めない。clear-stopは解除の申請であり、停止理由を維持したまま有界計測し、合格時にだけ監査付きで原子的解除する。未完要求はcompleted照合、または新bootを確認するまでselftestも0要求。boot変更自体は永続停止を解除しない。ctl sync/再起動/周期retryによる迂回は不可。自己計測の受付は202、結果と未合格理由をrequest idで追う。offlineの別selftestコマンドは追加しない。
@@ -307,6 +309,8 @@ rollbackは新コードのうちにauto_enabled=falseへ変更して再起動し
 | 2026-11-15 | C5.4 | 日別run集計の永続表 `history_sync_daily` を明記 (run終了と同transactionで加算、二重に数えない) | series詳細の90日GC後も日別を復元できるようにする | — (未commit) |
 | 2026-11-15 | C5.5 | 検査尾の候補を `[B,c)` に限る制限を撤廃し、始端がBのときもBより前の既存keyから尾を選ぶ。尾は比較・監査だけに使い、尾の欠落足は挿入しない | `max(B,E-D日)` と `[B,c)` 制限が両立せず、lookbackがBに届く設定と境界日のgapが進めなかった | — (未commit) |
 | 2026-11-15 | C5.6 | §1.3 に段2のstatusの固定表示 (effective disabled、自己計測/worker、参照の疑いの新旧detail、`eval_window` 未収集、3b未対応の情報行) を明記。HB C2.6・段1a C2.5・wizard案内と同時に原本を追随 | T3 (表示・運用原本) の実装 | — (未commit) |
+| 2026-11-17 | C5.7 | T4 の基準線の記録先を明記 (指揮者決定)。主記録は bridge 側の要求ごとの構造化記録 (`mt5_bridge/logs/bridge-metrics.jsonl`、caller は daemon・Mission・CLI が固定ラベルの request header `X-Afx-Caller` で送る、標準 logging の queue と UTC 日次ローテーション 14 日)。daemon 側は client から見た経過・timeout・接続失敗だけを同じ方式で `logs/bridge-metrics/client.jsonl` に書く。集計は `scripts/bridge_metrics_report.py` | 設計が記録先を定めていなかった。daemon 側の自前の file 書込みは取引の経路を同期 I/O で止めうる (実装レビュー 1 周目)、Mission 子 process は Landlock で logs に書けない | 実装 branch |
+| 2026-11-18 | C5.8 | 記録先と writer の方式を改訂 (§2.4 末尾)。標準 logging の queue と日次ローテーションをやめ、UTC 日付入りの file への追記と自前の有界 queue + daemon thread の writer、期限付き停止 (MT5 切断を先に)、POSIX 専用呼出しの条件付き使用に変更。集計の引数を `--bridge-dir` / `--client-dir` に | 書込みが止まると bridge の終了と MT5 切断が止まる、Windows / Wine で POSIX 専用の呼出しにより全件失われる、改名を伴うローテーションが記録 dir 外の file を動かしうる (実装の閉鎖確認 1 回目) | 実装 branch |
 
 ## 6. 短い task 表
 

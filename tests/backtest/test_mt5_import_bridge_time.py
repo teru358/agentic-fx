@@ -32,7 +32,12 @@ def _load_bridge():
     spec = importlib.util.spec_from_file_location(MODULE, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[MODULE] = module
-    spec.loader.exec_module(module)
+    # 本番の起動 (mt5_bridge/ を作業 dir にする) と同じく、同じ dir の兄弟 module を解決させる。
+    sys.path.insert(0, str(path.parent))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(str(path.parent))
     return module
 
 

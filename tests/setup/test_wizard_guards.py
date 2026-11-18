@@ -22,8 +22,14 @@ from tests.setup.wizard_support import (
 KEY = "KEYVALUE-1"
 
 
+def _without_caller_label(headers):
+    """呼出し元のラベル (秘密ではない固定の header) を除いた、送った header。"""
+    return {k: v for k, v in (headers or {}).items() if k != "X-Afx-Caller"}
+
+
 def bridge_headers(fetch):
-    return [kwargs.get("headers") for url, kwargs in fetch.calls if url.endswith("/health")]
+    return [_without_caller_label(kwargs.get("headers"))
+            for url, kwargs in fetch.calls if url.endswith("/health")]
 
 
 @pytest.mark.parametrize("url", ["https://bridge.example:8812", "http://127.0.0.1:8812",
@@ -70,7 +76,8 @@ def test_plain_http_auth_is_left_unverified_without_a_retry_question(tmp_path):
     assert price["result"] == "unverified" and price["reason_code"] == "key_withheld_plain_http"
     assert not io.asked_with("[r] 再試行")
     assert "daemon は `.env` の鍵で接続します" in io.text
-    assert all(kwargs.get("headers") == {} for url, kwargs in calls if "bridge.example" in url)
+    assert all(_without_caller_label(kwargs.get("headers")) == {}
+               for url, kwargs in calls if "bridge.example" in url)
 
 
 def test_plain_http_auth_without_a_key_explains_where_to_add_it(tmp_path):

@@ -896,7 +896,7 @@ def test_default_fetch_sends_headers_and_returns_json(monkeypatch):
     monkeypatch.setattr(mt5_import.httpx, "get", fake_get)
     result = _default_fetch("http://x/ohlcv/USDJPY?from=a&to=b&interval=1m")
     assert result == {"symbol": "USDJPY", "interval": "1m", "bars": []}
-    assert seen["headers"] == {"X-Bridge-Api-Key": "secret-key"}
+    assert seen["headers"] == {"X-Bridge-Api-Key": "secret-key", "X-Afx-Caller": "unknown"}
     assert seen["timeout"] == 30
 
 

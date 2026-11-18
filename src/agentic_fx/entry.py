@@ -336,6 +336,8 @@ def _main(args_list: list[str]) -> int:
     except RootError as error:
         print(error, file=sys.stderr)
         return 2
+    from agentic_fx.datafeed import bridge_observe
+    bridge_observe.configure(root, "cli")
     if args.command == "init":
         if not args.non_interactive:
             from agentic_fx.setup import wizard
@@ -383,6 +385,7 @@ def _main(args_list: list[str]) -> int:
         print("afx: stdin が端末ではないため daemon モードで起動します "
               "(対話コマンドは受け付けません。明示するには --daemon)",
               file=sys.stderr)
+    bridge_observe.configure(root, "unknown")
     return service.run_service(root, daemon=daemon)
 
 

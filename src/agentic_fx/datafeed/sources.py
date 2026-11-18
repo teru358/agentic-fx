@@ -14,6 +14,7 @@ import pandas as pd
 import yfinance
 
 from agentic_fx.core.contracts import Bar, Quote
+from agentic_fx.datafeed import bridge_observe
 
 
 class BridgeTimeRuleMismatch(RuntimeError):
@@ -159,7 +160,7 @@ def _raise_mt5_time_rule_error(response: httpx.Response) -> None:
 
 def mt5_health(bridge_url: str, *, timeout: float = 10) -> bool:
     """Return whether the bridge reports an attached MT5 terminal."""
-    response = httpx.get(f"{bridge_url.rstrip('/')}/health",
+    response = bridge_observe.bridge_get(f"{bridge_url.rstrip('/')}/health",
                          headers=_mt5_headers(), timeout=timeout)
     response.raise_for_status()
     return response.json().get("mt5_connected") is True
@@ -168,7 +169,7 @@ def mt5_health(bridge_url: str, *, timeout: float = 10) -> bool:
 def mt5_quote(bridge_url: str, pair: str) -> Quote:
     # symbol はパスパラメータ (クエリではない — 実 bridge 仕様)
     sym = vendor_symbol(pair, "mt5")
-    r = httpx.get(f"{bridge_url}/quote/{sym}",
+    r = bridge_observe.bridge_get(f"{bridge_url}/quote/{sym}",
                   headers=_mt5_headers(), timeout=10)
     _raise_mt5_time_rule_error(r)
     d = r.json()   # {symbol, bid, ask, spread_points, time}
@@ -187,7 +188,7 @@ def mt5_bars_range(bridge_url: str, pair: str, interval: str,
     Phase 2 の長期 backfill もこの関数をそのまま使う。
     """
     sym = vendor_symbol(pair, "mt5")
-    r = httpx.get(f"{bridge_url}/ohlcv/{sym}",
+    r = bridge_observe.bridge_get(f"{bridge_url}/ohlcv/{sym}",
                   params={"from": start.isoformat(), "to": end.isoformat(),
                           "interval": interval},
                   headers=_mt5_headers(), timeout=timeout)
@@ -210,7 +211,7 @@ def mt5_raw_bars_range(bridge_url: str, symbol: MT5RawSymbol, interval: str,
     """
     if not isinstance(symbol, MT5RawSymbol):
         raise TypeError("mt5_raw_bars_range requires an MT5RawSymbol")
-    r = httpx.get(f"{bridge_url.rstrip('/')}/ohlcv/{quote(symbol.value, safe='')}",
+    r = bridge_observe.bridge_get(f"{bridge_url.rstrip('/')}/ohlcv/{quote(symbol.value, safe='')}",
                   params={"from": start.isoformat(), "to": end.isoformat(),
                           "interval": interval},
                   headers=_mt5_headers(), timeout=timeout)

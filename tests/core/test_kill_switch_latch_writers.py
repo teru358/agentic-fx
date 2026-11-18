@@ -11,11 +11,30 @@ REPO = Path(__file__).resolve().parents[2]
 SOURCE_DIRS = ("src/agentic_fx", "afx-ops/afx_ops", "mt5_bridge")
 
 
+_SKIPPED_PARTS = frozenset({".venv", "site-packages", "__pycache__"})
+
+
+def _python_files(root):
+    for path in sorted(root.rglob("*.py")):
+        if _SKIPPED_PARTS.isdisjoint(path.relative_to(root).parts):
+            yield path
+
+
 def _files():
     for d in SOURCE_DIRS:
         root = REPO / d
         if root.exists():
-            yield from sorted(root.rglob("*.py"))
+            yield from _python_files(root)
+
+
+def test_scan_skips_virtualenvs_and_caches(tmp_path):
+    (tmp_path / "mod.py").write_text("x = 1\n")
+    for hidden in (".venv/lib/python3/site-packages/pkg", "nested/.venv/lib",
+                   "site-packages/pkg", "__pycache__"):
+        directory = tmp_path / hidden
+        directory.mkdir(parents=True)
+        (directory / "broken.py").write_text("def (:\n")
+    assert [p.name for p in _python_files(tmp_path)] == ["mod.py"]
 
 
 class _Scan(ast.NodeVisitor):

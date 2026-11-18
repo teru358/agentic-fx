@@ -51,6 +51,30 @@ afx の価格取得だけが目的なら、API キーなしでも動く (発注�
 - API キーを設定すると、全 endpoint (`/health` 以外。キーを設定済みなら `/health` は接続元を問わず開いている) が `X-Bridge-Api-Key` ヘッダを要求する。
 - この bridge には認可や rate limit の仕組みは無い。インターネットには公開しないこと。
 
+## 計測 header と履歴専用 slot
+
+全ての応答 (成功、エラー、401・403、未知の path を含む) に、body・detail・status を変えない受動計測の header が付く (protocol v1)。
+
+| header | 意味 |
+|---|---|
+| `X-Bridge-Metrics-Version` | protocol の版 (`1`) |
+| `X-Bridge-Boot-Id` | process 起動ごとの opaque 値。口座に由来しない。process が再起動すると変わる |
+| `X-Bridge-Lock-State` | `measured` (MT5 の lock を 1 回以上取った) / `not_locked` / `unavailable` (計測できなかった。0 と読まない) |
+| `X-Bridge-Lock-Wait-Ms` `-Hold-Ms` `-Acquisitions` | 1 要求内の全取得の合計待ち・合計占有・回数 |
+| `X-Bridge-Lock-Wait-Max-Ms` `-Hold-Max-Ms` | 1 回の取得の最大の待ち・占有 |
+| `X-Bridge-Error-Code` | 失敗応答の固定 code (`symbol_unavailable` `history_copy_failed` `route_not_found` `time_rule_mismatch` など)。detail の文字列は従来のまま |
+
+履歴専用 slot: `/ohlcv` の要求が `X-Bridge-History-Request-Id` (英数字と `._-`、128 文字まで) を持つとき、bridge は単一の slot に登録する。
+
+- native の取得の前に登録し、全 native 呼出しと lock の解放が終わった後だけ `completed` にする。HTTP が切れても追跡は続く。
+- slot は次の履歴要求まで保持する。header の無い要求は上書きしない。
+- 完了前に別の ID の履歴要求が来ると、native を実行せず 409 で拒否する。同じ ID の再送も実行しない (409)。
+- ID は要求ごとに新しく作る。同じ ID の再送は完了後も 409 になる (再試行にも新しい ID を使う)。
+- `waiting` は「登録済みで未完、まだ MT5 の lock を持っていない」状態。lock を持った後が `holding`。
+- 状態は lock を取らずに読まれ、認証済みの既存応答 (API キー設定時は正しいキーを提示した要求) の header に載る: `X-Bridge-History-Request-Id` / `-State` (`waiting` `holding` `completed` `none`) / `-Wait-Ms` `-Hold-Ms` (`completed` のときだけ)。認証に失敗した応答には載せない。
+
+boot id と slot は process の中に持つので、bridge は 1 process で動かす (`uv run python server.py`)。app を object で渡す起動のため、uvicorn は複数 worker を拒否する。
+
 ## 配備 (upgrade)
 
 時刻規則を持つ版へ上げるときの手順。MT5 ターミナルは止めない (再ログインに OTP が要るため)。
@@ -136,6 +160,24 @@ bridge は `America/New_York` の DST 規則と「サーバ時刻 = NY 壁時計
 ## ログ
 
 `logs/bridge.log` にローテーション付きで出力される (5MB × 6 世代)。ファイルに入るのは bridge 自身のログ (MT5 接続・切断・起動メッセージ等)。HTTP アクセスログは標準出力にだけ出る。
+
+### 要求ごとの構造化記録
+
+`logs/bridge-metrics/YYYY-MM-DD.jsonl` (UTC の日付) に、1 要求 1 行の JSON を書く (応答の body・detail・status・header は変えない)。要求の処理は有界 queue に積むだけで、書込みは daemon thread の writer が行い、要求は待たない。queue が詰まったら行を捨て、次に書けた行の `dropped_before` に欠落数を載せる。記録の失敗は応答に影響しない。
+
+| 欄 | 内容 |
+|---|---|
+| `ts` | UTC の時刻 (要求ごとに 1 回だけ取る) |
+| `caller` | request header `X-Afx-Caller` を固定集合 `tick` `mission` `cli` と照合した値。他の値・欠落は `unknown` |
+| `route` | endpoint の形 (`/quote/{symbol}` `/positions/{ticket}/modify` など)。生の path・query は書かない。未知の path は `/other` |
+| `status` | HTTP status |
+| `error_code` | 失敗応答の固定 code。固定の集合に無い値は `unknown`、無ければ `null` |
+| `lock_state` `wait_ms` `hold_ms` `wait_max_ms` `hold_max_ms` `acquisitions` | MT5 lock の状態と、1 要求内の待ち・占有の合計・最大・取得回数 (`unavailable` のときは数値なし) |
+| `history_state` | 履歴専用 slot の状態 (`none` `waiting` `holding` `completed`)。認証に失敗した応答では `null`。ID は書かない |
+
+URL・API キー・生の header・boot id の生値・価格・履歴の ID は書かない。POSIX では dir を `0700`、file を `0600` で作り、既存の権限が緩ければ開くときに直す。symlink と通常でない file は開かない。POSIX 専用の仕組みが無い OS (Wine 上の Windows Python) では通常の追記 open で書く。
+
+保持: 日付入りの file へ追記するだけで改名しない。writer が日付の変わり目に、14 日を超えた `YYYY-MM-DD.jsonl` の通常 file だけを消す (他の名前・dir・symlink は残す)。停止は期限付きで、MT5 の切断を先に行う。集計は daemon 側の記録と合わせて `scripts/bridge_metrics_report.py --bridge-dir <この dir> --client-dir <logs/bridge-metrics>` で出す (client 側は daemon の `client-YYYY-MM-DD.jsonl` と CLI の `client-cli-YYYY-MM-DD.jsonl` に分かれ、`--client-dir` を省くと `<root>/logs/bridge-metrics` の両方を読む)。
 
 ## トラブルシュート
 

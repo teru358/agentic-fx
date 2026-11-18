@@ -134,7 +134,7 @@ def test_the_key_comes_from_the_environment_or_dotenv_without_changing_the_envir
     (root / ".env").write_text("MT5_BRIDGE_API_KEY=FROMDOTENV\n")
     calls = serve(monkeypatch, ["JP225"])
     run_check(root)
-    assert calls[0][1]["headers"] == {"X-Bridge-Api-Key": "FROMDOTENV"}
+    assert calls[0][1]["headers"] == {"X-Bridge-Api-Key": "FROMDOTENV", "X-Afx-Caller": "unknown"}
     import os
     assert "MT5_BRIDGE_API_KEY" not in os.environ
 

@@ -419,7 +419,7 @@ def test_bridge_http_uses_mt5_auth_headers_and_hides_request_details(monkeypatch
     assert error.value.exit_code == 1
     assert "secret-key" not in str(error.value)
     assert str(error.value) == "bridge server-time unavailable"
-    assert captured == [{"X-API-Key": "secret"}]
+    assert captured == [{"X-API-Key": "secret", "X-Afx-Caller": "unknown"}]
 
 
 def test_plan_stops_when_bridge_rule_check_fails(tmp_path, monkeypatch):
