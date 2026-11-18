@@ -59,9 +59,21 @@ def _state_words(source: str) -> set[str]:
             found.add(node.value)
         elif isinstance(node, ast.Name) and node.id in consts:
             found.add(consts[node.id])
+        elif isinstance(node, ast.Name) and node.id == "state":
+            pass  # 追跡中の変数そのもの (その代入は別に検査される)
+        elif isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) \
+                and node.slice.value == "state":
+            pass  # 保存済みの state を読み戻すだけ
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and node.func.attr == "get" and node.args
+              and isinstance(node.args[0], ast.Constant) and node.args[0].value == "state"):
+            if len(node.args) == 2:
+                take(node.args[1])
         elif isinstance(node, ast.IfExp):
             take(node.body)
             take(node.orelse)
+        else:  # 語を解決できない式 (別の変数・関数の戻り値など) は、不明として失敗させる
+            found.add(f"<unresolved: {ast.unparse(node) if node is not None else 'None'}>")
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign) and any(
@@ -79,8 +91,8 @@ def _state_words(source: str) -> set[str]:
             take(node.args[1])
         elif isinstance(node, ast.FunctionDef) and node.name in _STATE_FUNCTIONS:
             for inner in ast.walk(node):
-                if isinstance(inner, ast.Return):
-                    take(inner.value)
+                if isinstance(inner, ast.Return) and not isinstance(inner.value, ast.Dict):
+                    take(inner.value)  # dict を返す関数は、その "state" の値を別に検査する
     return found
 
 
@@ -106,6 +118,17 @@ def test_a_new_outage_state_on_any_producing_path_is_caught():
             ('"state": row.get("state", "ready")', '"state": row.get("state", "idle")')):
         assert needle in source, needle
         assert not _state_words(source.replace(needle, mutated, 1)) <= set(outage.DATA_STATES), needle
+
+
+def test_a_state_word_that_arrives_through_a_variable_or_a_call_is_not_trusted():
+    for source in (
+            "class A:\n    @property\n    def state(self):\n        new_value = 'paused'\n"
+            "        state = new_value\n        return state\n",
+            "class A:\n    @property\n    def state(self):\n        new_value = 'paused'\n"
+            "        return new_value\n",
+            "def f(row):\n    state = compute(row)\n    return state\n",
+            "def f(row):\n    return {'state': compute(row)}\n"):
+        assert any(word.startswith("<unresolved:") for word in _state_words(source)), source
 
 
 def test_every_state_the_bot_health_evaluation_produces_is_in_the_vocabulary():
