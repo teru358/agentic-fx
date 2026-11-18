@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from afx_ops import base_text, display_time, history_text, reevaluation_text
 from afx_ops.display_zone import zone_of
 from afx_ops.metric_words import metric_items
+from afx_ops.web import marks
 from afx_ops.web import tabs as tab_table
 from afx_ops.web.routes import ROUTE_TABLE, resolve_route
 
@@ -59,9 +60,16 @@ ul { margin: 0; padding-left: 1.25rem; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--soft); padding: 0.6rem;
   border-radius: 6px; font-size: 0.85rem; }
 .danger { color: var(--bad); }
-dd.danger { font-weight: 700; background: var(--bad-bg); }
+dd.danger, .st.danger { font-weight: 700; background: var(--bad-bg); }
 .warn { color: var(--warn); }
-dd.warn { font-weight: 700; background: var(--warn-bg); }
+dd.warn, .st.warn { font-weight: 700; background: var(--warn-bg); }
+.ok { color: var(--ok); background: var(--ok-bg); }
+.st { display: inline-block; padding: 0 0.4rem; border: 1px solid; border-radius: 1rem;
+  font-size: 0.85rem; white-space: nowrap; }
+.kpi { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0 0 0.75rem; }
+.kpi div { border: 1px solid var(--line); border-radius: 6px; padding: 0.4rem 0.75rem;
+  background: var(--soft); }
+.kpi strong { display: block; font-size: 0.8rem; color: var(--mut); }
 table { border-collapse: collapse; font-size: 0.85rem; }
 th, td { border: 1px solid var(--line); padding: 0.15rem 0.45rem; text-align: left; }
 th { background: var(--soft); }
@@ -200,8 +208,24 @@ STATUS_GROUPS = (
 )
 
 
+def _scalar_card(data: Mapping[str, object], key: str) -> tuple[str, str]:
+    """印を持たない値だけのカード。画面が今も出している scalar の値をそのまま出す。"""
+    return key, _text(data.get(key)) if key in data else ""
+
+
+def _status_cards(data: Mapping[str, object]) -> str:
+    def marked(key: str, classify) -> str:
+        return marks.render_verdict(classify(data[key])) if key in data else ""
+    return marks.cards([
+        ("kill switch", marked("kill_switch", marks.classify_kill_switch)),
+        ("health", marked("health", marks.classify_health)),
+        ("autopilot", marked("autopilot", marks.classify_autopilot)),
+        _scalar_card(data, "mode"), _scalar_card(data, "equity"), _scalar_card(data, "balance"),
+        ("data", marked("data", marks.classify_data))])
+
+
 def _status_overview(data: Mapping[str, object], tz: str) -> str:
-    parts = []
+    parts = [_status_cards(data)]
     for title, keys in STATUS_GROUPS:
         rows = _pairs(data, STATUS_FIELDS, nested_allowed=NESTED_FIELDS, emphasis=_EMPHASIS,
                       tz=tz, order=keys)
@@ -213,8 +237,8 @@ def _status_overview(data: Mapping[str, object], tz: str) -> str:
 # Status のタブごとの本文。キーは tabs.TABS["/"] の名前と一致させる
 STATUS_TAB_SECTIONS = {
     "overview": lambda data, tz: _status_overview(data, tz),
-    "bot": lambda data, tz: _bot_section(data, tz),
-    "econ": lambda data, tz: _calendar_section(data) + _econ_section(data, tz),
+    "bot": lambda data, tz: _bot_cards(data) + _bot_section(data, tz),
+    "econ": lambda data, tz: _econ_cards(data) + _calendar_section(data) + _econ_section(data, tz),
     "reaction": lambda data, tz: _reaction_section(data),
 }
 
@@ -233,6 +257,14 @@ BOT_ALTERNATE_PUSH = ("none", "configured")
 _BOT_CODE = re.compile(r"[a-z_]{1,48}\Z")
 INTERACTION_UNAVAILABLE_TEXT = "gateway が健全でない間、Discord の承認操作は使えません"
 ALTERNATE_NONE_TEXT = "alternate_push=none (別経路の通知が設定されていません)"
+
+
+def _bot_cards(data: Mapping[str, object]) -> str:
+    health = data.get("bot_health")
+    if type(health) is not dict:
+        return ""
+    return marks.cards([("gateway health", marks.render_verdict(
+        marks.classify_word(marks.BOT_HEALTH, health.get("state"))))])
 
 
 def _bot_section(data: Mapping[str, object], tz: str = "UTC") -> str:
@@ -288,6 +320,22 @@ def _word(value: object, allowed: Sequence[str]) -> str:
 
 def _dict(value: object) -> dict:
     return value if type(value) is dict else {}
+
+
+def _econ_cards(data: Mapping[str, object]) -> str:
+    window, econ = data.get("window"), data.get("econ_signal")
+    items = []
+    if type(window) is dict:
+        items.append(("calendar", marks.render_verdict(
+            marks.classify_word(marks.CALENDAR, window.get("freshness")))))
+    if type(econ) is dict:
+        items.append(("worker", marks.render_verdict(
+            marks.classify_word(marks.WORKER, econ.get("slice_worker")))))
+        capacity = econ.get("slice_capacity")
+        if type(capacity) is dict:
+            items.append(("slice 容量", marks.render_verdict(
+                marks.classify_word(marks.CAPACITY, capacity.get("level")))))
+    return marks.cards(items)
 
 
 def _calendar_section(data: Mapping[str, object]) -> str:

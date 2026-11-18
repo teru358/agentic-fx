@@ -71,7 +71,7 @@ from afx_ops.web import headers, render  # noqa: E402
 from afx_ops.web.routes import ROUTE_TABLE  # noqa: E402
 
 # CSS を変えたらこの値も変える (CSP の hash と埋め込む CSS の取り違えを防ぐ)
-PINNED_STYLE_HASH = "sha256-Bn1rrFTpmsBPwM7K6sK8FmbH60HY2NVYDdQ+zP7ZkLs="
+PINNED_STYLE_HASH = "sha256-qiZacxC6roHXmI7P8rm8egku/grOsHbS3rfGS/tgUC4="
 
 
 class ReadClient:
@@ -158,7 +158,8 @@ def test_kill_switch_and_autopilot_are_marked_by_class_only_when_on():
     assert '<dt class="warn">autopilot</dt><dd class="warn">' in on
     off = handle_request(Request("GET", "/", {}), ReadClient(status={
         "kill_switch": {"latched": False}, "autopilot": False})).body.decode()
-    assert "class=" not in off.split("</nav>")[-1]
+    # 表示の dl の中には、印の class を入れない (印はカードにだけ出る)
+    assert not [dl for dl in re.findall(r"<dl>.*?</dl>", off.split("</nav>")[-1]) if "class=" in dl]
 
 
 def test_log_and_activity_show_the_newest_lines_of_a_long_window():
@@ -272,3 +273,9 @@ def test_stacked_forms_are_spaced_and_buttons_carry_no_state_color():
     controls = _rule("button, input")
     assert "font: inherit" in controls
     assert "color" not in controls and "background" not in controls
+
+
+def test_the_css_has_the_mark_and_card_rules_and_the_full_style_fits_the_budget():
+    for selector in (".st", ".ok", ".kpi", ".kpi div", ".kpi strong"):
+        assert re.search(r"(^|\n|, )" + re.escape(selector) + r"[ ,{]", render.STYLE), selector
+    assert "dd.danger, .st.danger" in render.STYLE and "dd.warn, .st.warn" in render.STYLE

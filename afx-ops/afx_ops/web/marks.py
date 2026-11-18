@@ -1,0 +1,103 @@
+"""状態の印とカード。値の分類 (割当表) と、印・カードの描画を分けて持つ。
+
+分類は daemon の応答から取り出した生の値と厳密な型だけで行う。表に無い値・欠損・None・型違いは
+必ず「? 不明」(色なし) で、正常には倒さない。翻訳や代替表示は分類の後に行い、置き換えた後の値は
+分類に使わない。この表示は判断には使わない (決定論のコアは daemon 側)。
+"""
+from __future__ import annotations
+
+import html
+from collections.abc import Mapping, Sequence
+
+OK, WARN, DANGER, NEUTRAL, UNKNOWN = "ok", "warn", "danger", "neutral", "unknown"
+_SYMBOL = {OK: "○", WARN: "△", DANGER: "✕", NEUTRAL: "–", UNKNOWN: "?"}
+_CLASS = {OK: "st ok", WARN: "st warn", DANGER: "st danger", NEUTRAL: "st", UNKNOWN: "st"}
+UNKNOWN_WORD = "不明"
+
+Verdict = tuple[str, str]  # (level, 語)
+
+
+def mark(level: str, text: str) -> str:
+    """level ごとの記号 + 語の印。語が空なら不明の印にする。記号は文字として出す (CSS に頼らない)。"""
+    if level not in _SYMBOL or not text:
+        return mark(UNKNOWN, UNKNOWN_WORD)
+    if level == UNKNOWN:
+        text = UNKNOWN_WORD
+    return f'<span class="{_CLASS[level]}">{_SYMBOL[level]} {html.escape(text, quote=True)}</span>'
+
+
+def render_verdict(verdict: Verdict) -> str:
+    return mark(*verdict)
+
+
+def cards(items: Sequence[tuple[str, str]]) -> str:
+    """見出しと値 1 つのカードの列。値が空の項目は出さず、全部空なら列ごと出さない。
+
+    値は escape 済みの HTML を渡す。見出しは固定の語。
+    """
+    shown = [f"<div><strong>{html.escape(label, quote=True)}</strong>{value}</div>"
+             for label, value in items if value]
+    return '<div class="kpi">' + "".join(shown) + "</div>" if shown else ""
+
+
+_UNKNOWN: Verdict = (UNKNOWN, UNKNOWN_WORD)
+
+# --- 語 → level の割当表。語の集合は語彙の写し (render・plugin_text など) と test が突き合わせる ---
+
+# data (daemon の datafeed outage の state。定義は agentic_fx.datafeed.outage.DATA_STATES の写し)
+DATA_STATES = {"ready": OK, "degraded": WARN, "restricted": WARN}
+BOT_HEALTH = {"healthy": OK, "stale": WARN, "unknown": WARN, "unhealthy": DANGER,
+              "stalled": DANGER, "permanent-failure": DANGER, "not_configured": NEUTRAL}
+CALENDAR = {"fresh": OK, "stale": WARN, "unknown": NEUTRAL}
+WORKER = {"alive": OK, "stopped": DANGER, "start_failed": DANGER, "not_started": NEUTRAL,
+          "unknown": NEUTRAL}
+CAPACITY = {"ok": OK, "warn": WARN, "full": DANGER}
+
+
+def classify_word(table: Mapping[str, str], raw: object) -> Verdict:
+    """表にある語だけを、語そのままで分類する。表に無い値・型違いは不明。"""
+    if type(raw) is str and raw in table:
+        return table[raw], raw
+    return _UNKNOWN
+
+
+def classify_kill_switch(raw: object) -> Verdict:
+    if type(raw) is not dict:
+        return _UNKNOWN
+    latched, reconcile = raw.get("latched"), raw.get("reconcile_required")
+    if latched is True:
+        return DANGER, "作動中"
+    if latched is not False:
+        return _UNKNOWN
+    if reconcile is True:
+        return WARN, "照合待ち"
+    if reconcile is False:
+        return OK, "解除"
+    return _UNKNOWN
+
+
+def _count(value: object) -> int | None:
+    return value if type(value) is int and value >= 0 else None
+
+
+def classify_health(raw: object) -> Verdict:
+    if type(raw) is not dict:
+        return _UNKNOWN
+    latched, failures = raw.get("latched"), _count(raw.get("failures"))
+    if latched is True or (failures is not None and failures >= 1):
+        return WARN, (f"異常の記録 {failures} 件" if failures else "異常の記録")
+    if latched is False and failures == 0:
+        return OK, "正常"
+    return _UNKNOWN
+
+
+def classify_autopilot(raw: object) -> Verdict:
+    if raw is True:
+        return WARN, "ON"
+    if raw is False:
+        return NEUTRAL, "OFF"
+    return _UNKNOWN
+
+
+def classify_data(raw: object) -> Verdict:
+    return classify_word(DATA_STATES, raw.get("state") if type(raw) is dict else None)

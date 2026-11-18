@@ -162,7 +162,7 @@ def _ladder_page(tail_chars, items=21):
 
 def test_claims_shrink_through_each_step_before_the_parent_record_is_given_up():
     seen, omitted_claims = set(), False
-    for items in range(14, 32):
+    for items in range(8, 32):
         for tail in range(0, 501, 10):
             built = _ladder_page(tail, items)
             assert built.other_bytes <= render.OTHER_BUDGET_BYTES
