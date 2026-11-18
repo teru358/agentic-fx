@@ -6,7 +6,7 @@ import re
 import unicodedata
 from collections.abc import Mapping, Sequence
 
-from afx_ops import base_text, display_time, history_text, reevaluation_text
+from afx_ops import base_text, display_time, history_text, plugin_text, reevaluation_text
 from afx_ops.display_zone import zone_of
 from afx_ops.metric_words import metric_items
 from afx_ops.web import marks
@@ -102,7 +102,9 @@ _EMPHASIS = {"kill_switch": "danger", "autopilot": "warn"}
 # server DTO の新 field を表示面へ自動的に広げないための allowlist。
 STATUS_FIELDS = frozenset({"mode", "autopilot", "kill_switch", "equity", "balance", "orders",
                            "mission", "health", "data"})
-APPROVAL_FIELDS = frozenset({"id", "kind", "name", "content_hash", "created_at"})
+# 承認待ちの表の列。表示してよい項目の唯一の定義 (列の並びがそのまま表の並び)
+_APPROVAL_COLUMNS = ("id", "kind", "name", "created_at", "content_hash")
+APPROVAL_FIELDS = frozenset(_APPROVAL_COLUMNS)
 JOURNAL_FIELDS = frozenset({"approval_id", "name", "phase"})
 DETAIL_FIELDS = frozenset({"id", "kind", "status", "in_sample", "holdout", "payload_sha256",
                            "decided_by", "decided_at", "asserted_actor", "parent_facts", "baseline"})
@@ -213,33 +215,39 @@ def _scalar_card(data: Mapping[str, object], key: str) -> tuple[str, str]:
     return key, _text(data.get(key)) if key in data else ""
 
 
-def _status_cards(data: Mapping[str, object]) -> str:
-    def marked(key: str, classify) -> str:
-        return marks.render_verdict(classify(data[key])) if key in data else ""
-    return marks.cards([
-        ("kill switch", marked("kill_switch", marks.classify_kill_switch)),
-        ("health", marked("health", marks.classify_health)),
-        ("autopilot", marked("autopilot", marks.classify_autopilot)),
-        _scalar_card(data, "mode"), _scalar_card(data, "equity"), _scalar_card(data, "balance"),
-        ("data", marked("data", marks.classify_data))])
+def _status_cards(data: Mapping[str, object]) -> tuple[str, set[str]]:
+    """Status 概要のカードと、カードが同じ内容を出していて dl の行を省いてよい key。
 
+    分類は 1 回で、カードと「行を省く」判定の両方に使う。異常・不明・型違いは省かない。
+    """
+    covered: set[str] = set()
+    items: list[tuple[str, str]] = []
 
-def _cards_cover(data: Mapping[str, object]) -> set[str]:
-    """カードが同じ内容を出していて、dl の行を省いてよい key。異常・不明・型違いは含めない。"""
-    covered = set()
-    if "kill_switch" in data and marks.classify_kill_switch(data["kill_switch"])[0] == marks.OK:
-        covered.add("kill_switch")
-    if "health" in data and marks.classify_health(data["health"])[0] == marks.OK:
-        covered.add("health")
+    def marked(key: str, classify, label: str, *, hide_when_ok: bool) -> None:
+        if key not in data:
+            return
+        verdict = classify(data[key])
+        items.append((label, marks.render_verdict(verdict)))
+        if hide_when_ok and verdict[0] == marks.OK:
+            covered.add(key)
+
+    marked("kill_switch", marks.classify_kill_switch, "kill switch", hide_when_ok=True)
+    marked("health", marks.classify_health, "health", hide_when_ok=True)
+    marked("autopilot", marks.classify_autopilot, "autopilot", hide_when_ok=False)
     if type(data.get("autopilot")) is bool:
         covered.add("autopilot")
-    covered |= {key for key in ("mode", "equity", "balance") if key in data and _text(data[key])}
-    return covered
+    for key in ("mode", "equity", "balance"):
+        label, value = _scalar_card(data, key)
+        items.append((label, value))
+        if value:
+            covered.add(key)
+    marked("data", marks.classify_data, "data", hide_when_ok=False)
+    return marks.cards(items), covered
 
 
 def _status_overview(data: Mapping[str, object], tz: str) -> str:
-    parts = [_status_cards(data)]
-    covered = _cards_cover(data)
+    cards, covered = _status_cards(data)
+    parts = [cards]
     for title, keys in STATUS_GROUPS:
         rows = _pairs(data, STATUS_FIELDS, nested_allowed=NESTED_FIELDS, emphasis=_EMPHASIS,
                       tz=tz, order=[key for key in keys if key not in covered])
@@ -265,8 +273,7 @@ def render_status(data: Mapping[str, object], tab: str = "overview") -> bytes:
 
 # daemon の `bot_health` の語 (agentic_fx.ops.bot_health の写し。test が突き合わせる)。web は daemon API
 # だけを読み、bot の state dir には触れない
-BOT_HEALTH_STATES = ("healthy", "unhealthy", "stalled", "stale", "unknown", "not_configured",
-                     "permanent-failure")
+BOT_HEALTH_STATES = tuple(marks.BOT_HEALTH)
 BOT_ALTERNATE_PUSH = ("none", "configured")
 _BOT_CODE = re.compile(r"[a-z_]{1,48}\Z")
 INTERACTION_UNAVAILABLE_TEXT = "gateway が健全でない間、Discord の承認操作は使えません"
@@ -314,9 +321,9 @@ def _bot_section(data: Mapping[str, object], tz: str = "UTC") -> str:
 ECON_ABANDON_REASONS = ("freshness_expired", "requeued_expired", "retry_exhausted",
                         "source_inactive", "normalization_failed", "deploy_op",
                         "deploy_linked")
-_CALENDAR_STATES = ("unknown", "fresh", "stale")
-_WORKER_STATES = ("alive", "stopped", "start_failed", "not_started", "unknown")
-_LEVELS = ("ok", "warn", "full")
+_CALENDAR_STATES = tuple(marks.CALENDAR)
+_WORKER_STATES = tuple(marks.WORKER)
+_LEVELS = tuple(marks.CAPACITY)
 _MISSION_KEYS = ("system_filtered", "failed", "running")
 _CAPACITY_KEYS = ("signal_daily", "signal_producer", "signal_override", "rows",
                   "row_capacity", "row_level", "slice_bytes", "slice_bytes_measured_at",
@@ -534,9 +541,6 @@ def _detail_link(item: dict) -> str:
     return f'<p><a href="{path}">Details #{approval_id}</a></p>'
 
 
-_APPROVAL_COLUMNS = ("id", "kind", "name", "created_at", "content_hash")
-
-
 def _approval_row(item: Mapping[str, object], tz: str) -> str:
     """承認待ちの 1 行。欠けた値・型違いは「-」。hash は先頭 12 文字。"""
     approval_id = item.get("id")
@@ -545,12 +549,10 @@ def _approval_row(item: Mapping[str, object], tz: str) -> str:
         first = f'<a href="/approvals/{approval_id}">#{approval_id}</a>'
     else:
         first = _text(approval_id) or "-"
-    digest = item.get("content_hash")
-    digest = digest[:12] if type(digest) is str else digest
     created = item.get("created_at")
     cells = [first, _text(item.get("kind")) or "-", _text(item.get("name")) or "-",
              _time_text(created, tz) if type(created) is str and created else "-",
-             _text(digest) or "-"]
+             _hash12(item.get("content_hash"))]
     return "<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>"
 
 
@@ -860,10 +862,9 @@ def _approval_groups(data: Mapping[str, object], tz: str, *, parent: bool = True
 def _approval_cards(data: Mapping[str, object], name: str | None = None,
                     classification: str | None = None) -> str:
     """承認詳細の概要の先頭のカード。成績の判定は出さない (承認・却下の form と同じタブなので)。"""
-    status = data.get("status")
-    items = [("status", marks.mark(marks.level_of(marks.APPROVAL_STATUS, status),
-                                   status if type(status) is str and status in marks.APPROVAL_STATUS
-                                   else marks.UNKNOWN_WORD))]
+    level, word = marks.classify_word(marks.APPROVAL_STATUS, data.get("status"))
+    items = [("status", marks.mark(level, plugin_text.APPROVAL_STATUS[word]
+                                   if level != marks.UNKNOWN else word))]
     if name is not None and name != "-":
         items.append(("plugin", html.escape(name)))
     if classification is not None:

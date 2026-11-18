@@ -47,9 +47,10 @@ _UNKNOWN: Verdict = (UNKNOWN, UNKNOWN_WORD)
 
 # data (daemon の datafeed outage の state。定義は agentic_fx.datafeed.outage.DATA_STATES の写し)
 DATA_STATES = {"ready": OK, "degraded": WARN, "restricted": WARN}
-BOT_HEALTH = {"healthy": OK, "stale": WARN, "unknown": WARN, "unhealthy": DANGER,
-              "stalled": DANGER, "permanent-failure": DANGER, "not_configured": NEUTRAL}
-CALENDAR = {"fresh": OK, "stale": WARN, "unknown": NEUTRAL}
+# bot の gateway health・calendar・worker・容量の語彙は、この表のキーが唯一の定義 (render が写さず導く)
+BOT_HEALTH = {"healthy": OK, "unhealthy": DANGER, "stalled": DANGER, "stale": WARN, "unknown": WARN,
+              "not_configured": NEUTRAL, "permanent-failure": DANGER}
+CALENDAR = {"unknown": NEUTRAL, "fresh": OK, "stale": WARN}
 WORKER = {"alive": OK, "stopped": DANGER, "start_failed": DANGER, "not_started": NEUTRAL,
           "unknown": NEUTRAL}
 CAPACITY = {"ok": OK, "warn": WARN, "full": DANGER}

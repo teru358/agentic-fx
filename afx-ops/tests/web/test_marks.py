@@ -312,3 +312,18 @@ def test_a_word_outside_these_tables_or_of_the_wrong_type_has_no_level(table, ra
 
 def test_an_unknown_mark_keeps_the_given_word():
     assert marks.mark("unknown", "不明 (x)") == '<span class="st">? 不明 (x)</span>'
+
+
+def test_the_renderer_vocabulary_is_derived_from_the_assignment_tables_in_the_same_order():
+    assert render.BOT_HEALTH_STATES == tuple(marks.BOT_HEALTH)
+    assert render._CALENDAR_STATES == tuple(marks.CALENDAR)
+    assert render._WORKER_STATES == tuple(marks.WORKER)
+    assert render._LEVELS == tuple(marks.CAPACITY)
+
+
+def test_each_status_card_and_its_hidden_row_come_from_one_classification(monkeypatch):
+    calls = []
+    real = marks.classify_kill_switch
+    monkeypatch.setattr(marks, "classify_kill_switch", lambda raw: calls.append(raw) or real(raw))
+    _page(FULL)
+    assert len(calls) == 1

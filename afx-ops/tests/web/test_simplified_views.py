@@ -231,3 +231,21 @@ def test_the_improve_list_has_no_unsorted_explanation_but_a_sorted_one_stays():
     assert "新しい順に並べています" not in improve_support.page("/improve")
     sorted_page = improve_support.page("/improve", None, {"sort": "started"})
     assert "で並べています" in sorted_page
+
+
+# --- 承認待ちの表の hash と列の定義 ------------------------------------------------------
+
+@pytest.mark.parametrize(("value", "shown"), [
+    ("0123456789abcdef" * 4, "0123456789ab"), ("abc", "-"), ("0123456789abcdef" * 3 + "0123456789abcdeg", "-"),
+    ("0123456789ABCDEF" * 4, "-"), ("0123456789abcdef" * 4 + "0", "-"), (5, "-"), (None, "-"), ([], "-")])
+def test_the_pending_hash_is_cut_only_when_it_is_a_full_hash_otherwise_a_dash(value, shown):
+    page = _approvals([dict(ITEM, content_hash=value)])
+    assert re.findall(r"<td>(.*?)</td>", page)[4] == shown
+
+
+def test_the_table_columns_are_the_allowlist_and_a_field_outside_it_is_not_shown():
+    from afx_ops.web import render
+    page = _approvals([dict(ITEM, zz_new_field="LEAK")])
+    assert re.findall(r"<th>(.*?)</th>", page) == list(render._APPROVAL_COLUMNS)
+    assert set(render._APPROVAL_COLUMNS) == render.APPROVAL_FIELDS
+    assert "LEAK" not in page

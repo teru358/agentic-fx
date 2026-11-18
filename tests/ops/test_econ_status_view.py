@@ -289,14 +289,28 @@ def _web_constants():
 
     source = (Path(__file__).resolve().parents[2] / "afx-ops" / "afx_ops" / "web"
               / "render.py").read_text(encoding="utf-8")
+    marks_source = (Path(__file__).resolve().parents[2] / "afx-ops" / "afx_ops" / "web"
+                    / "marks.py").read_text(encoding="utf-8")
+    tables = {node.targets[0].id: tuple(ast.literal_eval(key) for key in node.value.keys)
+              for node in ast.parse(marks_source).body
+              if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+              and isinstance(node.value, ast.Dict)
+              and all(isinstance(key, ast.Constant) for key in node.value.keys)}
     constants = {}
     for node in ast.parse(source).body:
         if not (isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
-                and node.targets[0].id.isupper() | node.targets[0].id.startswith("_")
-                and isinstance(node.value, (ast.Tuple, ast.Constant))):
+                and node.targets[0].id.isupper() | node.targets[0].id.startswith("_")):
+            continue
+        name, value = node.targets[0].id, node.value
+        if (isinstance(value, ast.Call) and getattr(value.func, "id", None) == "tuple"
+                and isinstance(value.args[0], ast.Attribute)
+                and getattr(value.args[0].value, "id", None) == "marks"):
+            constants[name] = tables[value.args[0].attr]  # 語彙は marks の割当表のキーが定義
+            continue
+        if not isinstance(value, (ast.Tuple, ast.Constant)):
             continue
         try:
-            constants[node.targets[0].id] = ast.literal_eval(node.value)
+            constants[name] = ast.literal_eval(value)
         except ValueError:  # 関数の参照を並べた表など、literal でない定数は突き合わせの対象外
             continue
     return constants

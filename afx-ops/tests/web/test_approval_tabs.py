@@ -471,8 +471,8 @@ def _overview_cards(page: str) -> str:
 
 
 @pytest.mark.parametrize(("status", "text"), [
-    ("approved", "○ approved"), ("pending", "△ pending"), ("rejected", "– rejected"),
-    ("expired", "– expired"), ("invalidated", "– invalidated")])
+    ("approved", "○ 承認済み"), ("pending", "△ 承認待ち"), ("rejected", "– 却下"),
+    ("expired", "– 期限切れ"), ("invalidated", "– 無効化")])
 def test_the_overview_leads_with_the_status_card(status, text):
     detail = full_detail(status=status)
     row = _overview_cards(text_of(Client(detail=detail, change_data=make_change_data(

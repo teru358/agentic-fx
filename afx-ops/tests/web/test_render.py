@@ -41,14 +41,15 @@ def test_renderers_project_the_read_dto_shapes_without_unknown_fields():
 
         def approvals(self, *, limit):
             return Reply(200, {"approvals": [{"id": 4, "kind": "plugin", "name": "p",
-                                                "content_hash": "abc", "created_at": "now"}],
+                                                "content_hash": "0123456789abcdef" * 4,
+                                                "created_at": "now"}],
                                "open_journals": [{"approval_id": 4, "name": "p", "phase": "prepared"}]}, None)
 
     client = Client()
     assert "log line" in handle_request(Request("GET", "/logs", {}), client).body.decode()
     assert "activity line" in handle_request(Request("GET", "/activity", {}), client).body.decode()
     page = handle_request(Request("GET", "/approvals", {}), client).body.decode()
-    assert "abc" in page and "prepared" in page and "token" not in page
+    assert "0123456789ab" in page and "prepared" in page and "token" not in page
 
 
 def test_response_body_has_a_fixed_upper_bound():
