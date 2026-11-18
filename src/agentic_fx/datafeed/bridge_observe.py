@@ -319,7 +319,7 @@ class _DailyWriter:
     def _append(self, day: str, line: str) -> None:
         if self._fd is None or self._fd_day != day:
             self._close()
-            self._fd = self._open(day)
+            self._fd = self._open_day_file(day)
             self._fd_day = day
         data = (line + "\n").encode("utf-8")
         while data:
@@ -340,7 +340,7 @@ class _DailyWriter:
             if stat.S_IMODE(info.st_mode) != 0o700:
                 os.chmod(self.directory, 0o700)
 
-    def _open(self, day: str) -> int:
+    def _open_day_file(self, day: str) -> int:
         self._ensure_directory()
         flags = (os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
                  | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
