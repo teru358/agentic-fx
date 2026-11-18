@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from afx_ops.display_zone import zone_of
 from afx_ops.plugin_text import label
-from afx_ops.web import plugin_pages, render, tabs
+from afx_ops.web import marks, plugin_pages, render, tabs
 from afx_ops.web.common import approval_link, display_time, pick, plugin_link
 from afx_ops.web.routes import resolve_route
 
@@ -177,6 +177,14 @@ def _result_text(result: object, reason: object) -> str:
     return html.escape(text, quote=True)
 
 
+def _result_mark(result: object, reason: object) -> str:
+    """結果の印。印は結果の語、理由の括弧は印の外。"""
+    shown = marks.mark(marks.level_of(marks.IMPROVE_RESULT, result), label(RESULT, result))
+    if reason is not None:
+        shown += html.escape(f" ({label(REASON, reason)})", quote=True)
+    return shown
+
+
 # ---------------------------------------------------------------- 一覧
 
 def _time_value(raw: object) -> datetime | None:
@@ -243,7 +251,7 @@ def _list_row(raw: dict, tz: str) -> list[str]:
     plugin = row.get("plugin")
     return [_run_link(row.get("id")), display_time(row.get("started_at"), tz),
             display_time(row.get("finished_at"), tz), _text(row.get("trigger"), TRIGGER),
-            _result_text(row.get("result_code"), row.get("reason_code")),
+            _result_mark(row.get("result_code"), row.get("reason_code")),
             plugin_link(plugin) if plugin is not None else "-", _floor_cell(row),
             approval_link(row.get("approval_id"))]
 
@@ -336,7 +344,12 @@ def _overview(row: dict, snapshot: dict, approval: dict) -> str:
         ("レポート", _text(row.get("report_state"), REPORT_STATE)),
         ("承認", approval_cell if approval else "-"),
     ]
-    return _section("概要", render._rows(pairs))
+    head = marks.cards([
+        ("結果", _result_mark(snapshot.get("result_code"), snapshot.get("reason_code"))
+         if snapshot else ""),
+        ("起動", _text(snapshot.get("trigger"), TRIGGER) if snapshot else ""),
+        ("経過 (秒)", _num(elapsed) if type(elapsed) in (int, float) else "")])
+    return _section("概要", head + render._rows(pairs))
 
 
 def _text_section(title: str, items: list[tuple[str, object]]) -> str:

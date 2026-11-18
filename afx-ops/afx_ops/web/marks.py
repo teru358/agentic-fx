@@ -18,11 +18,12 @@ Verdict = tuple[str, str]  # (level, 語)
 
 
 def mark(level: str, text: str) -> str:
-    """level ごとの記号 + 語の印。語が空なら不明の印にする。記号は文字として出す (CSS に頼らない)。"""
+    """level ごとの記号 + 語の印。level が不正・語が空なら不明の印にする。
+
+    記号は文字として出す (CSS に頼らない)。不明の印は渡された語 (「不明 (<語>)」など) を残す。
+    """
     if level not in _SYMBOL or not text:
-        return mark(UNKNOWN, UNKNOWN_WORD)
-    if level == UNKNOWN:
-        text = UNKNOWN_WORD
+        level, text = UNKNOWN, UNKNOWN_WORD
     return f'<span class="{_CLASS[level]}">{_SYMBOL[level]} {html.escape(text, quote=True)}</span>'
 
 
@@ -52,6 +53,23 @@ CALENDAR = {"fresh": OK, "stale": WARN, "unknown": NEUTRAL}
 WORKER = {"alive": OK, "stopped": DANGER, "start_failed": DANGER, "not_started": NEUTRAL,
           "unknown": NEUTRAL}
 CAPACITY = {"ok": OK, "warn": WARN, "full": DANGER}
+
+
+# plugin (一覧の配備列・詳細のカード)。語は plugin_text の写しと突き合わせる
+DEPLOY = {"symlink": OK, "plain": OK, "unreadable": DANGER, "absent": NEUTRAL}
+ADMISSION = {"loaded": OK, "excluded": WARN, "unapproved": WARN, "none": NEUTRAL,
+             "unknown": NEUTRAL}
+# improve (一覧の結果列・詳細のカード)
+IMPROVE_RESULT = {"submitted": OK, "report": OK, "gate_failed": WARN, "failed": DANGER,
+                  "observation": NEUTRAL}
+# 承認詳細の status
+APPROVAL_STATUS = {"approved": OK, "pending": WARN, "rejected": NEUTRAL, "expired": NEUTRAL,
+                   "invalidated": NEUTRAL}
+
+
+def level_of(table: Mapping[str, str], raw: object) -> str:
+    """表にある語の level。表に無い値・型違いは不明 (正常に倒さない)。"""
+    return table[raw] if type(raw) is str and raw in table else UNKNOWN
 
 
 def classify_word(table: Mapping[str, str], raw: object) -> Verdict:

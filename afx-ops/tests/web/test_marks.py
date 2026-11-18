@@ -41,7 +41,7 @@ def test_a_mark_always_carries_a_symbol_and_a_word(level, symbol, cls):
 def test_a_mark_without_a_word_or_with_a_bad_level_is_unknown_not_normal():
     assert marks.mark("ok", "") == UNKNOWN_MARK
     assert marks.mark("fine", "x") == UNKNOWN_MARK
-    assert marks.mark("unknown", "anything") == UNKNOWN_MARK
+    assert marks.mark("unknown", "") == UNKNOWN_MARK
 
 
 def test_a_mark_escapes_its_word():
@@ -277,3 +277,38 @@ def test_a_real_unknown_calendar_and_worker_are_neutral_with_their_word():
 def test_the_reaction_tab_has_no_cards():
     body = _body(_page({"mode": "paper"}, "reaction"))
     assert 'class="kpi"' not in body
+
+
+# --- plugin・improve・承認詳細の印とカード --------------------------------------------------
+
+from afx_ops import plugin_text  # noqa: E402
+from afx_ops.web import improve_pages  # noqa: E402
+
+
+def test_the_plugin_improve_and_approval_tables_cover_exactly_the_words_the_screens_know():
+    assert set(marks.DEPLOY) == set(plugin_text.ENTITY)
+    assert set(marks.ADMISSION) == set(plugin_text.ADMISSION)
+    assert set(marks.APPROVAL_STATUS) == set(plugin_text.APPROVAL_STATUS)
+    assert set(marks.IMPROVE_RESULT) == set(improve_pages.RESULT)
+
+
+def test_the_plugin_improve_and_approval_levels_are_the_agreed_ones():
+    assert dict(marks.DEPLOY) == {"symlink": "ok", "plain": "ok", "unreadable": "danger",
+                                  "absent": "neutral"}
+    assert dict(marks.ADMISSION) == {"loaded": "ok", "excluded": "warn", "unapproved": "warn",
+                                     "none": "neutral", "unknown": "neutral"}
+    assert dict(marks.IMPROVE_RESULT) == {"submitted": "ok", "report": "ok", "gate_failed": "warn",
+                                          "failed": "danger", "observation": "neutral"}
+    assert dict(marks.APPROVAL_STATUS) == {"approved": "ok", "pending": "warn", "rejected": "neutral",
+                                           "expired": "neutral", "invalidated": "neutral"}
+
+
+@pytest.mark.parametrize("table", [marks.DEPLOY, marks.ADMISSION, marks.IMPROVE_RESULT,
+                                   marks.APPROVAL_STATUS])
+@pytest.mark.parametrize("raw", JUNK + ["SYMLINK", " ok"])
+def test_a_word_outside_these_tables_or_of_the_wrong_type_has_no_level(table, raw):
+    assert marks.level_of(table, raw) == "unknown"
+
+
+def test_an_unknown_mark_keeps_the_given_word():
+    assert marks.mark("unknown", "不明 (x)") == '<span class="st">? 不明 (x)</span>'

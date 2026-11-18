@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from afx_ops import plugin_text
 from afx_ops.display_zone import zone_of
 from afx_ops.plugin_text import label
-from afx_ops.web import render, tabs
+from afx_ops.web import marks, render, tabs
 from afx_ops.web.common import approval_link, display_time, pick, plugin_link
 
 # server DTO の新 field を表示面へ自動的に広げないための allowlist (入れ子の object ごと)。
@@ -67,6 +67,24 @@ def _entity_text(entity: dict) -> str:
     if entity.get("reason") is not None:
         text += f" ({label(plugin_text.ENTITY_REASON, entity['reason'])})"
     return html.escape(text, quote=True)
+
+
+def _entity_mark(entity: dict) -> str:
+    """配備の印。印は状態の語、理由の括弧は印の外。"""
+    shown = marks.mark(marks.level_of(marks.DEPLOY, entity.get("state")),
+                       label(plugin_text.ENTITY, entity.get("state")))
+    if entity.get("reason") is not None:
+        shown += html.escape(f" ({label(plugin_text.ENTITY_REASON, entity['reason'])})", quote=True)
+    return shown
+
+
+def _admission_mark(admission: dict) -> str:
+    shown = marks.mark(marks.level_of(marks.ADMISSION, admission.get("state")),
+                       label(plugin_text.ADMISSION, admission.get("state")))
+    if admission.get("reason") is not None:
+        shown += html.escape(
+            f" ({label(plugin_text.ADMISSION_REASON, admission['reason'])})", quote=True)
+    return shown
 
 
 def _admission_text(admission: dict) -> str:
@@ -169,7 +187,7 @@ def _list_row(raw: dict) -> list[str]:
     return [
         plugin_link(row.get("name")),
         html.escape(label(plugin_text.KIND, row.get("kind")), quote=True),
-        _entity_text(entity),
+        _entity_mark(entity),
         _admission_text(admission),
         _count(row.get("pending_count")),
         _hash(entity.get("content_hash")),
@@ -338,7 +356,9 @@ def _overview(row: dict, entity: dict, admission: dict, tz: str) -> str:
         ("途中の操作", _open_ops_text(ops)),
         ("注意", _issues_text(row.get("issues"))),
     ]
-    return _section("概要", render._rows(pairs))
+    head = marks.cards([("配備", _entity_mark(entity)), ("承認と読込", _admission_mark(admission)),
+                        ("承認待ち", _count(row.get("pending_count")))])
+    return _section("概要", head + render._rows(pairs))
 
 
 def _pending_section(row: dict) -> str:

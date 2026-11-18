@@ -462,3 +462,37 @@ def test_the_reevaluation_change_without_a_diff_still_reads_as_a_block_with_a_fo
     rig = _rig(detail=dict(LONG, change=REEVAL_CHANGE), change_data=None)
     page = _page(rig)
     assert "<form" in page and render.REASON_TEXT["unavailable"] not in _block(page)
+
+
+# ---------------------------------------------------------------- 状態の印とカード
+
+def _overview_cards(page: str) -> str:
+    return re.search(r'<section><h2>概要</h2>(<div class="kpi">.*?</div></div>)', page, re.S).group(1)
+
+
+@pytest.mark.parametrize(("status", "text"), [
+    ("approved", "○ approved"), ("pending", "△ pending"), ("rejected", "– rejected"),
+    ("expired", "– expired"), ("invalidated", "– invalidated")])
+def test_the_overview_leads_with_the_status_card(status, text):
+    detail = full_detail(status=status)
+    row = _overview_cards(text_of(Client(detail=detail, change_data=make_change_data(
+        change=make_change()))))
+    assert "<strong>status</strong>" in row and text in row
+    assert "<strong>plugin</strong>" in row and "<strong>分類</strong>" in row
+
+
+@pytest.mark.parametrize("bad", ["paused", None, 1, [], True, "PENDING"])
+def test_an_unrecognised_approval_status_is_an_unknown_mark(bad):
+    row = _overview_cards(text_of(Client(detail=full_detail(status=bad))))
+    assert '<span class="st">? 不明</span>' in row and "○" not in row
+
+
+def test_no_performance_verdict_card_is_shown_beside_the_decision_forms():
+    page = text_of(Client(detail=full_detail(), change_data=make_change_data(change=make_change())))
+    assert "成績" not in _overview_cards(page) and "verdict" not in _overview_cards(page)
+    assert _overview_cards(page).count("<div><strong>") <= 3
+
+
+def test_the_other_tabs_have_no_cards():
+    for tab in ("change", "claims", "result"):
+        assert 'class="kpi"' not in text_of(Client(detail=full_detail()), tab)

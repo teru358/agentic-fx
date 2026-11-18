@@ -809,6 +809,20 @@ def _approval_groups(data: Mapping[str, object], tz: str, *, parent: bool = True
     return "".join(parts)
 
 
+def _approval_cards(data: Mapping[str, object], name: str | None = None,
+                    classification: str | None = None) -> str:
+    """承認詳細の概要の先頭のカード。成績の判定は出さない (承認・却下の form と同じタブなので)。"""
+    status = data.get("status")
+    items = [("status", marks.mark(marks.level_of(marks.APPROVAL_STATUS, status),
+                                   status if type(status) is str and status in marks.APPROVAL_STATUS
+                                   else marks.UNKNOWN_WORD))]
+    if name is not None and name != "-":
+        items.append(("plugin", html.escape(name)))
+    if classification is not None:
+        items.append(("分類", classification))
+    return marks.cards(items)
+
+
 def _overview_section(data: Mapping[str, object], change: Mapping[str, object], parent: bool,
                       tz: str = "UTC") -> str:
     name = change.get("name")
@@ -825,7 +839,8 @@ def _overview_section(data: Mapping[str, object], change: Mapping[str, object], 
     reason = change.get("reason")
     if reason is not None:
         target += "<p>" + REASON_TEXT.get(reason, REASON_TEXT["unsafe_source"]) + "</p>"
-    return ("<section><h2>概要</h2>"
+    head = _approval_cards(data, name, label)
+    return ("<section><h2>概要</h2>" + head
             + _approval_groups(data, tz, parent=parent, target=target, metrics=False) + "</section>")
 
 
@@ -1178,7 +1193,8 @@ def _unchanged_virtual(data: Mapping[str, object], message: str,
                        extra_sections: Sequence[tuple[str, str]], at: str) -> ApprovalPage:
     """変更内容の無い承認詳細。概要に dl と固定文、追加節は通常と同じタブ、変更と申告は「なし」。"""
     tz = zone_of(data)
-    overview = ("<section><h2>概要</h2>" + _approval_groups(data, tz) + "</section>"
+    overview = ("<section><h2>概要</h2>" + _approval_cards(data) + _approval_groups(data, tz)
+                + "</section>"
                 "<section><h2>変更内容</h2><p>" + message + "</p></section>")
     skeleton = _approval_skeleton(tz, at)
     fit = _fit_tagged_extras(skeleton + _bytes(overview), extra_sections)

@@ -107,7 +107,7 @@ def test_the_list_shows_every_name_with_kind_axes_hash_pending_and_usefulness():
         assert f'<a href="/plugins/{name}">{name}</a>' in html
     rsi = cells(html, "rsi")
     assert rsi[0] == "indicator"
-    assert rsi[1] == "配備中 (版を指す)" and rsi[2] == "読込可" and rsi[3] == "1"
+    assert rsi[1] == '<span class="st ok">○ 配備中 (版を指す)</span>' and rsi[2] == "読込可" and rsi[3] == "1"
     assert rsi[4] == sample("plugin_rsi")["plugin"]["entity"]["content_hash"][:12]
     assert '<a href="/plugins/brk">brk</a> (pin 不一致)' in rsi[6]
     assert '<a href="/plugins/mom">mom</a>' in rsi[6] and "mom</a> (" not in rsi[6]
@@ -115,10 +115,10 @@ def test_the_list_shows_every_name_with_kind_axes_hash_pending_and_usefulness():
     brk = cells(html, "brk")
     assert brk[2] == "読込除外 (indicator を解決できない) [a: pin 不一致]"
     assert brk[6:8] == ["-", "-"]
-    assert cells(html, "bol")[1] == "配備なし" and cells(html, "bol")[3] == "1"
+    assert cells(html, "bol")[1] == '<span class="st">– 配備なし</span>' and cells(html, "bol")[3] == "1"
     assert cells(html, "bol")[7] == "提出 0 / 配備成功 0"
     assert cells(html, "junk")[0] == "不明"
-    assert cells(html, "junk")[1] == "読めない (必要なファイルが無い)"
+    assert cells(html, "junk")[1] == '<span class="st danger">✕ 読めない</span> (必要なファイルが無い)'
     assert cells(html, "junk")[8] == "読めない (必要なファイルが無い)"
     assert cells(html, "ghost")[0] == "signal"
 
@@ -249,7 +249,7 @@ def test_a_word_the_table_does_not_know_is_shown_as_unknown_with_the_word_never_
     other["kind"] = "gizmo"
     html = page("/plugins", Client(listing=listing))
     cell = cells(html, "mom")
-    assert cell[0] == "不明 (gizmo)" and cell[1] == "不明 (weird_state)" and cell[2] == "不明 (odd)"
+    assert cell[0] == "不明 (gizmo)" and cell[1] == '<span class="st">? 不明 (weird_state)</span>' and cell[2] == "不明 (odd)"
     assert "不明 (frobnicated)" in cells(html, "rsi")[6]
     assert not MATCH.search(html)
 
@@ -447,3 +447,47 @@ def test_a_detail_with_the_largest_lists_and_longest_values_stays_in_the_limit()
         omitted = int(re.search(r"…\((\d+) 件省略", section).group(1))
         assert shown + omitted == 300, title
     assert len(re.findall(r'<a href="/approvals/\d+">', html)) <= 5 * render.MAX_ITEMS + 2
+
+
+# ---------------------------------------------------------------- 状態の印とカード
+
+UNKNOWN_MARK = '<span class="st">? 不明</span>'
+
+
+def _first_card_row(html: str) -> str:
+    return re.search(r'<section><h2>概要</h2>(<div class="kpi">.*?</div></div>)', html, re.S).group(1)
+
+
+def test_the_detail_overview_starts_with_the_deploy_admission_and_pending_cards():
+    row = _first_card_row(page("/plugins/rsi"))
+    assert "<strong>配備</strong>" in row and "○ 配備中 (版を指す)" in row
+    assert "<strong>承認と読込</strong>" in row and "○ 読込可" in row
+    assert "<strong>承認待ち</strong>1" in row
+
+
+def test_the_detail_cards_mark_trouble_and_never_turn_an_unknown_word_into_normal():
+    listing = sample("plugin_brk")
+    assert "△ 読込除外</span> (indicator を解決できない)" in _first_card_row(
+        page("/plugins/brk", Client(details={"brk": listing})))
+    junk = page("/plugins/junk")
+    assert "✕ 読めない" in _first_card_row(junk)
+    data = sample("plugin_rsi")
+    data["plugin"]["entity"]["state"] = "weird_state"
+    data["plugin"]["admission"]["state"] = ["loaded"]
+    row = _first_card_row(page("/plugins/rsi", Client(details={"rsi": data})))
+    assert '<span class="st">? 不明 (weird_state)</span>' in row
+    assert "○" not in row.split("承認と読込")[1]
+
+
+@pytest.mark.parametrize("bad", [None, 1, [], True, "SYMLINK"])
+def test_a_deploy_state_of_the_wrong_type_or_spelling_is_an_unknown_mark(bad):
+    listing = sample("plugins_list")
+    next(item for item in listing["plugins"] if item["name"] == "rsi")["entity"]["state"] = bad
+    cell = cells(page("/plugins", Client(listing=listing)), "rsi")[1]
+    assert cell.startswith('<span class="st">? ') and "○" not in cell
+
+
+def test_the_list_deploy_column_is_the_only_marked_column():
+    html = page("/plugins")
+    assert html.count('class="st') == len(NAMES) + 1  # 一覧の行ごとに 1 つ (名前の無い old を含む)
+    assert 'class="kpi"' not in html

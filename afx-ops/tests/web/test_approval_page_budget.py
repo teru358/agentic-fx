@@ -393,3 +393,58 @@ def test_a_missing_or_invalid_change_still_keeps_gate_rows_and_the_omission_line
     every_tab = b"".join(render.render_approval(detail, None, tab)
                          for tab in tabs.tab_names(tabs.APPROVAL_DETAIL))
     assert b"bbbbbbbbbb" not in every_tab
+
+
+# ---------------------------------------------------------------- 骨格が増えても省略が画面で分かる
+
+def _shrink_case(params=64, claim="x" * 2000, parent_items=0, extras=()):
+    items = [{"key": f"params.p{i:03d}" + "k" * 60, "old": "o" * 80, "new": "n" * 80}
+             for i in range(params)]
+    change = make_change(items)
+    data = change_data(change, claims={"summary": claim, "selection_rationale": claim})
+    detail = dict(DETAIL)
+    if parent_items:
+        detail["parent_facts"] = {"result": ["p" * 500] * parent_items}
+    built = render.compose_approval_page(detail, change, data, extra_sections=list(extras))
+    return built, detail
+
+
+def test_a_page_where_only_the_params_shrink_says_how_many_were_left_out():
+    built, detail = _shrink_case()
+    assert built.other_bytes <= render.OTHER_BUDGET_BYTES and not built.clipped
+    shown = tab_text(built, "change", detail).count("<dt>params.p")
+    left_out = int(re.search(r"…\((\d+) 件省略\)", tab_text(built, "change", detail)).group(1))
+    assert 0 < left_out and shown + left_out == 64
+    assert "<pre>" + "x" * 2000 + "</pre>" in tab_text(built, "claims", detail)
+    assert "params の差分 64 件" in built.scale and "申告: あり" in built.block
+    assert render.REFRESH_SECONDS and b'http-equiv="refresh"' in tab_page(built, "overview", detail)
+
+
+def test_a_page_whose_claims_shrink_marks_each_cut_claim_and_a_dropped_claim():
+    built, detail = _shrink_case(claim="あ" * 2000)
+    claims = tab_text(built, "claims", detail)
+    assert re.findall(r"<pre>(あ+)…</pre>", claims) and "…(省略)" not in claims
+    assert "…(" in tab_text(built, "change", detail) and "申告: あり" in built.block
+    built, detail = _shrink_case(claim="あ" * 2000, parent_items=20)
+    claims = tab_text(built, "claims", detail)
+    assert "<p>…(省略)</p>" in claims and "<pre>" not in claims
+    assert "申告: あり" in built.block and "<dt>parent_facts</dt>" in tab_text(built, "overview", detail)
+
+
+def test_the_parent_record_is_the_last_thing_a_shrinking_page_gives_up():
+    built, detail = _shrink_case(claim="あ" * 2000, parent_items=30)
+    assert built.other_bytes <= render.OTHER_BUDGET_BYTES
+    assert "<dt>parent_facts</dt>" not in tab_text(built, "overview", detail)
+    assert "<p>…(省略)</p>" in tab_text(built, "claims", detail)
+    assert "申告: あり" in built.block and "params の差分 64 件" in built.scale
+
+
+def test_when_extra_sections_do_not_fit_the_owning_tab_says_so_and_other_tabs_do_not():
+    extras = [("result", "<section><h2>配備中の版の比較</h2><p>" + "c" * 6000 + "</p></section>"),
+              ("overview", "<section><h2>gate</h2><p>" + "g" * 6000 + "</p></section>")]
+    built, detail = _shrink_case(claim="あ" * 2000, extras=extras)
+    assert built.other_bytes <= render.OTHER_BUDGET_BYTES
+    result = tab_text(built, "result", detail)
+    assert render.EXTRA_OMITTED_SECTION in result and "<h2>配備中の版の比較</h2>" not in result
+    for tab in ("change", "claims"):
+        assert render.EXTRA_OMITTED_SECTION not in tab_text(built, tab, detail)
