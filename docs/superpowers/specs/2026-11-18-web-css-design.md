@@ -1,7 +1,7 @@
-# 同梱 web の CSS の段 (web-css-design) 設計 C0
+# 同梱 web の CSS の段 (web-css-design) 設計 C0.1
 
 **チケット:** `web-css-design` (中、機能)。関連: `web-layout-tabs` (配置の段、完了)、`web-ui-charts-equity-indicators` (チャートは次の段)
-**状態:** C0 (2026-11-18、下書き)。簡略化の候補 (§6) と問い (§7) は未裁定
+**状態:** C0.1 (2026-11-18)。簡略化の候補 (§6) と問い (§7) は未裁定
 
 パスの略記: A = `afx-ops/afx_ops`、T = `afx-ops/tests`、S = `src/agentic_fx`。
 
@@ -24,7 +24,7 @@
 | 承認詳細は diff 48 KiB、diff 以外 15 KiB。**15 KiB は骨格 (`STYLE` を含む) を数える** | `render.py:22-23`、`:1091-1094`、`:1158-1165` |
 | 15 KiB と 48 KiB は daemon 側に同じ値の定義があり、test が突き合わせる | `S/ops/change_limits.py:35-37`、`T/web/test_approval_change.py:448-451` |
 | plugin 一覧と improve 一覧の表の予算は、骨格を引いた残り | `A/web/plugin_pages.py:313-315`、`A/web/improve_pages.py:292-295` |
-| 時刻は内部 UTC、表記は `YYYY-MM-DD HH:MM:SS +09:00`。全ページの h1 (と帯) の直後に tz の行 | `render.py:112-115`、`:152-156`、`T/web/test_display_zone.py:134` |
+| 時刻は内部 UTC。表示は応答の表示 tz (`display_timezone`) に換算し、表記は `YYYY-MM-DD HH:MM:SS ±HH:MM` (本番は `+09:00`)。tz が欠けている・使えないときは UTC。tz を渡す読む画面は h1 (と帯) の直後に tz の行を出し、tz を渡さない画面 (error・書込み・Improve の実行) には行が無い | `A/display_zone.py:25-33`、`render.py:112-115`、`:152-156`、`T/web/test_display_zone.py:134` |
 | HTML を出すのは `render.py`・`plugin_pages.py`・`improve_pages.py`・`write_pages.py`・`tabs.py`・`common.py` だけ。`request.py` は `render_error` を呼ぶだけ (`request.py:416`)、`runtime.py`・`auth.py` は HTML を持たない | grep |
 
 ## 1. 何が変わるか (動作)
@@ -90,6 +90,13 @@
 
 印は `_mark(level, text)` の 1 関数で作り、`<span class="st ok">○ 解除</span>` の形にする。記号は HTML の文字として出す (CSS の `::before` にしない。hash が合わず CSS が外れても記号が残る)。level は `ok`・`warn`・`danger`・中立 (class は `st` だけ) の 4 つ。記号は level ごとに 1 つ: 正常「○」、注意「△」、危険「✕」、中立「–」。表に無い値だけ「?」。1 つの項目で複数の列に当たるときは、危険 > 注意 > 正常 の順に先のものを採る。
 
+**分類と描画を分ける。** `_mark` は渡された level と文字を描くだけで、値が既知かどうかは知らない。level を決めるのは項目ごとの分類関数 (`_classify_<項目>(生の値) -> (level, 語)`) で、責務は次のとおり。
+
+- **生の値を、厳密な型で見る**。daemon の応答から取り出した値そのものを割当表に当てる。翻訳 (`plugin_text.label`)・代替表示 (`_word` の「-」、Bot の `unknown` への置き換え) は分類の後に行い、置き換えた後の値を分類に使わない。
+- **未知と既知の `unknown` を分ける**。Bot の状態が表に無い語のとき、今の表示は `unknown` に置き換える (`render.py:225-227`) が、印は「? 不明」(中立) にする。daemon が実際に `unknown` を返したときだけ、表の `unknown` の列 (注意) になる。calendar も同じで、今は未知の値を `unknown` と出す (`render.py:280-281`) が、印は未知なら「? 不明」、既知の `unknown` なら「– unknown」。
+- **真偽値は `is True`・`is False` だけ**。欠けている・`None`・整数 (`0`・`1`)・文字列 (`"false"`) は偽に丸めず「? 不明」。件数 (`failures`) は `type(v) is int` かつ 0 以上だけを値とし、bool・負・欠損は「? 不明」。
+- 複数の field を見る項目 (kill switch・health) は、どれか 1 つでも不明なら、危険・注意が確定している場合を除いて「? 不明」。例: `latched` が真なら `reconcile_required` が欠けていても「✕ 作動中」。`latched` が偽で `reconcile_required` が欠けていれば「? 不明」(「○ 解除」にしない)。
+
 | 画面 | 項目 | 正常 ○ | 注意 △ | 危険 ✕ | 中立 (色なし) |
 |---|---|---|---|---|---|
 | Status 概要 | kill switch | `latched` が偽 (照合待ちでない) →「解除」 | `latched` が偽で `reconcile_required` が真 →「照合待ち」 | `latched` が真 →「作動中」 | — |
@@ -107,7 +114,11 @@
 
 - **表に無い値・型が違う値は「? 不明」(中立)**。`plugin_text.label` と同じ規律で、未知の語を正常に倒さない (`A/plugin_text.py:59-65`)。
 - 語の表示は今の表 (`plugin_text.ENTITY`・`ADMISSION`、`improve_pages.RESULT`、`render.BOT_HEALTH_STATES` など) をそのまま使う。新しい訳語は上の表の「」内だけ。
-- 割当表はコードで 1 か所に持つ。表の語の集合が、今の語彙の表 (上の各表と `_CALENDAR_STATES`・`_WORKER_STATES`・`_LEVELS`) と一致することを test で固定する。語彙に語を足して割当を忘れると赤になる。
+- 割当表はコードで 1 か所に持つ。**語彙の突き合わせは二段で test する**。
+  1. daemon の語彙 → afx-ops の語彙の写し: リポジトリ直下の `tests/` (両 package を import できる側) で、daemon の定義と afx-ops の写しの集合が一致することを見る。今あるのは Bot (`T/web/test_bot_health_page.py:46` の golden)・plugin の語 (`T/web/test_plugin_pages.py:284` 付近)・経済指標の理由。足りない項目 (`data` の state、calendar・worker・容量の level、improve の `result_code`、承認の status) は T3・T4 で足す。daemon 側に 1 か所の定義が無い語彙 (`data` の state は `S/datafeed/outage.py` の文字列) は、その旨を test に書き、定義を 1 か所にまとめるかは実装で判断する。
+  2. afx-ops の語彙の写し → 割当表: 割当表の語の集合が写しと一致することを見る。
+  - 二段のどちらが欠けても「daemon が語を足したのに印の割当が無い」を検出できない。一段目が無い項目は、割当を「未検査」と test 名に残す。
+- **入力例を test に固定する** (どれも「? 不明」・中立になる): 語が表に無い (`"paused"`)、型が違う (`1`・`None`・`[]`)、真偽値の欠損・`None`・`0`・`1`・`"false"`、`failures` が `True`・`-1`・欠損。
 - `data` の語彙は `ready`・`degraded`・`restricted` の 3 つ (`S/datafeed/outage.py:153-160`、`:341-382`)。afx-ops に語彙の表が無いので、T3 で写しを置く。
 - health の `latched` は「process の再起動まで異常を覚えている」印で、`failures` はその件数 (`S/core/health_latch.py:7-20`)。停止を意味するかは確かめていないので、危険にはしない (§7 の問い 2)。
 - **承認詳細には、成績の判定 (配備中の版との比較) のカードを出さない。** 承認・却下の form と同じタブに緑や黄の合図を置くと、ボタンに色を付けない理由 (§2.6) と同じ誘導になる。判定は今どおり成績のタブにだけ出す。
@@ -129,7 +140,7 @@
 | `improve_pages._list_row` (`:241-248`) | 「結果」の cell の語を印で包む (理由の括弧は印の外) |
 
 - カードの値は、その画面が今も出している値だけ。新しい field を allowlist に足さない。値が無い項目のカードは出さず、全部無ければ列ごと出さない。
-- カードは tz の行の後ろ (本文の先頭) に置く。h1 → 帯 → tz の行の並び (`test_display_zone.py:134`) は変えない。
+- カードは tz の行の後ろ (本文の先頭) に置く。tz の行が無い画面にはカードも無い。h1 → 帯 → tz の行の並び (`test_display_zone.py:134`) は変えない。
 - 一覧 (plugin・improve・承認待ち)、Log、Activity、書込みの画面、job、error にはカードを足さない。
 - `lang="ja"` の理由: 今は英語と宣言していて、OS によっては漢字に別の言語の字形が選ばれる。
 
@@ -139,15 +150,21 @@
 
 - **上限: `STYLE` は 4,096 byte 以下** (今より +2,624 byte まで)。`len(STYLE.encode()) <= 4096` を test で固定する。下書き (付録 D) は 2,957 byte。
 - **カードの列は 1 画面 512 byte 以下** を目安にし、最大の Status 概要で test する。
-- **承認詳細が最もきつい**。骨格は今 2,080 byte で、15 KiB (15,360 byte) の中に数える。実測 (`compose_approval_page` を scratchpad から呼んだ値。申告は 2 項目とも 2,000 文字):
+- **承認詳細が最もきつい**。骨格は今 2,080 byte で、15 KiB (15,360 byte) の中に数える。
+  - **縮むかどうかは件数でなく byte で決まる**。申告は 1 項目 2,000 文字まで (`CLAIM_CHARS`、escape 後の文字数、`render.py:676-688`) で、ASCII なら 2 項目で約 4,000 byte、日本語 (1 文字 3 byte) なら約 12,000 byte。params は 1 件あたり key 80 文字 + 値 80 文字 × 2 まで (`VALUE_CHARS`) で、日本語なら最大約 720 byte。
+  - 実測 (`compose_approval_page` を scratchpad から呼び、`STYLE` を伸ばして骨格の増分を模した)。入力は、params の key が `params.period_N`・値が 2 桁の整数、成績と配備中の版の比較は pair ごとに全項目あり、gate の行は 1 行 39 byte、親の記録は 2 項目。「今」は増分 0、「下書き」は +1,950 byte (STYLE +1,485、viewport 67、カード約 400)、「上限」は +3,200 byte (STYLE +2,624、viewport 67、カード 512)。cell は「params の表示件数 / 申告 1 項目の表示文字数」。
 
-| 承認の中身 | 今の diff 以外 (byte) | 下書き (+約 1,950: STYLE +1485、viewport 67、カード約 400) | 上限いっぱい (+約 3,200: STYLE +2,624、viewport 67、カード 512) |
+| 入力 | 今 | 下書き | 上限 |
 |---|---|---|---|
-| params 10 件・pair 2・gate 2 行 | 9,737 | 収まる | 収まる |
-| params 10 件・pair 4・gate 4 行 | 11,423 | 収まる | 収まる (約 14,620) |
-| params 30 件・pair 4・gate 8 行 | 12,391 | 収まる (約 14,340) | 超える (約 15,590)。params の差分の末尾から縮む |
-| params 64 件・pair 4・gate 16 行 | 14,093 | 超える (約 16,040)。同上 | 超える。同上 |
+| params 10 件・pair 2・gate 2 行、申告 ASCII 2,000 文字 × 2 | 10 / 2,000 (9,737 byte) | 10 / 2,000 (11,687) | 10 / 2,000 (12,937) |
+| 同、申告 日本語 600 文字 × 2 | 10 / 600 (9,337) | 10 / 600 (11,287) | 10 / 600 (12,537) |
+| 同、申告 日本語 1,000 文字 × 2 | 10 / 1,000 (11,737) | 10 / 1,000 (13,687) | 10 / 1,000 (14,937) |
+| 同、申告 日本語 2,000 文字 × 2 (最大長) | **0 / 1,000** | 0 / 1,000 | 0 / 1,000 |
+| params 30 件・pair 4・gate 8 行、申告 日本語 2,000 文字 × 2 | 0 / 1,000 | 0 / 1,000 (15,202) | **0 / 500** |
+| params 64 件・pair 4・gate 16 行、申告 日本語 2,000 文字 × 2 | 0 / 1,000 | **0 / 500** | 0 / 500 |
 
+  - 読み取れること: (1) 日本語で最大長の申告は、**今でも** params の差分を全部省き、申告を 1,000 文字に切っている。CSS の増分で新しく起きることではない。(2) ASCII の申告、または日本語で 1,000 文字までの申告なら、params 10 件・pair 2 の承認は上限いっぱいでも縮まない (残り約 420 byte)。(3) 増分が効くのは境界の近くで、申告の切り詰めが 1 段 (1,000 → 500 文字) 早まる。この 6 例では親の記録と追加節 (配備中の版の比較・gate の警告) は省かれなかった。
+  - 上の 6 例は保証ではない。pair が多い・params の値が長い・gate が 16 行で長文、の組合せでは、親の記録と追加節まで省かれる (受入 §4 の 7 で例を作って確かめる)。
   - 超えたときの縮め方は今のまま: params の差分 → 申告 → 親の記録 → 末尾の追加節 (配備中の版の比較が先、gate の警告が次) の順 (`render.py:1154-1165`、`:956-966`)。
   - 15 KiB を広げるかは §7 の問い 1。この設計の既定は「広げない」。
 - **一覧**: 表の予算は骨格を引いた残りなので、`STYLE` が増えた分だけ自動で減る。plugin 一覧は 1 行が平均 206 byte (fixture `T/fixtures/plugins_list.json` で実測)。64 KiB に達するのは約 300 行で、`STYLE` +1.5 KiB で約 7 行、印 (1 行 +約 30 byte) で約 40 行減る。improve 一覧は最大 100 行 (`improve_pages.py:48`) で、行の大きさは測っていない。
@@ -200,7 +217,13 @@ dl・表・見出し・form の markup に属性を足さないので、書き�
 4. **割当表**: §2.3 の各値 → level と記号。表に無い値・型違いは「? 不明」で中立。割当表の語の集合が語彙の表と一致。
 5. **色だけに頼らない**: 印は必ず記号と語を持つ (`_mark` の出力に文字がある)。
 6. **カード**: 各画面でカードが tz の行の後ろ・節の前 (または節の先頭) にあり、値が無ければ出ない。カードの値は escape 済み。
-7. **予算**: 承認詳細の縮む順が今と同じ (今の境界の test は骨格を `_document` から測るので、値を直さずに通る想定。`test_approval_page_budget.py:101-136`)。
+7. **予算**: 承認詳細の縮む順が今と同じ (今の境界の test は骨格を `_document` から測るので、値を直さずに通る想定。`test_approval_page_budget.py:101-136`)。加えて、新しい骨格で次の例を作り、省略が画面で分かることを見る。
+   - **params だけ縮む例**: 変更のタブに「…(N 件省略)」が出る (`render.py:799-801`)。決定のブロックの規模は省く前の件数を出す。
+   - **申告まで縮む例** (日本語の最大長): 申告のタブの各項目の末尾に「…」が付き、0 文字まで縮んだときは「…(省略)」になる (`render.py:825-826`)。決定のブロックは「申告: あり」のまま。
+   - **親の記録まで省く例**: 概要の内部値から `parent_facts` の行が消える。
+   - **追加節まで省く例** (配備中の版の比較、gate の警告): 省いた節が属するタブに「省略: 一部の節は表示容量の都合で省きました」が、残った節と form より前に出る (`render.py:948`、`:1074-1077`)。
+   - **確認の経路**: どの例でも、省かれた中身を読める経路が画面から分かること。今ある案内は params の省略印と追加節の省略の注記だけで、申告と親の記録には CLI の案内が無い。足すかは T4 で文言と byte を見て決め、足さないなら残余 (§8) に書く。
+   - 各例で、form が付くか (64 KiB の判定)・再読込の有無が今の規則どおり。
 8. **form**: 書込みの画面の markup が変わらない (今の test)。
 
 判定は `tmp/tools/judge.sh` 経由。`T/web/` に加えて `tests/ops/test_change_web_e2e.py` と `tests/ops_setup/` (web の起動) を含める。
@@ -239,6 +262,8 @@ dl・表・見出し・form の markup に属性を足さないので、書き�
 
 各画面を読んで出した候補。**どれも未裁定で、利用者が選んだものだけを T5 に入れる。** 選ばれなかった項目は今のまま。消しても daemon の API (`GET /v1/status` など) には値が残る。
 
+**異常・失敗・古い値・未測定・警告を示す値は、消す候補にしない。** 省く案は「0 のときだけ省き、非 0 と不明は必ず出す」の形にした。
+
 「たたむ」は `<details>` を使う。ただし 30 秒の自動再読込のある画面では、開いても次の読み直しで閉じる (§7 の問い 3)。表の「再読込」の列がその印。
 
 | # | 画面 | 項目 | 案 (★ = 推奨) | 理由 | 失う情報 | 再読込 |
@@ -249,10 +274,10 @@ dl・表・見出し・form の markup に属性を足さないので、書き�
 | K4 | Status 概要 | 資金の群 (`equity`・`balance`) | ★消す / 残す | カードと同じ値。群に残る行が無くなり見出しも消える | なし | あり |
 | K5 | Status 概要 | allowlist の `jobs`・`pnl`・`performance` | ★消す (allowlist と並びの表から外す) / 残す | daemon は値を入れない (`S/service.py:2220-2224`)。画面には今も出ていない | 将来 daemon が入れたとき、自動では出ない | — |
 | K6 | Status 経済指標 | `abandoned <理由> (latest day / total)` の 9 行 | ★値が 0 だけの行を消す / たたむ / 残す | 平常時は 0 が並び、0 でない行が埋もれる | 「0 である」ことの明示。行の数が日によって変わる | あり |
-| K7 | Status 経済指標 | `slice <key>` の 21 行 | ★容量に効く 6 行 (`level`・`rows`・`row_capacity`・`used_bytes`・`byte_capacity`・`slice_bytes_stale`) だけ残して消す / たたむ / 残す | `base_bytes`・`bytes_per_row`・`db_bytes`・`wal_bytes`・`measure_elapsed_sec` などは計測の内部値 | 計測の内部値 15 行 | あり |
+| K7 | Status 経済指標 | `slice <key>` の 21 行 | ★計算の内訳 4 行 (`base_bytes`・`bytes_per_row`・`db_bytes`・`wal_bytes`) だけ消す / 残す | 4 行は `used_bytes` の内訳で、異常の合図にならない。**残す 17 行**: 3 つの level、`rows`・`row_capacity`、`used_bytes`・`byte_capacity`、`free_bytes` (空き容量)、`slice_bytes`・`slice_bytes_measured_at`・`slice_bytes_stale` (未測定・古い値)、`measure_outcome`・`measure_elapsed_sec` (測定の失敗)、`signal_daily`・`signal_producer`・`signal_override` と `capacity_override_below_producer` (設定の警告)、`slice capacity warning` | DB と WAL の大きさの内訳 | あり |
 | K8 | Status 経済指標 | `shadow <組>` の行 (最大 50) | ★残す / たたむ | 見送った判断の仮想損益で、判断の材料 | (たたむなら) 初めの表示で見えない | あり |
-| K9 | Status 反応統計 | 6 表の列 `unique_ts_n`・`未算定` | ★消す / 残す | 集計の診断用。表が 10 列で横に長い | 重複時刻と算定できなかった件数 | あり |
-| K10 | Status 反応統計 | 末尾の dl (`reaction sets_without_values`・`events_without_currency_key`) | ★消す (「reaction 省略」は残す) / 残す | 集計の滞留の診断値 | 滞留の件数 | あり |
+| K9 | Status 反応統計 | 6 表の列 `unique_ts_n`・`未算定` | ★残す / 表の全行で `未算定` が 0 かつ `unique_ts_n` が `n` と同じときだけ列を省く (1 行でも非 0・差あり・不明があれば出す) | 欠損や停滞で未算定が増えると、残った標本の中央値だけが見える。今の「印」は `n<床` しか見ない (`render.py:383-385`) ので、この 2 列が統計の信頼性の材料 | (省く案でも) 正常時に「0 である」ことの明示 | あり |
+| K10 | Status 反応統計 | 末尾の dl (`reaction sets_without_values`・`events_without_currency_key`) | ★残す / 値が 0 の行だけ省く (非 0 と不明「-」は必ず出す) | 集計の滞留を示す値で、非 0 は統計が遅れている合図 | (省く案でも) 正常時に「0 である」ことの明示 | あり |
 | K11 | 承認待ち一覧 | 1 件ごとの節と dl (`content_hash`・`created_at`・`id`・`kind`・`name`) | ★1 枚の表にまとめ、`content_hash` は先頭 12 文字 / 残す | 件数が増えると縦に長い。ほかの画面は hash を 12 文字で出す | `content_hash` の 13 文字目以降 | あり |
 | K12 | 承認詳細 概要 | 内部値の群 (`payload_sha256` の全桁・`parent_facts`) | たたむ / ★残す | 照合用の値。決定のブロックに先頭 12 文字がある | (たたむなら) 初めの表示で見えない | form があるときは無し、ほかはあり |
 | K13 | Plugins 一覧 | 先頭の link「承認待ちの一覧 (Pending approvals)」(`plugin_pages.py:290`) | ★消す / 残す | 帯の「承認待ち」と同じ先 | なし | — |
@@ -267,7 +292,7 @@ dl・表・見出し・form の markup に属性を足さないので、書き�
 
 | # | 問い | 推奨 | 理由 |
 |---|---|---|---|
-| 1 | 承認詳細の 15 KiB をどうするか。(a) 変えず、`STYLE` を 4,096 byte 以下に抑える。(b) diff を 46 KiB、diff 以外を 17 KiB に振り替える | (a) | (a) で縮むのは params 30 件・gate 8 行を超える重い承認だけで、縮む先頭は params の差分 (§2.5 の実測)。(b) は daemon 側の定義 (`S/ops/change_limits.py:36-37`) と 2 package の test を動かし、長い diff の見える量が 2 KiB 減る。実運用で縮みが出たら (b) を別チケットにする |
+| 1 | 承認詳細の 15 KiB をどうするか。(a) 変えず、`STYLE` を 4,096 byte 以下に抑える。(b) diff を 46 KiB、diff 以外を 17 KiB に振り替える | (a) | 縮むかは件数でなく byte で決まり、日本語で最大長の申告は今でも params を全部省いて申告を 1,000 文字に切る (§2.5 の実測)。(a) の増分は、この境界を最大 3,200 byte 手前にずらし、申告の切り詰めが 1 段早まる例がある。ASCII か 1,000 文字までの申告で params 10 件・pair 2 なら縮まない。(b) は増分を打ち消すが、daemon 側の定義 (`S/ops/change_limits.py:36-37`) と 2 package の test を動かし、長い diff の見える量が 2 KiB 減る。日本語の長い申告が縮む問題は (b) の 2 KiB では解けない (不足は約 8 KiB) ので、予算の見直しとして別チケットにする |
 | 2 | 状態の割当表 (§2.3) はこれでよいか。迷うのは 4 つ: `autopilot` が真 = 注意、improve の `gate_failed` (見送り) = 注意、承認の `pending` = 注意、health の異常の記録 = 注意 (危険にしない) | 表のとおり | `autopilot` は今の `.warn` の意味を保つ (変えるなら意味の変更になる)。見送りは失敗ではないが、床を割った合図。承認待ちは人の対応が要る。health の記録は再起動まで残るので、赤にすると解消後も赤いままになる。危険 (赤) は停止・故障だけに絞り、慣れで見落とさないようにする |
 | 3 | 「たたむ」を使うか | 使わない (消すか残すかで選ぶ) | 再読込のある画面では 30 秒で閉じ、読んでいる途中で消える。開閉を保つには query を足す必要があり、タブの表と検査が増える。§6 の推奨はこれに合わせてある |
 | 4 | スマホ幅: viewport の meta (`<meta name="viewport" content="width=device-width,initial-scale=1">`、67 byte) を入れるか | 入れる。専用の配置は作らない | 今はスマホで PC 幅の縮小表示になり、字が読めない。入れれば字の大きさが合い、広い表は節の中で横にスクロールする (§2.2)。カードは折り返す。入れるなら受入に LAN 越しの 2 画面を足す (§4) |
@@ -322,7 +347,7 @@ WCAG の式で計算した (scratchpad の script)。4.5 以上が目安。
 3. `2026-10-19-approval-content-design.md:152` は、15 KiB を超えるとき「params 差分 → 申告 の順で省略」。コードは params の差分 → 申告 → 親の記録 → 追加節 (`render.py:1154-1165`)。
 4. 同 `:202` は変更内容を「同ページの下部の節として出す」、`:391` (AC-13) は「CSS と STYLE_HASH が不変」。コードはタブに分かれ (`render.py:1079-1088`)、`STYLE` は前段で変わっている。
 5. チケット `web-ui-charts-equity-indicators` の「読み取り専用」。コードには書込みの画面 (承認・却下・改善の実行・job の取消) がある (`write_pages.py`)。
-6. `plugin_pages.py:34` と `improve_pages.py:53` のコメント「合計と枠・nav・style が 64 KiB に収まる値」。節は今タブに分かれ、1 ページに合計して出ない (`plugin_pages.py:444-453`)。
+6. `plugin_pages.py:34` と `improve_pages.py:53` のコメント「合計と枠・nav・style が 64 KiB に収まる値」。節は今タブに分かれ、1 ページに合計して出ない (`plugin_pages.py:444-453`)。上限は合計でも収まる保守的な値として今も正しく、不具合ではない。コメントがタブに分かれたことを説明していないだけ。
 7. この設計の下書きの依頼は書込みの画面を「承認・改善の実行」とするが、`write_pages.py` にはほかに job の取消 (`:157-158`) と「結果を確かめる」(`:108-110`) の form がある。§2.6 は 5 つとも対象にした。
 
 ## 付録 D. `STYLE` の下書き (2,957 byte)
@@ -385,4 +410,5 @@ button, input { font: inherit; padding: 0.25rem 0.6rem; }
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
-| 2026-11-18 | C0 | 初版 (下書き) | 利用者の方針 (OS に従う暗い配色、運用画面風、簡略化は候補から選ぶ) | — |
+| 2026-11-18 | C0.1 | <ul><li>K7 は計算の内訳 4 行だけを消す候補にし、測定結果・測定時刻・空き容量・override の警告は残す</li><li>K9・K10 の推奨を「残す」にし、省く案は 0 のときだけ</li><li>語彙の突き合わせを daemon → afx-ops の写し → 割当表の二段で test。真偽値の欠損・None・整数は不明とする入力例を固定</li><li>15 KiB の縮みを byte (ASCII・日本語・最大長) で測り直し、受入に申告・親の記録・追加節まで縮む例と省略表示・確認経路を足す。問い 1 の理由も直す</li><li>分類は生の値と厳密な型で行い、翻訳・代替表示はその後。分類関数の責務 (Bot と calendar の未知と既知の unknown の区別) を明記</li><li>時刻の制約を、応答の表示 tz に従う・欠損は UTC・tz を渡さない画面は行なし、に直す。付録 C の 6 はコメントの説明不足</li></ul> | 設計レビュー 1 周目 (Important 5 / Minor 1、全件採用) | — |
+| 2026-11-18 | C0 | 初版 (下書き) | 利用者の方針 (OS に従う暗い配色、運用画面風、簡略化は候補から選ぶ) | bc275183 |
