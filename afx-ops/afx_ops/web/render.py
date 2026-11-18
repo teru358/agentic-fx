@@ -37,33 +37,42 @@ STYLE = """
 @media (prefers-color-scheme: dark) { :root { --bg: #0d1117; --fg: #e6edf3; --mut: #9198a1;
   --line: #3d444d; --soft: #161b22; --link: #4493f8; --ok: #3fb950; --ok-bg: #12261e;
   --warn: #d29922; --warn-bg: #2a2111; --bad: #ff7b72; --bad-bg: #2d1316; } }
-body { margin: 0; padding: 0 1.5rem 2rem; color: var(--fg); background: var(--bg);
-  font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
-  line-height: 1.5; }
-nav { display: flex; flex-wrap: wrap; gap: 1.25rem; padding: 0.75rem 0;
-  border-bottom: 1px solid var(--line); margin-bottom: 1rem; }
-nav a { color: var(--link); text-decoration: none; font-weight: 600; }
+body { margin: 0; padding: 0 1rem 2rem; color: var(--fg); background: var(--bg);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+  font-variant-numeric: tabular-nums; }
+a { color: var(--link); }
+nav { display: flex; flex-wrap: wrap; gap: 1.25rem; padding: 0.6rem 0;
+  border-bottom: 1px solid var(--line); margin-bottom: 0.75rem; }
+nav a { text-decoration: none; font-weight: 600; }
 nav a:hover { text-decoration: underline; }
-h1 { font-size: 1.4rem; margin: 0.5rem 0 1rem; }
-section { border-bottom: 1px solid var(--line); padding: 0.5rem 0; }
-dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1.5rem; margin: 0; }
+nav a[aria-current="page"] { color: var(--fg); }
+h1 { font-size: 1.25rem; margin: 0.5rem 0 0.75rem; }
+h2 { font-size: 1rem; margin: 0 0 0.4rem; }
+h3, h4 { font-size: 0.9rem; margin: 0.6rem 0 0.3rem; }
+section { border: 1px solid var(--line); border-radius: 6px; padding: 0.6rem 0.75rem;
+  margin: 0 0 0.75rem; overflow-x: auto; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.15rem 1.25rem; margin: 0; }
 dt { font-weight: 600; color: var(--mut); }
 dd { margin: 0; overflow-wrap: anywhere; }
 dd dl { padding-left: 0.5rem; border-left: 2px solid var(--line); }
 ul { margin: 0; padding-left: 1.25rem; }
-pre { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--soft); padding: 0.75rem;
-  border-radius: 6px; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--soft); padding: 0.6rem;
+  border-radius: 6px; font-size: 0.85rem; }
 .danger { color: var(--bad); }
 dd.danger { font-weight: 700; background: var(--bad-bg); }
 .warn { color: var(--warn); }
 dd.warn { font-weight: 700; background: var(--warn-bg); }
-table { border-collapse: collapse; }
-th, td { border: 1px solid var(--line); padding: 0.25rem 0.5rem; text-align: left; }
+table { border-collapse: collapse; font-size: 0.85rem; }
+th, td { border: 1px solid var(--line); padding: 0.15rem 0.45rem; text-align: left; }
 th { background: var(--soft); }
+tbody tr:nth-child(even) { background: var(--soft); }
 .tabs a { padding-bottom: 0.25rem; border-bottom: 2px solid transparent; }
 .tabs a[aria-current="page"] { border-bottom-color: var(--link); }
 .scroll { max-height: 70vh; overflow: auto; }
 .scroll th { position: sticky; top: 0; }
+form { margin: 0.5rem 0; }
+form + form { margin-top: 1.5rem; }
+button, input { font: inherit; padding: 0.25rem 0.6rem; }
 """
 
 # nav に出す静的な route (表示順)。/approvals は /plugins から辿り、詳細は一覧の各項目から辿る

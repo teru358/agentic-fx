@@ -71,7 +71,7 @@ from afx_ops.web import headers, render  # noqa: E402
 from afx_ops.web.routes import ROUTE_TABLE  # noqa: E402
 
 # CSS を変えたらこの値も変える (CSP の hash と埋め込む CSS の取り違えを防ぐ)
-PINNED_STYLE_HASH = "sha256-QbciIlPQ0TyhWw+US1Ea9Gz//dQYAwN3RPMwsYZYIK4="
+PINNED_STYLE_HASH = "sha256-Bn1rrFTpmsBPwM7K6sK8FmbH60HY2NVYDdQ+zP7ZkLs="
 
 
 class ReadClient:
@@ -246,3 +246,29 @@ def test_every_page_declares_japanese_and_a_device_width_viewport():
         page = handle_request(Request("GET", path, {}), ReadClient()).body.decode()
         assert '<html lang="ja">' in page, path
         assert '<meta name="viewport" content="width=device-width,initial-scale=1">' in page, path
+
+
+def _rule(selector: str) -> str:
+    match = re.search(r"(?:^|\n)" + re.escape(selector) + r" \{([^}]*)\}", render.STYLE)
+    assert match, selector
+    return match.group(1)
+
+
+def test_tables_are_dense_striped_and_digits_are_tabular():
+    assert "tabular-nums" in _rule("body")
+    assert "font-size: 0.85rem" in _rule("table")
+    assert "padding: 0.15rem 0.45rem" in _rule("th, td")
+    assert "var(--soft)" in _rule("tbody tr:nth-child(even)")
+    assert "var(--soft)" in _rule("th")
+
+
+def test_a_section_is_framed_and_scrolls_a_wide_table_inside_itself():
+    section = _rule("section")
+    assert "border: 1px solid var(--line)" in section and "overflow-x: auto" in section
+
+
+def test_stacked_forms_are_spaced_and_buttons_carry_no_state_color():
+    assert "margin-top: 1.5rem" in _rule("form + form")
+    controls = _rule("button, input")
+    assert "font: inherit" in controls
+    assert "color" not in controls and "background" not in controls
