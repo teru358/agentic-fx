@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from afx_ops.display_zone import zone_of
 from afx_ops.plugin_text import label
-from afx_ops.web import plugin_pages, render, tabs
+from afx_ops.web import marks, plugin_pages, render, tabs
 from afx_ops.web.common import approval_link, display_time, pick, plugin_link
 from afx_ops.web.routes import resolve_route
 
@@ -177,6 +177,14 @@ def _result_text(result: object, reason: object) -> str:
     return html.escape(text, quote=True)
 
 
+def _result_mark(result: object, reason: object) -> str:
+    """結果の印。印は結果の語、理由の括弧は印の外。"""
+    shown = marks.mark(marks.level_of(marks.IMPROVE_RESULT, result), label(RESULT, result))
+    if reason is not None:
+        shown += html.escape(f" ({label(REASON, reason)})", quote=True)
+    return shown
+
+
 # ---------------------------------------------------------------- 一覧
 
 def _time_value(raw: object) -> datetime | None:
@@ -243,7 +251,7 @@ def _list_row(raw: dict, tz: str) -> list[str]:
     plugin = row.get("plugin")
     return [_run_link(row.get("id")), display_time(row.get("started_at"), tz),
             display_time(row.get("finished_at"), tz), _text(row.get("trigger"), TRIGGER),
-            _result_text(row.get("result_code"), row.get("reason_code")),
+            _result_mark(row.get("result_code"), row.get("reason_code")),
             plugin_link(plugin) if plugin is not None else "-", _floor_cell(row),
             approval_link(row.get("approval_id"))]
 
@@ -269,7 +277,7 @@ def _more_note(fetched: int, shown: int, has_more: bool, limit: int, sort: str |
 
 def _intro(fetched: int, sort: str | None, direction: str | None) -> str:
     if sort is None:
-        return "<p>終了した改善 mission を新しい順に並べています。run の番号から要約を開けます。</p>"
+        return ""
     effective = direction or SORT_COLUMNS[sort].first
     return (f"<p>取得した最新 {fetched} 件を {SORT_LABEL[sort]} の {DIRECTION_TEXT[effective]} "
             "で並べています。run の番号から要約を開けます。</p>")
@@ -336,7 +344,12 @@ def _overview(row: dict, snapshot: dict, approval: dict) -> str:
         ("レポート", _text(row.get("report_state"), REPORT_STATE)),
         ("承認", approval_cell if approval else "-"),
     ]
-    return _section("概要", render._rows(pairs))
+    head = marks.cards([
+        ("結果", _result_mark(snapshot.get("result_code"), snapshot.get("reason_code"))
+         if snapshot else ""),
+        ("起動", _text(snapshot.get("trigger"), TRIGGER) if snapshot else ""),
+        ("経過 (秒)", _num(elapsed) if type(elapsed) in (int, float) else "")])
+    return _section("概要", head + render._rows(pairs))
 
 
 def _text_section(title: str, items: list[tuple[str, object]]) -> str:
@@ -515,7 +528,6 @@ def render_improve_detail(data: Mapping[str, object], tab: str = "overview",
     items = pick(summary.get("items"), ITEM_FIELDS) if state == "ok" else {}
     own = row.get("id")
     shown = own if type(own) is int and own >= 1 else "-"
-    nav = '<p><a href="/improve">Improve (一覧)</a> / <a href="/plugins">Plugins</a></p>'
     bar = tabs.bar(tabs.IMPROVE_DETAIL, tab, at=f"/improve/{run_id if run_id is not None else shown}")
     if not snapshot:
         sections = {"overview": _section("概要", f"<p>{NO_TERMINAL_TEXT}</p>")}
@@ -536,4 +548,4 @@ def render_improve_detail(data: Mapping[str, object], tab: str = "overview",
             "handoff": _handoff_section(items),
         }
     body = sections.get(tab) or "<p>なし</p>"
-    return render._page(f"Improve #{shown}", body, tz, current="/improve", tabs=nav + bar)
+    return render._page(f"Improve #{shown}", body, tz, current="/improve", tabs=bar)

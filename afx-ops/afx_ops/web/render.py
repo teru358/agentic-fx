@@ -6,9 +6,10 @@ import re
 import unicodedata
 from collections.abc import Mapping, Sequence
 
-from afx_ops import base_text, display_time, history_text, reevaluation_text
+from afx_ops import base_text, display_time, history_text, plugin_text, reevaluation_text
 from afx_ops.display_zone import zone_of
 from afx_ops.metric_words import metric_items
+from afx_ops.web import marks
 from afx_ops.web import tabs as tab_table
 from afx_ops.web.routes import ROUTE_TABLE, resolve_route
 
@@ -31,32 +32,55 @@ REFRESH_SECONDS = 30
 # 埋め込む唯一の CSS。CSP は hash (headers.STYLE_HASH) で これだけを許すので、1 byte でも
 # 変えたら hash も変える。強調は値の属性ではなく renderer が付ける class で行う
 STYLE = """
-body { margin: 0; padding: 0 1.5rem 2rem; color: #1f2328; background: #fff;
-  font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
-  line-height: 1.5; }
-nav { display: flex; flex-wrap: wrap; gap: 1.25rem; padding: 0.75rem 0;
-  border-bottom: 1px solid #d0d7de; margin-bottom: 1rem; }
-nav a { color: #0969da; text-decoration: none; font-weight: 600; }
+:root { color-scheme: light dark; --bg: #fff; --fg: #1f2328; --mut: #57606a; --line: #d0d7de;
+  --soft: #f6f8fa; --link: #0969da; --ok: #116329; --ok-bg: #dafbe1; --warn: #7d4e00;
+  --warn-bg: #fff8c5; --bad: #cf222e; --bad-bg: #ffebe9; }
+@media (prefers-color-scheme: dark) { :root { --bg: #0d1117; --fg: #e6edf3; --mut: #9198a1;
+  --line: #3d444d; --soft: #161b22; --link: #4493f8; --ok: #3fb950; --ok-bg: #12261e;
+  --warn: #d29922; --warn-bg: #2a2111; --bad: #ff7b72; --bad-bg: #2d1316; } }
+body { margin: 0; padding: 0 1rem 2rem; color: var(--fg); background: var(--bg);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+  font-variant-numeric: tabular-nums; }
+a { color: var(--link); }
+nav { display: flex; flex-wrap: wrap; gap: 1.25rem; padding: 0.6rem 0;
+  border-bottom: 1px solid var(--line); margin-bottom: 0.75rem; }
+nav a { text-decoration: none; font-weight: 600; }
 nav a:hover { text-decoration: underline; }
-h1 { font-size: 1.4rem; margin: 0.5rem 0 1rem; }
-section { border-bottom: 1px solid #eaeef2; padding: 0.5rem 0; }
-dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1.5rem; margin: 0; }
-dt { font-weight: 600; color: #57606a; }
+nav a[aria-current="page"] { color: var(--fg); }
+h1 { font-size: 1.25rem; margin: 0.5rem 0 0.75rem; }
+h2 { font-size: 1rem; margin: 0 0 0.4rem; }
+h3, h4 { font-size: 0.9rem; margin: 0.6rem 0 0.3rem; }
+section { border: 1px solid var(--line); border-radius: 6px; padding: 0.6rem 0.75rem;
+  margin: 0 0 0.75rem; overflow-x: auto; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.15rem 1.25rem; margin: 0; }
+dt { font-weight: 600; color: var(--mut); }
 dd { margin: 0; overflow-wrap: anywhere; }
-dd dl { padding-left: 0.5rem; border-left: 2px solid #eaeef2; }
+dd dl { padding-left: 0.5rem; border-left: 2px solid var(--line); }
 ul { margin: 0; padding-left: 1.25rem; }
-pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #f6f8fa; padding: 0.75rem;
-  border-radius: 6px; }
-.danger { color: #cf222e; }
-dd.danger { font-weight: 700; background: #ffebe9; }
-.warn { color: #9a6700; }
-dd.warn { font-weight: 700; background: #fff8c5; }
-table { border-collapse: collapse; }
-th, td { border: 1px solid #d0d7de; padding: 0.25rem 0.5rem; text-align: left; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--soft); padding: 0.6rem;
+  border-radius: 6px; font-size: 0.85rem; }
+.danger { color: var(--bad); }
+dd.danger, .st.danger { font-weight: 700; background: var(--bad-bg); }
+.warn { color: var(--warn); }
+dd.warn, .st.warn { font-weight: 700; background: var(--warn-bg); }
+.ok { color: var(--ok); background: var(--ok-bg); }
+.st { display: inline-block; padding: 0 0.4rem; border: 1px solid; border-radius: 1rem;
+  font-size: 0.85rem; white-space: nowrap; }
+.kpi { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0 0 0.75rem; }
+.kpi div { border: 1px solid var(--line); border-radius: 6px; padding: 0.4rem 0.75rem;
+  background: var(--soft); }
+.kpi strong { display: block; font-size: 0.8rem; color: var(--mut); }
+table { border-collapse: collapse; font-size: 0.85rem; }
+th, td { border: 1px solid var(--line); padding: 0.15rem 0.45rem; text-align: left; }
+th { background: var(--soft); }
+tbody tr:nth-child(even) { background: var(--soft); }
 .tabs a { padding-bottom: 0.25rem; border-bottom: 2px solid transparent; }
-.tabs a[aria-current="page"] { border-bottom-color: #0969da; }
+.tabs a[aria-current="page"] { border-bottom-color: var(--link); }
 .scroll { max-height: 70vh; overflow: auto; }
-.scroll th { position: sticky; top: 0; background: #fff; }
+.scroll th { position: sticky; top: 0; }
+form { margin: 0.5rem 0; }
+form + form { margin-top: 1.5rem; }
+button, input { font: inherit; padding: 0.25rem 0.6rem; }
 """
 
 # nav に出す静的な route (表示順)。/approvals は /plugins から辿り、詳細は一覧の各項目から辿る
@@ -76,9 +100,11 @@ def _nav(current: str | None) -> str:
 _EMPHASIS = {"kill_switch": "danger", "autopilot": "warn"}
 
 # server DTO の新 field を表示面へ自動的に広げないための allowlist。
-STATUS_FIELDS = frozenset({"mode", "autopilot", "kill_switch", "equity", "balance", "pnl",
-                           "performance", "orders", "mission", "health", "data", "jobs"})
-APPROVAL_FIELDS = frozenset({"id", "kind", "name", "content_hash", "created_at"})
+STATUS_FIELDS = frozenset({"mode", "autopilot", "kill_switch", "equity", "balance", "orders",
+                           "mission", "health", "data"})
+# 承認待ちの表の列。表示してよい項目の唯一の定義 (列の並びがそのまま表の並び)
+_APPROVAL_COLUMNS = ("id", "kind", "name", "created_at", "content_hash")
+APPROVAL_FIELDS = frozenset(_APPROVAL_COLUMNS)
 JOURNAL_FIELDS = frozenset({"approval_id", "name", "phase"})
 DETAIL_FIELDS = frozenset({"id", "kind", "status", "in_sample", "holdout", "payload_sha256",
                            "decided_by", "decided_at", "asserted_actor", "parent_facts", "baseline"})
@@ -159,7 +185,8 @@ def _zone_line(tz: str | None) -> str:
 def _document(title: str, body: str, tz: str | None = None, *, refresh: bool = True,
               current: str | None = None, tabs: str = "") -> bytes:
     reload = f'<meta http-equiv="refresh" content="{REFRESH_SECONDS}">' if refresh else ""
-    return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+    return ("<!doctype html><html lang=\"ja\"><head><meta charset=\"utf-8\">"
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
             + reload + '<title>'
             + html.escape(title, quote=True) + "</title><style>" + STYLE + "</style></head><body>"
             + _nav(current) + "<h1>" + html.escape(title, quote=True) + "</h1>" + tabs
@@ -178,16 +205,52 @@ def _page(title: str, body: str, tz: str | None = None, *, current: str | None =
 # Status の概要の群と、群の中の並び。allowlist (STATUS_FIELDS) と同じ集合を並べる
 STATUS_GROUPS = (
     ("安全", ("kill_switch", "health", "autopilot")),
-    ("資金", ("equity", "balance", "pnl", "performance")),
-    ("稼働", ("mode", "mission", "data", "orders", "jobs")),
+    ("資金", ("equity", "balance")),
+    ("稼働", ("mode", "mission", "data", "orders")),
 )
 
 
+def _scalar_card(data: Mapping[str, object], key: str) -> tuple[str, str]:
+    """印を持たない値だけのカード。画面が今も出している scalar の値をそのまま出す。"""
+    return key, _text(data.get(key)) if key in data else ""
+
+
+def _status_cards(data: Mapping[str, object]) -> tuple[str, set[str]]:
+    """Status 概要のカードと、カードが同じ内容を出していて dl の行を省いてよい key。
+
+    分類は 1 回で、カードと「行を省く」判定の両方に使う。異常・不明・型違いは省かない。
+    """
+    covered: set[str] = set()
+    items: list[tuple[str, str]] = []
+
+    def marked(key: str, classify, label: str, *, hide_when_ok: bool) -> None:
+        if key not in data:
+            return
+        verdict = classify(data[key])
+        items.append((label, marks.render_verdict(verdict)))
+        if hide_when_ok and verdict[0] == marks.OK:
+            covered.add(key)
+
+    marked("kill_switch", marks.classify_kill_switch, "kill switch", hide_when_ok=True)
+    marked("health", marks.classify_health, "health", hide_when_ok=True)
+    marked("autopilot", marks.classify_autopilot, "autopilot", hide_when_ok=False)
+    if type(data.get("autopilot")) is bool:
+        covered.add("autopilot")
+    for key in ("mode", "equity", "balance"):
+        label, value = _scalar_card(data, key)
+        items.append((label, value))
+        if value:
+            covered.add(key)
+    marked("data", marks.classify_data, "data", hide_when_ok=False)
+    return marks.cards(items), covered
+
+
 def _status_overview(data: Mapping[str, object], tz: str) -> str:
-    parts = []
+    cards, covered = _status_cards(data)
+    parts = [cards]
     for title, keys in STATUS_GROUPS:
         rows = _pairs(data, STATUS_FIELDS, nested_allowed=NESTED_FIELDS, emphasis=_EMPHASIS,
-                      tz=tz, order=keys)
+                      tz=tz, order=[key for key in keys if key not in covered])
         if rows:
             parts.append(f"<section><h2>{title}</h2>{rows}</section>")
     return "".join(parts)
@@ -196,8 +259,8 @@ def _status_overview(data: Mapping[str, object], tz: str) -> str:
 # Status のタブごとの本文。キーは tabs.TABS["/"] の名前と一致させる
 STATUS_TAB_SECTIONS = {
     "overview": lambda data, tz: _status_overview(data, tz),
-    "bot": lambda data, tz: _bot_section(data, tz),
-    "econ": lambda data, tz: _calendar_section(data) + _econ_section(data, tz),
+    "bot": lambda data, tz: _bot_cards(data) + _bot_section(data, tz),
+    "econ": lambda data, tz: _econ_cards(data) + _calendar_section(data) + _econ_section(data, tz),
     "reaction": lambda data, tz: _reaction_section(data),
 }
 
@@ -210,12 +273,19 @@ def render_status(data: Mapping[str, object], tab: str = "overview") -> bytes:
 
 # daemon の `bot_health` の語 (agentic_fx.ops.bot_health の写し。test が突き合わせる)。web は daemon API
 # だけを読み、bot の state dir には触れない
-BOT_HEALTH_STATES = ("healthy", "unhealthy", "stalled", "stale", "unknown", "not_configured",
-                     "permanent-failure")
+BOT_HEALTH_STATES = tuple(marks.BOT_HEALTH)
 BOT_ALTERNATE_PUSH = ("none", "configured")
 _BOT_CODE = re.compile(r"[a-z_]{1,48}\Z")
 INTERACTION_UNAVAILABLE_TEXT = "gateway が健全でない間、Discord の承認操作は使えません"
 ALTERNATE_NONE_TEXT = "alternate_push=none (別経路の通知が設定されていません)"
+
+
+def _bot_cards(data: Mapping[str, object]) -> str:
+    health = data.get("bot_health")
+    if type(health) is not dict:
+        return ""
+    return marks.cards([("gateway health", marks.render_verdict(
+        marks.classify_word(marks.BOT_HEALTH, health.get("state"))))])
 
 
 def _bot_section(data: Mapping[str, object], tz: str = "UTC") -> str:
@@ -251,15 +321,17 @@ def _bot_section(data: Mapping[str, object], tz: str = "UTC") -> str:
 ECON_ABANDON_REASONS = ("freshness_expired", "requeued_expired", "retry_exhausted",
                         "source_inactive", "normalization_failed", "deploy_op",
                         "deploy_linked")
-_CALENDAR_STATES = ("unknown", "fresh", "stale")
-_WORKER_STATES = ("alive", "stopped", "start_failed", "not_started", "unknown")
-_LEVELS = ("ok", "warn", "full")
+_CALENDAR_STATES = tuple(marks.CALENDAR)
+_WORKER_STATES = tuple(marks.WORKER)
+_LEVELS = tuple(marks.CAPACITY)
 _MISSION_KEYS = ("system_filtered", "failed", "running")
 _CAPACITY_KEYS = ("signal_daily", "signal_producer", "signal_override", "rows",
                   "row_capacity", "row_level", "slice_bytes", "slice_bytes_measured_at",
                   "slice_bytes_stale", "measure_outcome", "measure_elapsed_sec",
                   "used_bytes", "byte_capacity", "byte_level", "base_bytes",
                   "bytes_per_row", "db_bytes", "wal_bytes", "free_bytes", "level")
+# used_bytes の内訳で、異常の合図にならない行
+_CAPACITY_BREAKDOWN = frozenset({"base_bytes", "bytes_per_row", "db_bytes", "wal_bytes"})
 _MEASURE_OUTCOMES = ("ok", "aborted", "failed")
 _OTHER_KIND = "other"
 _ECON_WORD = re.compile(r"[A-Za-z0-9_.:-]{1,64}\Z")
@@ -273,6 +345,22 @@ def _dict(value: object) -> dict:
     return value if type(value) is dict else {}
 
 
+def _econ_cards(data: Mapping[str, object]) -> str:
+    window, econ = data.get("window"), data.get("econ_signal")
+    items = []
+    if type(window) is dict:
+        items.append(("calendar", marks.render_verdict(
+            marks.classify_word(marks.CALENDAR, window.get("freshness")))))
+    if type(econ) is dict:
+        items.append(("worker", marks.render_verdict(
+            marks.classify_word(marks.WORKER, econ.get("slice_worker")))))
+        capacity = econ.get("slice_capacity")
+        if type(capacity) is dict:
+            items.append(("slice 容量", marks.render_verdict(
+                marks.classify_word(marks.CAPACITY, capacity.get("level")))))
+    return marks.cards(items)
+
+
 def _calendar_section(data: Mapping[str, object]) -> str:
     if type(data.get("window")) is not dict:
         return ""
@@ -282,6 +370,11 @@ def _calendar_section(data: Mapping[str, object]) -> str:
     if "in_window" in window:
         pairs.append(("in_window", _text(window.get("in_window")) or "-"))
     return "<section><h2>Economic calendar</h2>" + _rows(pairs) + "</section>"
+
+
+def _is_zero(*values: object) -> bool:
+    """全部が整数の 0 のときだけ真。欠損・None・bool・文字列・負は 0 と読まない。"""
+    return all(type(value) is int and value == 0 for value in values)
 
 
 def _count_text(value: object) -> str:
@@ -310,14 +403,18 @@ def _econ_section(data: Mapping[str, object], tz: str = "UTC") -> str:
     abandoned = econ.get("abandoned")
     if type(abandoned) is dict:
         total, day = _dict(abandoned.get("total")), _dict(abandoned.get("latest_day"))
+        # 0 と読めた行は出さない。欠損・型違い (「-」)・0 でない値の行は必ず出す
         for reason in ECON_ABANDON_REASONS:
-            pairs.append((f"abandoned {reason} (latest day / total)",
-                          f"{_count_text(day.get(reason))} / {_count_text(total.get(reason))}"))
+            if not _is_zero(day.get(reason), total.get(reason)):
+                pairs.append((f"abandoned {reason} (latest day / total)",
+                              f"{_count_text(day.get(reason))} / {_count_text(total.get(reason))}"))
         cleanup = _dict(abandoned.get("cleanup"))
-        pairs.append(("abandoned ineligible_cleanup (latest day / total)",
-                      f"{_count_text(cleanup.get('latest_day'))} / {_count_text(cleanup.get('total'))}"))
-        pairs.append(("abandoned legacy_unknown (total)",
-                      _count_text(abandoned.get("legacy_unknown_total"))))
+        if not _is_zero(cleanup.get("latest_day"), cleanup.get("total")):
+            pairs.append(("abandoned ineligible_cleanup (latest day / total)",
+                          f"{_count_text(cleanup.get('latest_day'))} / {_count_text(cleanup.get('total'))}"))
+        if not _is_zero(abandoned.get("legacy_unknown_total")):
+            pairs.append(("abandoned legacy_unknown (total)",
+                          _count_text(abandoned.get("legacy_unknown_total"))))
     else:
         pairs.append(("abandoned", "unavailable"))
     missions = econ.get("missions_latest_day")
@@ -340,6 +437,8 @@ def _econ_section(data: Mapping[str, object], tz: str = "UTC") -> str:
     capacity = econ.get("slice_capacity")
     if type(capacity) is dict:
         for key in _CAPACITY_KEYS:
+            if key in _CAPACITY_BREAKDOWN:
+                continue
             value = capacity.get(key)
             if key.endswith("_level") or key == "level":
                 shown = _word(value, _LEVELS)
@@ -442,12 +541,32 @@ def _detail_link(item: dict) -> str:
     return f'<p><a href="{path}">Details #{approval_id}</a></p>'
 
 
+def _approval_cell(column: str, item: Mapping[str, object], tz: str) -> str:
+    """承認待ちの表の 1 つの cell。欠けた値・型違いは「-」。hash は先頭 12 文字。"""
+    value = item.get(column)
+    if column == "id":
+        link = _detail_link(item)
+        return f'<a href="/approvals/{value}">#{value}</a>' if link else (_text(value) or "-")
+    if column == "created_at":
+        return _time_text(value, tz) if type(value) is str and value else "-"
+    if column == "content_hash":
+        return _hash12(value)
+    return _text(value) or "-"
+
+
+def _approval_row(item: Mapping[str, object], tz: str) -> str:
+    """承認待ちの 1 行。cell は列の定義 (`_APPROVAL_COLUMNS`) の名前と順で作り、見出しとずれない。"""
+    return "<tr>" + "".join(f"<td>{_approval_cell(column, item, tz)}</td>"
+                            for column in _APPROVAL_COLUMNS) + "</tr>"
+
+
 def render_approvals(data: Mapping[str, object]) -> bytes:
     approvals = data.get("approvals")
     entries = approvals if isinstance(approvals, list) else []
     tz = zone_of(data)
-    body = "".join("<section>" + _detail_link(item) + _pairs(item, APPROVAL_FIELDS, tz=tz) + "</section>"
-                   for item in entries[:MAX_ITEMS] if type(item) is dict)
+    rows = [_approval_row(item, tz) for item in entries[:MAX_ITEMS] if type(item) is dict]
+    body = ("<section><table><thead><tr>" + "".join(f"<th>{name}</th>" for name in _APPROVAL_COLUMNS)
+            + "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></section>") if rows else ""
     journals = data.get("open_journals")
     if isinstance(journals, list):
         body += "".join("<section>" + _pairs(item, JOURNAL_FIELDS, tz=tz) + "</section>"
@@ -744,6 +863,19 @@ def _approval_groups(data: Mapping[str, object], tz: str, *, parent: bool = True
     return "".join(parts)
 
 
+def _approval_cards(data: Mapping[str, object], name: str | None = None,
+                    classification: str | None = None) -> str:
+    """承認詳細の概要の先頭のカード。成績の判定は出さない (承認・却下の form と同じタブなので)。"""
+    level, word = marks.classify_word(marks.APPROVAL_STATUS, data.get("status"))
+    items = [("status", marks.mark(level, plugin_text.APPROVAL_STATUS[word]
+                                   if level != marks.UNKNOWN else word))]
+    if name is not None and name != "-":
+        items.append(("plugin", html.escape(name)))
+    if classification is not None:
+        items.append(("分類", classification))
+    return marks.cards(items)
+
+
 def _overview_section(data: Mapping[str, object], change: Mapping[str, object], parent: bool,
                       tz: str = "UTC") -> str:
     name = change.get("name")
@@ -760,7 +892,8 @@ def _overview_section(data: Mapping[str, object], change: Mapping[str, object], 
     reason = change.get("reason")
     if reason is not None:
         target += "<p>" + REASON_TEXT.get(reason, REASON_TEXT["unsafe_source"]) + "</p>"
-    return ("<section><h2>概要</h2>"
+    head = _approval_cards(data, name, label)
+    return ("<section><h2>概要</h2>" + head
             + _approval_groups(data, tz, parent=parent, target=target, metrics=False) + "</section>")
 
 
@@ -1113,7 +1246,8 @@ def _unchanged_virtual(data: Mapping[str, object], message: str,
                        extra_sections: Sequence[tuple[str, str]], at: str) -> ApprovalPage:
     """変更内容の無い承認詳細。概要に dl と固定文、追加節は通常と同じタブ、変更と申告は「なし」。"""
     tz = zone_of(data)
-    overview = ("<section><h2>概要</h2>" + _approval_groups(data, tz) + "</section>"
+    overview = ("<section><h2>概要</h2>" + _approval_cards(data) + _approval_groups(data, tz)
+                + "</section>"
                 "<section><h2>変更内容</h2><p>" + message + "</p></section>")
     skeleton = _approval_skeleton(tz, at)
     fit = _fit_tagged_extras(skeleton + _bytes(overview), extra_sections)

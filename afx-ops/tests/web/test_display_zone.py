@@ -70,9 +70,9 @@ def test_every_status_time_at_every_depth_is_converted_to_the_zone_of_the_respon
     client = Client(status=_status())
     text = "".join(_get(client, "/", {"tab": tab}) for tab in ("overview", "bot", "econ", "reaction"))
     for shown in ("2026-11-06 19:04:05 +09:00", "2026-11-06 19:11:00 +09:00",
-                  "2026-11-06 19:22:00 +09:00", "2026-11-06 19:33:00 +09:00",
                   "2026-11-06 19:44:00 +09:00"):
         assert shown in text
+    assert "19:22:00" not in text and "19:33:00" not in text  # jobs は表示面の外
     assert "T10:" not in text
 
 
@@ -139,7 +139,7 @@ def test_the_approval_pages_have_the_zone_line_and_a_converted_created_at():
         {"id": 4, "kind": "plugin", "name": "p", "content_hash": "abc",
          "created_at": "2026-11-06T10:55:00+00:00"}]}
     text = _get(Client(approvals=listing), "/approvals")
-    assert "<dd>2026-11-06 19:55:00 +09:00</dd>" in text
+    assert "<td>2026-11-06 19:55:00 +09:00</td>" in text
     assert "<p>表示 tz: Asia/Tokyo (+09:00)</p>" in text
 
 

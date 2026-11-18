@@ -41,14 +41,15 @@ def test_renderers_project_the_read_dto_shapes_without_unknown_fields():
 
         def approvals(self, *, limit):
             return Reply(200, {"approvals": [{"id": 4, "kind": "plugin", "name": "p",
-                                                "content_hash": "abc", "created_at": "now"}],
+                                                "content_hash": "0123456789abcdef" * 4,
+                                                "created_at": "now"}],
                                "open_journals": [{"approval_id": 4, "name": "p", "phase": "prepared"}]}, None)
 
     client = Client()
     assert "log line" in handle_request(Request("GET", "/logs", {}), client).body.decode()
     assert "activity line" in handle_request(Request("GET", "/activity", {}), client).body.decode()
     page = handle_request(Request("GET", "/approvals", {}), client).body.decode()
-    assert "abc" in page and "prepared" in page and "token" not in page
+    assert "0123456789ab" in page and "prepared" in page and "token" not in page
 
 
 def test_response_body_has_a_fixed_upper_bound():
@@ -71,7 +72,7 @@ from afx_ops.web import headers, render  # noqa: E402
 from afx_ops.web.routes import ROUTE_TABLE  # noqa: E402
 
 # CSS を変えたらこの値も変える (CSP の hash と埋め込む CSS の取り違えを防ぐ)
-PINNED_STYLE_HASH = "sha256-ikbXKLrXYVfxPcWWcuDZtzvvyqj/k6rP5KkKwrMxPpU="
+PINNED_STYLE_HASH = "sha256-qiZacxC6roHXmI7P8rm8egku/grOsHbS3rfGS/tgUC4="
 
 
 class ReadClient:
@@ -155,10 +156,11 @@ def test_kill_switch_and_autopilot_are_marked_by_class_only_when_on():
     on = handle_request(Request("GET", "/", {}), ReadClient(status={
         "kill_switch": {"latched": True, "generation": 2}, "autopilot": True})).body.decode()
     assert '<dt class="danger">kill_switch</dt><dd class="danger">' in on
-    assert '<dt class="warn">autopilot</dt><dd class="warn">' in on
+    assert "autopilot</dt>" not in on and '<span class="st warn">△ ON</span>' in on
     off = handle_request(Request("GET", "/", {}), ReadClient(status={
         "kill_switch": {"latched": False}, "autopilot": False})).body.decode()
-    assert "class=" not in off.split("</nav>")[-1]
+    # 表示の dl の中には、印の class を入れない (印はカードにだけ出る)
+    assert not [dl for dl in re.findall(r"<dl>.*?</dl>", off.split("</nav>")[-1]) if "class=" in dl]
 
 
 def test_log_and_activity_show_the_newest_lines_of_a_long_window():
@@ -177,7 +179,106 @@ def test_log_and_activity_show_the_newest_lines_of_a_long_window():
         assert "entry-049" not in html and "entry-000" not in html, path
 
 
-def test_the_plugins_pages_link_to_the_approvals_that_the_nav_no_longer_shows():
+def test_the_plugins_list_band_links_to_the_approvals_and_no_page_repeats_the_link_paragraph():
+    page = handle_request(Request("GET", "/plugins", {}), ReadClient()).body.decode()
+    assert '<a href="/approvals">承認待ち</a>' in page
     for path in ("/plugins", "/plugins/rsi"):
         page = handle_request(Request("GET", path, {}), ReadClient()).body.decode()
-        assert '<a href="/approvals">' in page.split("</nav>", 1)[1], path
+        assert "Pending approvals" not in page.split("</nav>", 1)[1], path
+
+
+# --- CSS の token・配色・大きさ ------------------------------------------------------
+
+STYLE_MAX_BYTES = 4096
+
+
+def _style_tokens() -> tuple[dict[str, str], dict[str, str]]:
+    css = render.STYLE
+    light_block = re.match(r"\s*:root \{([^}]*)\}", css).group(1)
+    dark_block = re.search(r"@media \(prefers-color-scheme: dark\) \{ :root \{([^}]*)\}", css).group(1)
+
+    def parse(block):
+        return dict(re.findall(r"(--[a-z-]+):\s*(#[0-9a-fA-F]{3,6})", block))
+    return parse(light_block), parse(dark_block)
+
+
+def _luminance(color: str) -> float:
+    color = color.lstrip("#")
+    if len(color) == 3:
+        color = "".join(c * 2 for c in color)
+    channels = []
+    for i in (0, 2, 4):
+        c = int(color[i:i + 2], 16) / 255
+        channels.append(c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def _contrast(a: str, b: str) -> float:
+    la, lb = sorted((_luminance(a), _luminance(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+def test_colors_are_written_only_in_the_two_root_blocks():
+    css = render.STYLE
+    outside = re.sub(r"\s*:root \{[^}]*\}", "", css)
+    outside = re.sub(r"@media \(prefers-color-scheme: dark\) \{ :root \{[^}]*\} \}", "", outside)
+    assert not re.search(r"#[0-9a-fA-F]{3,8}\b", outside), re.findall(r"#[0-9a-fA-F]{3,8}\b", outside)
+    light, dark = _style_tokens()
+    assert set(light) == set(dark) and "--bg" in light
+    assert "color-scheme: light dark" in css
+
+
+_TEXT_ON_BG = [("--fg", "--bg"), ("--fg", "--soft"), ("--fg", "--ok-bg"), ("--fg", "--warn-bg"),
+               ("--fg", "--bad-bg"), ("--mut", "--bg"), ("--mut", "--soft"), ("--link", "--bg"),
+               ("--link", "--soft"), ("--ok", "--bg"), ("--ok", "--soft"), ("--ok", "--ok-bg"),
+               ("--warn", "--bg"), ("--warn", "--soft"), ("--warn", "--warn-bg"),
+               ("--bad", "--bg"), ("--bad", "--soft"), ("--bad", "--bad-bg")]
+
+
+def test_every_text_and_background_pair_has_contrast_of_at_least_4_5_in_light_and_dark():
+    for name, tokens in zip(("light", "dark"), _style_tokens()):
+        for fg, bg in _TEXT_ON_BG:
+            assert _contrast(tokens[fg], tokens[bg]) >= 4.5, (name, fg, bg)
+
+
+def test_the_style_stays_within_its_byte_budget():
+    assert len(render.STYLE.encode("utf-8")) <= STYLE_MAX_BYTES
+
+
+def test_every_page_declares_japanese_and_a_device_width_viewport():
+    for path in PAGES:
+        page = handle_request(Request("GET", path, {}), ReadClient()).body.decode()
+        assert '<html lang="ja">' in page, path
+        assert '<meta name="viewport" content="width=device-width,initial-scale=1">' in page, path
+
+
+def _rule(selector: str) -> str:
+    match = re.search(r"(?:^|\n)" + re.escape(selector) + r" \{([^}]*)\}", render.STYLE)
+    assert match, selector
+    return match.group(1)
+
+
+def test_tables_are_dense_striped_and_digits_are_tabular():
+    assert "tabular-nums" in _rule("body")
+    assert "font-size: 0.85rem" in _rule("table")
+    assert "padding: 0.15rem 0.45rem" in _rule("th, td")
+    assert "var(--soft)" in _rule("tbody tr:nth-child(even)")
+    assert "var(--soft)" in _rule("th")
+
+
+def test_a_section_is_framed_and_scrolls_a_wide_table_inside_itself():
+    section = _rule("section")
+    assert "border: 1px solid var(--line)" in section and "overflow-x: auto" in section
+
+
+def test_stacked_forms_are_spaced_and_buttons_carry_no_state_color():
+    assert "margin-top: 1.5rem" in _rule("form + form")
+    controls = _rule("button, input")
+    assert "font: inherit" in controls
+    assert "color" not in controls and "background" not in controls
+
+
+def test_the_css_has_the_mark_and_card_rules_and_the_full_style_fits_the_budget():
+    for selector in (".st", ".ok", ".kpi", ".kpi div", ".kpi strong"):
+        assert re.search(r"(^|\n|, )" + re.escape(selector) + r"[ ,{]", render.STYLE), selector
+    assert "dd.danger, .st.danger" in render.STYLE and "dd.warn, .st.warn" in render.STYLE

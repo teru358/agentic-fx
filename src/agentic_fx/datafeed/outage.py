@@ -20,6 +20,9 @@ from agentic_fx.core import market_hours
 from agentic_fx.core.timeutil import as_utc
 from agentic_fx.store import ohlcv, orders
 
+# 永続状態機械の取りうる state。web の状態の印の割当表 (afx-ops) はこの語彙を写して持ち、test が突き合わせる
+DATA_STATES = ("ready", "restricted", "degraded")
+
 
 @dataclass(frozen=True, slots=True)
 class IngestTickReport:

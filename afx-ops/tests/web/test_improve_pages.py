@@ -110,7 +110,8 @@ def test_the_list_shows_runs_in_the_daemon_order_with_links_and_display_times():
     first, second = text.index('<a href="/improve/9">'), text.index('<a href="/improve/8">')
     assert first < second
     assert "2026-11-01 09:00:00 +09:00" in text and "2026-11-01 09:10:00 +09:00" in text
-    assert "見送り (床未達)" in text and "候補を提出" in text
+    assert '<span class="st warn">△ 見送り</span> (床未達)' in text
+    assert '<span class="st ok">○ 候補を提出</span>' in text
     assert '<a href="/plugins/cand">cand</a>' in text
     assert '<a href="/approvals/4">#4</a>' in text
     assert "holdout: PF (2 pair)" in text and "手動" in text
@@ -477,3 +478,36 @@ def test_reason_section_requires_parent_reason():
     data["summary"]["items"]["parent_reason"] = "unprofitable"
     text = detail_page(data, tab="agent")
     assert "<h2>判定理由</h2>" in text and "床未達" in text
+
+
+# ---------------------------------------------------------------- 状態の印とカード
+
+@pytest.mark.parametrize(("code", "symbol", "level"), [
+    ("submitted", "○", "st ok"), ("report", "○", "st ok"), ("gate_failed", "△", "st warn"),
+    ("failed", "✕", "st danger"), ("observation", "–", "st")])
+def test_each_result_in_the_list_is_marked_with_its_level(code, symbol, level):
+    client = Client(listing={"runs": [run_row(9, result_code=code, reason_code=None)],
+                             "has_more": False, "display_timezone": "Asia/Tokyo"})
+    assert f'<span class="{level}">{symbol} ' in page("/improve", client)
+
+
+@pytest.mark.parametrize("bad", ["paused", None, 1, [], True, "FAILED"])
+def test_an_unrecognised_result_is_an_unknown_mark_never_a_normal_one(bad):
+    client = Client(listing={"runs": [run_row(9, result_code=bad, reason_code=None)],
+                             "has_more": False, "display_timezone": "Asia/Tokyo"})
+    html = page("/improve", client)
+    assert '<span class="st">? 不明' in html and "○" not in body_of(html)
+
+
+def test_the_detail_overview_starts_with_the_result_trigger_and_elapsed_cards():
+    html = detail_page("submitted")
+    row = re.search(r'<section><h2>概要</h2>(<div class="kpi">.*?</div></div>)', html, re.S).group(1)
+    assert "<strong>結果</strong>" in row and "○ 候補を提出" in row
+    assert "<strong>起動</strong>" in row and "<strong>経過 (秒)</strong>" in row
+
+
+def test_a_detail_without_a_snapshot_has_no_result_card():
+    data = dto("submitted")
+    data["snapshot"] = None
+    html = detail_page(data)
+    assert "<strong>結果</strong>" not in html and "<strong>起動</strong>" not in html

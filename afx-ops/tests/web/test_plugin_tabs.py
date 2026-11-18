@@ -128,10 +128,10 @@ def test_the_detail_bar_uses_the_plugin_path_and_the_fixed_table():
         ("/plugins/rsi?tab=versions", "", "版の履歴")]
 
 
-def test_the_page_nav_paragraph_stays_above_the_bar():
+def test_the_detail_has_no_link_paragraph_above_the_bar():
     page = get("/plugins/rsi")[0].body.decode()
-    nav = '<p><a href="/plugins">Plugins</a> / <a href="/approvals">Pending approvals</a></p>'
-    assert page.index(nav) < page.index('<nav class="tabs">')
+    head = page.split('<nav class="tabs">')[0]
+    assert "Pending approvals" not in head and head.endswith("</h1>")
 
 
 def test_a_missing_detail_tab_and_the_default_tab_give_the_same_body():
