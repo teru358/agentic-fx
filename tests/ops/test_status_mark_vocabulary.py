@@ -47,6 +47,17 @@ def _module_strings(tree: ast.Module) -> dict[str, str]:
             for t in node.targets if isinstance(t, ast.Name)}
 
 
+def _unpacked_from_state_attribute(name: ast.Name, target: ast.Tuple, parents: dict) -> bool:
+    """`a, b = x.state, y` の形で、state の位置の値が属性 `.state` の読み戻しか。"""
+    assign = parents[target]
+    if not (isinstance(assign, ast.Assign) and assign.targets == [target]
+            and isinstance(assign.value, ast.Tuple)
+            and len(assign.value.elts) == len(target.elts)):
+        return False
+    value = assign.value.elts[target.elts.index(name)]
+    return isinstance(value, ast.Attribute) and value.attr == "state"
+
+
 def _state_words(source: str) -> set[str]:
     """状態語を作る箇所 (state への代入・"state" の dict 値・state= の引数・.get("state", 既定)・
     状態を返す関数の return) が持つ語。定数の名前は module の文字列定数で引く。"""
@@ -75,10 +86,24 @@ def _state_words(source: str) -> set[str]:
         else:  # 語を解決できない式 (別の変数・関数の戻り値など) は、不明として失敗させる
             found.add(f"<unresolved: {ast.unparse(node) if node is not None else 'None'}>")
 
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and any(
-                isinstance(t, ast.Name) and t.id == "state" for t in node.targets):
-            take(node.value)
+        if isinstance(node, ast.Name) and node.id == "state" and isinstance(node.ctx, ast.Store):
+            # state を束縛する形は構文を問わず全部拾い、Assign・値のある AnnAssign だけ値を検査する
+            parent = parents[node]
+            if isinstance(parent, ast.Assign) and node in parent.targets:
+                take(parent.value)
+            elif isinstance(parent, ast.AnnAssign) and parent.target is node and parent.value is not None:
+                take(parent.value)
+            elif isinstance(parent, ast.Tuple) and _unpacked_from_state_attribute(node, parent, parents):
+                pass  # `state, x = outcome.state, ...`: 検査済みの結果から読み戻すだけ
+            elif (isinstance(parent, ast.AnnAssign) and parent.value is None
+                  and isinstance(parents[parent], ast.ClassDef)):
+                pass  # dataclass の field の宣言
+            else:
+                found.add(f"<unresolved binding: {type(parent).__name__}>")
+        elif isinstance(node, ast.ExceptHandler) and node.name == "state":
+            found.add("<unresolved binding: ExceptHandler>")
         elif isinstance(node, ast.Dict):
             for key, value in zip(node.keys, node.values):
                 if isinstance(key, ast.Constant) and key.value == "state":
@@ -129,6 +154,28 @@ def test_a_state_word_that_arrives_through_a_variable_or_a_call_is_not_trusted()
             "def f(row):\n    state = compute(row)\n    return state\n",
             "def f(row):\n    return {'state': compute(row)}\n"):
         assert any(word.startswith("<unresolved:") for word in _state_words(source)), source
+
+
+def test_every_way_of_binding_state_other_than_a_plain_literal_assignment_is_caught():
+    vocabulary = set(outage.DATA_STATES)
+    for source in (
+            "def f():\n    state: str = 'paused'\n    return state\n",
+            "def f():\n    state: str\n    return state\n",
+            "def f(x):\n    state = 'ready'\n    state += x\n    return state\n",
+            "def f(x):\n    (state := x)\n    return state\n",
+            "def f(x):\n    state, other = x\n    return state\n",
+            "def f(x):\n    [state] = x\n    return state\n",
+            "def f(x):\n    for state in x:\n        pass\n    return state\n",
+            "def f(x):\n    with x as state:\n        pass\n    return state\n",
+            "def f(x):\n    try:\n        pass\n    except Exception as state:\n        pass\n    return state\n",
+            "def f(x):\n    state, e = x, 1\n    return state\n",
+            "def f(x):\n    state, e = x.state, 1, 2\n    return state\n",
+            "def f(x):\n    state = other = compute(x)\n    return state\n"):
+        assert not _state_words(source) <= vocabulary, source
+    for source in ("def f(o):\n    state, epoch = o.state, o.epoch\n    return state\n",
+                   "def f():\n    state = 'ready'\n    return state\n",
+                   "def f():\n    state: str = 'degraded'\n    return state\n"):
+        assert _state_words(source) <= vocabulary, source
 
 
 def test_every_state_the_bot_health_evaluation_produces_is_in_the_vocabulary():
