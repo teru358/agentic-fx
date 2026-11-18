@@ -60,7 +60,7 @@
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [escape-probe-manual-measurement](open/escape-probe-manual-measurement.md) | 中 | 2026-10-04 | 改善 agent の檻からの脱出可否を人手で実測する |
-| [indicator-forward-response-evaluation](open/indicator-forward-response-evaluation.md) | 中 | 2026-11-18 | 指標の計算値の系列を加工し、将来の値動きで評価して改善 agent に返す |
+| [indicator-forward-response-evaluation](open/indicator-forward-response-evaluation.md) | 中 | 2026-11-18 | 指標の計算値を数学的な計算にかけ、通貨ペアの傾向を改善 agent に見せる分析の道具 |
 | [legacy-e2e-ttl](open/legacy-e2e-ttl.md) | 低 |  | llama-swap の TTL 120 秒で mission 中にモデルが unload される |
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 
