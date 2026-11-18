@@ -249,3 +249,16 @@ def test_the_table_columns_are_the_allowlist_and_a_field_outside_it_is_not_shown
     assert re.findall(r"<th>(.*?)</th>", page) == list(render._APPROVAL_COLUMNS)
     assert set(render._APPROVAL_COLUMNS) == render.APPROVAL_FIELDS
     assert "LEAK" not in page
+
+
+def test_headings_and_values_stay_aligned_when_the_columns_are_reordered_or_reduced(monkeypatch):
+    from afx_ops.web import render
+    expected = {"id": '<a href="/approvals/7">#7</a>', "kind": "plugin", "name": "rsi",
+                "created_at": "2026-11-18 10:02:03 +09:00", "content_hash": "0123456789ab"}
+    for columns in (("content_hash", "name", "id", "created_at", "kind"),
+                    ("name", "id"), ("created_at",)):
+        monkeypatch.setattr(render, "_APPROVAL_COLUMNS", columns)
+        page = handle_request(Request("GET", "/approvals", {}), Client(approvals={
+            "approvals": [ITEM], "display_timezone": "Asia/Tokyo"})).body.decode()
+        assert re.findall(r"<th>(.*?)</th>", page) == list(columns)
+        assert re.findall(r"<td>(.*?)</td>", page) == [expected[name] for name in columns]

@@ -541,19 +541,23 @@ def _detail_link(item: dict) -> str:
     return f'<p><a href="{path}">Details #{approval_id}</a></p>'
 
 
+def _approval_cell(column: str, item: Mapping[str, object], tz: str) -> str:
+    """承認待ちの表の 1 つの cell。欠けた値・型違いは「-」。hash は先頭 12 文字。"""
+    value = item.get(column)
+    if column == "id":
+        link = _detail_link(item)
+        return f'<a href="/approvals/{value}">#{value}</a>' if link else (_text(value) or "-")
+    if column == "created_at":
+        return _time_text(value, tz) if type(value) is str and value else "-"
+    if column == "content_hash":
+        return _hash12(value)
+    return _text(value) or "-"
+
+
 def _approval_row(item: Mapping[str, object], tz: str) -> str:
-    """承認待ちの 1 行。欠けた値・型違いは「-」。hash は先頭 12 文字。"""
-    approval_id = item.get("id")
-    link = _detail_link(item)
-    if link:
-        first = f'<a href="/approvals/{approval_id}">#{approval_id}</a>'
-    else:
-        first = _text(approval_id) or "-"
-    created = item.get("created_at")
-    cells = [first, _text(item.get("kind")) or "-", _text(item.get("name")) or "-",
-             _time_text(created, tz) if type(created) is str and created else "-",
-             _hash12(item.get("content_hash"))]
-    return "<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>"
+    """承認待ちの 1 行。cell は列の定義 (`_APPROVAL_COLUMNS`) の名前と順で作り、見出しとずれない。"""
+    return "<tr>" + "".join(f"<td>{_approval_cell(column, item, tz)}</td>"
+                            for column in _APPROVAL_COLUMNS) + "</tr>"
 
 
 def render_approvals(data: Mapping[str, object]) -> bytes:
