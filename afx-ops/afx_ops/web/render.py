@@ -31,32 +31,39 @@ REFRESH_SECONDS = 30
 # 埋め込む唯一の CSS。CSP は hash (headers.STYLE_HASH) で これだけを許すので、1 byte でも
 # 変えたら hash も変える。強調は値の属性ではなく renderer が付ける class で行う
 STYLE = """
-body { margin: 0; padding: 0 1.5rem 2rem; color: #1f2328; background: #fff;
+:root { color-scheme: light dark; --bg: #fff; --fg: #1f2328; --mut: #57606a; --line: #d0d7de;
+  --soft: #f6f8fa; --link: #0969da; --ok: #116329; --ok-bg: #dafbe1; --warn: #7d4e00;
+  --warn-bg: #fff8c5; --bad: #cf222e; --bad-bg: #ffebe9; }
+@media (prefers-color-scheme: dark) { :root { --bg: #0d1117; --fg: #e6edf3; --mut: #9198a1;
+  --line: #3d444d; --soft: #161b22; --link: #4493f8; --ok: #3fb950; --ok-bg: #12261e;
+  --warn: #d29922; --warn-bg: #2a2111; --bad: #ff7b72; --bad-bg: #2d1316; } }
+body { margin: 0; padding: 0 1.5rem 2rem; color: var(--fg); background: var(--bg);
   font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
   line-height: 1.5; }
 nav { display: flex; flex-wrap: wrap; gap: 1.25rem; padding: 0.75rem 0;
-  border-bottom: 1px solid #d0d7de; margin-bottom: 1rem; }
-nav a { color: #0969da; text-decoration: none; font-weight: 600; }
+  border-bottom: 1px solid var(--line); margin-bottom: 1rem; }
+nav a { color: var(--link); text-decoration: none; font-weight: 600; }
 nav a:hover { text-decoration: underline; }
 h1 { font-size: 1.4rem; margin: 0.5rem 0 1rem; }
-section { border-bottom: 1px solid #eaeef2; padding: 0.5rem 0; }
+section { border-bottom: 1px solid var(--line); padding: 0.5rem 0; }
 dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1.5rem; margin: 0; }
-dt { font-weight: 600; color: #57606a; }
+dt { font-weight: 600; color: var(--mut); }
 dd { margin: 0; overflow-wrap: anywhere; }
-dd dl { padding-left: 0.5rem; border-left: 2px solid #eaeef2; }
+dd dl { padding-left: 0.5rem; border-left: 2px solid var(--line); }
 ul { margin: 0; padding-left: 1.25rem; }
-pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #f6f8fa; padding: 0.75rem;
+pre { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--soft); padding: 0.75rem;
   border-radius: 6px; }
-.danger { color: #cf222e; }
-dd.danger { font-weight: 700; background: #ffebe9; }
-.warn { color: #9a6700; }
-dd.warn { font-weight: 700; background: #fff8c5; }
+.danger { color: var(--bad); }
+dd.danger { font-weight: 700; background: var(--bad-bg); }
+.warn { color: var(--warn); }
+dd.warn { font-weight: 700; background: var(--warn-bg); }
 table { border-collapse: collapse; }
-th, td { border: 1px solid #d0d7de; padding: 0.25rem 0.5rem; text-align: left; }
+th, td { border: 1px solid var(--line); padding: 0.25rem 0.5rem; text-align: left; }
+th { background: var(--soft); }
 .tabs a { padding-bottom: 0.25rem; border-bottom: 2px solid transparent; }
-.tabs a[aria-current="page"] { border-bottom-color: #0969da; }
+.tabs a[aria-current="page"] { border-bottom-color: var(--link); }
 .scroll { max-height: 70vh; overflow: auto; }
-.scroll th { position: sticky; top: 0; background: #fff; }
+.scroll th { position: sticky; top: 0; }
 """
 
 # nav に出す静的な route (表示順)。/approvals は /plugins から辿り、詳細は一覧の各項目から辿る
@@ -159,7 +166,8 @@ def _zone_line(tz: str | None) -> str:
 def _document(title: str, body: str, tz: str | None = None, *, refresh: bool = True,
               current: str | None = None, tabs: str = "") -> bytes:
     reload = f'<meta http-equiv="refresh" content="{REFRESH_SECONDS}">' if refresh else ""
-    return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+    return ("<!doctype html><html lang=\"ja\"><head><meta charset=\"utf-8\">"
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
             + reload + '<title>'
             + html.escape(title, quote=True) + "</title><style>" + STYLE + "</style></head><body>"
             + _nav(current) + "<h1>" + html.escape(title, quote=True) + "</h1>" + tabs

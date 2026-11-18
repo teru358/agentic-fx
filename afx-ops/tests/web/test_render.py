@@ -71,7 +71,7 @@ from afx_ops.web import headers, render  # noqa: E402
 from afx_ops.web.routes import ROUTE_TABLE  # noqa: E402
 
 # CSS を変えたらこの値も変える (CSP の hash と埋め込む CSS の取り違えを防ぐ)
-PINNED_STYLE_HASH = "sha256-ikbXKLrXYVfxPcWWcuDZtzvvyqj/k6rP5KkKwrMxPpU="
+PINNED_STYLE_HASH = "sha256-QbciIlPQ0TyhWw+US1Ea9Gz//dQYAwN3RPMwsYZYIK4="
 
 
 class ReadClient:
@@ -181,3 +181,68 @@ def test_the_plugins_pages_link_to_the_approvals_that_the_nav_no_longer_shows():
     for path in ("/plugins", "/plugins/rsi"):
         page = handle_request(Request("GET", path, {}), ReadClient()).body.decode()
         assert '<a href="/approvals">' in page.split("</nav>", 1)[1], path
+
+
+# --- CSS の token・配色・大きさ ------------------------------------------------------
+
+STYLE_MAX_BYTES = 4096
+
+
+def _style_tokens() -> tuple[dict[str, str], dict[str, str]]:
+    css = render.STYLE
+    light_block = re.match(r"\s*:root \{([^}]*)\}", css).group(1)
+    dark_block = re.search(r"@media \(prefers-color-scheme: dark\) \{ :root \{([^}]*)\}", css).group(1)
+
+    def parse(block):
+        return dict(re.findall(r"(--[a-z-]+):\s*(#[0-9a-fA-F]{3,6})", block))
+    return parse(light_block), parse(dark_block)
+
+
+def _luminance(color: str) -> float:
+    color = color.lstrip("#")
+    if len(color) == 3:
+        color = "".join(c * 2 for c in color)
+    channels = []
+    for i in (0, 2, 4):
+        c = int(color[i:i + 2], 16) / 255
+        channels.append(c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def _contrast(a: str, b: str) -> float:
+    la, lb = sorted((_luminance(a), _luminance(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+def test_colors_are_written_only_in_the_two_root_blocks():
+    css = render.STYLE
+    outside = re.sub(r"\s*:root \{[^}]*\}", "", css)
+    outside = re.sub(r"@media \(prefers-color-scheme: dark\) \{ :root \{[^}]*\} \}", "", outside)
+    assert not re.search(r"#[0-9a-fA-F]{3,8}\b", outside), re.findall(r"#[0-9a-fA-F]{3,8}\b", outside)
+    light, dark = _style_tokens()
+    assert set(light) == set(dark) and "--bg" in light
+    assert "color-scheme: light dark" in css
+
+
+_TEXT_ON_BG = [("--fg", "--bg"), ("--fg", "--soft"), ("--fg", "--ok-bg"), ("--fg", "--warn-bg"),
+               ("--fg", "--bad-bg"), ("--mut", "--bg"), ("--mut", "--soft"), ("--link", "--bg"),
+               ("--link", "--soft"), ("--ok", "--bg"), ("--ok", "--soft"), ("--ok", "--ok-bg"),
+               ("--warn", "--bg"), ("--warn", "--soft"), ("--warn", "--warn-bg"),
+               ("--bad", "--bg"), ("--bad", "--soft"), ("--bad", "--bad-bg")]
+
+
+def test_every_text_and_background_pair_has_contrast_of_at_least_4_5_in_light_and_dark():
+    for name, tokens in zip(("light", "dark"), _style_tokens()):
+        for fg, bg in _TEXT_ON_BG:
+            assert _contrast(tokens[fg], tokens[bg]) >= 4.5, (name, fg, bg)
+
+
+def test_the_style_stays_within_its_byte_budget():
+    assert len(render.STYLE.encode("utf-8")) <= STYLE_MAX_BYTES
+
+
+def test_every_page_declares_japanese_and_a_device_width_viewport():
+    for path in PAGES:
+        page = handle_request(Request("GET", path, {}), ReadClient()).body.decode()
+        assert '<html lang="ja">' in page, path
+        assert '<meta name="viewport" content="width=device-width,initial-scale=1">' in page, path

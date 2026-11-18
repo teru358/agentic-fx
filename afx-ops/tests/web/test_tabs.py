@@ -199,5 +199,6 @@ def test_an_error_page_has_the_nav_but_no_tab_bar_and_no_mark():
 def test_the_css_has_the_tab_bar_the_scroll_frame_and_the_sticky_header():
     assert '.tabs a[aria-current="page"]' in render.STYLE
     assert "max-height: 70vh" in render.STYLE and "overflow: auto" in render.STYLE
-    assert re.search(r"\.scroll th \{[^}]*position: sticky;[^}]*top: 0;[^}]*background: #fff;",
+    assert re.search(r"\.scroll th \{[^}]*position: sticky;[^}]*top: 0;",
                      render.STYLE)
+    assert re.search(r"(^|\n)th \{[^}]*background: var\(--soft\)", render.STYLE)
