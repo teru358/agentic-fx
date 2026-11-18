@@ -1,15 +1,21 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 175 件。完了分は closed/。
+未完了: 176 件。完了分は closed/。
 
-## 実装中 (1)
+## 実装中 (2)
 
 ### 不具合 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [live-confirmed-bars-into-history](open/live-confirmed-bars-into-history.md) | 高 | 2026-09-21 | backtest の履歴が自動で更新されず、評価が古い入力で通る |
+
+### 機能 (1)
+
+| id | 優先 | 起票 | 概要 |
+|---|---|---|---|
+| [web-css-design](open/web-css-design.md) | 中 | 2026-11-18 | 同梱 web の見た目を運用画面風に整え、ダークモードと内容の簡略化を入れる |
 
 ## 実装待ち (12)
 
@@ -66,7 +72,7 @@
 
 ## 設計待ち (155)
 
-### 不具合 (81)
+### 不具合 (82)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -138,6 +144,7 @@
 | [mission-worker-improve-rpc-frame-test-fails](open/mission-worker-improve-rpc-frame-test-fails.md) | 低 | 2026-11-03 | mission_worker の improve RPC frame test が main で落ちる |
 | [killswitch-latched-activity-repeats](open/killswitch-latched-activity-repeats.md) | 低 | 2026-11-14 | 同一 kill switch 世代で繰り返される latch activity を一件にする |
 | [paper-starting-balance-cashflow-history](open/paper-starting-balance-cashflow-history.md) | 低 | 2026-11-15 | paper.starting_balance の変更が cashflow 履歴に残らない |
+| [web-approval-detail-budget-review](open/web-approval-detail-budget-review.md) | 低 | 2026-11-18 | 承認詳細で日本語の長い申告があると params の差分と申告が切られる |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backtest-scheduler-log-leak](open/backtest-scheduler-log-leak.md) | 低 |  | backtest 内部 Scheduler の `maintain_reservations failed: no c… |
 | [graceful-stop-waits-mission](open/graceful-stop-waits-mission.md) | 低 |  | graceful stop が走行中 improve mission の timeout (最大 60 分) を待つ … |
@@ -152,7 +159,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (44)
+### 機能 (43)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -169,7 +176,6 @@
 | [improve-runner-choice](open/improve-runner-choice.md) | 中 | 2026-11-08 | 改善の実行ごとに backend / model の候補を選べるようにする |
 | [web-https-for-writes](open/web-https-for-writes.md) | 中 | 2026-11-08 | 同梱 web を HTTPS で動かし LAN から書込めるようにする |
 | [killswitch-reset-implicit-generation-and-dd-preview](open/killswitch-reset-implicit-generation-and-dd-preview.md) | 中 | 2026-11-16 | kill switch の解除で世代の入力を不要にし、確認画面に現在の DD と再ラッチの予告を出す |
-| [web-css-design](open/web-css-design.md) | 中 | 2026-11-18 | 同梱 web の見た目を運用画面風に整え、ダークモードと内容の簡略化を入れる |
 | [improve-targeted-run](open/improve-targeted-run.md) | 低 | 2026-09-12 | 現状は `improve add <text>` + 引数なし `improve` で LLM が open から自分… |
 | [pine-script-to-plugin](open/pine-script-to-plugin.md) | 低 | 2026-09-12 | Pine script を plugin に変換する手段が無い |
 | [indicator-reference-oracle-gate](open/indicator-reference-oracle-gate.md) | 低 | 2026-09-15 | indicator の正しさを確かめる門が無い |
