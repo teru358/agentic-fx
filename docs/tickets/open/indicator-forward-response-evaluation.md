@@ -1,6 +1,6 @@
 ---
 id: indicator-forward-response-evaluation
-title: 指標とその変換が将来の値動きとどう関係するかを測り、改善 agent に返す
+title: 指標の計算値の系列を加工し、将来の値動きで評価して改善 agent に返す
 status: 設計待ち
 priority: 中
 kind: 機能
@@ -35,3 +35,4 @@ related: [multi-input-indicator-relations, strategy-attribution-and-shadow-evalu
 ## 経緯
 
 - 2026-11-18: 起票。
+- 2026-11-18: 題名: 指標の計算値の系列を加工し、将来の値動きで評価して改善 agent に返す — 利用者の意図の補足 (11-18): チャートに描かれる EMA 等の計算値そのものを、backtest 期間の時系列として扱い、差・微分・積分・比較などの処理をかけたい。仕組みは 2 層: (1) 指標の値の系列を作り、決まった演算で加工する層 (要望の中心)、(2) 加工した系列を、その後の値動きと照らして良し悪しを測る層。系列そのもの (5m 18 か月で約 11 万点) は agent に渡さず、agent は演算の組合せを指定し、計算はコード側で行って要約だけを返す。確認用の期間の系列・結果は agent に見せない
