@@ -1,16 +1,16 @@
 ---
 id: web-css-design
 title: 同梱 web の見た目を運用画面風に整え、ダークモードと内容の簡略化を入れる
-status: 実装中
+status: 是正済
 priority: 中
 kind: 機能
 opened: 2026-11-18
-closed: null
+closed: 2026-11-18
 related: [web-layout-tabs, web-ui-charts-equity-indicators, web-plugin-improve-hub]
 ---
 # [web-css-design] 同梱 web の見た目を運用画面風に整え、ダークモードと内容の簡略化を入れる
 
-**状態**: 実装中 / **優先**: 中 / **種別**: 機能
+**状態**: 是正済 / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -26,8 +26,11 @@ related: [web-layout-tabs, web-ui-charts-equity-indicators, web-plugin-improve-h
 
 ## 修正内容
 
+- 2026-11-18: 同梱 web を運用画面風にした: 色を token 化し OS の設定に従う暗い配色、要点のカードと状態の印 (記号 + 語、表に無い値は「? 不明」)、表を詰めて縞・等幅の数字、節の枠、viewport。簡略化は利用者が選んだ K1〜K7・K11・K13・K15・K16。設計 C1.1 (状態の語彙の静的検査の保証の範囲を残余に明記)、実装レビュー terra 1 周目・/code-review high 2 周目・閉鎖確認 3 回。main b6798d20、afx-ops@web 再起動。2026-11-18 利用者が実機で明・暗を確認 (スマホ幅は未確認)
+
 ## 経緯
 
 - 2026-11-18: 起票。
 - 2026-11-18: 状態: 設計待ち — 設計 C0 の下書きを依頼 (2026-11-18)
 - 2026-11-18: 状態: 実装中 — 設計 C1 を利用者承認 (2026-11-18)。§6 の簡略化と §7 の問いはすべて推奨どおり。task: T1 token と暗い配色 / T2 表・節・form の CSS / T3 印とカードの仕組みと Status / T4 Plugin・Improve・承認詳細のカードと一覧の印 / T5 簡略化 / T6 実ブラウザの受入
+- 2026-11-18: 是正内容 — 同梱 web を運用画面風にした: 色を token 化し OS の設定に従う暗い配色、要点のカードと状態の印 (記号 + 語、表に無い値は「? 不明」)、表を詰めて縞・等幅の数字、節の枠、viewport。簡略化は利用者が選んだ K1〜K7・K11・K13・K15・K16。設計 C1.1 (状態の語彙の静的検査の保証の範囲を残余に明記)、実装レビュー terra 1 周目・/code-review high 2 周目・閉鎖確認 3 回。main b6798d20、afx-ops@web 再起動。2026-11-18 利用者が実機で明・暗を確認 (スマホ幅は未確認)
