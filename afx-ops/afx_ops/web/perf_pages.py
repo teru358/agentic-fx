@@ -193,7 +193,11 @@ def _current(data: Mapping[str, object], tz: str) -> str:
         stale = f"{limit:g} 分を超えた最新記録は古い記録として扱います。"
     notes = ("<p>余裕が正でも解除されたとは限りません。新規の約定が止まっているかどうかは"
              "「新規の約定」の欄が示します。" + stale + "</p>")
-    return "<section><h2>今の状態</h2>" + marks.cards(items) + notes + "</section>"
+    notice = (f"<p>状態の取得時刻: {_time(current.get('state_fetched_at'), tz)} / "
+              f"最新記録の時刻: {_time(current.get('snapshot_at'), tz)}</p>"
+              "<p>この画面は自動で更新しません。今の状態は再読み込みか Status 画面 (自動で更新) で"
+              '確かめてください (<a href="/">Status 画面を開く</a>)</p>')
+    return "<section><h2>今の状態</h2>" + notice + marks.cards(items) + notes + "</section>"
 
 
 # --- 数字で読む ------------------------------------------------------------------------

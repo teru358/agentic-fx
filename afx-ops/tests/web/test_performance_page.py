@@ -490,9 +490,9 @@ def test_a_marks_table_over_its_budget_is_replaced_whole_by_a_note_and_the_rest_
 
 
 def test_a_page_over_the_total_budget_replaces_parts_and_never_clips(monkeypatch):
-    monkeypatch.setattr(perf_pages, "PAGE_BUDGET_BYTES", 6000)
+    monkeypatch.setattr(perf_pages, "PAGE_BUDGET_BYTES", 6500)
     html = page(payload(marks=[mark() for _ in range(20)]))
-    assert "Output clipped" not in html and len(html.encode()) <= 6000
+    assert "Output clipped" not in html and len(html.encode()) <= 6500
     assert "今の状態" in html and "paper の記録です" in html
 
 
@@ -552,9 +552,9 @@ def test_an_integer_too_large_for_a_float_is_unknown_in_every_numeric_cell(metho
 
 
 def test_a_page_over_the_total_budget_keeps_the_shown_and_omitted_mark_counts(monkeypatch):
-    monkeypatch.setattr(perf_pages, "PAGE_BUDGET_BYTES", 6000)
+    monkeypatch.setattr(perf_pages, "PAGE_BUDGET_BYTES", 6500)
     html = page(payload(marks=[mark() for _ in range(25)], marks_omitted=7))
-    assert "Output clipped" not in html and len(html.encode()) <= 6000
+    assert "Output clipped" not in html and len(html.encode()) <= 6500
     assert "<table><thead><tr><th>種別" not in html
     assert "ほか 12 件" in html and "<h2>印</h2>" in html
 
@@ -646,3 +646,40 @@ def test_the_tab_link_and_the_range_links_agree_on_one_url_per_view(query):
     range_key = (query or {}).get("range", "30d")
     assert tab_href == perf_pages.range_href("equity", range_key).replace("&amp;", "&")
     assert "tab=equity" not in tab_href
+
+
+NOT_REFRESHED = ("この画面は自動で更新しません。今の状態は再読み込みか Status 画面 (自動で更新) で"
+                 "確かめてください")
+
+
+def current_frame(html: str) -> str:
+    return html.split("<h2>今の状態</h2>", 1)[1].split("</section>", 1)[0]
+
+
+def test_the_current_frame_starts_with_the_fetch_times_the_no_refresh_sentence_and_a_status_link():
+    frame = current_frame(page())
+    head = frame.split('<div', 1)[0]
+    assert "状態の取得時刻: 2026-11-19 12:00:00 +09:00" in head
+    assert "最新記録の時刻: 2026-11-19 11:59:30 +09:00" in head
+    assert NOT_REFRESHED in head
+    assert '<a href="/">Status 画面を開く</a>' in head
+
+
+def test_the_frame_notice_is_unknown_when_the_times_are_unreadable():
+    data = payload()
+    data["current"]["state_fetched_at"] = "nonsense"
+    del data["current"]["snapshot_at"]
+    head = current_frame(page(data)).split('<div', 1)[0]
+    assert "状態の取得時刻: 不明" in head and "最新記録の時刻: 不明" in head
+    assert NOT_REFRESHED in head
+
+
+def test_the_frame_notice_survives_the_replacement_page():
+    data = payload(marks=[mark(plot_at=f"2026-11-18T01:{i % 60:02d}:03+00:00") for i in range(20)])
+    big = perf_pages.PAGE_BUDGET_BYTES
+    try:
+        perf_pages.PAGE_BUDGET_BYTES = 1
+        html = page(data)
+    finally:
+        perf_pages.PAGE_BUDGET_BYTES = big
+    assert NOT_REFRESHED in current_frame(html)
