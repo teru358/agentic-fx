@@ -302,6 +302,24 @@ def test_only_the_newest_hundred_and_twenty_settlements_are_drawn_and_the_rest_i
     assert series[-1] == {"t": data["to"], "pnl": data["strategies"][0]["total_pnl"]}
 
 
+def test_the_newest_hundred_and_twenty_are_chosen_among_all_placeable_settlements(ops_env):
+    conn = ops_env.conn
+    base = NOW - timedelta(days=5)
+    for i in range(120):
+        put(conn, pnl=float(i + 1), closed=base + timedelta(minutes=i))
+    put(conn, pnl=None, closed=base + timedelta(minutes=500))
+    data = read(ops_env, "7d")
+    row = data["strategies"][0]
+    series = row["cumulative"]
+    assert row["closed_count"] == 121 and row["pnl_unknown_count"] == 1
+    omitted = row["closed_count"] - pv.SERIES_EVENTS
+    assert omitted == 1
+    assert series[0] == {"t": (base + timedelta(minutes=1)).isoformat(), "pnl": 1.0}
+    assert len(series) == 1 + 119 + 1
+    assert series[-1] == {"t": data["to"], "pnl": row["total_pnl"]}
+    assert series[-2]["pnl"] == series[-1]["pnl"]
+
+
 def test_exactly_a_hundred_and_twenty_settlements_keep_the_period_start(ops_env):
     conn = ops_env.conn
     base = NOW - timedelta(days=5)
@@ -396,6 +414,40 @@ def test_all_starts_at_the_oldest_settlement_when_it_is_older_than_everything_el
     data = read(ops_env, "all")
     assert data["from"] == old.isoformat()
     assert data["strategies"][0]["closed_count"] == 1
+
+
+@pytest.mark.parametrize("bad", ["0000-bad", "garbage", ""])
+def test_all_ignores_unreadable_settlement_times_and_counts_them_as_unplaced(ops_env, bad):
+    conn = ops_env.conn
+    old = NOW - timedelta(days=400)
+    put(conn, closed=bad)
+    put(conn, closed=old)
+    put(conn, closed=NOW - timedelta(days=1))
+    data = read(ops_env, "all")
+    assert data["from"] == old.isoformat()
+    assert data["strategies"][0]["closed_count"] == 2
+    assert data["quality"]["unplaced_closed_count"] == 1
+
+
+def test_a_settlement_time_that_sorts_below_the_window_is_still_counted_when_unreadable(
+        ops_env):
+    conn = ops_env.conn
+    put(conn, closed="0000-bad")
+    put(conn, closed=NOW - timedelta(days=1))
+    data = read(ops_env, "7d")
+    assert data["strategies"][0]["closed_count"] == 1
+    assert data["quality"]["unplaced_closed_count"] == 1
+
+
+def test_a_settlement_with_a_readable_non_utc_offset_is_placed_by_its_real_time(ops_env):
+    conn = ops_env.conn
+    inside = (NOW - timedelta(days=1)).astimezone(timezone(timedelta(hours=9)))
+    outside = (NOW - timedelta(days=30)).astimezone(timezone(timedelta(hours=9)))
+    put(conn, closed=inside.isoformat())
+    put(conn, closed=outside.isoformat())
+    data = read(ops_env, "7d")
+    assert data["strategies"][0]["closed_count"] == 1
+    assert data["quality"]["unplaced_closed_count"] == 0
 
 
 def test_a_sum_that_overflows_is_reported_as_unknown_not_as_infinity(ops_env):

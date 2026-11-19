@@ -117,7 +117,7 @@ web (afx-ops) ──GET /v1/performance?range=30d──▶ daemon (ops API、sta
 
 | 入れ子 | 全 key と意味 |
 |---|---|
-| `current` | `kill_switch` (下記の status と同形 / 取得不能は null)、`state_fetched_at`、`snapshot_at` (最新行時刻 / null)、`snapshot_fetched_at`、`snapshot_age_sec` (非負秒 / null)、`snapshot_freshness` (`fresh/stale/unknown`)、`dd_pct,kill_level,headroom` (算出不能は null)、`kill_pct` (現閾値)、`fill_hold` (`stale/drawdown/none/unknown`) |
+| `current` | `kill_switch` (下記の status と同形 / 取得不能は null)、`state_fetched_at`、`snapshot_at` (最新行時刻 / null)、`snapshot_fetched_at`、`snapshot_age_sec` (非負秒 / null)、`snapshot_freshness` (`fresh/stale/unknown`)、`dd_pct,kill_level,headroom` (算出不能は null)、`kill_pct` (現閾値)、`fill_hold` (`kill_switch/stale/drawdown/none/unknown`、daemon が約定を止める理由の総合) |
 | 代表点 | `start_at,end_at,last_at` (部分束の実時刻)、`equity_min,equity_max,equity_last,balance_last`、`seg` (非負整数)。null 無し。帯は `[start_at,end_at]`、代表線は last_at に置く |
 | `stats` | `first_at,last_at,equity_first,equity_last,balance_first,balance_last,equity_min,equity_max,balance_min,balance_max,dd_max,dd_max_at`。期間が空・算出不能は null。極値同値は最初の `(ts,id)` |
 | 印 | `kind` (`latched/released/rebase/cashflow/unknown_hwm_drop`)、`plot_at`、`occurred_at,recorded_at` (実時刻 / 記録時刻、不明は null)、`source_snapshot_ts,applied_at` (付け直し専用、他は null)、`generation` (非該当は null)、`time_source` (`state/ledger/event_ts/snapshot`)。付け直しの occurred_at / recorded_at は共に null |
@@ -126,7 +126,7 @@ web (afx-ops) ──GET /v1/performance?range=30d──▶ daemon (ops API、sta
 
 現在状態は status の読取部分 (`S/ops/service.py:1011-1024`) を関数に切り出して共用する。`kill_switch` は `latched,generation,latched_at,reconcile_required` と、marker がある場合の `requested_generation,started_at,file_latched`。web は `marks.classify_kill_switch` (`A/web/marks.py:83-95`) を使う。marker 投影で latched_at が無ければ作動印を合成しない。
 
-現在の口座は `snapshots.latest()` (`S/store/snapshots.py:20-24`) を source で絞らず読む。daemon と同じ `drawdown_pct`・`drawdown_kill_reached` (`S/core/accounting.py:44-52`) を使い、kill_level = HWM × (1 − kill_pct / 100)、headroom = equity − kill_level。10 分超は stale、欠損・不正値・非正 equity は unknown、他は閾値到達なら drawdown、それ以外 none (`S/core/scheduler.py:291-301`)。停止判定に余裕の表示値や符号を使わない。これは口座による停止理由で、ラッチによる停止は別に示す。
+現在の口座は `snapshots.latest()` (`S/store/snapshots.py:20-24`) を source で絞らず読む。daemon と同じ `drawdown_pct`・`drawdown_kill_reached` (`S/core/accounting.py:44-52`) を使い、kill_level = HWM × (1 − kill_pct / 100)、headroom = equity − kill_level。10 分超は stale、欠損・不正値・非正 equity は unknown、他は閾値到達なら drawdown、それ以外 none (`S/core/scheduler.py:291-301`)。停止判定に余裕の表示値や符号を使わない。`fill_hold` は daemon の約定停止の総合で、優先順は (1) kill switch がラッチ中、または解除途中の marker が残る (`kill_switch`)、(2) state を読めない・形が違う (`unknown`)、(3) 上の口座の理由 (`stale/drawdown/unknown`)。`none` は、約定を止める理由が一つも無いときだけ (`S/core/scheduler.py` の `_fills_allowed_by_state` と tick の account / DD の判定と同じ条件)。state を読めないときに `none` へ倒さない。`kill_switch` の表示も併せて出し、ラッチは別に示す。
 
 同時刻の順序は daemon が id で決める。pnl_unknown_count = closed_count − pnl_known_count、r_unknown_count = closed_count − r_known_count、wins + losses + flats = pnl_known_count。
 不正行の検証は daemon が担当する。snapshot は除外して区間を切り、印は除外、注文は件数を残して該当指標を不明にし quality へ数える。非有限値・bool、不正 JSON・SL 欠落は指標不明、closed_at 欠落・不正は期間へ割り当てず unplaced_closed_count へ。

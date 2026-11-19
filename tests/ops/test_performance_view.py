@@ -448,7 +448,97 @@ def test_the_kill_switch_state_is_passed_through_and_none_stays_none(ops_env):
     snap(ops_env.conn, NOW - timedelta(seconds=5), 1000.0, 1000.0)
     assert _current(ops_env, kill_switch=LATCHED)["kill_switch"] == LATCHED
     assert _current(ops_env, kill_switch=None)["kill_switch"] is None
-    assert _current(ops_env, kill_switch=None)["fill_hold"] == "none"
+
+
+MARKER = {"latched": True, "generation": 3, "latched_at": None, "reconcile_required": True,
+          "requested_generation": 4, "started_at": "2026-11-19T11:00:00+00:00",
+          "file_latched": False}
+RELEASED_MARKER = {**FREE, "reconcile_required": True}
+_ACCOUNTS = {"fresh_ok": (5, 900.0, 1000.0), "fresh_dd": (5, 800.0, 1000.0),
+             "stale": (601, 900.0, 1000.0), "no_row": None, "zero_equity": (5, 0.0, 1000.0),
+             "bad_row": (5, float("inf"), 1000.0)}
+_STATES = {"free": FREE, "latched": LATCHED, "marker_only": RELEASED_MARKER,
+           "marker_latched": MARKER, "unreadable": None,
+           "malformed": {"latched": "no", "generation": 0, "latched_at": None,
+                         "reconcile_required": False}}
+
+
+def _daemon_allows_fills(env, state_name, now=NOW) -> bool:
+    """daemon の tick が約定を許す条件 (scheduler の約定を止める条件の全部)。
+
+    state を読めない・ラッチ中 (marker の投影を含む)・口座が無い / 陳腐化・equity が 0 以下・
+    DD が閾値以上のどれかなら止める。"""
+    state = _STATES[state_name]
+    if (not isinstance(state, dict) or type(state.get("latched")) is not bool
+            or type(state.get("reconcile_required")) is not bool):
+        return False
+    if state["latched"] or state["reconcile_required"]:
+        return False
+    account = accounting.current_account(env.conn, now)
+    if account is None or account[0] <= 0 or not all(math.isfinite(v) for v in account):
+        return False  # 非有限の値は daemon が書かない。表示は安全側に倒す
+    return not accounting.drawdown_kill_reached(account[0], account[1], KILL)
+
+
+_EXPECTED = {
+    ("fresh_ok", "free"): "none", ("fresh_ok", "latched"): "kill_switch",
+    ("fresh_ok", "marker_only"): "kill_switch", ("fresh_ok", "marker_latched"): "kill_switch",
+    ("fresh_ok", "unreadable"): "unknown", ("fresh_ok", "malformed"): "unknown",
+    ("fresh_dd", "free"): "drawdown", ("fresh_dd", "latched"): "kill_switch",
+    ("fresh_dd", "marker_only"): "kill_switch", ("fresh_dd", "marker_latched"): "kill_switch",
+    ("fresh_dd", "unreadable"): "unknown", ("fresh_dd", "malformed"): "unknown",
+    ("stale", "free"): "stale", ("stale", "latched"): "kill_switch",
+    ("stale", "marker_only"): "kill_switch", ("stale", "marker_latched"): "kill_switch",
+    ("stale", "unreadable"): "unknown", ("stale", "malformed"): "unknown",
+    ("no_row", "free"): "unknown", ("no_row", "latched"): "kill_switch",
+    ("no_row", "marker_only"): "kill_switch", ("no_row", "marker_latched"): "kill_switch",
+    ("no_row", "unreadable"): "unknown", ("no_row", "malformed"): "unknown",
+    ("zero_equity", "free"): "unknown", ("zero_equity", "latched"): "kill_switch",
+    ("zero_equity", "marker_only"): "kill_switch",
+    ("zero_equity", "marker_latched"): "kill_switch",
+    ("zero_equity", "unreadable"): "unknown", ("zero_equity", "malformed"): "unknown",
+    ("bad_row", "free"): "unknown", ("bad_row", "latched"): "kill_switch",
+    ("bad_row", "marker_only"): "kill_switch", ("bad_row", "marker_latched"): "kill_switch",
+    ("bad_row", "unreadable"): "unknown", ("bad_row", "malformed"): "unknown",
+}
+
+
+@pytest.mark.parametrize("account", list(_ACCOUNTS))
+@pytest.mark.parametrize("state_name", list(_STATES))
+def test_the_fill_stop_is_shown_exactly_when_the_daemon_stops_filling(
+        ops_env, account, state_name):
+    spec = _ACCOUNTS[account]
+    if spec is not None:
+        age, equity, hwm = spec
+        snap(ops_env.conn, NOW - timedelta(seconds=age), equity, hwm)
+    current = _current(ops_env, kill_switch=_STATES[state_name])
+    assert current["fill_hold"] == _EXPECTED[(account, state_name)]
+    assert (current["fill_hold"] == "none") is _daemon_allows_fills(ops_env, state_name)
+
+
+def test_a_latched_kill_switch_wins_over_every_account_reason(ops_env):
+    snap(ops_env.conn, NOW - timedelta(seconds=5), 800.0, 1000.0)
+    assert _current(ops_env, kill_switch=LATCHED)["fill_hold"] == "kill_switch"
+    assert _current(ops_env, kill_switch=LATCHED)["snapshot_freshness"] == "fresh"
+
+
+def test_the_service_never_shows_no_stop_while_the_state_is_unreadable_or_the_marker_stays(
+        ops_env, monkeypatch):
+    snap(ops_env.conn, ops_env.wall() - timedelta(seconds=5), 1000.0, 1000.0)
+    service = ops_env.service()
+    assert service.performance(Principal.OPS_WEB, "7d")["current"]["fill_hold"] in (
+        "none", "kill_switch")
+
+    def broken(deadline):
+        raise OSError("state")
+
+    monkeypatch.setattr(service, "_read_kill_switch", broken)
+    assert service.performance(Principal.OPS_WEB, "7d")["current"]["fill_hold"] == "unknown"
+
+    marker = {"latched": True, "generation": 1, "latched_at": None,
+              "reconcile_required": True}
+    monkeypatch.setattr(service, "_read_kill_switch", lambda deadline: (None, marker))
+    assert service.performance(Principal.OPS_WEB, "7d")["current"]["fill_hold"] == "kill_switch"
 
 
 def test_the_current_row_is_read_in_the_same_transaction_as_the_aggregates(
@@ -683,6 +773,88 @@ def test_the_fallback_query_gives_the_same_answer_as_the_adjacent_id_join(
     slow = read(ops_env, "7d")
     assert fast == slow
     assert len({p["seg"] for p in fast["points"]}) == 3
+
+
+def _permuted_ids(conn):
+    """時刻の順は id 1, 3, 2, 4。隣の id との結合では 3 → 2 の欠けが見えない。"""
+    many(conn, [(at(-60).isoformat(), 1000.0, 1000.0, 1000.0, 0.0, "paper"),
+                (at(-45).isoformat(), 1002.0, 1002.0, 1002.0, 0.0, "paper"),
+                (at(-59).isoformat(), 1001.0, 1001.0, 1001.0, 0.0, "paper"),
+                (at(-44).isoformat(), 1003.0, 1003.0, 1003.0, 0.0, "paper")])
+
+
+def test_ids_that_are_swapped_only_in_the_middle_still_cut_at_the_real_gap(ops_env):
+    _permuted_ids(ops_env.conn)
+    assert pv._ids_follow_time(ops_env.conn, at(-70).isoformat(), NOW.isoformat()) is False
+    data = read(ops_env, "7d")
+    assert [p["equity_last"] for p in data["points"]] == [1001.0, 1003.0]
+    assert [p["seg"] for p in data["points"]] == [0, 1]
+    assert data["points"][0]["start_at"] == at(-60).isoformat()
+    assert data["points"][1]["start_at"] == at(-45).isoformat()
+
+
+def test_both_row_queries_agree_when_the_ids_follow_time_and_the_fast_one_is_refused_otherwise(
+        ops_env):
+    conn = ops_env.conn
+    rows = minute_rows(NOW - timedelta(hours=5), 60, equity=1000.0, step=1.0)
+    rows += minute_rows(NOW - timedelta(hours=2), 20, equity=900.0, step=-1.0)
+    many(conn, rows)
+    lo, hi = (NOW - timedelta(days=1)).isoformat(), NOW.isoformat()
+    assert pv._ids_follow_time(conn, lo, hi) is True
+    by_id = [tuple(r) for r in pv._special_rows_by_id(conn, lo, hi)]
+    by_window = [tuple(r) for r in pv._special_rows_by_window(conn, lo, hi)]
+    assert by_id == by_window and by_id
+    conn.execute("DELETE FROM account_snapshots")
+    conn.commit()
+    _permuted_ids(conn)
+    assert pv._ids_follow_time(conn, lo, hi) is False
+
+
+def test_equal_times_in_id_order_still_allow_the_fast_query(ops_env):
+    conn = ops_env.conn
+    many(conn, [(at(-5).isoformat(), 1000.0, 1000.0, 1000.0, 0.0, "paper")] * 3)
+    assert pv._ids_follow_time(conn, at(-10).isoformat(), NOW.isoformat()) is True
+
+
+_BAD_TIMES = ["T11:56:0A+00:00", "T11:5A:00+00:00", "T11:60:00+00:00", "T11:56:61+00:00",
+              "T11:56:00.12345A+00:00"]
+
+
+@pytest.mark.parametrize("tail", _BAD_TIMES)
+@pytest.mark.parametrize("cashflow", [0.0, 5.0])
+def test_a_shaped_but_unreadable_time_is_excluded_counted_and_cuts_the_line(
+        ops_env, tail, cashflow):
+    conn = ops_env.conn
+    day = (NOW - timedelta(days=1)).isoformat()[:10]
+    stamp = day + tail
+    many(conn, [((NOW - timedelta(days=1, minutes=5)).isoformat(), 1000.0, 1000.0, 1000.0,
+                 0.0, "paper")])
+    conn.execute("INSERT INTO account_snapshots(ts,balance,equity,hwm,cashflow) "
+                 "VALUES (?,?,?,?,?)", (stamp, 1.0, 5.0, 5.0, cashflow))
+    conn.commit()
+    many(conn, [((NOW - timedelta(days=1, minutes=-5)).isoformat(), 1001.0, 1001.0, 1001.0,
+                 0.0, "paper")])
+    data = read(ops_env, "7d")
+    assert data["quality"]["invalid_snapshots"] == 1
+    assert [p["equity_last"] for p in data["points"]] == [1000.0, 1001.0]
+    assert data["points"][0]["seg"] != data["points"][1]["seg"]
+    assert data["stats"]["equity_min"] == 1000.0
+    json.dumps(data, allow_nan=False)
+
+
+def test_the_sql_time_check_agrees_with_the_python_reader_on_every_field_boundary(ops_env):
+    import itertools
+    conn = ops_env.conn
+    checked = 0
+    for year, month, day, hour, minute, second, frac in itertools.product(
+            ("0000", "1900", "2024", "2025", "2100"), ("00", "01", "02", "04", "12", "13"),
+            ("00", "01", "28", "29", "30", "31", "32"), ("00", "23", "24", "25"),
+            ("00", "59", "60"), ("00", "59", "60", "61"), ("", ".000001", ".00000A")):
+        stamp = f"{year}-{month}-{day}T{hour}:{minute}:{second}{frac}+00:00"
+        bad = conn.execute(f"SELECT {pv._bad_time('ts')} FROM (SELECT ? AS ts)", (stamp,)).fetchone()[0]
+        assert bool(bad) is (pv._parse(stamp) is None), stamp
+        checked += 1
+    assert checked > 10000
 
 
 def test_rows_with_missing_ids_or_out_of_order_ids_are_still_cut_correctly(ops_env):

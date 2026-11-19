@@ -77,16 +77,35 @@ def _int(value: object) -> int | None:
 
 # --- 行の検査 (SQL と Python の両方で同じ規則) ------------------------------------------
 
-def _bad_values(alias: str) -> str:
-    """時刻・数値が使えない行 (UTC の文字列の形でない、数でない、有限でない)。
+def _bad_time(column: str) -> str:
+    """UTC の ``YYYY-MM-DDTHH:MM:SS[.ffffff]+00:00`` として読めない時刻 (形と暦と時刻の範囲)。
 
-    時刻は形 (型・長さ・UTC の接尾辞) だけを SQL で見て、読めるかは切れ目・端の行を読む
-    Python 側で確かめる。数の検査は ``BETWEEN`` 1 回で、文字列・blob・無限大をまとめて外す
-    (NULL は列の制約で無い)。"""
-    parts = [f"typeof({alias}ts)<>'text'", f"length({alias}ts) NOT IN (25,32)",
-             f"substr({alias}ts,-6)<>'+00:00'"]
+    型・長さ・接尾辞・区切り・小数部の桁を安い順に見て、SQLite の ``unixepoch`` が読めない
+    もの (月・日・分・秒の範囲外) を外す。``unixepoch`` が通してしまう 24 時、30 日までの月の
+    31 日、2 月 30・31 日、閏年でない年の 2 月 29 日は文字列の比較で外す (Python の読み方と一致)。
+    行ごとに走るので、重い日付の関数は使わない。"""
+    year = f"CAST(substr({column},1,4) AS INTEGER)"
+    month_day = f"substr({column},6,5)"
+    return (f"(typeof({column})<>'text' OR length({column}) NOT IN (25,32) "
+            f"OR substr({column},-6)<>'+00:00' "
+            f"OR substr({column},11,3) NOT BETWEEN 'T00' AND 'T23' "
+            f"OR (length({column})=32 AND (substr({column},20,1)<>'.' "
+            f"OR substr({column},21,6) GLOB '*[^0-9]*')) "
+            f"OR unixepoch({column}) IS NULL OR {column}<'0001' "
+            f"OR (substr({column},9,2)>'28' AND ("
+            f"{month_day} IN ('02-30','02-31','04-31','06-31','09-31','11-31') "
+            f"OR ({month_day}='02-29' AND NOT ({year}%4=0 AND ({year}%100<>0 OR {year}%400=0))))))")
+
+
+def _bad_values(alias: str) -> str:
+    """時刻・数値が使えない行 (UTC の時刻として読めない、数でない、有限でない)。
+
+    数の検査は ``BETWEEN`` 1 回で、文字列・blob・無限大をまとめて外す
+    (NULL は列の制約で無い)。時刻の検査は行ごとの安い条件の後ろに置く。"""
+    parts = []
     for column in ("equity", "balance", "hwm", "cashflow"):
         parts.append(f"{alias}{column} NOT BETWEEN -{_MAX_PLAIN!r} AND {_MAX_PLAIN!r}")
+    parts.append(_bad_time(f"{alias}ts"))
     return "(" + " OR ".join(parts) + ")"
 
 
@@ -130,19 +149,17 @@ def _special_rows_by_window(conn, lo: str, hi: str) -> list[sqlite3.Row]:
 
 
 def _ids_follow_time(conn, lo: str, hi: str) -> bool:
-    """窓内の id が連続していて、時刻の順と id の順が一致するか (隣の id との結合が使える条件)。"""
-    n, low, high = conn.execute(
-        "SELECT COUNT(*),MIN(id),MAX(id) FROM account_snapshots WHERE ts>=? AND ts<=?",
-        (lo, hi)).fetchone()
+    """窓内の id が連続していて、隣り合う id のどの組も時刻が戻らないか。
+
+    成り立てば id の順と ``(ts, id)`` の順が一致し、隣の id との結合が使える。1 回の走査で
+    行数・id の幅・戻りの有無を見る。"""
+    n, low, high, backwards = conn.execute(
+        "SELECT COUNT(*),MIN(a.id),MAX(a.id),MAX(b.ts<a.ts) FROM account_snapshots a "
+        "LEFT JOIN account_snapshots b ON b.id=a.id+1 AND b.ts>=? AND b.ts<=? "
+        "WHERE a.ts>=? AND a.ts<=?", (lo, hi, lo, hi)).fetchone()
     if n == 0:
         return True
-    if high - low + 1 != n:
-        return False
-    first = conn.execute("SELECT id FROM account_snapshots WHERE ts>=? AND ts<=? "
-                         "ORDER BY ts,id LIMIT 1", (lo, hi)).fetchone()[0]
-    last = conn.execute("SELECT id FROM account_snapshots WHERE ts>=? AND ts<=? "
-                        "ORDER BY ts DESC,id DESC LIMIT 1", (lo, hi)).fetchone()[0]
-    return first == low and last == high
+    return high - low + 1 == n and not backwards
 
 
 # --- 区間と束 -------------------------------------------------------------------------
@@ -418,14 +435,14 @@ def _cuts(conn, lo: str, hi: str, ledger_ids: frozenset[int], quality: _Quality
 
     for row in rows:
         pos = (row["ts"], row["id"])
-        if row["bad"] or row["source"] not in _SOURCES:
+        here = None if row["bad"] else _parse(row["ts"])
+        if row["bad"] or here is None or row["source"] not in _SOURCES:
             bad_rows.append(pos)
-            if row["bad"]:
+            if row["bad"] or here is None:
                 quality.invalid_snapshots += 1
             else:
                 other_sources += 1
             continue
-        here = _parse(row["ts"])
         before = _parse(row["prev_ts"]) if row["prev_ts"] is not None else None
         if before is not None:
             if here < before or (here - before).total_seconds() > GAP_SEC:
@@ -676,9 +693,24 @@ def _select_marks(marks: list[_Mark], start: datetime, end: datetime
 
 # --- 今の状態 -------------------------------------------------------------------------
 
+def _state_hold(kill_switch: object) -> str | None:
+    """state が約定を止める理由。ラッチ中 (marker の投影を含む) は ``kill_switch``、
+    読めない・形が違うは ``unknown``、止めないなら None。"""
+    if not isinstance(kill_switch, dict):
+        return "unknown"
+    latched, pending = kill_switch.get("latched"), kill_switch.get("reconcile_required")
+    if type(latched) is not bool or type(pending) is not bool:
+        return "unknown"
+    return "kill_switch" if latched or pending else None
+
+
 def current_block(conn: sqlite3.Connection, now: datetime, *, kill_pct: float,
                   kill_switch: dict | None, state_fetched_at: datetime) -> dict:
-    """今の資金保護の状態。daemon と同じ最新行・同じ DD の関数で出し、読めなければ不明に倒す。"""
+    """今の資金保護の状態。daemon と同じ最新行・同じ DD の関数で出し、読めなければ不明に倒す。
+
+    ``fill_hold`` は daemon が約定を止める理由の総合 (ラッチ > state 不明 > 口座)。
+    ``none`` は、state が読めてラッチも途中の marker も無く、口座が新鮮で equity が正で
+    DD が閾値未満のときだけ。"""
     row = snapshots.latest(conn)
     stamp = _parse(row["ts"]) if row is not None else None
     equity = _number(row["equity"]) if row is not None else None
@@ -689,20 +721,21 @@ def current_block(conn: sqlite3.Connection, now: datetime, *, kill_pct: float,
            "snapshot_fetched_at": _iso(now), "snapshot_age_sec": None,
            "snapshot_freshness": "unknown", "dd_pct": None, "kill_level": None,
            "headroom": None, "kill_pct": kill_pct, "fill_hold": "unknown"}
-    if not usable:
-        return out
-    out["snapshot_age_sec"] = max(0.0, (now - stamp).total_seconds())
-    out["dd_pct"] = accounting.drawdown_pct(equity, hwm)
-    out["kill_level"] = hwm * (1.0 - kill_pct / 100.0)
-    out["headroom"] = equity - out["kill_level"]
-    if accounting.is_stale(stamp, now):
-        out["snapshot_freshness"], out["fill_hold"] = "stale", "stale"
-    elif equity <= 0:
-        out["snapshot_freshness"], out["fill_hold"] = "fresh", "unknown"
-    elif accounting.drawdown_kill_reached(equity, hwm, kill_pct):
-        out["snapshot_freshness"], out["fill_hold"] = "fresh", "drawdown"
-    else:
-        out["snapshot_freshness"], out["fill_hold"] = "fresh", "none"
+    account_hold = "unknown"
+    if usable:
+        out["snapshot_age_sec"] = max(0.0, (now - stamp).total_seconds())
+        out["dd_pct"] = accounting.drawdown_pct(equity, hwm)
+        out["kill_level"] = hwm * (1.0 - kill_pct / 100.0)
+        out["headroom"] = equity - out["kill_level"]
+        if accounting.is_stale(stamp, now):
+            out["snapshot_freshness"], account_hold = "stale", "stale"
+        elif equity <= 0:
+            out["snapshot_freshness"] = "fresh"
+        elif accounting.drawdown_kill_reached(equity, hwm, kill_pct):
+            out["snapshot_freshness"], account_hold = "fresh", "drawdown"
+        else:
+            out["snapshot_freshness"], account_hold = "fresh", "none"
+    out["fill_hold"] = _state_hold(kill_switch) or account_hold
     return out
 
 
@@ -779,10 +812,11 @@ def _risk_multiple(row, account_currency: str, payload: object) -> tuple[float |
 
 
 def _series(acc: _Acc, start: datetime, end: datetime) -> list[dict]:
-    """決済のたびに段が動く累積損益。最新 120 件の決済だけを使い、それ以前は始点 1 点にまとめる。"""
+    """決済のたびに段が動く累積損益。時刻を置ける全決済のうち最新 120 件だけを使い、
+    それ以前の損益は始点 1 点にまとめる。損益が不明の決済は累計を動かさず、件数にだけ入る。"""
     events = sorted(acc.events, key=lambda e: (e[0], e[1]))
     if len(events) > SERIES_EVENTS:
-        earlier = sum(pnl for _, _, pnl in events[:-SERIES_EVENTS])
+        earlier = sum(pnl for _, _, pnl in events[:-SERIES_EVENTS] if pnl is not None)
         events = events[-SERIES_EVENTS:]
         points = [(events[0][0], earlier)]
         total = earlier
@@ -791,7 +825,8 @@ def _series(acc: _Acc, start: datetime, end: datetime) -> list[dict]:
         total = 0.0
     by_time: dict[datetime, float] = {}
     for stamp, _, pnl in events:
-        by_time[stamp] = by_time.get(stamp, 0.0) + pnl
+        if pnl is not None:
+            by_time[stamp] = by_time.get(stamp, 0.0) + pnl
     for stamp in sorted(by_time):
         total += by_time[stamp]
         points.append((stamp, total))
@@ -831,7 +866,8 @@ def _strategy_section(conn, start: datetime, end: datetime, account_currency: st
         "FROM orders o LEFT JOIN trade_intents i ON i.id=o.intent_id "
         "LEFT JOIN missions m ON m.id=i.mission_id "
         f"WHERE o.status IN ({marks}) AND (o.status<>'closed' OR o.closed_at IS NULL "
-        "OR o.closed_at>=?) ORDER BY o.id", (*_ORDER_STATUSES, _iso(start))).fetchall()
+        f"OR o.closed_at>=? OR {_bad_time('o.closed_at')}) ORDER BY o.id",
+        (*_ORDER_STATUSES, _iso(start))).fetchall()
     accs: dict[str, _Acc] = {}
     for row in rows:
         status = row["status"]
@@ -848,12 +884,12 @@ def _strategy_section(conn, start: datetime, end: datetime, account_currency: st
             reason = row["close_reason"] if row["close_reason"] in _REASONS else "other"
             acc.reasons[reason] += 1
             pnl = _number(row["realized_pnl"])
+            acc.events.append((closed_at, row["id"], pnl))
             if pnl is None:
                 quality.invalid_orders += row["realized_pnl"] is not None
                 continue
             acc.pnl_known += 1
             acc.total += pnl
-            acc.events.append((closed_at, row["id"], pnl))
             if pnl > 0:
                 acc.wins += 1
                 acc.gross_profit += pnl
@@ -940,11 +976,9 @@ def build(conn: sqlite3.Connection, *, range_key: str, now: datetime, kill_pct: 
         lo = row["ts"] if row is not None else None
         if lo is not None and _parse(lo) is not None:
             candidates.append(_parse(lo))
-        settled = conn.execute(
-            "SELECT closed_at FROM orders WHERE status='closed' AND closed_at IS NOT NULL "
-            "ORDER BY closed_at LIMIT 1").fetchone()
-        if settled is not None and _parse(settled[0]) is not None:
-            candidates.append(_parse(settled[0]))
+        settled = [_parse(r[0]) for r in conn.execute(
+            "SELECT closed_at FROM orders WHERE status='closed' AND closed_at IS NOT NULL")]
+        candidates.extend(stamp for stamp in settled if stamp is not None)
         start = min(candidates) if candidates else to
         lo = lo if lo is not None and _parse(lo) == start else _iso(start)
     hi = _iso(to)
