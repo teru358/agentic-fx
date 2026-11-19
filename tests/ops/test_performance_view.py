@@ -24,7 +24,7 @@ TOP_KEYS = {"range", "from", "to", "bucket_sec", "account_currency", "current", 
             "strategies", "thresholds", "omissions", "quality"}
 CURRENT_KEYS = {"kill_switch", "state_fetched_at", "snapshot_at", "snapshot_fetched_at",
                 "snapshot_age_sec", "snapshot_freshness", "dd_pct", "kill_level", "headroom",
-                "kill_pct", "fill_hold"}
+                "kill_pct", "fill_hold", "snapshot_max_age_min"}
 
 
 def at(minutes: float = 0.0, *, base: datetime = NOW) -> datetime:
@@ -1295,3 +1295,12 @@ def test_ten_times_the_production_rows_over_the_whole_range_read_within_two_seco
     assert data["stats"]["equity_last"] == rows[-1][2]
     assert sum(r["closed_count"] for r in data["strategies"]) == 240
     assert best <= 2.0, best
+
+
+def test_the_current_block_carries_the_stale_threshold_the_daemon_uses(ops_env, monkeypatch):
+    assert _current(ops_env)["snapshot_max_age_min"] == accounting.SNAPSHOT_MAX_AGE_MIN
+    monkeypatch.setattr(accounting, "SNAPSHOT_MAX_AGE_MIN", 7.0)
+    snap(ops_env.conn, NOW - timedelta(minutes=8), 900.0, 1000.0)
+    block = _current(ops_env)
+    assert block["snapshot_max_age_min"] == 7.0
+    assert block["snapshot_freshness"] == "stale"

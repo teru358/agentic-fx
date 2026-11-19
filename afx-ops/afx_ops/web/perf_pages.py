@@ -59,18 +59,23 @@ def _number(value: object) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _unsigned_zero(text: str) -> str:
+    """書式で 0 になった値 (-0.00 など) から符号を落とす。"""
+    return text[1:] if text.startswith("-") and not any(c in "123456789" for c in text) else text
+
+
 def _amount(value: object) -> str:
     number = _number(value)
     if number is None:
         return UNKNOWN
-    return f"{number:.2e}" if abs(number) >= BIG else f"{number:.2f}"
+    return f"{number:.2e}" if abs(number) >= BIG else _unsigned_zero(f"{number:.2f}")
 
 
 def _percent(value: object) -> str:
     number = _number(value)
     if number is None:
         return UNKNOWN
-    return f"{number:.2e}%" if abs(number) >= BIG else f"{number:.1f}%"
+    return f"{number:.2e}%" if abs(number) >= BIG else _unsigned_zero(f"{number:.1f}") + "%"
 
 
 def _count(value: object) -> str:
@@ -111,12 +116,9 @@ def _dict(value: object) -> dict:
 
 def range_href(tab: str, range_key: str) -> str:
     """期間の link。既定の tab と既定の期間は query に出さない。"""
-    params = []
-    if tab != tabs.default_tab(PATH):
-        params.append(f"tab={tab}")
-    if range_key != DEFAULT_RANGE:
-        params.append(f"range={range_key}")
-    return PATH + ("?" + "&amp;".join(params) if params else "")
+    item = next(i for i in tabs.TABS[PATH] if i.name == tab)
+    carry = {"range": range_key} if range_key != DEFAULT_RANGE else None
+    return tabs._href(PATH, item, carry or {}, omit_default=True)
 
 
 def _range_links(tab: str, range_key: str) -> str:
@@ -184,8 +186,13 @@ def _current(data: Mapping[str, object], tz: str) -> str:
         ("余裕", money(current.get("headroom"))),
         ("閾値 (DD)", _esc(_percent(current.get("kill_pct")))),
     ]
+    limit = _number(current.get("snapshot_max_age_min"))
+    if type(current.get("snapshot_max_age_min")) is bool or limit is None or limit <= 0:
+        stale = "最新記録が古い場合は古い記録として扱います。"
+    else:
+        stale = f"{limit:g} 分を超えた最新記録は古い記録として扱います。"
     notes = ("<p>余裕が正でも解除されたとは限りません。新規の約定が止まっているかどうかは"
-             "「新規の約定」の欄が示します。10 分を超えた最新記録は古い記録として扱います。</p>")
+             "「新規の約定」の欄が示します。" + stale + "</p>")
     return "<section><h2>今の状態</h2>" + marks.cards(items) + notes + "</section>"
 
 
@@ -284,14 +291,16 @@ def render_performance(data: Mapping[str, object], tab: str = "equity",
                        range_key: str = DEFAULT_RANGE) -> bytes:
     """資金推移の画面。合計の予算を超えるときは、印の表を説明文に置き換える 1 段だけ行う。"""
     tz = zone_of(data)
-    bar = tabs.bar(PATH, tab, carry={"range": range_key} if range_key != DEFAULT_RANGE else None)
+    bar = tabs.bar(PATH, tab, carry={"range": range_key} if range_key != DEFAULT_RANGE else None,
+                   omit_default=True)
     head = "<p>paper の記録です</p>" + _warnings(data) + _range_links(tab, range_key)
     fixed = _current(data, tz) + _stats(data, tz)
     tail = _notes(data, tz)
     marks_part = _marks_section(data, tz)
     document = render._document("Performance", head + fixed + marks_part + tail, tz,
-                                current=PATH, tabs=bar)
+                                current=PATH, tabs=bar, refresh=False)
     if len(document) <= PAGE_BUDGET_BYTES:
         return document
     replaced = _marks_section(data, tz, table=False)
-    return render._page("Performance", head + fixed + replaced + tail, tz, current=PATH, tabs=bar)
+    return render._page("Performance", head + fixed + replaced + tail, tz, current=PATH, tabs=bar,
+                        refresh=False)

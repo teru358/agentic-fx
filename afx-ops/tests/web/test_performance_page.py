@@ -129,7 +129,7 @@ def test_the_range_links_swap_range_and_keep_the_tab_and_the_tab_bar_keeps_the_r
     assert hrefs["30 日"] == "/performance"
     assert hrefs["全期間"] == "/performance?range=all"
     bar = re.search(r'<nav class="tabs">(.*?)</nav>', html, re.S).group(1)
-    assert re.findall(r'<a href="([^"]*)"', bar) == ["/performance?tab=equity&amp;range=7d"]
+    assert re.findall(r'<a href="([^"]*)"', bar) == ["/performance?range=7d"]
     assert "range=" not in re.search(r'<nav class="tabs">(.*?)</nav>', page(), re.S).group(1)
 
 
@@ -149,7 +149,7 @@ def test_the_page_has_the_paper_sentence_the_zone_line_the_nav_mark_and_no_scrip
     nav = re.search(r"<nav>(.*?)</nav>", html, re.S).group(1)
     assert re.findall(r'<a href="([^"]*)" aria-current="page">', nav) == ["/performance"]
     assert "<script" not in html and " style=" not in html and "<svg" not in html
-    assert html.count('<meta http-equiv="refresh" content="30">') == 1
+    assert 'http-equiv="refresh"' not in html
     assert re.findall(r"<style>(.*?)</style>", html, re.S) == [render.STYLE]
 
 
@@ -581,3 +581,68 @@ def test_the_marks_budget_counts_the_heading_and_the_omission_note(monkeypatch):
     shrunk = page(data)
     assert "<table><thead><tr><th>種別" not in shrunk
     assert "表示の上限を超えたため" in shrunk and "ほか 5 件" in shrunk
+
+
+# --- 表示の細部 ---------------------------------------------------------------------
+
+@pytest.mark.parametrize("value", [-0.0, -0.001, -0.004])
+def test_a_value_that_rounds_to_zero_has_no_minus_sign(value):
+    assert perf_pages._amount(value) == "0.00"
+    assert perf_pages._percent(value) == "0.0%"
+    assert perf_pages._percent(-0.04) == "0.0%"
+
+
+def test_real_negative_values_keep_their_sign():
+    assert perf_pages._amount(-0.01) == "-0.01"
+    assert perf_pages._percent(-0.06) == "-0.1%"
+    assert perf_pages._amount(-1234.5) == "-1234.50"
+
+
+def test_a_tiny_negative_dd_does_not_render_as_a_negative_drawdown():
+    html = page(payload(current=current(dd_pct=-0.01, headroom=-0.001)))
+    assert "-0.0%" not in html and "-0.00" not in html
+
+
+@pytest.mark.parametrize("query", [None, {"range": "all"}, {"range": "7d", "tab": "equity"}])
+def test_the_page_has_no_meta_refresh(query):
+    assert 'http-equiv="refresh"' not in page(query=query)
+
+
+def test_the_replacement_page_has_no_meta_refresh_either():
+    data = payload(marks=[mark(plot_at=f"2026-11-18T01:{i % 60:02d}:03+00:00") for i in range(20)])
+    big = perf_pages.PAGE_BUDGET_BYTES
+    try:
+        perf_pages.PAGE_BUDGET_BYTES = 1
+        html = page(data)
+    finally:
+        perf_pages.PAGE_BUDGET_BYTES = big
+    assert 'http-equiv="refresh"' not in html
+
+
+@pytest.mark.parametrize("minutes,text", [(10.0, "10 分を超えた"), (5.0, "5 分を超えた"),
+                                          (12.5, "12.5 分を超えた")])
+def test_the_staleness_note_uses_the_daemons_threshold(minutes, text):
+    html = page(payload(current=current(snapshot_max_age_min=minutes)))
+    assert text in html
+
+
+@pytest.mark.parametrize("bad", [None, "x", True, 0, -1, float("nan"), float("inf")])
+def test_without_a_usable_threshold_the_note_writes_no_number(bad):
+    html = page(payload(current=current(snapshot_max_age_min=bad)))
+    assert "分を超えた" not in html and "最新記録が古い場合" in html
+
+
+def test_a_missing_threshold_key_writes_no_number():
+    data = payload()
+    assert "snapshot_max_age_min" not in data["current"]
+    assert "分を超えた" not in page(data)
+
+
+@pytest.mark.parametrize("query", [None, {"range": "7d"}, {"range": "all", "tab": "equity"}])
+def test_the_tab_link_and_the_range_links_agree_on_one_url_per_view(query):
+    html = page(query=query)
+    bar = re.search(r'<nav class="tabs">(.*?)</nav>', html, re.S).group(1)
+    tab_href = re.findall(r'<a href="([^"]*)"', bar)[0].replace("&amp;", "&")
+    range_key = (query or {}).get("range", "30d")
+    assert tab_href == perf_pages.range_href("equity", range_key).replace("&amp;", "&")
+    assert "tab=equity" not in tab_href

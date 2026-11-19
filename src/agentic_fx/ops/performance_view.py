@@ -728,14 +728,15 @@ def current_block(conn: sqlite3.Connection, now: datetime, *, kill_pct: float,
            "snapshot_at": None if stamp is None else _iso(stamp),
            "snapshot_fetched_at": _iso(now), "snapshot_age_sec": None,
            "snapshot_freshness": "unknown", "dd_pct": None, "kill_level": None,
-           "headroom": None, "kill_pct": kill_pct, "fill_hold": "unknown"}
+           "headroom": None, "kill_pct": kill_pct, "fill_hold": "unknown",
+           "snapshot_max_age_min": accounting.SNAPSHOT_MAX_AGE_MIN}
     account_hold = "unknown"
     if usable:
         out["snapshot_age_sec"] = max(0.0, (now - stamp).total_seconds())
         out["dd_pct"] = accounting.drawdown_pct(equity, hwm)
         out["kill_level"] = hwm * (1.0 - kill_pct / 100.0)
         out["headroom"] = equity - out["kill_level"]
-        if accounting.is_stale(stamp, now):
+        if accounting.is_stale(stamp, now, max_age_min=accounting.SNAPSHOT_MAX_AGE_MIN):
             out["snapshot_freshness"], account_hold = "stale", "stale"
         elif equity <= 0:
             out["snapshot_freshness"] = "fresh"

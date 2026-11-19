@@ -129,7 +129,7 @@ def test_the_csp_style_hash_is_the_hash_of_the_embedded_css():
         assert "<script" not in page and " style=" not in page, path
 
 
-def test_every_page_has_the_route_nav_and_a_read_only_refresh():
+def test_every_page_has_the_route_nav_and_a_read_only_refresh_except_the_costly_performance_read():
     static = [route.path for route in ROUTE_TABLE if "{" not in route.path]
     # /approvals は nav に出さず、/plugins の画面から辿る
     in_nav = ["/", "/plugins", "/improve", "/performance", "/logs", "/activity"]
@@ -139,7 +139,8 @@ def test_every_page_has_the_route_nav_and_a_read_only_refresh():
         nav = re.search(r"<nav>(.*?)</nav>", page, re.S).group(1)
         assert re.findall(r'<a href="([^"]*)"(?: aria-current="page")?>', nav) == in_nav, path
         assert 'Approvals</a>' not in nav, path
-        assert page.count('<meta http-equiv="refresh" content="30">') == 1, path
+        expected = 0 if path == "/performance" else 1
+        assert page.count('<meta http-equiv="refresh" content="30">') == expected, path
 
 
 def test_each_pending_approval_links_to_its_detail_route():

@@ -119,7 +119,7 @@ web (afx-ops) ──GET /v1/performance?range=30d──▶ daemon (ops API、sta
 
 | 入れ子 | 全 key と意味 |
 |---|---|
-| `current` | `kill_switch` (下記の status と同形 / 取得不能は null)、`state_fetched_at`、`snapshot_at` (最新行時刻 / null)、`snapshot_fetched_at`、`snapshot_age_sec` (非負秒 / null)、`snapshot_freshness` (`fresh/stale/unknown`)、`dd_pct,kill_level,headroom` (算出不能は null)、`kill_pct` (現閾値)、`fill_hold` (`kill_switch/stale/drawdown/none/unknown`、daemon が約定を止める理由の総合) |
+| `current` | `kill_switch` (下記の status と同形 / 取得不能は null)、`state_fetched_at`、`snapshot_at` (最新行時刻 / null)、`snapshot_fetched_at`、`snapshot_age_sec` (非負秒 / null)、`snapshot_freshness` (`fresh/stale/unknown`)、`dd_pct,kill_level,headroom` (算出不能は null)、`kill_pct` (現閾値)、`fill_hold` (`kill_switch/stale/drawdown/none/unknown`、daemon が約定を止める理由の総合)、`snapshot_max_age_min` (陳腐化と扱う閾値・分。daemon の判定と同じ定数) |
 | 代表点 | `start_at,end_at,last_at` (部分束の実時刻)、`equity_min,equity_max,equity_last,balance_last`、`seg` (非負整数)。null 無し。帯は `[start_at,end_at]`、代表線は last_at に置く |
 | `stats` | `first_at,last_at,equity_first,equity_last,balance_first,balance_last,equity_min,equity_max,balance_min,balance_max,dd_max,dd_max_at`。期間が空・算出不能は null。極値同値は最初の `(ts,id)` |
 | 印 | `kind` (`latched/released/rebase/cashflow/unknown_hwm_drop`)、`plot_at`、`occurred_at,recorded_at` (実時刻 / 記録時刻、不明は null)、`source_snapshot_ts,applied_at` (付け直し専用、他は null)、`generation` (非該当は null)、`time_source` (`state/ledger/event_ts/snapshot`)。付け直しの occurred_at / recorded_at は共に null |

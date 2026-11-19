@@ -196,11 +196,11 @@ def _document(title: str, body: str, tz: str | None = None, *, refresh: bool = T
 
 
 def _page(title: str, body: str, tz: str | None = None, *, current: str | None = None,
-          tabs: str = "") -> bytes:
-    document = _document(title, body, tz, current=current, tabs=tabs)
+          tabs: str = "", refresh: bool = True) -> bytes:
+    document = _document(title, body, tz, refresh=refresh, current=current, tabs=tabs)
     if len(document) <= MAX_RESPONSE_BYTES:
         return document
-    return _page(title, "<p>Output clipped</p>", tz, current=current, tabs=tabs)
+    return _page(title, "<p>Output clipped</p>", tz, current=current, tabs=tabs, refresh=refresh)
 
 
 # Status の概要の群と、群の中の並び。allowlist (STATUS_FIELDS) と同じ集合を並べる
