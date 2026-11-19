@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 175 件。完了分は closed/。
+未完了: 176 件。完了分は closed/。
 
 ## 実装中 (1)
 
@@ -63,9 +63,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (156)
+## 設計待ち (157)
 
-### 不具合 (82)
+### 不具合 (83)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -138,6 +138,7 @@
 | [killswitch-latched-activity-repeats](open/killswitch-latched-activity-repeats.md) | 低 | 2026-11-14 | 同一 kill switch 世代で繰り返される latch activity を一件にする |
 | [paper-starting-balance-cashflow-history](open/paper-starting-balance-cashflow-history.md) | 低 | 2026-11-15 | paper.starting_balance の変更が cashflow 履歴に残らない |
 | [web-approval-detail-budget-review](open/web-approval-detail-budget-review.md) | 低 | 2026-11-18 | 承認詳細で日本語の長い申告があると params の差分と申告が切られる |
+| [backtest-avg-r-currency-mismatch](open/backtest-avg-r-currency-mismatch.md) | 低 | 2026-11-19 | backtest の avg_r が口座通貨の損益を quote 通貨のリスク額で割る |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backtest-scheduler-log-leak](open/backtest-scheduler-log-leak.md) | 低 |  | backtest 内部 Scheduler の `maintain_reservations failed: no c… |
 | [graceful-stop-waits-mission](open/graceful-stop-waits-mission.md) | 低 |  | graceful stop が走行中 improve mission の timeout (最大 60 分) を待つ … |
