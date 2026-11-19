@@ -209,6 +209,13 @@ def test_a_dict_reply_of_the_wrong_shape_is_502(method, data):
     ("/approvals/7", "approval", {"id": "7"}),
     ("/logs", "log", {"lines": "x"}),
     ("/activity", "activity", {"lines": {"a": 1}}),
+    ("/performance", "performance", {}),
+    ("/performance", "performance", {"points": [], "hwm_steps": [], "marks": [],
+                                     "strategies": "x", "stats": {}}),
+    ("/performance", "performance", {"points": {}, "hwm_steps": [], "marks": [],
+                                     "strategies": [], "stats": {}}),
+    ("/performance", "performance", {"points": [], "hwm_steps": [], "marks": [],
+                                     "strategies": [], "stats": None}),
 ])
 def test_every_route_checks_the_reply_shape_before_rendering(method, path, client_method, data):
     class Odd:

@@ -5,6 +5,7 @@ query の検査・帯・renderer の振り分けは、この表だけを読む�
 from __future__ import annotations
 
 import html
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -32,6 +33,7 @@ class Tab:
 
 ACTIVITY_CATEGORIES = ("NEWS", "TECH", "AGGREGATE", "TRADE", "IMPROVE", "APPROVAL", "SYSTEM")
 ALL = "all"
+PERFORMANCE = "/performance"
 PLUGIN_DETAIL = "/plugins/{name}"
 IMPROVE_DETAIL = "/improve/{id}"
 APPROVAL_DETAIL = "/approvals/{id}"
@@ -71,6 +73,7 @@ TABS: dict[str, tuple[Tab, ...]] = {
         Tab("change", "変更", Link(TAB, "change")),
         Tab("claims", "申告", Link(TAB, "claims")),
     ),
+    "/performance": (Tab("equity", "資金推移", Link(TAB, "equity")),),
     "/activity": (Tab(ALL, "全件", Link(CATEGORY, None)),)
     + tuple(Tab(name, name, Link(CATEGORY, name)) for name in ACTIVITY_CATEGORIES),
 }
@@ -86,7 +89,10 @@ def default_tab(path: str) -> str:
     return TABS[path][0].name
 
 
-def _href(path: str, item: Tab, carry: Mapping[str, int]) -> str:
+_CARRY_WORD = re.compile(r"[0-9a-z]{1,8}\Z")
+
+
+def _href(path: str, item: Tab, carry: Mapping[str, int | str]) -> str:
     params: list[tuple[str, str]] = []
     link = item.link
     if link.kind == PATH:
@@ -96,13 +102,13 @@ def _href(path: str, item: Tab, carry: Mapping[str, int]) -> str:
     elif link.kind == CATEGORY and link.value is not None:
         params.append(("category", link.value))
     for key, number in carry.items():
-        if type(number) is int:
+        if type(number) is int or (type(number) is str and _CARRY_WORD.match(number)):
             params.append((key, str(number)))
     query = "&".join(f"{key}={value}" for key, value in params)
     return html.escape(path + ("?" + query if query else ""), quote=True)
 
 
-def bar(path: str, current: str, *, carry: Mapping[str, int] | None = None,
+def bar(path: str, current: str, *, carry: Mapping[str, int | str] | None = None,
         writable: bool = False, at: str | None = None) -> str:
     """h1 の下に置く帯。href は path・固定表の値・検査済みの整数だけで組む。
 

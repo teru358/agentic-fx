@@ -27,6 +27,7 @@ ROUTE_TABLE = (
     Route("/plugins/{name}", "plugin"),
     Route("/improve", "improve_list"),
     Route("/improve/{id}", "improve_detail"),
+    Route("/performance", "performance"),
 )
 
 _EXACT = {route.path: route for route in ROUTE_TABLE if "{" not in route.path}

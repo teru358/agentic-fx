@@ -270,7 +270,7 @@ def test_with_write_on_a_method_outside_the_route_is_405_without_daemon_call(met
 
 
 @pytest.mark.parametrize("path", ["/", "/approvals", "/approvals/7", "/logs", "/activity",
-                                  "/plugins", "/plugins/x"])
+                                  "/plugins", "/plugins/x", "/performance"])
 def test_with_write_on_a_read_route_still_refuses_every_change_method(path):
     from _write_support import Rig
     rig = Rig()

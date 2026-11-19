@@ -107,9 +107,13 @@ class ReadClient:
     def improve_detail(self, mission_id):
         return Reply(200, {"id": mission_id, "snapshot": None, "summary": None}, None)
 
+    def performance(self, *, range):
+        return Reply(200, {"points": [], "hwm_steps": [], "marks": [], "strategies": [],
+                           "stats": {}}, None)
+
 
 PAGES = ["/", "/approvals", "/approvals/7", "/logs", "/activity", "/plugins", "/plugins/rsi",
-         "/improve", "/improve/3", "/missing"]
+         "/improve", "/improve/3", "/performance", "/missing"]
 
 
 def test_the_csp_style_hash_is_the_hash_of_the_embedded_css():
@@ -128,7 +132,7 @@ def test_the_csp_style_hash_is_the_hash_of_the_embedded_css():
 def test_every_page_has_the_route_nav_and_a_read_only_refresh():
     static = [route.path for route in ROUTE_TABLE if "{" not in route.path]
     # /approvals は nav に出さず、/plugins の画面から辿る
-    in_nav = ["/", "/plugins", "/improve", "/logs", "/activity"]
+    in_nav = ["/", "/plugins", "/improve", "/performance", "/logs", "/activity"]
     assert sorted(in_nav + ["/approvals"]) == sorted(static)
     for path in PAGES:
         page = handle_request(Request("GET", path, {}), ReadClient()).body.decode()

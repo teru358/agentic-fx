@@ -68,6 +68,12 @@ APPROVAL_STATUS = {"approved": OK, "pending": WARN, "rejected": NEUTRAL, "expire
                    "invalidated": NEUTRAL}
 
 
+# performance (今の資金保護の状態)。語は daemon の performance 応答の写し
+FILL_HOLD = {"kill_switch": DANGER, "unknown": UNKNOWN, "stale": WARN, "drawdown": DANGER,
+             "none": OK}
+FRESHNESS = {"fresh": OK, "stale": WARN, "unknown": UNKNOWN}
+
+
 def level_of(table: Mapping[str, str], raw: object) -> str:
     """表にある語の level。表に無い値・型違いは不明 (正常に倒さない)。"""
     return table[raw] if type(raw) is str and raw in table else UNKNOWN
