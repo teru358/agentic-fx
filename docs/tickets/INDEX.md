@@ -1,15 +1,21 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 176 件。完了分は closed/。
+未完了: 178 件。完了分は closed/。
 
-## 実装中 (1)
+## 実装中 (2)
 
 ### 不具合 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [live-confirmed-bars-into-history](open/live-confirmed-bars-into-history.md) | 高 | 2026-09-21 | backtest の履歴が自動で更新されず、評価が古い入力で通る |
+
+### 機能 (1)
+
+| id | 優先 | 起票 | 概要 |
+|---|---|---|---|
+| [web-ui-charts-equity-indicators](open/web-ui-charts-equity-indicators.md) | 低 | 2026-10-11 | 同梱 web に資金遷移グラフとチャート重ね表示 |
 
 ## 実装待ち (12)
 
@@ -63,7 +69,7 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (157)
+## 設計待ち (158)
 
 ### 不具合 (83)
 
@@ -153,7 +159,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (44)
+### 機能 (45)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -181,7 +187,6 @@
 | [restricted-state-followups](open/restricted-state-followups.md) | 低 | 2026-10-02 | restricted 状態の残り: 欠落の記録、入力契約のテスト、結合検証 |
 | [improve-daily-params-weekly-algorithm](open/improve-daily-params-weekly-algorithm.md) | 低 | 2026-10-03 | 改善を日次のパラメータ調整と週次のアルゴリズム改善に分ける |
 | [verify-backend-isolated-via-service](open/verify-backend-isolated-via-service.md) | 低 | 2026-10-11 | 隔離付きの backend 疎通確認を service 経由 (ops API / afx ctl) で提供する |
-| [web-ui-charts-equity-indicators](open/web-ui-charts-equity-indicators.md) | 低 | 2026-10-11 | 同梱 web に資金遷移グラフとチャート重ね表示 |
 | [afx-init-reset-builtin](open/afx-init-reset-builtin.md) | 低 | 2026-10-12 | afx init --reset (内蔵のリセット) を追加する |
 | [trade-backend-opencode-single-local-path](open/trade-backend-opencode-single-local-path.md) | 低 | 2026-10-14 | 取引判断にも opencode backend を許し、完全ローカル運用を opencode 1 本に |
 | [wizard-stage4-menu-per-role](open/wizard-stage4-menu-per-role.md) | 低 | 2026-10-14 | 段 4 の LLM 構成メニューを役割ごとの 2 問に揃える |
@@ -199,6 +204,8 @@
 | [datafeed-fetch-evidence-and-bridge-completeness](open/datafeed-fetch-evidence-and-bridge-completeness.md) | 低 | 2026-11-03 | 価格取得の証跡と bridge の過去区間の完全性保証 (tick 無しの証明) |
 | [cli-datetime-input-in-display-timezone](open/cli-datetime-input-in-display-timezone.md) | 低 | 2026-11-06 | CLI の日時入力 (--from / --to) を表示 tz で解釈する |
 | [approval-retry-button-always-shown](open/approval-retry-button-always-shown.md) | 低 | 2026-11-07 | Discord の承認カードに Retry が常に出て、未承認の依頼では承認と同じになる |
+| [web-decision-close-vs-hold-r-compare](open/web-decision-close-vs-hold-r-compare.md) | 低 | 2026-11-19 | 判断による決済と SL/TP まで持った場合の R の比較を見せる |
+| [web-price-chart-overlays](open/web-price-chart-overlays.md) | 低 | 2026-11-19 | 価格チャートに指標・シグナル・建玉を重ねて見せる |
 | [legacy-e2e-model](open/legacy-e2e-model.md) | 低 |  | backend を切り替えるたびにモデル名の手編集が要る |
 | [legacy-oc-qwen3-8-toolcall](open/legacy-oc-qwen3-8-toolcall.md) | 低 |  | モデルが壊れた引数でツールを連打し予算を焼く |
 
