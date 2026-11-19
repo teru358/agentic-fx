@@ -1072,7 +1072,7 @@ def test_the_view_needs_the_sqlite_version_of_its_functions(ops_env, monkeypatch
     with pytest.raises(OpsError) as raised:
         read(ops_env, "7d")
     assert raised.value.code is ErrorCode.UNAVAILABLE
-    assert raised.value.detail == "sqlite_version"
+    assert raised.value.detail == "sqlite_version_too_old: need 3.42, have 3.41.2"
 
 
 @pytest.mark.parametrize("raised_error,code", [
@@ -1128,6 +1128,77 @@ def test_a_stop_in_the_middle_of_a_large_read_interrupts_the_queries(big):
                             state_fetched_at=NOW, interrupt=interrupt)
     assert raised.value.code is ErrorCode.REQUEST_TIMEOUT
     assert len(calls) < 200
+
+
+class _Late:
+    """n 回目の確認から後を期限切れ (または停止) にする。"""
+
+    def __init__(self, error, after):
+        self.error, self.after, self.calls = error, after, 0
+
+    def __call__(self):
+        self.calls += 1
+        return self.error if self.calls > self.after else None
+
+
+def _count_checks(path):
+    counter = _Late(None, 10 ** 9)
+    pv.read_performance(path, range_key="all", now=NOW, kill_pct=KILL, account_currency="JPY",
+                        kill_switch=FREE, state_fetched_at=NOW, interrupt=counter)
+    return counter.calls
+
+
+@pytest.mark.parametrize("error,code", [
+    (OpsError(ErrorCode.REQUEST_TIMEOUT), ErrorCode.REQUEST_TIMEOUT),
+    (OpsError(ErrorCode.UNAVAILABLE), ErrorCode.UNAVAILABLE)])
+def test_a_deadline_or_stop_after_the_last_query_still_refuses_the_response(
+        ops_env, monkeypatch, error, code):
+    snap(ops_env.conn, at(-5), 1000.0)
+    expired = []
+    real = pv._point_dto
+
+    def late_point(part):
+        expired.append(True)  # 応答の組み立て (最後の SQL の後) に入った
+        return real(part)
+
+    monkeypatch.setattr(pv, "_point_dto", late_point)
+    with pytest.raises(OpsError) as raised:
+        pv.read_performance(ops_env.db_path, range_key="all", now=NOW, kill_pct=KILL,
+                            account_currency="JPY", kill_switch=FREE, state_fetched_at=NOW,
+                            interrupt=lambda: error if expired else None)
+    assert expired
+    assert raised.value.code is code
+
+
+@pytest.mark.parametrize("error,code", [
+    (OpsError(ErrorCode.REQUEST_TIMEOUT), ErrorCode.REQUEST_TIMEOUT),
+    (OpsError(ErrorCode.UNAVAILABLE), ErrorCode.UNAVAILABLE)])
+def test_a_deadline_or_stop_inside_the_python_aggregation_refuses_the_response(
+        ops_env, error, code):
+    from .test_performance_strategies import put
+    for i in range(3 * pv.CHECK_EVERY):
+        put(ops_env.conn, closed=NOW - timedelta(minutes=i + 1))
+    total = _count_checks(ops_env.db_path)
+    assert total >= 3
+    for after in range(total):
+        late = _Late(error, after)
+        with pytest.raises(OpsError) as raised:
+            pv.read_performance(ops_env.db_path, range_key="all", now=NOW, kill_pct=KILL,
+                                account_currency="JPY", kill_switch=FREE,
+                                state_fetched_at=NOW, interrupt=late)
+        assert raised.value.code is code
+
+
+def test_a_clock_that_passes_the_deadline_after_the_queries_times_the_service_out(ops_env):
+    snap(ops_env.conn, at(-5), 1000.0)
+    service = ops_env.service()
+    base = ops_env.mono()
+    ticks = iter(range(10 ** 6))
+    # 先頭の数回は期限内、その後は期限後を指す時計
+    service._monotonic = lambda: base if next(ticks) < 2 else base + 10_000.0
+    with pytest.raises(OpsError) as raised:
+        service.performance(Principal.OPS_WEB, "7d", deadline=base + 5_000.0)
+    assert raised.value.code is ErrorCode.REQUEST_TIMEOUT
 
 
 def test_the_daemon_wiring_serves_the_view(tmp_path):

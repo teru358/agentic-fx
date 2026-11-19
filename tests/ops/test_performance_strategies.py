@@ -147,7 +147,7 @@ def test_only_settlements_inside_the_closed_window_count_and_unplaced_ones_are_r
     conn.commit()
     data = read(ops_env, "7d")
     assert {r["origin"]: r["closed_count"] for r in data["strategies"]} == {"signal:alpha": 2}
-    assert data["quality"]["unplaced_closed_count"] == 2
+    assert data["quality"]["unplaced_closed_count"] == 3  # 欠落・不正・未来の 3 件
 
 
 def test_win_rate_pf_and_totals_follow_the_backtest_definitions_on_the_same_rows(ops_env):
@@ -457,3 +457,22 @@ def test_a_sum_that_overflows_is_reported_as_unknown_not_as_infinity(ops_env):
     json.dumps(data, allow_nan=False)
     row = data["strategies"][0]
     assert row["total_pnl"] is None and row["pf"] is None
+
+
+def test_a_settlement_in_the_future_does_not_start_the_whole_range_after_its_end(ops_env):
+    put(ops_env.conn, closed=NOW + timedelta(days=3))
+    data = read(ops_env, "all")
+    assert pv._parse(data["from"]) <= pv._parse(data["to"])
+    assert data["from"] == data["to"] == NOW.isoformat()
+    assert data["quality"]["unplaced_closed_count"] == 1
+    assert sum(r["closed_count"] for r in data["strategies"]) == 0
+
+
+def test_a_future_settlement_beside_a_past_one_leaves_the_start_at_the_past_one(ops_env):
+    past = NOW - timedelta(days=9)
+    put(ops_env.conn, closed=past)
+    put(ops_env.conn, closed=NOW + timedelta(days=3))
+    data = read(ops_env, "all")
+    assert data["from"] == past.isoformat()
+    assert data["quality"]["unplaced_closed_count"] == 1
+    assert sum(r["closed_count"] for r in data["strategies"]) == 1

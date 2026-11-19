@@ -43,6 +43,7 @@ EVENT_LIMIT = 5000
 
 # unixepoch(..., 'subsec') が入った版。これ未満では読めない。
 MIN_SQLITE = (3, 42, 0)
+CHECK_EVERY = 256  # Python 側の行ごとの処理で、期限・停止を確かめる間隔 (行数)
 PROGRESS_OPS = 20000      # 打ち切りの確認の間隔 (SQLite の VM 命令数)
 
 _SOURCES = ("paper", "manual_ks_rebase")
@@ -864,7 +865,8 @@ def _row_dto(acc: _Acc, series: list[dict]) -> dict:
 
 
 def _strategy_section(conn, start: datetime, end: datetime, account_currency: str,
-                      quality: _Quality) -> tuple[list[dict], int, int]:
+                      quality: _Quality, check: Callable[[], None] | None = None
+                      ) -> tuple[list[dict], int, int]:
     """起動理由ごとの成績。返り値は (行, 合算した元行の数, 図に出さない系列の数)。"""
     marks = ",".join("?" * len(_ORDER_STATUSES))
     rows = conn.execute(
@@ -876,15 +878,17 @@ def _strategy_section(conn, start: datetime, end: datetime, account_currency: st
         f"OR o.closed_at>=? OR {_bad_time('o.closed_at')}) ORDER BY o.id",
         (*_ORDER_STATUSES, _iso(start))).fetchall()
     accs: dict[str, _Acc] = {}
-    for row in rows:
+    for number, row in enumerate(rows):
+        if check is not None and number % CHECK_EVERY == 0:
+            check()
         status = row["status"]
         origin = _origin_of(row["trigger"])
         if status == "closed":
             closed_at = _parse(row["closed_at"])
-            if closed_at is None:
+            if closed_at is None or closed_at > end:
                 quality.unplaced_closed_count += 1
                 continue
-            if not start <= closed_at <= end:
+            if closed_at < start:
                 continue
             acc = accs.setdefault(origin, _Acc(origin))
             acc.closed += 1
@@ -915,6 +919,8 @@ def _strategy_section(conn, start: datetime, end: datetime, account_currency: st
         elif status in _HOLDING or (status in _HOLDING_IF_FILLED
                                     and (_number(row["filled_quantity"]) or 0) > 0):
             accs.setdefault(origin, _Acc(origin)).holding += 1
+    if check is not None:
+        check()
     ordered = sorted(accs.values(), key=lambda a: (-a.closed, a.origin))
     must = [a for a in ordered if a.origin in (CRON_ORIGIN, UNKNOWN_ORIGIN)]
     rest = [a for a in ordered if a.origin not in (CRON_ORIGIN, UNKNOWN_ORIGIN)]
@@ -934,6 +940,8 @@ def _strategy_section(conn, start: datetime, end: datetime, account_currency: st
     drawn.add(CRON_ORIGIN)
     out, hidden = [], 0
     for acc in shown + tail:
+        if check is not None:
+            check()
         draw = acc.origin in drawn and acc.closed > 0
         hidden += acc.closed > 0 and not draw
         out.append(_row_dto(acc, _series(acc, start, end) if draw else []))
@@ -951,11 +959,22 @@ def read_performance(db_path: Path, *, range_key: str, now: datetime, kill_pct: 
     ``interrupt`` は問合せの途中で定期的に呼ばれ、エラーを返すと読取を打ち切ってそれを送出する
     (部分の応答は返さない)。"""
     if sqlite3.sqlite_version_info < MIN_SQLITE:
-        raise OpsError(ErrorCode.UNAVAILABLE, detail="sqlite_version")
+        raise OpsError(
+            ErrorCode.UNAVAILABLE,
+            detail="sqlite_version_too_old: need "
+                   f"{'.'.join(map(str, MIN_SQLITE[:2]))}, have "
+                   f"{'.'.join(map(str, sqlite3.sqlite_version_info))}")
     if interrupt is not None:
         early = interrupt()
         if early is not None:
             raise early
+    check = None
+    if interrupt is not None:
+        def check() -> None:
+            error = interrupt()
+            if error is not None:
+                raise error
+
     conn = connect_readonly(db_path)
     stopped: list[OpsError] = []
     if interrupt is not None:
@@ -972,7 +991,7 @@ def read_performance(db_path: Path, *, range_key: str, now: datetime, kill_pct: 
         try:
             return build(conn, range_key=range_key, now=now, kill_pct=kill_pct,
                          account_currency=account_currency, kill_switch=kill_switch,
-                         state_fetched_at=state_fetched_at)
+                         state_fetched_at=state_fetched_at, check=check)
         except sqlite3.OperationalError:
             if stopped:
                 raise stopped[0] from None
@@ -985,12 +1004,20 @@ def read_performance(db_path: Path, *, range_key: str, now: datetime, kill_pct: 
 
 def build(conn: sqlite3.Connection, *, range_key: str, now: datetime, kill_pct: float,
           account_currency: str, kill_switch: dict | None,
-          state_fetched_at: datetime) -> dict:
+          state_fetched_at: datetime,
+          check: Callable[[], None] | None = None) -> dict:
+    """``check`` は SQL の外の長い処理の途中と、応答を返す直前に呼ばれる。送出すれば読取は打ち切り。"""
     if range_key not in RANGES:
         raise ValueError("range")
     to = now.astimezone(timezone.utc)
     quality = _Quality()
+
+    def poll() -> None:
+        if check is not None:
+            check()
+
     ledger, ledger_ids = _ledger(conn, quality)
+    poll()
     history, marks_since, clipped = ops_events.kill_switch_event_history(
         conn, limit=EVENT_LIMIT)
     if clipped:
@@ -1014,9 +1041,14 @@ def build(conn: sqlite3.Connection, *, range_key: str, now: datetime, kill_pct: 
         lo = row["ts"] if row is not None else None
         if lo is not None and _parse(lo) is not None:
             candidates.append(_parse(lo))
-        settled = [_parse(r[0]) for r in conn.execute(
-            "SELECT closed_at FROM orders WHERE status='closed' AND closed_at IS NOT NULL")]
-        candidates.extend(stamp for stamp in settled if stamp is not None)
+        for number, r in enumerate(conn.execute(
+                "SELECT closed_at FROM orders WHERE status='closed' AND closed_at IS NOT NULL")):
+            if number % CHECK_EVERY == 0:
+                poll()
+            stamp = _parse(r[0])
+            if stamp is not None and stamp <= to:
+                candidates.append(stamp)
+        candidates = [stamp for stamp in candidates if stamp <= to]
         start = min(candidates) if candidates else to
         lo = lo if lo is not None and _parse(lo) == start else _iso(start)
     hi = _iso(to)
@@ -1024,12 +1056,14 @@ def build(conn: sqlite3.Connection, *, range_key: str, now: datetime, kill_pct: 
     equity = _equity_section(conn, lo, hi, width=width,
                              span=max(1, int((to - start).total_seconds())),
                              ledger_ids=ledger_ids, quality=quality)
+    poll()
     marks += equity.marks
     shown, omitted = _select_marks(marks, start, to)
     strategies, merged_rows, hidden_series = _strategy_section(
-        conn, start, to, account_currency, quality)
+        conn, start, to, account_currency, quality, check)
     steps = _steps(equity.parts)
-    return {
+    poll()
+    result = {
         "range": range_key, "from": _iso(start), "to": hi, "bucket_sec": equity.width,
         "account_currency": account_currency,
         "current": current_block(conn, to, kill_pct=kill_pct, kill_switch=kill_switch,
@@ -1046,3 +1080,5 @@ def build(conn: sqlite3.Connection, *, range_key: str, now: datetime, kill_pct: 
                       "strategy_rows": merged_rows, "strategy_series": hidden_series},
         "quality": quality.dto(),
     }
+    poll()
+    return result

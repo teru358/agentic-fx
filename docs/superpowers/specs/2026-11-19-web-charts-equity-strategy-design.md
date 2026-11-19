@@ -94,6 +94,8 @@ web (afx-ops) ──GET /v1/performance?range=30d──▶ daemon (ops API、sta
 - **新しい読取 endpoint が 1 本要る**。今の `GET /v1/status` は今の値だけ、`GET /v1/events` は 10 月以降の event だけで、snapshot の列も注文の集計も返さない。
 - **集計は daemon 側**。web は DB を持たず、6 万行を渡すと応答が数 MB になる。daemon は束ねた代表点 (基本 280 束、分割後も最大 280 点) と集計済みの行だけを返す。
 - **scope は `status.read`**。口座の値は今も `status` で同じ principal に見せている (F20)。新しい scope は作らない。`ops-notify` (`events.read` だけ) には見えない。
+- **SQLite 3.42 以上が要る**。daemon の Python の SQLite が 3.42 未満なら 503 `unavailable`、detail は `sqlite_version_too_old: need 3.42, have <今の版>`。要件は README と `docs/operations/ops-api-2026-10-09.md` 付録に書く。
+- **期限・停止**。SQL の途中 (progress handler) に加え、SQL の外の大きな Python 処理 (決済の解析・集計・並べ替え) の途中と応答を返す直前にも確かめる。期限切れは `request_timeout`、停止は `unavailable`、部分の応答は返さない。
 - **読取専用**。監査行 (`ops_requests`) は書かない (ほかの GET と同じ)。DB への書込みは無い。
 - **CLI は足さない**。daemon の生きた状態を読むので、置くなら `afx ctl` の「稼働観測・実行追跡」だが、この段は web だけにする (§7)。`cli_surface` の検査は CLI の記録から endpoint を引く向きなので、記録の無い endpoint は通る (`tests/test_cli_surface.py:183-195`)。逆向きの検査が無いことは T1 で確かめる。
 - web 側: `WebClient.performance(range=)` を足す (`A/api_client.py:535-573`)。`WebWriteClient` は継承するので、書込みを有効にした web でも同じ。
@@ -129,7 +131,7 @@ web (afx-ops) ──GET /v1/performance?range=30d──▶ daemon (ops API、sta
 現在の口座は `snapshots.latest()` (`S/store/snapshots.py:20-24`) を source で絞らず読む。daemon と同じ `drawdown_pct`・`drawdown_kill_reached` (`S/core/accounting.py:44-52`) を使い、kill_level = HWM × (1 − kill_pct / 100)、headroom = equity − kill_level。10 分超は stale、欠損・不正値・非正 equity は unknown、他は閾値到達なら drawdown、それ以外 none (`S/core/scheduler.py:291-301`)。停止判定に余裕の表示値や符号を使わない。`fill_hold` は daemon の約定停止の総合で、優先順は (1) kill switch がラッチ中、または解除途中の marker が残る (`kill_switch`)、(2) state を読めない・形が違う (`unknown`)、(3) 上の口座の理由 (`stale/drawdown/unknown`)。`none` は、約定を止める理由が一つも無いときだけ (`S/core/scheduler.py` の `_fills_allowed_by_state` と tick の account / DD の判定と同じ条件)。state を読めないときに `none` へ倒さない。`kill_switch` の表示も併せて出し、ラッチは別に示す。
 
 同時刻の順序は daemon が id で決める。pnl_unknown_count = closed_count − pnl_known_count、r_unknown_count = closed_count − r_known_count、wins + losses + flats = pnl_known_count。
-不正行の検証は daemon が担当する。snapshot は除外して区間を切り、印は除外、注文は件数を残して該当指標を不明にし quality へ数える。非有限値・bool、不正 JSON・SL 欠落は指標不明、closed_at 欠落・不正は期間へ割り当てず unplaced_closed_count へ。
+不正行の検証は daemon が担当する。snapshot は除外して区間を切り、印は除外、注文は件数を残して該当指標を不明にし quality へ数える。非有限値・bool、不正 JSON・SL 欠落は指標不明、closed_at 欠落・不正、および to より未来の closed_at は期間へ割り当てず unplaced_closed_count へ。`range=all` の始点は to 以下の候補だけから選ぶ (from <= to)。
 web は既存の `_check_reply_shape` (`A/web/request.py:206-234`) と同じ上位の型・形だけを検査し、違えば 502。個々の表示値の異常は「不明」。再集約・合算・行検証は繰り返さず、集計値を図から再計算しない。marks_since が null なら「event の記録はありません」。
 
 ### 2.3 資金推移の間引き
