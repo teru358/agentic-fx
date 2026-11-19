@@ -1068,17 +1068,32 @@ class OpsService:
         if self._state_store is not None:
             try:
                 kill_switch = self._read_kill_switch(deadline)[1]
-            except Exception:  # noqa: BLE001 - 読めない状態は「不明」として返す
+            except Exception as exc:  # noqa: BLE001 - 読めない状態は「不明」として返す
+                if isinstance(exc, OpsError):
+                    raise
+                code = self._map_exception(exc)
+                if code in (ErrorCode.REQUEST_TIMEOUT, ErrorCode.UNAVAILABLE):
+                    raise OpsError(code) from None
                 kill_switch = None
         state_fetched_at = self._wall_clock()
+
+        def interrupt() -> OpsError | None:
+            if self.stop_event.is_set():
+                return OpsError(ErrorCode.UNAVAILABLE)
+            if self._monotonic() >= deadline:
+                return OpsError(ErrorCode.REQUEST_TIMEOUT)
+            return None
+
         try:
             return performance_view.read_performance(
                 self._db_path, range_key=range_, now=self._wall_clock(),
                 kill_pct=float(settings.risk.drawdown_kill_pct),
                 account_currency=settings.account_currency, kill_switch=kill_switch,
-                state_fetched_at=state_fetched_at)
-        except sqlite3.OperationalError:
-            raise OpsError(ErrorCode.DATABASE_BUSY) from None
+                state_fetched_at=state_fetched_at, interrupt=interrupt)
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise OpsError(ErrorCode.DATABASE_BUSY) from None
+            raise OpsError(ErrorCode.INTERNAL) from None
 
     def _deploy_ops_status(self, deadline: float) -> dict | None:
         """Blocking deploy ops and ops needing attention, or an ``unavailable`` marker."""

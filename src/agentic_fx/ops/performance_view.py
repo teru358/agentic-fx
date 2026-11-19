@@ -9,6 +9,7 @@ import json
 import math
 import sqlite3
 from dataclasses import dataclass, field, replace
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from agentic_fx.store import snapshots
 from agentic_fx.store.db import connect_readonly
 
 from . import events as ops_events
+from .contracts import ErrorCode, OpsError
 from . import trade_events
 
 RANGES = {"7d": 7, "30d": 30, "90d": 90, "all": None}
@@ -38,6 +40,10 @@ REFERENCE_COUNT = 30
 SPECIAL_LIMIT = 2000      # 切れ目・印の候補として読む行数の上限
 REGION_LIMIT = 400        # 図のために集計する区間の上限
 EVENT_LIMIT = 5000
+
+# unixepoch(..., 'subsec') が入った版。これ未満では読めない。
+MIN_SQLITE = (3, 42, 0)
+PROGRESS_OPS = 20000      # 打ち切りの確認の間隔 (SQLite の VM 命令数)
 
 _SOURCES = ("paper", "manual_ks_rebase")
 _REBASE_SOURCE = "manual_ks_rebase"
@@ -452,7 +458,8 @@ def _cuts(conn, lo: str, hi: str, ledger_ids: frozenset[int], quality: _Quality
         if row["cashflow"] != 0:
             cut(pos).split = True
             marks.append(_Mark("cashflow", here, occurred_at=here, order=row["id"]))
-        dropped = row["prev_hwm"] is not None and row["hwm"] < row["prev_hwm"]
+        prev_hwm = _number(row["prev_hwm"])
+        dropped = prev_hwm is not None and row["hwm"] < prev_hwm
         if (dropped and row["cashflow"] == 0 and not known) or (
                 row["source"] == _REBASE_SOURCE and not known):
             quality.unknown_hwm_drops += 1
@@ -937,15 +944,39 @@ def _strategy_section(conn, start: datetime, end: datetime, account_currency: st
 
 def read_performance(db_path: Path, *, range_key: str, now: datetime, kill_pct: float,
                      account_currency: str, kill_switch: dict | None,
-                     state_fetched_at: datetime) -> dict:
-    """短命の読取専用の接続で 1 本の transaction を張り、集計して閉じる。"""
+                     state_fetched_at: datetime,
+                     interrupt: Callable[[], OpsError | None] | None = None) -> dict:
+    """短命の読取専用の接続で 1 本の transaction を張り、集計して閉じる。
+
+    ``interrupt`` は問合せの途中で定期的に呼ばれ、エラーを返すと読取を打ち切ってそれを送出する
+    (部分の応答は返さない)。"""
+    if sqlite3.sqlite_version_info < MIN_SQLITE:
+        raise OpsError(ErrorCode.UNAVAILABLE, detail="sqlite_version")
+    if interrupt is not None:
+        early = interrupt()
+        if early is not None:
+            raise early
     conn = connect_readonly(db_path)
+    stopped: list[OpsError] = []
+    if interrupt is not None:
+        def watch() -> int:
+            error = interrupt()
+            if error is None:
+                return 0
+            stopped.append(error)
+            return 1
+
+        conn.set_progress_handler(watch, PROGRESS_OPS)
     try:
         conn.execute("BEGIN")
         try:
             return build(conn, range_key=range_key, now=now, kill_pct=kill_pct,
                          account_currency=account_currency, kill_switch=kill_switch,
                          state_fetched_at=state_fetched_at)
+        except sqlite3.OperationalError:
+            if stopped:
+                raise stopped[0] from None
+            raise
         finally:
             conn.rollback()
     finally:
@@ -964,6 +995,13 @@ def build(conn: sqlite3.Connection, *, range_key: str, now: datetime, kill_pct: 
         conn, limit=EVENT_LIMIT)
     if clipped:
         quality.partial = True
+    since = None
+    if marks_since is not None:
+        since_at = _parse(marks_since)
+        if since_at is None:
+            quality.partial = True
+        else:
+            since = _iso(since_at)
     marks = (_kill_switch_marks(history, ledger, kill_switch, quality)
              + _rebase_marks(ledger, quality))
     days = RANGES[range_key]
@@ -1000,7 +1038,7 @@ def build(conn: sqlite3.Connection, *, range_key: str, now: datetime, kill_pct: 
         "hwm_steps": [{"t": _iso(_parse(t)), "hwm": hwm, "seg": seg} for t, hwm, seg in steps],
         "stats": equity.stats,
         "marks": [m.dto() for m in shown], "marks_omitted": omitted,
-        "marks_since": None if marks_since is None else _iso(_parse(marks_since)),
+        "marks_since": since,
         "other_sources": equity.other_sources,
         "strategies": strategies,
         "thresholds": {"min_count": MIN_COUNT, "reference_count": REFERENCE_COUNT},
