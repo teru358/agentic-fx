@@ -50,9 +50,13 @@ def _esc(text: str) -> str:
 
 
 def _number(value: object) -> float | None:
-    if type(value) in (int, float) and math.isfinite(value):
-        return float(value)
-    return None
+    if type(value) not in (int, float):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _amount(value: object) -> str:
@@ -72,7 +76,12 @@ def _percent(value: object) -> str:
 def _count(value: object) -> str:
     if type(value) is not int or value < 0:
         return UNKNOWN
-    return str(value) if value < COUNT_LIMIT else f"{float(value):.2e}"
+    if value < COUNT_LIMIT:
+        return str(value)
+    try:
+        return f"{float(value):.2e}"
+    except OverflowError:
+        return UNKNOWN
 
 
 def _seconds(value: object) -> str:
@@ -184,7 +193,8 @@ def _current(data: Mapping[str, object], tz: str) -> str:
 
 def _stats(data: Mapping[str, object], tz: str) -> str:
     stats = _dict(data.get("stats"))
-    if stats.get("first_at") is None and stats.get("last_at") is None:
+    if "first_at" in stats and "last_at" in stats and stats["first_at"] is None \
+            and stats["last_at"] is None:
         return "<section><h2>数字で読む</h2><p>この期間の記録はありません</p></section>"
     unit = _currency(data)
     rows = []
@@ -226,7 +236,7 @@ def _mark_row(item: Mapping[str, object], tz: str) -> str:
     return "<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>"
 
 
-def _marks_section(data: Mapping[str, object], tz: str) -> str:
+def _marks_section(data: Mapping[str, object], tz: str, *, table: bool = True) -> str:
     raw = data.get("marks")
     items = [item for item in raw if type(item) is dict] if type(raw) is list else []
     shown = items[:MAX_MARKS]
@@ -235,15 +245,18 @@ def _marks_section(data: Mapping[str, object], tz: str) -> str:
     if type(daemon_omitted) is int and daemon_omitted > 0:
         omitted += daemon_omitted
     more = f"<p>ほか {_count(omitted)} 件</p>" if omitted > 0 else ""
+    heading = "<section><h2>印</h2>"
     if not shown:
-        body = "<p>印はありません</p>"
-    else:
+        return heading + "<p>印はありません</p>" + more + "</section>"
+    omitted_note = f"<p>印の表 ({len(shown)} 件) は表示の上限を超えたため省きました</p>"
+    if table:
         body = ("<table><thead><tr>" + "".join(f"<th>{name}</th>" for name in MARK_HEADERS)
                 + "</tr></thead><tbody>" + "".join(_mark_row(item, tz) for item in shown)
                 + "</tbody></table>")
-        if len(body.encode("utf-8")) > MARKS_BUDGET_BYTES:
-            body = f"<p>印の表 ({len(shown)} 件) は表示の上限を超えたため省きました</p>"
-    return "<section><h2>印</h2>" + body + more + "</section>"
+        # 表の部品の予算は、見出しと省略数の注記を含めた byte 数で見る
+        if len((heading + body + more + "</section>").encode("utf-8")) <= MARKS_BUDGET_BYTES:
+            return heading + body + more + "</section>"
+    return heading + omitted_note + more + "</section>"
 
 
 # --- 注記 ----------------------------------------------------------------------------------
@@ -280,5 +293,5 @@ def render_performance(data: Mapping[str, object], tab: str = "equity",
                                 current=PATH, tabs=bar)
     if len(document) <= PAGE_BUDGET_BYTES:
         return document
-    replaced = ("<section><h2>印</h2><p>印の表は表示の上限を超えたため省きました</p></section>")
+    replaced = _marks_section(data, tz, table=False)
     return render._page("Performance", head + fixed + replaced + tail, tz, current=PATH, tabs=bar)

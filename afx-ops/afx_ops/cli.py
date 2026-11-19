@@ -39,10 +39,22 @@ RUNTIMES: Mapping[str, Callable[[startup.Isolated], int]] = MappingProxyType({
 
 
 def _preload_zone() -> None:
-    """tz の規則を読む標準の経路と pip の tzdata を、隔離前に import しておく。"""
+    """tz の規則を読む標準の経路と pip の tzdata を、隔離前に読んでおく。
+
+    ZoneInfo は初回の解決で zipfile・importlib.util と tzdata の地域ごとの package を遅延 import する。
+    隔離後に新しい module を読まないよう、1 回解決して前者を、全 package の import で後者を済ませる。
+    """
+    import importlib
     import importlib.resources  # noqa: F401
+    import pkgutil
+    import zoneinfo
 
     import tzdata  # noqa: F401
+
+    zoneinfo.ZoneInfo("Asia/Tokyo")
+    zones = importlib.import_module("tzdata.zoneinfo")
+    for _finder, name, _ispkg in pkgutil.walk_packages(zones.__path__, "tzdata.zoneinfo."):
+        importlib.import_module(name)
 
 
 def _preload_bot() -> None:

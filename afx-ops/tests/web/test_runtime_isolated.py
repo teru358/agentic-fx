@@ -695,3 +695,18 @@ def test_a_pipelined_second_request_on_one_connection_is_not_answered(root, daem
     replies, done = serve(root, port, child_env, [raw])
     assert_finished(done)
     assert replies[0].count(b"HTTP/1.1 ") == 1
+
+
+def test_a_non_utc_display_zone_converts_without_loading_modules_after_isolation(
+        root, daemon, child_env):
+    zoned = {"display_timezone": "Asia/Tokyo"}
+    daemon.set({**ROUTES, "/v1/performance": {**PERFORMANCE, **zoned},
+                "/v1/status": {**STATUS, **zoned}})
+    port = free_port()
+    replies, done = serve(root, port, child_env, [get("/performance"), get("/")])
+    assert_finished(done)
+    for reply in replies:
+        status, _headers, body = parse(reply)
+        assert status == 200
+        assert b"+09:00" in body
+    assert b"2026-11-19 11:59:30 +09:00" in parse(replies[0])[2]

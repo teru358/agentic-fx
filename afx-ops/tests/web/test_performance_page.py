@@ -525,3 +525,59 @@ def test_the_response_data_is_not_mutated_by_rendering():
     before = copy.deepcopy(data)
     page(data)
     assert data == before
+
+
+# --- 異常値・予算の追加の検査 ----------------------------------------------------------------
+
+HUGE_INT = 10 ** 309
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_an_integer_too_large_for_a_float_is_unknown_in_every_numeric_cell(method):
+    data = payload()
+    data["stats"].update({k: HUGE_INT for k in data["stats"] if "at" not in k})
+    data["current"].update({"dd_pct": HUGE_INT, "kill_level": HUGE_INT, "headroom": HUGE_INT,
+                            "kill_pct": HUGE_INT, "snapshot_age_sec": HUGE_INT,
+                            "kill_switch": {"latched": True, "generation": HUGE_INT,
+                                            "reconcile_required": False}})
+    data["marks"] = [mark(generation=HUGE_INT)]
+    data["marks_omitted"] = HUGE_INT
+    data["other_sources"] = HUGE_INT
+    data["quality"].update({"invalid_snapshots": HUGE_INT, "invalid_marks": HUGE_INT,
+                            "unknown_hwm_drops": HUGE_INT})
+    response, _ = get(data, method=method)
+    assert response.status == 200
+    if method == "GET":
+        assert "不明" in response.body.decode()
+
+
+def test_a_page_over_the_total_budget_keeps_the_shown_and_omitted_mark_counts(monkeypatch):
+    monkeypatch.setattr(perf_pages, "PAGE_BUDGET_BYTES", 6000)
+    html = page(payload(marks=[mark() for _ in range(25)], marks_omitted=7))
+    assert "Output clipped" not in html and len(html.encode()) <= 6000
+    assert "<table><thead><tr><th>種別" not in html
+    assert "ほか 12 件" in html and "<h2>印</h2>" in html
+
+
+@pytest.mark.parametrize("stats", [{}, {"equity_first": 1.0}, {"first_at": None},
+                                   {"last_at": None}])
+def test_a_stats_object_missing_the_empty_period_shape_is_unknown_not_empty(stats):
+    data = payload()
+    data["stats"] = stats
+    html = page(data)
+    assert "この期間の記録はありません" not in html
+    assert "<h2>数字で読む</h2><table>" in html
+    assert html.split("<h2>数字で読む</h2>", 1)[1].split("</section>", 1)[0].count("不明") >= 5
+
+
+def test_the_marks_budget_counts_the_heading_and_the_omission_note(monkeypatch):
+    data = payload(marks=[mark() for _ in range(3)], marks_omitted=5)
+    html = page(data)
+    section = html.split("<h2>印</h2>", 1)[1].split("</section>", 1)[0]
+    table = section[:section.index("</table>") + len("</table>")]
+    whole = "<h2>印</h2>" + section
+    assert len(table.encode()) < len(whole.encode())
+    monkeypatch.setattr(perf_pages, "MARKS_BUDGET_BYTES", len(table.encode()) + 1)
+    shrunk = page(data)
+    assert "<table><thead><tr><th>種別" not in shrunk
+    assert "表示の上限を超えたため" in shrunk and "ほか 5 件" in shrunk
