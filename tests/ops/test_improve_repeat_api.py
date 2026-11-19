@@ -35,7 +35,7 @@ def test_the_endpoint_table_is_unchanged():
     endpoint = ENDPOINTS["improve"]
     assert (endpoint.route, endpoint.scope.value, endpoint.idempotent) == (
         "POST /v1/improve/runs", "improve.run", True)
-    assert len(ENDPOINTS) == 35
+    assert len(ENDPOINTS) == 36
 
 
 def test_an_empty_body_is_the_old_call(repeat_api):

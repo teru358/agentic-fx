@@ -271,3 +271,23 @@ def kill_switch_event_states(conn: sqlite3.Connection, generation: int) -> list[
         "AND json_extract(fields_json,'$.generation')=?", (generation,)).fetchall()
     return [(row[0], row[1]) for row in rows]
 
+
+
+_KILL_SWITCH_WHERE = ("code='guard_state_changed' AND ref='instance' "
+                      "AND json_extract(fields_json,'$.guard_kind')='kill_switch'")
+
+
+def kill_switch_event_history(conn: sqlite3.Connection, *, limit: int
+                              ) -> tuple[list[tuple[int, str, object, object]], str | None, bool]:
+    """kill switch の ``guard_state_changed`` を新しい順に最大 ``limit`` 件。
+
+    返り値は ((id, ts, state, generation) の list、最古の記録時刻、``limit`` で打ち切ったか)。
+    読むだけで、呼出し側の transaction に従う。"""
+    rows = conn.execute(
+        "SELECT id,ts,json_extract(fields_json,'$.state'),"
+        "json_extract(fields_json,'$.generation') FROM ops_events "
+        f"WHERE {_KILL_SWITCH_WHERE} ORDER BY id DESC LIMIT ?", (limit + 1,)).fetchall()
+    first = conn.execute(
+        f"SELECT MIN(ts) FROM ops_events WHERE {_KILL_SWITCH_WHERE}").fetchone()[0]
+    clipped = len(rows) > limit
+    return [tuple(row) for row in rows[:limit]], first, clipped
