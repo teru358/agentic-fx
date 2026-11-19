@@ -889,6 +889,21 @@ def _big_db(path, rows_count, *, with_events=True):
                          ((start + timedelta(days=gen)).isoformat(), "guard_state_changed",
                           "instance", json.dumps({"guard_kind": "kill_switch",
                                                   "state": "latched", "generation": gen})))
+    for index in range(240):
+        mission = conn.execute(
+            "INSERT INTO missions(loop,runner,model,status,trigger,started_at) "
+            "VALUES ('trade','local','m','done',?,?)",
+            (f"signal:s{index % 40:02d}", start.isoformat())).lastrowid
+        intent = conn.execute(
+            "INSERT INTO trade_intents(mission_id,payload_json,action,created_at) "
+            "VALUES (?,?,'open',?)", (mission, '{"stop_loss": 155.0}', start.isoformat())
+        ).lastrowid
+        closed = (start + timedelta(days=2 * index)).isoformat()
+        conn.execute(
+            "INSERT INTO orders(intent_id,pair,direction,entry_type,horizon,status,quantity,"
+            "filled_quantity,avg_fill_price,stop_loss,realized_pnl,close_reason,created_at,"
+            "updated_at,closed_at) VALUES (?,'USDJPY','long','market','day','closed',1000,1000,"
+            "156,155,?,'llm_close',?,?,?)", (intent, float(index % 7 - 3), closed, closed, closed))
     conn.commit()
     conn.close()
     return rows
@@ -913,4 +928,5 @@ def test_ten_times_the_production_rows_over_the_whole_range_read_within_half_a_s
         best = elapsed if best is None else min(best, elapsed)
     assert len(data["points"]) <= pv.MAX_POINTS
     assert data["stats"]["equity_last"] == rows[-1][2]
+    assert sum(r["closed_count"] for r in data["strategies"]) == 240
     assert best <= 0.5, best

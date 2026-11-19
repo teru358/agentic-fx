@@ -5,6 +5,7 @@ web の Performance 画面が使う読取 API の本体。DB を書かず、ops 
 """
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 from dataclasses import dataclass, field, replace
@@ -12,10 +13,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from agentic_fx.core import accounting
+from agentic_fx.datafeed.price_provider import _SPECS
 from agentic_fx.store import snapshots
 from agentic_fx.store.db import connect_readonly
 
 from . import events as ops_events
+from . import trade_events
 
 RANGES = {"7d": 7, "30d": 30, "90d": 90, "all": None}
 DEFAULT_RANGE = "30d"
@@ -24,6 +27,9 @@ MAX_POINTS = 280
 MAX_STEPS = 320
 MAX_SEGS = 32
 MAX_MARKS = 20
+MAX_STRATEGY_ROWS = 32
+SERIES_EVENTS = 120
+MAX_SERIES = 4
 GAP_SEC = 600.0
 BUCKET_DIVISOR = 279
 MIN_COUNT = 5
@@ -700,6 +706,197 @@ def current_block(conn: sqlite3.Connection, now: datetime, *, kill_pct: float,
     return out
 
 
+# --- 戦略ごとの成績 ---------------------------------------------------------------------
+
+_HOLDING = frozenset({"open", "protection_pending"})
+_HOLDING_IF_FILLED = frozenset({"cancelling", "cancel_unknown"})
+_PENDING_CLOSE = frozenset({"closing", "close_unknown"})
+_ORDER_STATUSES = tuple(sorted(_HOLDING | _HOLDING_IF_FILLED | _PENDING_CLOSE | {"closed"}))
+_REASONS = ("llm_close", "sl", "tp", "other")
+CRON_ORIGIN = "cron"
+UNKNOWN_ORIGIN = "unknown"
+OTHER_ORIGIN = "other"
+
+
+@dataclass(slots=True)
+class _Acc:
+    origin: str
+    count: int = 1
+    closed: int = 0
+    pnl_known: int = 0
+    r_known: int = 0
+    wins: int = 0
+    losses: int = 0
+    flats: int = 0
+    gross_profit: float = 0.0
+    gross_loss: float = 0.0
+    total: float = 0.0
+    r_sum: float = 0.0
+    holding: int = 0
+    pending: int = 0
+    reasons: dict = field(default_factory=lambda: dict.fromkeys(_REASONS, 0))
+    events: list = field(default_factory=list)
+
+    def absorb(self, other: "_Acc") -> None:
+        for name in ("closed", "pnl_known", "r_known", "wins", "losses", "flats",
+                     "gross_profit", "gross_loss", "total", "r_sum", "holding", "pending"):
+            setattr(self, name, getattr(self, name) + getattr(other, name))
+        for key in _REASONS:
+            self.reasons[key] += other.reasons[key]
+
+
+def _origin_of(trigger: object) -> str:
+    """建てた判断の起動理由。文法に合わない・結合できない注文は「帰属不明」。"""
+    code = trade_events.origin_code(trigger)
+    return UNKNOWN_ORIGIN if code is None else code
+
+
+def _risk_multiple(row, account_currency: str, payload: object) -> tuple[float | None, bool]:
+    """金額で見た R (手数料込み)。返り値は (R / None, 値が壊れていたか)。
+
+    quote 通貨が口座通貨の注文だけ計算する。初期の SL は注文と判断の payload が一致したものだけ使う。"""
+    spec = _SPECS.get(row["pair"])
+    qty, avg, stop, pnl = (_number(row[k]) for k in
+                           ("quantity", "avg_fill_price", "stop_loss", "realized_pnl"))
+    broken = any(row[k] is not None and _number(row[k]) is None
+                 for k in ("quantity", "avg_fill_price", "stop_loss", "realized_pnl"))
+    try:
+        body = json.loads(payload) if type(payload) is str else None
+    except (ValueError, RecursionError):
+        body = None
+    planned = _number(body.get("stop_loss")) if isinstance(body, dict) else None
+    if planned is None or stop is None or planned != stop:
+        return None, True
+    if spec is None or spec.quote_currency != account_currency:
+        return None, broken
+    if qty is None or qty <= 0 or avg is None or pnl is None:
+        return None, True
+    risk = abs(avg - stop) * qty * spec.contract_size
+    if not math.isfinite(risk) or risk == 0:
+        return None, broken
+    value = pnl / risk
+    return (value if math.isfinite(value) else None), broken
+
+
+def _series(acc: _Acc, start: datetime, end: datetime) -> list[dict]:
+    """決済のたびに段が動く累積損益。最新 120 件の決済だけを使い、それ以前は始点 1 点にまとめる。"""
+    events = sorted(acc.events, key=lambda e: (e[0], e[1]))
+    if len(events) > SERIES_EVENTS:
+        earlier = sum(pnl for _, _, pnl in events[:-SERIES_EVENTS])
+        events = events[-SERIES_EVENTS:]
+        points = [(events[0][0], earlier)]
+        total = earlier
+    else:
+        points = [(start, 0.0)]
+        total = 0.0
+    by_time: dict[datetime, float] = {}
+    for stamp, _, pnl in events:
+        by_time[stamp] = by_time.get(stamp, 0.0) + pnl
+    for stamp in sorted(by_time):
+        total += by_time[stamp]
+        points.append((stamp, total))
+    points.append((end, total))
+    if not all(math.isfinite(value) for _, value in points):
+        return []
+    return [{"t": _iso(t), "pnl": value} for t, value in points]
+
+
+def _finite(value: float | None) -> float | None:
+    return value if value is not None and math.isfinite(value) else None
+
+
+def _row_dto(acc: _Acc, series: list[dict]) -> dict:
+    known = acc.pnl_known
+    return {
+        "origin": acc.origin, "origin_count": acc.count, "closed_count": acc.closed,
+        "pnl_known_count": known, "r_known_count": acc.r_known,
+        "pnl_unknown_count": acc.closed - known, "r_unknown_count": acc.closed - acc.r_known,
+        "open_count": acc.holding, "close_pending_count": acc.pending,
+        "wins": acc.wins, "losses": acc.losses, "flats": acc.flats,
+        "win_rate": acc.wins / known if known else None,
+        "pf": _finite(acc.gross_profit / acc.gross_loss
+                      if known and acc.gross_loss > 0 else None),
+        "avg_r": _finite(acc.r_sum / acc.r_known if acc.r_known else None),
+        "total_pnl": _finite(acc.total if known else None),
+        "close_reasons": dict(acc.reasons), "cumulative": series}
+
+
+def _strategy_section(conn, start: datetime, end: datetime, account_currency: str,
+                      quality: _Quality) -> tuple[list[dict], int, int]:
+    """起動理由ごとの成績。返り値は (行, 合算した元行の数, 図に出さない系列の数)。"""
+    marks = ",".join("?" * len(_ORDER_STATUSES))
+    rows = conn.execute(
+        "SELECT o.id,o.pair,o.status,o.quantity,o.filled_quantity,o.avg_fill_price,"
+        "o.stop_loss,o.realized_pnl,o.close_reason,o.closed_at,m.trigger,i.payload_json "
+        "FROM orders o LEFT JOIN trade_intents i ON i.id=o.intent_id "
+        "LEFT JOIN missions m ON m.id=i.mission_id "
+        f"WHERE o.status IN ({marks}) AND (o.status<>'closed' OR o.closed_at IS NULL "
+        "OR o.closed_at>=?) ORDER BY o.id", (*_ORDER_STATUSES, _iso(start))).fetchall()
+    accs: dict[str, _Acc] = {}
+    for row in rows:
+        status = row["status"]
+        origin = _origin_of(row["trigger"])
+        if status == "closed":
+            closed_at = _parse(row["closed_at"])
+            if closed_at is None:
+                quality.unplaced_closed_count += 1
+                continue
+            if not start <= closed_at <= end:
+                continue
+            acc = accs.setdefault(origin, _Acc(origin))
+            acc.closed += 1
+            reason = row["close_reason"] if row["close_reason"] in _REASONS else "other"
+            acc.reasons[reason] += 1
+            pnl = _number(row["realized_pnl"])
+            if pnl is None:
+                quality.invalid_orders += row["realized_pnl"] is not None
+                continue
+            acc.pnl_known += 1
+            acc.total += pnl
+            acc.events.append((closed_at, row["id"], pnl))
+            if pnl > 0:
+                acc.wins += 1
+                acc.gross_profit += pnl
+            elif pnl < 0:
+                acc.losses += 1
+                acc.gross_loss += -pnl
+            else:
+                acc.flats += 1
+            r, broken = _risk_multiple(row, account_currency, row["payload_json"])
+            quality.invalid_orders += 1 if broken else 0
+            if r is not None:
+                acc.r_known += 1
+                acc.r_sum += r
+        elif status in _PENDING_CLOSE:
+            accs.setdefault(origin, _Acc(origin)).pending += 1
+        elif status in _HOLDING or (status in _HOLDING_IF_FILLED
+                                    and (_number(row["filled_quantity"]) or 0) > 0):
+            accs.setdefault(origin, _Acc(origin)).holding += 1
+    ordered = sorted(accs.values(), key=lambda a: (-a.closed, a.origin))
+    must = [a for a in ordered if a.origin in (CRON_ORIGIN, UNKNOWN_ORIGIN)]
+    rest = [a for a in ordered if a.origin not in (CRON_ORIGIN, UNKNOWN_ORIGIN)]
+    merged = 0
+    if len(ordered) > MAX_STRATEGY_ROWS:
+        room = MAX_STRATEGY_ROWS - 1 - len(must)
+        kept, dropped = rest[:max(0, room)], rest[max(0, room):]
+        other = _Acc(OTHER_ORIGIN, count=len(dropped))
+        for acc in dropped:
+            other.absorb(acc)
+        merged = len(dropped)
+        shown = sorted(must + kept, key=lambda a: (-a.closed, a.origin))
+        tail = [other]
+    else:
+        shown, tail = ordered, []
+    drawn = {a.origin for a in rest[:MAX_SERIES]}
+    drawn.add(CRON_ORIGIN)
+    out, hidden = [], 0
+    for acc in shown + tail:
+        draw = acc.origin in drawn and acc.closed > 0
+        hidden += acc.closed > 0 and not draw
+        out.append(_row_dto(acc, _series(acc, start, end) if draw else []))
+    return out, merged, hidden
+
+
 # --- 入口 -----------------------------------------------------------------------------
 
 def read_performance(db_path: Path, *, range_key: str, now: datetime, kill_pct: float,
@@ -741,8 +938,13 @@ def build(conn: sqlite3.Connection, *, range_key: str, now: datetime, kill_pct: 
         candidates = [m.plot_at for m in marks]
         row = _first_valid(conn, "0001-01-01T00:00:00+00:00", _iso(to))
         lo = row["ts"] if row is not None else None
-        if lo is not None:
+        if lo is not None and _parse(lo) is not None:
             candidates.append(_parse(lo))
+        settled = conn.execute(
+            "SELECT closed_at FROM orders WHERE status='closed' AND closed_at IS NOT NULL "
+            "ORDER BY closed_at LIMIT 1").fetchone()
+        if settled is not None and _parse(settled[0]) is not None:
+            candidates.append(_parse(settled[0]))
         start = min(candidates) if candidates else to
         lo = lo if lo is not None and _parse(lo) == start else _iso(start)
     hi = _iso(to)
@@ -752,6 +954,8 @@ def build(conn: sqlite3.Connection, *, range_key: str, now: datetime, kill_pct: 
                              ledger_ids=ledger_ids, quality=quality)
     marks += equity.marks
     shown, omitted = _select_marks(marks, start, to)
+    strategies, merged_rows, hidden_series = _strategy_section(
+        conn, start, to, account_currency, quality)
     steps = _steps(equity.parts)
     return {
         "range": range_key, "from": _iso(start), "to": hi, "bucket_sec": equity.width,
@@ -764,9 +968,9 @@ def build(conn: sqlite3.Connection, *, range_key: str, now: datetime, kill_pct: 
         "marks": [m.dto() for m in shown], "marks_omitted": omitted,
         "marks_since": None if marks_since is None else _iso(_parse(marks_since)),
         "other_sources": equity.other_sources,
-        "strategies": [],
+        "strategies": strategies,
         "thresholds": {"min_count": MIN_COUNT, "reference_count": REFERENCE_COUNT},
         "omissions": {"equity_points": equity.omitted_points, "hwm_steps": equity.omitted_steps,
-                      "strategy_rows": 0, "strategy_series": 0},
+                      "strategy_rows": merged_rows, "strategy_series": hidden_series},
         "quality": quality.dto(),
     }
