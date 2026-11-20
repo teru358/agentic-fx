@@ -21,7 +21,7 @@ FREE = {"latched": False, "generation": 0, "latched_at": None, "reconcile_requir
 
 TOP_KEYS = {"range", "from", "to", "bucket_sec", "account_currency", "current", "points",
             "hwm_steps", "stats", "marks", "marks_omitted", "marks_since", "other_sources",
-            "strategies", "thresholds", "series_limits", "omissions", "quality"}
+            "strategies", "forward", "thresholds", "series_limits", "omissions", "quality"}
 CURRENT_KEYS = {"kill_switch", "state_fetched_at", "snapshot_at", "snapshot_fetched_at",
                 "snapshot_age_sec", "snapshot_freshness", "dd_pct", "kill_level", "headroom",
                 "kill_pct", "fill_hold", "snapshot_max_age_min"}

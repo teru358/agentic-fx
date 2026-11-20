@@ -1089,7 +1089,8 @@ class OpsService:
                 self._db_path, range_key=range_, now=self._wall_clock(),
                 kill_pct=float(settings.risk.drawdown_kill_pct),
                 account_currency=settings.account_currency, kill_switch=kill_switch,
-                state_fetched_at=state_fetched_at, interrupt=interrupt)
+                state_fetched_at=state_fetched_at, interrupt=interrupt,
+                plugins_root=self._plugins_root)
         except sqlite3.OperationalError as exc:
             if _is_busy(exc):
                 raise OpsError(ErrorCode.DATABASE_BUSY) from None
