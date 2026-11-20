@@ -1,7 +1,7 @@
 ---
 id: weekly-plugin-inventory-notice
 title: 週次の棚卸し: 未使用の指標と成績の悪い戦略を停止の提案として通知する
-status: 設計待ち
+status: 実装中
 priority: 中
 kind: 機能
 opened: 2026-10-29
@@ -10,7 +10,7 @@ related: [plugin-naming-lifecycle-policy, weekly-improve-rebacktests-deployed-st
 ---
 # [weekly-plugin-inventory-notice] 週次の棚卸し: 未使用の指標と成績の悪い戦略を停止の提案として通知する
 
-**状態**: 設計待ち / **優先**: 中 / **種別**: 機能
+**状態**: 実装中 / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -25,3 +25,4 @@ related: [plugin-naming-lifecycle-policy, weekly-improve-rebacktests-deployed-st
 ## 経緯
 
 - 2026-10-29: 起票。
+- 2026-11-20: 状態: 実装中 — 設計 docs/superpowers/specs/2026-11-19-weekly-deployed-strategy-review-design.md C1 を利用者承認 (§6 は 6 件とも推奨どおり)。3 チケットを 1 設計の 3 段 (指標の棚卸しの読取面 / 戦略別の前方成績 = 機械採点 / 週次の確定・判定・停止の提案の通知) で実装する

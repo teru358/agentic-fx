@@ -1,7 +1,7 @@
 ---
 id: strategy-attribution-and-shadow-evaluation
 title: 戦略ごとの帰属と影の評価 (共有建玉のまま戦略別の成績を出す)
-status: 設計待ち
+status: 実装中
 priority: 中
 opened: 2026-10-16
 closed: null
@@ -9,7 +9,7 @@ related: [improve-objective-filtered-signal-quality, bot-readonly-slash-commands
 ---
 # [strategy-attribution-and-shadow-evaluation] 戦略ごとの帰属と影の評価 (共有建玉のまま戦略別の成績を出す)
 
-**状態**: 設計待ち / **優先**: 中 / **種別**: 機能
+**状態**: 実装中 / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -25,3 +25,4 @@ related: [improve-objective-filtered-signal-quality, bot-readonly-slash-commands
 
 - 2026-10-16: 起票。
 - 2026-10-29: 関連: [improve-objective-filtered-signal-quality, bot-readonly-slash-commands, per-strategy-virtual-books, plugin-naming-lifecycle-policy] — 2026-10-29 棚卸し: 関連を束ねる先に張る
+- 2026-11-20: 状態: 実装中 — 設計 docs/superpowers/specs/2026-11-19-weekly-deployed-strategy-review-design.md C1 を利用者承認 (§6 は 6 件とも推奨どおり)。3 チケットを 1 設計の 3 段 (指標の棚卸しの読取面 / 戦略別の前方成績 = 機械採点 / 週次の確定・判定・停止の提案の通知) で実装する

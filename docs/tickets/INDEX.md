@@ -1,9 +1,9 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 179 件。完了分は closed/。
+未完了: 178 件。完了分は closed/。
 
-## 実装中 (2)
+## 実装中 (5)
 
 ### 不具合 (1)
 
@@ -11,10 +11,13 @@
 |---|---|---|---|
 | [live-confirmed-bars-into-history](open/live-confirmed-bars-into-history.md) | 高 | 2026-09-21 | backtest の履歴が自動で更新されず、評価が古い入力で通る |
 
-### 機能 (1)
+### 機能 (4)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
+| [strategy-attribution-and-shadow-evaluation](open/strategy-attribution-and-shadow-evaluation.md) | 中 | 2026-10-16 | 戦略ごとの帰属と影の評価 (共有建玉のまま戦略別の成績を出す) |
+| [weekly-improve-rebacktests-deployed-strategies](open/weekly-improve-rebacktests-deployed-strategies.md) | 中 | 2026-10-25 | 週次改善の冒頭で稼働中の戦略を再 backtest し、成績を改善の方向性の材料にする |
+| [weekly-plugin-inventory-notice](open/weekly-plugin-inventory-notice.md) | 中 | 2026-10-29 | 週次の棚卸し: 未使用の指標と成績の悪い戦略を停止の提案として通知する |
 | [web-ui-charts-equity-indicators](open/web-ui-charts-equity-indicators.md) | 低 | 2026-10-11 | 同梱 web に資金遷移グラフとチャート重ね表示 |
 
 ## 実装待ち (12)
@@ -69,9 +72,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (159)
+## 設計待ち (155)
 
-### 不具合 (84)
+### 不具合 (83)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -107,7 +110,6 @@
 | [improve-eval-window-reference-availability](open/improve-eval-window-reference-availability.md) | 中 | 2026-11-09 | 参照系列を宣言した候補の評価区間に、参照の履歴が無い先頭の足が入る |
 | [reference-daily-session-completeness](open/reference-daily-session-completeness.md) | 中 | 2026-11-14 | 非24時間銘柄の1d参照を取引セッションに沿って確定する |
 | [cancel-stall-in-cancelling-state](open/cancel-stall-in-cancelling-state.md) | 中 | 2026-11-16 | 取消の途中で DB 遷移に失敗した注文が CANCELLING に残り予約を占有する |
-| [account-snapshot-future-ts-treated-fresh](open/account-snapshot-future-ts-treated-fresh.md) | 中 | 2026-11-19 | 時計が戻ると未来時刻の口座 snapshot が新鮮と扱われ続ける |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
 | [tier-a-directive-ignored](open/tier-a-directive-ignored.md) | 中 |  | 自己テストの連続失敗の警告が無視され続け、止める仕組みが無い |
@@ -160,18 +162,15 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (45)
+### 機能 (42)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [backtest-history-snapshot-reproducibility](open/backtest-history-snapshot-reproducibility.md) | 高 | 2026-11-14 | 履歴が変わった後も同じ入力で backtest を再現できるようにする |
 | [backtest-dedup-cache](open/backtest-dedup-cache.md) | 中 | 2026-09-08 | 同一 (候補, config) の backtest 再実行で予算を消費しない (run6: 6 枠中 3 枠がビット… |
-| [strategy-attribution-and-shadow-evaluation](open/strategy-attribution-and-shadow-evaluation.md) | 中 | 2026-10-16 | 戦略ごとの帰属と影の評価 (共有建玉のまま戦略別の成績を出す) |
-| [weekly-improve-rebacktests-deployed-strategies](open/weekly-improve-rebacktests-deployed-strategies.md) | 中 | 2026-10-25 | 週次改善の冒頭で稼働中の戦略を再 backtest し、成績を改善の方向性の材料にする |
 | [indicator-update-dependent-relock-flow](open/indicator-update-dependent-relock-flow.md) | 中 | 2026-10-27 | 指標更新時に依存する戦略の再ロックを手順化する |
 | [plugin-naming-lifecycle-policy](open/plugin-naming-lifecycle-policy.md) | 中 | 2026-10-27 | plugin の命名・引退・保有上限の方針 (同名更新か新名作成か) |
 | [indicator-params-not-new-plugin](open/indicator-params-not-new-plugin.md) | 中 | 2026-10-29 | 既存の指標の params で表せる指標を新規として提出させない |
-| [weekly-plugin-inventory-notice](open/weekly-plugin-inventory-notice.md) | 中 | 2026-10-29 | 週次の棚卸し: 未使用の指標と成績の悪い戦略を停止の提案として通知する |
 | [datafeed-outage-discord-notice](open/datafeed-outage-discord-notice.md) | 中 | 2026-10-31 | MT5 不通 (degraded) と復帰待ちを Discord に通知する |
 | [multi-input-indicator-relations](open/multi-input-indicator-relations.md) | 中 | 2026-10-31 | 多入力 indicator: 2 銘柄の生系列から関係 (相関・スプレッド・β) を指標として計算する |
 | [improve-runner-choice](open/improve-runner-choice.md) | 中 | 2026-11-08 | 改善の実行ごとに backend / model の候補を選べるようにする |

@@ -1,7 +1,7 @@
 ---
 id: weekly-improve-rebacktests-deployed-strategies
 title: 週次改善の冒頭で稼働中の戦略を再 backtest し、成績を改善の方向性の材料にする
-status: 設計待ち
+status: 実装中
 priority: 中
 kind: 機能
 opened: 2026-10-25
@@ -10,7 +10,7 @@ related: [improve-daily-params-weekly-algorithm, baseline-replay-unimplemented, 
 ---
 # [weekly-improve-rebacktests-deployed-strategies] 週次改善の冒頭で稼働中の戦略を再 backtest し、成績を改善の方向性の材料にする
 
-**状態**: 設計待ち / **優先**: 中 / **種別**: 機能
+**状態**: 実装中 / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -40,3 +40,4 @@ related: [improve-daily-params-weekly-algorithm, baseline-replay-unimplemented, 
 - 2026-10-25: 起票。
 - 2026-10-25: 指揮者の意見 (定期評価として設計、主源はペーパー実績、ローリング判断、agent にはラベルだけ) をユーザーが了承、処置案に反映。
 - 2026-10-29: 関連: [improve-daily-params-weekly-algorithm, baseline-replay-unimplemented, improve-feedback-structure, same-name-candidate-must-beat-deployed-baseline] — 2026-10-29 棚卸し: 関連を束ねる先に張る
+- 2026-11-20: 状態: 実装中 — 設計 docs/superpowers/specs/2026-11-19-weekly-deployed-strategy-review-design.md C1 を利用者承認 (§6 は 6 件とも推奨どおり)。3 チケットを 1 設計の 3 段 (指標の棚卸しの読取面 / 戦略別の前方成績 = 機械採点 / 週次の確定・判定・停止の提案の通知) で実装する
