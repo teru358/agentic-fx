@@ -210,7 +210,7 @@ class _Mark:
     plot_at: datetime
     occurred_at: datetime | None = None
     recorded_at: datetime | None = None
-    source_snapshot_ts: datetime | None = None
+    book_at: datetime | None = None
     applied_at: datetime | None = None
     generation: int | None = None
     time_source: str = "snapshot"
@@ -221,7 +221,7 @@ class _Mark:
             return None if value is None else _iso(value)
         return {"kind": self.kind, "plot_at": _iso(self.plot_at),
                 "occurred_at": text(self.occurred_at), "recorded_at": text(self.recorded_at),
-                "source_snapshot_ts": text(self.source_snapshot_ts),
+                "book_at": text(self.book_at),
                 "applied_at": text(self.applied_at), "generation": self.generation,
                 "time_source": self.time_source}
 
@@ -687,7 +687,7 @@ def _rebase_marks(ledger: list[dict], quality: _Quality) -> list[_Mark]:
         if source_ts is None or applied is None or gen is None:
             quality.invalid_marks += 1
             continue
-        marks.append(_Mark("rebase", source_ts, source_snapshot_ts=source_ts, applied_at=applied,
+        marks.append(_Mark("rebase", source_ts, book_at=source_ts, applied_at=applied,
                            generation=gen, time_source="ledger", order=row["id"]))
     return marks
 

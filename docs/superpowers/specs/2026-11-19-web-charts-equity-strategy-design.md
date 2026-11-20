@@ -126,7 +126,7 @@ web (afx-ops) ──GET /v1/performance?range=30d──▶ daemon (ops API、sta
 | `current` | `kill_switch` (下記の status と同形 / 取得不能は null)、`state_fetched_at`、`snapshot_at` (最新行時刻 / null)、`snapshot_fetched_at`、`snapshot_age_sec` (非負秒 / null)、`snapshot_freshness` (`fresh/stale/unknown`)、`dd_pct,kill_level,headroom` (算出不能は null)、`kill_pct` (現閾値)、`fill_hold` (`kill_switch/stale/drawdown/none/unknown`、daemon が約定を止める理由の総合)、`snapshot_max_age_min` (陳腐化と扱う閾値・分。daemon の判定と同じ定数) |
 | 代表点 | `start_at,end_at,last_at` (部分束の実時刻)、`equity_min,equity_max,equity_last,balance_last`、`seg` (非負整数)。null 無し。帯は `[start_at,end_at]`、代表線は last_at に置く |
 | `stats` | `first_at,last_at,equity_first,equity_last,balance_first,balance_last,equity_min,equity_max,balance_min,balance_max,dd_max,dd_max_at`。期間が空・算出不能は null。極値同値は最初の `(ts,id)` |
-| 印 | `kind` (`latched/released/rebase/cashflow/unknown_hwm_drop`)、`plot_at`、`occurred_at,recorded_at` (実時刻 / 記録時刻、不明は null)、`source_snapshot_ts,applied_at` (付け直し専用、他は null)、`generation` (非該当は null)、`time_source` (`state/ledger/event_ts/snapshot`)。付け直しの occurred_at / recorded_at は共に null |
+| 印 | `kind` (`latched/released/rebase/cashflow/unknown_hwm_drop`)、`plot_at`、`occurred_at,recorded_at` (実時刻 / 記録時刻、不明は null)、`book_at,applied_at` (付け直し専用、他は null)、`generation` (非該当は null)、`time_source` (`state/ledger/event_ts/snapshot`)。付け直しの occurred_at / recorded_at は共に null |
 | 戦略行 | `origin` (文法に合う最大 71 ASCII byte、帰属不明は unknown、合算は other)、`origin_count` (通常 1)、`closed_count,pnl_known_count,r_known_count,pnl_unknown_count,r_unknown_count,open_count,close_pending_count,wins,losses,flats`、`win_rate,pf,avg_r` (計算不能は null)、`pf_state` (`computed` = pf は有限の値、`no_losses` = 損失 0 件かつ総利益が正で pf は null (損益が全部 0 なら `unknown`)、`unknown` = 計算不能・非有限で pf は null。web は state と pf が噛み合わないとき PF を「不明」にする)、`total_pnl` (既知 0 件なら null)、`close_reasons` (`llm_close/sl/tp/other`)、`cumulative` (図の選外は空 list) |
 | 累積点 | `{t,pnl}`。系列ごとに最新 120 件の決済を使い、同時刻合算、t 昇順。以前の合計を持つ始点 1 点と期間終了点を加え最大 122 点。切捨て前の開始は from / 0、切捨て時は採用した最初の決済時刻 / 直前の累計を始点とする。同時刻は始点を先に置く |
 
@@ -153,7 +153,7 @@ web は既存の `_check_reply_shape` (`A/web/request.py:206-234`) と同じ上�
 
 | 印 | 実時刻・記録時刻と位置 |
 |---|---|
-| 付け直し ▽ | source_snapshot_ts (= 元 snapshot の ts) に段と印を置き、期間への採否もこの時刻。表には操作時刻 applied_at を別列に出す (`S/ops/rebase_accounting.py:198-214`) |
+| 付け直し ▽ | book_at (= 元 snapshot の ts) に段と印を置き、期間への採否もこの時刻。表には操作時刻 applied_at を別列に出す (`S/ops/rebase_accounting.py:198-214`) |
 | 作動 ✕・解除 ↑ | 同じ世代・状態の候補を期間抽出より先に統合。作動実時刻は state の latched_at → 台帳の latched_at の順。解除は event の記録時刻だけ。event の ts は recorded_at |
 | event のみ | occurred_at は null、plot_at = recorded_at。「作動 / 解除を記録した時刻」と明記。通知時刻を状態変化時刻と断定しない |
 | 入出金 ◇・不明な下降 △ | snapshot の ts に置く。台帳なしの manual_ks_rebase も確認不能として警告 |

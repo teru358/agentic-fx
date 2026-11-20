@@ -287,7 +287,7 @@ def _mark_row(item: Mapping[str, object], tz: str) -> str:
     cells = [_kind_cell(item.get("kind")), _time(item.get("plot_at"), tz),
              _optional_time(item.get("occurred_at"), tz),
              _optional_time(item.get("recorded_at"), tz),
-             _optional_time(item.get("source_snapshot_ts"), tz),
+             _optional_time(item.get("book_at"), tz),
              _optional_time(item.get("applied_at"), tz), _generation_cell(item.get("generation")),
              _esc(TIME_SOURCES[source]) if type(source) is str and source in TIME_SOURCES
              else UNKNOWN]

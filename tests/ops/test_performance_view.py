@@ -302,7 +302,7 @@ def test_a_ledger_rebase_is_marked_at_the_source_time_with_both_times_and_splits
     kinds = {m["kind"]: m for m in data["marks"]}
     assert set(kinds) == {"rebase", "latched"}
     rebase_mark = kinds["rebase"]
-    assert rebase_mark["plot_at"] == rebase_mark["source_snapshot_ts"] == (
+    assert rebase_mark["plot_at"] == rebase_mark["book_at"] == (
         base + timedelta(minutes=1)).isoformat()
     assert rebase_mark["applied_at"] == applied.isoformat()
     assert rebase_mark["occurred_at"] is None and rebase_mark["recorded_at"] is None

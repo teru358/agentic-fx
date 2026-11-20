@@ -29,7 +29,7 @@ def current(**over):
 def mark(kind="latched", **over):
     base = {"kind": kind, "plot_at": "2026-11-18T01:02:03+00:00",
             "occurred_at": "2026-11-18T01:02:00+00:00",
-            "recorded_at": "2026-11-18T01:02:03+00:00", "source_snapshot_ts": None,
+            "recorded_at": "2026-11-18T01:02:03+00:00", "book_at": None,
             "applied_at": None, "generation": 2, "time_source": "state"}
     base.update(over)
     return base
@@ -398,7 +398,7 @@ def test_a_stats_object_with_wrong_typed_values_renders_unknown_values(bad):
 def test_the_marks_table_has_the_kind_words_the_times_and_the_two_rebase_columns():
     marks_ = [mark("latched"), mark("released", occurred_at=None, time_source="event_ts"),
               mark("rebase", occurred_at=None, recorded_at=None, generation=None,
-                   source_snapshot_ts="2026-11-17T00:00:00+00:00",
+                   book_at="2026-11-17T00:00:00+00:00",
                    applied_at="2026-11-18T12:00:00+00:00", time_source="ledger"),
               mark("cashflow", generation=None, time_source="snapshot"),
               mark("unknown_hwm_drop", generation=None, time_source="snapshot")]
@@ -551,7 +551,7 @@ def maximal() -> dict:
                                            "reconcile_required": True})
     data["stats"] = {k: (big if "at" not in k else "2026-11-19T02:59:30.123456+00:00")
                      for k in data["stats"]}
-    data["marks"] = [mark(kind=kind, generation=10 ** 40, source_snapshot_ts=NOW, applied_at=NOW)
+    data["marks"] = [mark(kind=kind, generation=10 ** 40, book_at=NOW, applied_at=NOW)
                      for kind in ["unknown_hwm_drop", "rebase", "cashflow", "released"] * 6]
     data["marks_omitted"] = 10 ** 40
     data["other_sources"] = 10 ** 40
