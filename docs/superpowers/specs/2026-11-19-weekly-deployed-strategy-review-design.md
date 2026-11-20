@@ -1,4 +1,6 @@
-# 週次の稼働中戦略の評価と棚卸し — 設計 C0.5
+# 週次の稼働中戦略の評価と棚卸し — 設計 C1
+
+**状態:** C1 (2026-11-20 利用者承認)。§6 の問い 6 件は推奨どおりに裁定
 
 チケット: `weekly-improve-rebacktests-deployed-strategies`、`strategy-attribution-and-shadow-evaluation`、`weekly-plugin-inventory-notice` (3 件を束ね、3 段で実装する)。
 関連: `improve-daily-params-weekly-algorithm`、`per-strategy-virtual-books`、`plugin-naming-lifecycle-policy`。
@@ -184,7 +186,7 @@ kind は検証済み保存版の config から取得し、親側で `{name, kind
 | 3 | event・未発行回収・bot 配送と本文 | `S/ops/events.py`、`A/gate/` | 週次保存と指定週 API |
 | 独立 | 停止名の投影と掲示 | `S/loops/improve_context.py`、`S/loops/prompts/improve_mission.md` | 週次判定への依存なし |
 
-## 6. 利用者に問う事項
+## 6. 利用者に問う事項 (2026-11-20 裁定: 6 件とも推奨どおり)
 
 | # | 問い | 推奨 | 理由 |
 |---|---|---|---|
@@ -233,3 +235,4 @@ kind は検証済み保存版の config から取得し、親側で `{name, kind
 | 2026-11-20 | C0.3 | 評価状態・提案対象・週別再試行と通知を明確化し、重複記述を整理 | 設計レビュー 3 周目の指摘を反映 | |
 | 2026-11-20 | C0.4 | 配備世代・依存抽出・標本不足・通知を是正し、重複と旧条件を整理 | 設計レビュー 4 周目の指摘を反映 | |
 | 2026-11-20 | C0.5 | 中断試行の永続化・起動時回収と失敗・回復通知を明確化し、重複を削減 | 設計レビュー 5 周目の指摘を反映 | |
+| 2026-11-20 | C1 | §6 を裁定済みにする | 利用者承認 (6 件とも推奨どおり)。レビューは 6 周 (sol → opus → sol → opus → sol → sol) で収束 | |
