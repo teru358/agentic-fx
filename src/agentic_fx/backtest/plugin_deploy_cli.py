@@ -24,7 +24,7 @@ from agentic_fx.activity import ActivityLog
 from agentic_fx.core.display_time import effective_tz_name
 from agentic_fx.plugin import deploy_disable, deploy_ops, deploy_retire, deploy_rollback
 from agentic_fx.plugin import deploy_versions, read_model, read_model_inputs
-from agentic_fx.plugin import strategy_gate
+from agentic_fx.plugin import strategy_gate, usage_review
 from agentic_fx.plugin import switch as plugin_switch
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 
@@ -33,6 +33,7 @@ LOCK_WAIT_SECONDS = 30.0
 RC_OK = 0
 RC_FAILED = 1
 RC_USE_REVOKE = 2
+RC_USAGE = 2
 
 UNRESOLVED_JOURNAL_RECOVERY_HINT = (
     "  収束手順: サービスの対話シェルで `approval list` → "
@@ -103,23 +104,6 @@ _PROPOSAL_TEXT = {
     "unknown_origin": "対象外 (出所を確認できない版)",
 }
 _ORIGIN_TEXT = {"staging": "改善の提出", "human": "人の提出", "unknown": "不明"}
-_UNKNOWN_REASON_TEXT = {
-    "scan_failed": "配備の走査を読み切れなかった",
-    "pending_source_unreadable": "承認待ちを読めなかった",
-    "pending_request_unreadable": "依存を読めない承認待ちがある",
-    "candidates_unreadable": "戦略候補の記録を読めなかった",
-    "key_mentioned": "読めない候補の key にこの名前が出てくる",
-    "time_unreadable": "時刻を読めなかった",
-    "journal_unreadable": "切替の記録を読めなかった",
-    "no_generation_record": "配備した記録が見つからない",
-    "generation_mismatch": "最後の配備記録がいまの版を指していない",
-}
-_INVENTORY_REASON_TEXT = {
-    "scan_failed": "配備の走査を読み切れなかったため、参照の有無を確かめきれません",
-    "journal_unreadable": "切替の記録を読めなかったため、配備時期を確かめきれません",
-}
-_EXCLUDED_TEXT = (("null_key", "key なし"), ("unreadable_key", "key を読めない"),
-                  ("unreadable_time", "作成時刻を読めない"))
 
 
 def _unused_lines(dto: dict, kind: str | None) -> list[str]:
@@ -151,11 +135,12 @@ def _unused_lines(dto: dict, kind: str | None) -> list[str]:
             reasons = sorted({item["reason"] for item in row["usage_review"]["conditions"]
                               if item["result"] == "unknown" and item["reason"]})
             lines.append(f"  {row['name']}: " + " / ".join(
-                _UNKNOWN_REASON_TEXT.get(reason, reason) for reason in reasons))
+                usage_review.REASON_TEXT.get(reason, reason) for reason in reasons))
     if inventory["status"] != "ok":
-        lines.append("注意: " + _INVENTORY_REASON_TEXT.get(
+        lines.append("注意: " + usage_review.INVENTORY_REASON_TEXT.get(
             inventory["reason"], "棚卸し全体を判定できませんでした"))
-    excluded = ", ".join(f"{text} {inventory['excluded'][word]}" for word, text in _EXCLUDED_TEXT)
+    excluded = ", ".join(f"{text} {inventory['excluded'][word]}"
+                         for word, text in usage_review.EXCLUDED_TEXT)
     if inventory["window_candidates"] is None:
         lines.append(f"直近 {weeks} 週の戦略候補: 不明")
     else:
@@ -175,6 +160,10 @@ def plugin_list(root: Path, *, kind: str | None = None, settings=None,
     states are reported as unknown. Nothing is created, written or migrated.
     ``unused`` shows the unused indicators instead of the table; the K weeks are
     measured from ``now`` (the read time)."""
+    if unused and kind == "strategy":
+        print("エラー: --unused は指標だけを調べます。--kind strategy とは同時に指定できません "
+              "(--kind indicator か、--kind なしで指定してください)", file=sys.stderr)
+        return RC_USAGE
     conn, db_status = read_model_inputs.open_observer(root)
     try:
         inputs = read_model_inputs.collect_inputs(

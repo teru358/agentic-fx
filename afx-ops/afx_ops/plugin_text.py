@@ -69,6 +69,7 @@ USAGE_REASON = {
     "journal_unreadable": "切替の記録を読めなかった",
     "no_generation_record": "配備した記録が見つからない",
     "generation_mismatch": "最後の配備記録がいまの版を指していない",
+    "strategy_unreadable": "読めない配備中の entry があり、strategy の参照を確かめきれない",
 }
 # 条件ごとの文言 (k は未使用と見なすまでの週数)。当てはまる / 当てはまらない
 USAGE_CONDITION = {

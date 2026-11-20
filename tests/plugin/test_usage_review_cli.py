@@ -119,10 +119,19 @@ def test_a_candidate_table_that_cannot_be_read_is_unknown_and_fails(world, capsy
     assert any("戦略候補の記録を読めませんでした" in line for line in lines)
 
 
-def test_kind_filters_the_review_too(world, capsys):
+def test_unused_with_the_strategy_kind_is_a_usage_error(world, capsys):
     put(world, "rsi")
-    _, lines = run(world, capsys, unused=True, kind="strategy", now=NOW)
-    assert not any(line.startswith("rsi") for line in lines)
+    rc = plugin_list(world.root, unused=True, kind="strategy", now=NOW)
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.out == ""
+    assert "--unused" in captured.err and "indicator" in captured.err
+
+
+def test_unused_with_the_indicator_kind_still_lists(world, capsys):
+    put(world, "rsi")
+    _, lines = run(world, capsys, unused=True, kind="indicator", now=NOW)
+    assert any(line.startswith("rsi") for line in lines)
 
 
 def test_the_option_is_wired_through_the_command_line(tmp_path, monkeypatch, capsys):

@@ -174,7 +174,7 @@ def test_an_indicator_candidate_is_left_out_of_the_strategy_candidate_count(worl
     world.candidate(legacy_key(["x1"]), NOW - WEEK)
     world.candidate("garbage", NOW - WEEK)
     summary = listing(world)["usage_inventory"]
-    assert summary["window_candidates"] == 2
+    assert summary["window_candidates"] == 1
     assert summary["excluded"]["unreadable_key"] == 1
 
 
@@ -428,7 +428,7 @@ def test_a_broken_entry_that_is_not_an_io_error_does_not_make_the_inventory_inde
     dto = listing(world)
     assert dto["usage_inventory"]["status"] == "ok"
     assert next(row for row in dto["plugins"]
-                if row["name"] == "rsi")["usage_review"]["state"] == STATE_UNUSED
+                if row["name"] == "rsi")["usage_review"]["state"] == STATE_INDETERMINATE
 
 
 # ---------------------------------------------------------------- 評価順 (使用中の優先)
@@ -637,3 +637,111 @@ def test_replacing_a_family_key_with_another_of_the_same_length_changes_the_gene
                        (legacy_key(["ema"]).replace("ema", "rsi"[::-1]), row_id))
     world.conn.commit()
     assert read_model_inputs.db_generation(world.conn) != before
+
+
+# ---------------------------------------------------------------- 世代値の費用と範囲
+
+def test_a_family_key_outside_the_window_does_not_change_the_generation(world):
+    row_id = world.candidate(legacy_key(["rsi"]), NOW - 30 * WEEK)
+    before = read_model_inputs.db_generation(world.conn, NOW)
+    world.conn.execute("UPDATE candidate_archives SET family_key=? WHERE id=?",
+                       (legacy_key(["ema"]), row_id))
+    world.conn.commit()
+    assert read_model_inputs.db_generation(world.conn, NOW) == before
+
+
+def test_a_family_key_inside_the_window_changes_the_generation(world):
+    row_id = world.candidate(legacy_key(["rsi"]), NOW - WEEK)
+    before = read_model_inputs.db_generation(world.conn, NOW)
+    world.conn.execute("UPDATE candidate_archives SET family_key=? WHERE id=?",
+                       (legacy_key(["ema"]), row_id))
+    world.conn.commit()
+    assert read_model_inputs.db_generation(world.conn, NOW) != before
+
+
+def test_the_generation_changes_when_the_window_start_moves_to_another_day(world):
+    world.candidate(legacy_key(["rsi"]), NOW - WEEK)
+    assert (read_model_inputs.db_generation(world.conn, NOW)
+            != read_model_inputs.db_generation(world.conn, NOW + timedelta(days=2)))
+
+
+def test_the_generation_cost_does_not_grow_with_old_candidate_keys(world):
+    import time
+    world.candidate(legacy_key(["rsi"]), NOW - WEEK)
+    big = "strategy:" + ",".join(f"p{i}" for i in range(120)) + "@1h@USDJPY"
+    world.conn.executemany(
+        "INSERT INTO candidate_archives(mission_id,name,content_hash,artifact_hash,"
+        "archive_path,pair,metrics_json,created_at,family_key) VALUES (1,'o',?,?,NULL,NULL,'{}',?,?)",
+        [(f"{i + 10**6:064x}", f"{i + 10**6:064x}", (NOW - 30 * WEEK).isoformat(), big + str(i))
+         for i in range(1, 20001)])
+    world.conn.commit()
+
+    def best(call):
+        times = []
+        for _ in range(5):
+            start = time.perf_counter()
+            call()
+            times.append(time.perf_counter() - start)
+        return min(times)
+
+    scan = best(lambda: world.conn.execute(
+        "SELECT COUNT(*), MAX(id), MAX(created_at) FROM candidate_archives").fetchone())
+    generation = best(lambda: read_model_inputs.db_generation(world.conn, NOW))
+    assert generation < 4 * scan + 0.002
+
+
+# ---------------------------------------------------------------- 読めない strategy と lazy な一覧
+
+def test_an_unreadable_deployed_entry_makes_the_live_condition_unknown(world):
+    put_indicator(world, "rsi")
+    (world.plugins / "follow").mkdir()
+    usage = review(world, "rsi")
+    assert usage["state"] == STATE_INDETERMINATE
+    assert results(usage)[COND_LIVE] == (RESULT_UNKNOWN, "strategy_unreadable")
+    assert usage["proposable"] is False
+
+
+def test_a_non_canonical_entry_name_is_not_a_deployed_strategy(world):
+    put_indicator(world, "rsi")
+    (world.plugins / "Not A Plugin").mkdir()
+    assert review(world, "rsi")["state"] == STATE_UNUSED
+
+
+def test_a_live_reference_still_wins_over_an_unreadable_entry(world):
+    meta = put_indicator(world, "rsi")
+    world.deploy("follow", "strategy", dependency_pin("rsi", meta.content_hash))
+    (world.plugins / "broken").mkdir()
+    assert review(world, "rsi")["state"] == STATE_USED
+
+
+def test_a_row_without_the_scan_is_never_judged_clear(world):
+    put_indicator(world, "rsi")
+    row = next(row for row in model_of(world).rows if row.name == "rsi")
+    for dto in (read_model.row_to_dto(row, now=NOW),
+                read_model.row_to_dto(row, detail=True, now=NOW)):
+        assert dto["usage_review"]["state"] == STATE_INDETERMINATE
+        assert dto["usage_review"]["proposable"] is False
+
+
+def test_the_detail_view_does_not_build_the_listing(world, monkeypatch):
+    put_indicator(world, "rsi")
+    calls = []
+    original = read_model.model_to_dto
+    monkeypatch.setattr(read_model, "model_to_dto",
+                        lambda *args, **kwargs: calls.append(1) or original(*args, **kwargs))
+    cache = PluginViewCache(world.plugins, SETTINGS, clock=lambda: NOW)
+    view = cache.get(world.conn, contextlib.nullcontext, lambda lock: lock.acquire())
+    assert view.model is not None and calls == []
+    assert view.listing["plugins"] and calls == [1]
+    assert view.listing is view.listing and calls == [1]
+
+
+def test_unreadable_and_null_key_rows_are_not_counted_as_strategy_candidates(world):
+    put_indicator(world, "rsi")
+    world.candidate(legacy_key(["x1"]), NOW - WEEK)
+    world.candidate(None, NOW - WEEK)
+    world.candidate("garbage", NOW - WEEK)
+    summary = listing(world)["usage_inventory"]
+    assert summary["window_candidates"] == 1
+    assert summary["excluded"]["null_key"] == 1
+    assert summary["excluded"]["unreadable_key"] == 1

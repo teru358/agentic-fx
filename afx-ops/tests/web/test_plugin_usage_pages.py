@@ -91,7 +91,8 @@ def test_the_usage_allowlists_name_exactly_the_fields_of_the_real_sample():
 def test_every_reason_the_daemon_can_give_has_a_japanese_label():
     for reason in ("scan_failed", "pending_source_unreadable", "pending_request_unreadable",
                    "candidates_unreadable", "key_mentioned", "time_unreadable",
-                   "journal_unreadable", "no_generation_record", "generation_mismatch"):
+                   "journal_unreadable", "no_generation_record", "generation_mismatch",
+                   "strategy_unreadable"):
         assert reason in plugin_text.USAGE_REASON
 
 

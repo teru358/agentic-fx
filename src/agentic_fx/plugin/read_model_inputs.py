@@ -11,9 +11,10 @@ import hashlib
 import os
 import re
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from agentic_fx.plugin import loader
+from agentic_fx.plugin import loader, usage_review
 from agentic_fx.plugin.read_model import (
     ENTITY_PLAIN, ENTITY_SYMLINK, ENTITY_UNREADABLE, SOURCE_MISSING, SOURCE_OK,
     SOURCE_UNAVAILABLE, ApprovalRow, DeployOpRow, JournalRow, LiveEntry, LiveScan, ReadInputs,
@@ -208,9 +209,18 @@ def read_db_inputs(conn: sqlite3.Connection) -> dict:
     return result
 
 
-def db_generation(conn: sqlite3.Connection) -> tuple:
+# 窓の始点より前の候補は判定に効かない。作成時刻の書式や時差の違いを吸収するため、
+# 日付で 2 日分の余裕を見て絞る。
+_WINDOW_MARGIN = timedelta(days=2)
+
+
+def db_generation(conn: sqlite3.Connection, now: datetime | None = None) -> tuple:
     """承認の行と配備・切替の行の最終更新の署名。中身は読まず、件数・最大 id・状態別の
-    件数・最後の更新時刻だけで作る。表が読めないときは None を含む。"""
+    件数・最後の更新時刻だけで作る。表が読めないときは None を含む。
+
+    戦略候補は、全体の件数・最大 id・最大作成時刻と、直近の窓にかかる行 (作成時刻が
+    読めない行を含む) の key の digest だけを見る。窓の始点の日付も署名に入れる (日が
+    変われば窓の中の行が変わる)。窓の外の行の key は判定に効かないので読まない。"""
     parts: list = []
     queries = (
         "SELECT COUNT(*), COALESCE(MAX(id),0), COALESCE(MAX(decided_at),''), "
@@ -222,26 +232,32 @@ def db_generation(conn: sqlite3.Connection) -> tuple:
         "SELECT COUNT(*), COALESCE(MAX(op_id),0), COALESCE(MAX(updated_at),''), "
         "COALESCE(SUM(phase='intent'),0), COALESCE(SUM(phase='needs_retry'),0) "
         "FROM plugin_deploy_ops",
-        "SELECT COUNT(*), COALESCE(MAX(id),0), COALESCE(MAX(created_at),''), "
-        "COALESCE(group_concat(family_key, char(0)),'') FROM "
-        "(SELECT id, created_at, family_key FROM candidate_archives ORDER BY id)",
     )
     for query in queries:
         try:
             parts.append(tuple(conn.execute(query).fetchone()))
         except sqlite3.Error:
             parts.append(None)
-    if parts[-1] is not None:
-        parts[-1] = _digest_last(parts[-1])
+    parts.append(_candidate_generation(conn, now or datetime.now(timezone.utc)))
     return tuple(parts)
 
 
-def _digest_last(row: tuple) -> tuple:
-    """最後の欄 (連結した文字列) を、同じ内容なら同じになる短い値に置き換える。
-
-    候補の family_key は既存の行でも後から埋まる・書き換わるので、件数や最大値だけでは
-    更新を見落とす。"""
-    return (*row[:-1], hashlib.sha256(str(row[-1]).encode()).hexdigest())
+def _candidate_generation(conn: sqlite3.Connection, now: datetime) -> tuple | None:
+    bound = (usage_review.window_start(now) - _WINDOW_MARGIN).date().isoformat()
+    try:
+        total = tuple(conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(id),0), COALESCE(MAX(created_at),'') "
+            "FROM candidate_archives").fetchone())
+        joined = conn.execute(
+            "SELECT COALESCE(group_concat(id || char(31) || COALESCE(created_at, char(30)) "
+            "|| char(31) || COALESCE(family_key, char(30)), char(0)), '') "
+            "FROM (SELECT id, created_at, family_key FROM candidate_archives "
+            "WHERE created_at IS NULL OR created_at >= ? "
+            "OR created_at NOT GLOB '[0-9][0-9][0-9][0-9]-*' ORDER BY id)",
+            (bound,)).fetchone()[0]
+    except sqlite3.Error:
+        return None
+    return (*total, bound, hashlib.sha256(str(joined).encode()).hexdigest())
 
 
 def collect_inputs(plugins_root: Path, conn: sqlite3.Connection | None, *,

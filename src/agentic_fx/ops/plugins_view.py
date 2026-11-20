@@ -9,17 +9,27 @@ from __future__ import annotations
 import sqlite3
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from agentic_fx.plugin import read_model, read_model_inputs
 
 
-@dataclass(frozen=True, slots=True)
 class PluginView:
-    model: read_model.ReadModel
-    listing: dict
+    """組み立て済みの model と、一覧の応答。一覧は使われたときに初めて作る (詳細は使わない)。"""
+
+    __slots__ = ("model", "_now", "_listing")
+
+    def __init__(self, model: read_model.ReadModel, now: datetime) -> None:
+        self.model = model
+        self._now = now
+        self._listing: dict | None = None
+
+    @property
+    def listing(self) -> dict:
+        if self._listing is None:
+            self._listing = read_model.model_to_dto(self.model, now=self._now)
+        return self._listing
 
 
 class PluginViewCache:
@@ -44,7 +54,7 @@ class PluginViewCache:
         """``acquire(lock)`` は memo の lock を期限つきで取る (取れなければ例外)。"""
         signature = read_model_inputs.live_signature(self._plugins_root)
         with lane():
-            generation = read_model_inputs.db_generation(conn)
+            generation = read_model_inputs.db_generation(conn, self._clock())
         key = (signature, generation)
         keyable = None not in generation and signature != ("unavailable",)
         acquire(self._lock)
@@ -67,4 +77,4 @@ class PluginViewCache:
         return self._view_of(model)
 
     def _view_of(self, model: read_model.ReadModel) -> PluginView:
-        return PluginView(model, read_model.model_to_dto(model, now=self._clock()))
+        return PluginView(model, self._clock())

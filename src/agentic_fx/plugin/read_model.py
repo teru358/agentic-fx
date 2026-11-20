@@ -450,7 +450,7 @@ def build_read_model(inputs: ReadInputs, *, settings) -> ReadModel:
         for name in sorted(names)]
     usage_scan, usage_facts = _usage_review(
         inputs, rows, requests, dependents,
-        scan_failed=_scan_failed(scan))
+        scan_failed=_scan_failed(scan), live_unreadable=_live_unreadable(scan))
     rows = [replace(row, usage=usage_facts[row.name]) if row.name in usage_facts else row
             for row in rows]
 
@@ -568,6 +568,12 @@ def _scan_failed(scan: LiveScan) -> bool:
         entry.reason == "io_error" for entry in scan.entries)
 
 
+def _live_unreadable(scan: LiveScan) -> bool:
+    """読めない配備中の entry があるか。meta が無いと kind を知れず、strategy かもしれない。"""
+    return any(entry.meta is None and entry.reason != "non_canonical_name"
+               for entry in scan.entries)
+
+
 def _pending_condition(inputs: ReadInputs, requests: Sequence[_Request]
                        ) -> tuple[dict[str, bool], str | None]:
     """承認待ちの依頼が参照する指標名と、読み切れない依頼があるときの理由。
@@ -629,7 +635,8 @@ def _transitions(inputs: ReadInputs) -> dict[str, list[usage_review.Transition]]
 
 
 def _usage_review(inputs: ReadInputs, rows: Sequence[PluginRow], requests: Sequence[_Request],
-                  dependents: Mapping[str, list[Dependent]], *, scan_failed: bool
+                  dependents: Mapping[str, list[Dependent]], *, scan_failed: bool,
+                  live_unreadable: bool
                   ) -> tuple[usage_review.UsageScan, dict[str, usage_review.UsageFacts]]:
     """読める配備中の指標ごとの事実と、棚卸し全体の事実。"""
     indicators = [row for row in rows
@@ -664,7 +671,7 @@ def _usage_review(inputs: ReadInputs, rows: Sequence[PluginRow], requests: Seque
             row.name, bool(dependents.get(row.name)), pending, reason, started,
             started_reason,
             _current_origin(requests_by_name.get(row.name, ()), row.entity.content_hash),
-            scan_failed)
+            scan_failed, live_unreadable)
     return usage_scan, facts
 
 
@@ -692,6 +699,10 @@ def _usefulness_dto(useful: Usefulness | None) -> dict | None:
             "by_pin": [{"content_hash": _hash(pin) if pin else None,
                         "submitted": counts[0], "deployed": counts[1]}
                        for pin, counts in useful.by_pin.items()]}
+
+
+# 棚卸しの scan を渡されなかった行は、候補を調べていないので「当てはまらない」と決めない。
+_UNSCANNED = usage_review.UsageScan(candidates_readable=False)
 
 
 def _now(now: datetime | None) -> datetime:
@@ -726,9 +737,9 @@ def row_to_dto(row: PluginRow, *, detail: bool = False,
                         "pin": _hash(item.pin), "state": item.state}
                        for item in row.dependents],
         "usefulness": _usefulness_dto(row.usefulness),
-        "usage_review": (usage_review.classify(
-            row.usage, usage if usage is not None else usage_review.UsageScan(), _now(now))
-            if row.usage is not None else None),
+        "usage_review": (usage_review.classify(row.usage, usage if usage is not None
+                                               else _UNSCANNED, _now(now))
+                         if row.usage is not None else None),
     }
     if detail:
         dto["history"] = [

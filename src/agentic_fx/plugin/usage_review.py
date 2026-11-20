@@ -57,16 +57,39 @@ REASON_TIME_UNREADABLE = "time_unreadable"
 REASON_JOURNAL_SOURCE = "journal_unreadable"
 REASON_NO_GENERATION = "no_generation_record"
 REASON_GENERATION_MISMATCH = "generation_mismatch"
+REASON_STRATEGY_UNREADABLE = "strategy_unreadable"
+
+# 判定不能の理由の日本語 (CLI の正本。afx-ops の `plugin_text.USAGE_REASON` は同じ値の写し)
+REASON_TEXT = {
+    REASON_SCAN_FAILED: "配備の走査を読み切れなかった",
+    REASON_PENDING_SOURCE: "承認待ちを読めなかった",
+    REASON_PENDING_REQUEST: "依存を読めない承認待ちがある",
+    REASON_CANDIDATES_SOURCE: "戦略候補の記録を読めなかった",
+    REASON_KEY_MENTIONED: "読めない候補の key にこの名前が出てくる",
+    REASON_TIME_UNREADABLE: "時刻を読めなかった",
+    REASON_JOURNAL_SOURCE: "切替の記録を読めなかった",
+    REASON_NO_GENERATION: "配備した記録が見つからない",
+    REASON_GENERATION_MISMATCH: "最後の配備記録がいまの版を指していない",
+    REASON_STRATEGY_UNREADABLE: "読めない配備中の entry があり、strategy の参照を確かめきれない",
+}
 
 # 棚卸し全体の状態
 INVENTORY_OK = "ok"
 INVENTORY_INDETERMINATE = "indeterminate"
+
+# 棚卸し全体の判定不能の理由の日本語 (同じく CLI が正本、afx-ops は写し)
+INVENTORY_REASON_TEXT = {
+    REASON_SCAN_FAILED: "配備の走査を読み切れなかったため、参照の有無を確かめきれません",
+    REASON_JOURNAL_SOURCE: "切替の記録を読めなかったため、配備時期を確かめきれません",
+}
 
 # 除外した候補行の理由 (固定語)
 EXCLUDED_NULL_KEY = "null_key"
 EXCLUDED_UNREADABLE_KEY = "unreadable_key"
 EXCLUDED_UNREADABLE_TIME = "unreadable_time"
 EXCLUDED_REASONS = (EXCLUDED_NULL_KEY, EXCLUDED_UNREADABLE_KEY, EXCLUDED_UNREADABLE_TIME)
+EXCLUDED_TEXT = ((EXCLUDED_NULL_KEY, "key なし"), (EXCLUDED_UNREADABLE_KEY, "key を読めない"),
+                 (EXCLUDED_UNREADABLE_TIME, "作成時刻を読めない"))
 
 ORIGIN_STAGING = "staging"
 ORIGIN_HUMAN = "human"
@@ -223,6 +246,8 @@ class UsageFacts:
     deployed_reason: str | None
     origin: str                        # staging | human | unknown
     scan_failed: bool = False
+    # 配備中の entry に読めないものがあり、strategy の参照を確かめきれない
+    live_unreadable: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,13 +297,14 @@ def window_start(now: datetime) -> datetime:
 def window_summary(scan: UsageScan, now: datetime) -> dict:
     """直近 K 週の戦略候補の件数と、除外した行の理由別の件数。休止の週は 0 件として出る。
 
-    指標の候補は数えない。候補の記録を読めないときの件数は None (0 件と区別する)。"""
+    数えるのは key を戦略の key として読めた行だけ。指標の候補と、除外した行 (key なし・
+    読めない) は数えない。候補の記録を読めないときの件数は None (0 件と区別する)。"""
     start = window_start(now)
     inside = 0
     excluded = dict.fromkeys(EXCLUDED_REASONS, 0)
     for record in scan.records:
         if (record.created_at is not None and record.created_at >= start
-                and not record.indicator):
+                and not record.indicator and record.reason is None):
             inside += 1
         if record.reason is not None and (
                 record.created_at is None or record.created_at >= start):
@@ -321,6 +347,8 @@ def classify(facts: UsageFacts, scan: UsageScan, now: datetime) -> dict:
         live: tuple[str, str | None] = (RESULT_HOLDS, None)
     elif facts.scan_failed:
         live = (RESULT_UNKNOWN, REASON_SCAN_FAILED)
+    elif facts.live_unreadable:
+        live = (RESULT_UNKNOWN, REASON_STRATEGY_UNREADABLE)
     else:
         live = (RESULT_CLEAR, None)
     results = (live, (facts.pending, facts.pending_reason),
