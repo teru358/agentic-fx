@@ -26,3 +26,4 @@ related: [plugin-naming-lifecycle-policy, weekly-improve-rebacktests-deployed-st
 
 - 2026-10-29: 起票。
 - 2026-11-20: 状態: 実装中 — 設計 docs/superpowers/specs/2026-11-19-weekly-deployed-strategy-review-design.md C1 を利用者承認 (§6 は 6 件とも推奨どおり)。3 チケットを 1 設計の 3 段 (指標の棚卸しの読取面 / 戦略別の前方成績 = 機械採点 / 週次の確定・判定・停止の提案の通知) で実装する
+- 2026-11-20: 状態: 実装中 — 段 1 (棚卸しの読取面: usage_review・afx plugin list --unused・web の使われ方の列) を main に merge 0d8fff89、2026-11-20 18:52 に afx と afx-ops@web/bot を再起動。本番で未使用 2 本 (停止の提案: 可)、直近 8 週の戦略候補 531 件。週次の通知は段 3
