@@ -572,7 +572,8 @@ def _pending_condition(inputs: ReadInputs, requests: Sequence[_Request]
                        ) -> tuple[dict[str, bool], str | None]:
     """承認待ちの依頼が参照する指標名と、読み切れない依頼があるときの理由。
 
-    戦略の依頼で依存の記録が読めないものは、どの指標を参照するか分からない。"""
+    戦略の依頼で依存の記録が読めないもの、記録の一部が壊れているものは、どの指標を参照
+    するか分からない。"""
     referenced: dict[str, bool] = {}
     if inputs.pending_status == SOURCE_UNAVAILABLE:
         return referenced, usage_review.REASON_PENDING_SOURCE
@@ -588,6 +589,8 @@ def _pending_condition(inputs: ReadInputs, requests: Sequence[_Request]
             for ref in refs.values():
                 if isinstance(ref, dict) and isinstance(ref.get("plugin"), str):
                     referenced[ref["plugin"]] = True
+                else:
+                    unreadable = True      # 読める参照は使用中とし、残りは決められない
         elif request.kind in (KIND_STRATEGY, None):
             unreadable = True
     return referenced, (usage_review.REASON_PENDING_REQUEST if unreadable else None)

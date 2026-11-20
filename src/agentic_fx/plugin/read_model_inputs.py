@@ -7,6 +7,7 @@ unavailable) に落とす。loader の自由文は読み取らず、読めない
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import sqlite3
@@ -221,15 +222,26 @@ def db_generation(conn: sqlite3.Connection) -> tuple:
         "SELECT COUNT(*), COALESCE(MAX(op_id),0), COALESCE(MAX(updated_at),''), "
         "COALESCE(SUM(phase='intent'),0), COALESCE(SUM(phase='needs_retry'),0) "
         "FROM plugin_deploy_ops",
-        "SELECT COUNT(*), COALESCE(MAX(id),0), COALESCE(MAX(created_at),'') "
-        "FROM candidate_archives",
+        "SELECT COUNT(*), COALESCE(MAX(id),0), COALESCE(MAX(created_at),''), "
+        "COALESCE(group_concat(family_key, char(0)),'') FROM "
+        "(SELECT id, created_at, family_key FROM candidate_archives ORDER BY id)",
     )
     for query in queries:
         try:
             parts.append(tuple(conn.execute(query).fetchone()))
         except sqlite3.Error:
             parts.append(None)
+    if parts[-1] is not None:
+        parts[-1] = _digest_last(parts[-1])
     return tuple(parts)
+
+
+def _digest_last(row: tuple) -> tuple:
+    """最後の欄 (連結した文字列) を、同じ内容なら同じになる短い値に置き換える。
+
+    候補の family_key は既存の行でも後から埋まる・書き換わるので、件数や最大値だけでは
+    更新を見落とす。"""
+    return (*row[:-1], hashlib.sha256(str(row[-1]).encode()).hexdigest())
 
 
 def collect_inputs(plugins_root: Path, conn: sqlite3.Connection | None, *,

@@ -414,7 +414,9 @@ def _usage_note(listing: dict, unused: bool) -> str:
     shown = [f"{plugin_text.USAGE_EXCLUDED[word]} {_count(excluded.get(word))}"
              for word in plugin_text.USAGE_EXCLUDED if type(excluded.get(word)) is int
              and excluded[word] > 0]
-    if type(inventory.get("window_candidates")) is int:
+    if inventory.get("candidates_readable") is False:
+        parts.append(f"<p>直近 {weeks} 週の戦略候補: 不明</p>")
+    elif type(inventory.get("window_candidates")) is int:
         text = f"直近 {weeks} 週の戦略候補: {_count(inventory.get('window_candidates'))} 件"
         if shown:
             text += " (除外した行: " + "、".join(shown) + ")"

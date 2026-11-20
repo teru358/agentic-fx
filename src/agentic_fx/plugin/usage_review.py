@@ -152,6 +152,7 @@ class CandidateRecord:
     reason: str | None                 # 除外した理由 (読めたときは None)
     names: frozenset[str]              # 読めた依存名 (時刻も読めた行だけ)
     possible: frozenset[str]           # 使われているかもしれない名前 (読み切れない行)
+    indicator: bool = False            # 指標の候補と判別できた行 (戦略候補の件数に入れない)
 
 
 def parse_candidates(rows: Iterable[CandidateRow], live: Collection[str]
@@ -165,7 +166,10 @@ def parse_candidates(rows: Iterable[CandidateRow], live: Collection[str]
                 created, EXCLUDED_NULL_KEY, frozenset(), frozenset()))
             continue
         names = dependency_names(key)
-        if names is None:
+        if key.startswith("indicator:"):
+            records.append(CandidateRecord(
+                created, None, frozenset(), frozenset(), True))
+        elif names is None:
             records.append(CandidateRecord(
                 created, EXCLUDED_UNREADABLE_KEY, frozenset(), mentioned_names(key, live)))
         elif created is None:
@@ -266,19 +270,23 @@ def window_start(now: datetime) -> datetime:
 
 
 def window_summary(scan: UsageScan, now: datetime) -> dict:
-    """直近 K 週の候補の件数と、除外した行の理由別の件数。休止の週は 0 件として出る。"""
+    """直近 K 週の戦略候補の件数と、除外した行の理由別の件数。休止の週は 0 件として出る。
+
+    指標の候補は数えない。候補の記録を読めないときの件数は None (0 件と区別する)。"""
     start = window_start(now)
     inside = 0
     excluded = dict.fromkeys(EXCLUDED_REASONS, 0)
     for record in scan.records:
-        if record.created_at is not None and record.created_at >= start:
+        if (record.created_at is not None and record.created_at >= start
+                and not record.indicator):
             inside += 1
         if record.reason is not None and (
                 record.created_at is None or record.created_at >= start):
             excluded[record.reason] += 1
     return {"status": scan.status, "reason": scan.reason, "k_weeks": K_WEEKS,
             "candidates_readable": scan.candidates_readable,
-            "window_candidates": inside, "excluded": excluded}
+            "window_candidates": inside if scan.candidates_readable else None,
+            "excluded": excluded}
 
 
 def _candidate_condition(name: str, scan: UsageScan, start: datetime

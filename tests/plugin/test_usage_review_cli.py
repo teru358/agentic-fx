@@ -108,6 +108,17 @@ def test_a_journal_that_cannot_be_read_is_reported_with_a_failing_status(world, 
     assert any("切替の記録を読めなかった" in line for line in lines)
 
 
+def test_a_candidate_table_that_cannot_be_read_is_unknown_and_fails(world, capsys):
+    put(world, "rsi")
+    world.conn.execute("ALTER TABLE candidate_archives RENAME TO moved")
+    world.conn.commit()
+    rc, lines = run(world, capsys, unused=True, now=NOW)
+    assert rc == 1
+    assert any("戦略候補" in line and "不明" in line for line in lines)
+    assert not any("戦略候補: 0 件" in line for line in lines)
+    assert any("戦略候補の記録を読めませんでした" in line for line in lines)
+
+
 def test_kind_filters_the_review_too(world, capsys):
     put(world, "rsi")
     _, lines = run(world, capsys, unused=True, kind="strategy", now=NOW)

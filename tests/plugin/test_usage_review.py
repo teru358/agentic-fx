@@ -165,7 +165,17 @@ def test_an_indicator_candidate_is_not_a_use_and_is_not_an_excluded_row(world):
                 if row["name"] == "rsi")["usage_review"]["state"] == STATE_UNUSED
     assert dto["usage_inventory"]["excluded"] == {
         "null_key": 0, "unreadable_key": 0, "unreadable_time": 0}
-    assert dto["usage_inventory"]["window_candidates"] == 1
+    assert dto["usage_inventory"]["window_candidates"] == 0
+
+
+def test_an_indicator_candidate_is_left_out_of_the_strategy_candidate_count(world):
+    put_indicator(world, "rsi")
+    world.candidate(family_key_from_parts("indicator", "rsi", "1h", (), ()), NOW - WEEK)
+    world.candidate(legacy_key(["x1"]), NOW - WEEK)
+    world.candidate("garbage", NOW - WEEK)
+    summary = listing(world)["usage_inventory"]
+    assert summary["window_candidates"] == 2
+    assert summary["excluded"]["unreadable_key"] == 1
 
 
 def test_a_recent_deployment_keeps_an_indicator_in_use_until_k_weeks_pass(world):
@@ -338,6 +348,28 @@ def test_a_pending_indicator_request_without_dependencies_is_not_a_problem(world
     put_indicator(world, "rsi")
     world.raw_request({"name": "new", "kind": "indicator", "content_hash": "a" * 64})
     assert review(world, "rsi")["state"] == STATE_UNUSED
+
+
+def test_a_pending_request_with_a_broken_dependency_entry_is_indeterminate(world):
+    put_indicator(world, "rsi")
+    world.raw_request({"name": "new", "kind": "strategy", "content_hash": "a" * 64,
+                       "indicator_deps": {"a": {"plugin": None}}})
+    usage = review(world, "rsi")
+    assert usage["state"] == STATE_INDETERMINATE
+    assert results(usage)[COND_PENDING] == (RESULT_UNKNOWN, "pending_request_unreadable")
+
+
+@pytest.mark.parametrize("broken", ["text", None, {"plugin": 3}, {}])
+def test_readable_references_hold_while_a_broken_one_leaves_the_rest_indeterminate(
+        world, broken):
+    put_indicator(world, "rsi")
+    put_indicator(world, "ema")
+    world.raw_request({"name": "new", "kind": "strategy", "content_hash": "a" * 64,
+                       "indicator_deps": {"a": {"plugin": "rsi"}, "b": broken}})
+    assert review(world, "rsi")["state"] == STATE_USED
+    ema = review(world, "ema")
+    assert ema["state"] == STATE_INDETERMINATE
+    assert results(ema)[COND_PENDING] == (RESULT_UNKNOWN, "pending_request_unreadable")
 
 
 # ---------------------------------------------------------------- 全体の状態
@@ -578,3 +610,30 @@ def test_a_new_candidate_invalidates_the_cached_model(world):
     world.candidate(legacy_key(["rsi"]), NOW - WEEK)
     assert state() == STATE_USED
     assert cache.builds == 2
+
+
+def test_a_family_key_filled_in_later_invalidates_the_cached_model(world):
+    put_indicator(world, "rsi")
+    row_id = world.candidate(None, NOW - WEEK)
+    cache = PluginViewCache(world.plugins, SETTINGS, clock=lambda: NOW)
+
+    def state():
+        view = cache.get(world.conn, contextlib.nullcontext, lambda lock: lock.acquire())
+        return next(row for row in view.listing["plugins"]
+                    if row["name"] == "rsi")["usage_review"]["state"]
+
+    assert state() == STATE_UNUSED
+    world.conn.execute("UPDATE candidate_archives SET family_key=? WHERE id=?",
+                       (legacy_key(["rsi"]), row_id))
+    world.conn.commit()
+    assert state() == STATE_USED
+    assert cache.builds == 2
+
+
+def test_replacing_a_family_key_with_another_of_the_same_length_changes_the_generation(world):
+    row_id = world.candidate(legacy_key(["rsi"]), NOW - WEEK)
+    before = read_model_inputs.db_generation(world.conn)
+    world.conn.execute("UPDATE candidate_archives SET family_key=? WHERE id=?",
+                       (legacy_key(["ema"]).replace("ema", "rsi"[::-1]), row_id))
+    world.conn.commit()
+    assert read_model_inputs.db_generation(world.conn) != before

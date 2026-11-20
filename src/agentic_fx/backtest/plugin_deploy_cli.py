@@ -156,8 +156,11 @@ def _unused_lines(dto: dict, kind: str | None) -> list[str]:
         lines.append("注意: " + _INVENTORY_REASON_TEXT.get(
             inventory["reason"], "棚卸し全体を判定できませんでした"))
     excluded = ", ".join(f"{text} {inventory['excluded'][word]}" for word, text in _EXCLUDED_TEXT)
-    lines.append(f"直近 {weeks} 週の戦略候補: {inventory['window_candidates']} 件 "
-                 f"(除外した行: {excluded})")
+    if inventory["window_candidates"] is None:
+        lines.append(f"直近 {weeks} 週の戦略候補: 不明")
+    else:
+        lines.append(f"直近 {weeks} 週の戦略候補: {inventory['window_candidates']} 件 "
+                     f"(除外した行: {excluded})")
     if not inventory["candidates_readable"]:
         lines.append("注意: 戦略候補の記録を読めませんでした")
     lines.append("停止は `afx plugin disable <name>` で行います。提案は自動では実行されません")
@@ -187,6 +190,7 @@ def plugin_list(root: Path, *, kind: str | None = None, settings=None,
         for line in _unused_lines(dto, kind):
             print(line)
         return 1 if ("unavailable" in model.sources.values()
+                     or not dto["usage_inventory"]["candidates_readable"]
                      or dto["usage_inventory"]["status"] != "ok") else 0
     shown = _plugin_list_print(model, kind)
     return 1 if ("unavailable" in model.sources.values()

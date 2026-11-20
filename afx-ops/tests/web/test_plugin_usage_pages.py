@@ -170,6 +170,8 @@ def test_an_inventory_that_could_not_be_judged_is_a_warning():
             "切替の記録を読めなかったため、配備時期を確かめきれません</p>") in html
     html = page(listing_of([], candidates_readable=False))
     assert "戦略候補の記録を読めなかったため、判定できない指標があります" in html
+    assert "直近 8 週の戦略候補: 不明" in html
+    assert "戦略候補: 0 件" not in html
 
 
 def test_a_daemon_without_the_review_shows_no_header_and_no_crash():
