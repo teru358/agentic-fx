@@ -807,17 +807,23 @@ def _final_is_generated(dir_fd: int, name: str) -> bool:
     return True
 
 
-def report_exists(reports_dir: Path, *, label: date,
-                  anchor: Path | None = None) -> bool:
-    """その取引日の report が生成済みか。保存 dir が無ければ False、形が不正なら例外。"""
+def named_report_exists(reports_dir: Path, *, name: str,
+                        anchor: Path | None = None) -> bool:
+    """保存 dir に `name` の report が生成済みか。dir が無ければ False、形が不正なら例外。"""
     try:
         dir_fd = _open_reports_dir(reports_dir, create=False, anchor=anchor)
     except FileNotFoundError:
         return False
     try:
-        return _final_is_generated(dir_fd, _report_name(label))
+        return _final_is_generated(dir_fd, name)
     finally:
         os.close(dir_fd)
+
+
+def report_exists(reports_dir: Path, *, label: date,
+                  anchor: Path | None = None) -> bool:
+    """その取引日の report が生成済みか。保存 dir が無ければ False、形が不正なら例外。"""
+    return named_report_exists(reports_dir, name=_report_name(label), anchor=anchor)
 
 
 #: これより古い part file は前回の異常終了の残りとして掃除する。
@@ -825,7 +831,8 @@ STALE_PART_AGE_SEC = 3600.0
 _PART_NAME = re.compile(r"\.econ-signal-.+\.part\Z")
 
 
-def sweep_dir_stale_parts(dir_fd: int, *, now: float | None = None) -> int:
+def sweep_dir_stale_parts(dir_fd: int, *, now: float | None = None,
+                          pattern: re.Pattern = _PART_NAME) -> int:
     """保存 dir にある `.econ-signal-*.part` のうち、`STALE_PART_AGE_SEC` 以上前の
     自分の通常 file を消す。消した数を返す。失敗は無視する (掃除は report の生成を
     妨げない)。"""
@@ -836,7 +843,7 @@ def sweep_dir_stale_parts(dir_fd: int, *, now: float | None = None) -> int:
     except OSError:
         return 0
     for name in names:
-        if not _PART_NAME.match(name):
+        if not pattern.match(name):
             continue
         try:
             st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
@@ -862,9 +869,11 @@ def sweep_stale_parts(reports_dir: Path, *, now: float | None = None,
         os.close(dir_fd)
 
 
-def write_report_once(reports_dir: Path, *, label: date, body: str,
-                      anchor: Path | None = None) -> Path | None:
-    """取引日ごとに 1 file。既にあれば何もせず None。親専有 (dir 0700 / file 0600)。
+def write_named_once(reports_dir: Path, *, name: str, part_prefix: str, body: str,
+                     anchor: Path | None = None,
+                     part_pattern: re.Pattern = _PART_NAME) -> Path | None:
+    """保存 dir に `name` の file を 1 つだけ作る。既にあれば何もせず None。親専有 (dir 0700 /
+    file 0600)。
 
     保存 dir は symlink を辿らずに開き、以降は dir fd 相対で作る。part file に書き切って
     から `link` で最終名にするので、途中で落ちても最終名の欠けた file は残らない
@@ -878,12 +887,10 @@ def write_report_once(reports_dir: Path, *, label: date, body: str,
     dir_fd = _open_reports_dir(reports_dir, create=True, anchor=anchor)
     try:
         os.fchmod(dir_fd, 0o700)
-        name = _report_name(label)
         if _final_is_generated(dir_fd, name):
             return None
-        sweep_dir_stale_parts(dir_fd)
-        part = (f".econ-signal-{label.isoformat()}.{os.getpid()}."
-                f"{secrets.token_hex(8)}.part")
+        sweep_dir_stale_parts(dir_fd, pattern=part_pattern)
+        part = f"{part_prefix}.{os.getpid()}.{secrets.token_hex(8)}.part"
         fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
                      dir_fd=dir_fd)
         try:
@@ -906,6 +913,14 @@ def write_report_once(reports_dir: Path, *, label: date, body: str,
         return reports_dir / name
     finally:
         os.close(dir_fd)
+
+
+def write_report_once(reports_dir: Path, *, label: date, body: str,
+                      anchor: Path | None = None) -> Path | None:
+    """取引日ごとに 1 file。既にあれば何もせず None (作り方は `write_named_once`)。"""
+    return write_named_once(reports_dir, name=_report_name(label),
+                            part_prefix=f".econ-signal-{label.isoformat()}", body=body,
+                            anchor=anchor)
 
 
 def make_daily_report_callback(*, reports_dir: Path,

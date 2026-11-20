@@ -925,6 +925,84 @@ CREATE TRIGGER IF NOT EXISTS improve_run_summaries_no_delete
 BEFORE DELETE ON improve_run_summaries BEGIN SELECT RAISE(ABORT, 'improve_run_summaries is append-only'); END;
 """
 
+# 週次の確定。1 週 1 行の記録と、その週の戦略別の集計・指標の棚卸しの 3 表で、同じ
+# transaction で書き、後から変えない (UPDATE / DELETE は trigger が拒む)。
+_WEEKLY_REVIEW_DDL = """
+CREATE TABLE IF NOT EXISTS review_weeks (
+  week TEXT PRIMARY KEY,
+  window_end TEXT NOT NULL,
+  finalized_at TEXT NOT NULL,
+  evaluated_at TEXT,
+  rule_version INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('completed','aborted')),
+  evaluation TEXT NOT NULL CHECK(evaluation IN ('normal','degraded','unevaluated')),
+  degraded_json TEXT NOT NULL,
+  inventory_state TEXT NOT NULL CHECK(inventory_state IN ('normal','indeterminate','none')),
+  inventory_reason TEXT,
+  stopped_json TEXT NOT NULL,
+  abort_reason TEXT,
+  CHECK((status='completed' AND evaluation IN ('normal','degraded')
+         AND evaluated_at IS NOT NULL AND abort_reason IS NULL
+         AND inventory_state IN ('normal','indeterminate'))
+        OR (status='aborted' AND evaluation='unevaluated' AND evaluated_at IS NULL
+            AND abort_reason IS NOT NULL AND inventory_state='none'))
+);
+CREATE TABLE IF NOT EXISTS strategy_review_weekly (
+  week TEXT NOT NULL REFERENCES review_weeks(week),
+  name TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  generation_source INTEGER NOT NULL,
+  generation_op_id INTEGER NOT NULL,
+  generation_started_at TEXT,
+  state TEXT NOT NULL CHECK(state IN ('ok','undetermined','failed')),
+  state_reason TEXT,
+  first_decided_at TEXT,
+  n INTEGER NOT NULL DEFAULT 0,
+  wins INTEGER NOT NULL DEFAULT 0,
+  losses INTEGER NOT NULL DEFAULT 0,
+  flats INTEGER NOT NULL DEFAULT 0,
+  r_profit REAL NOT NULL DEFAULT 0,
+  r_loss REAL NOT NULL DEFAULT 0,
+  series_json TEXT NOT NULL DEFAULT '{}',
+  holes_json TEXT NOT NULL DEFAULT '{}',
+  decisions_json TEXT NOT NULL DEFAULT '{}',
+  concentration_json TEXT NOT NULL DEFAULT '{}',
+  short_term_json TEXT NOT NULL DEFAULT '{}',
+  approval_json TEXT,
+  sign TEXT NOT NULL CHECK(sign IN
+    ('indeterminate','insufficient','stop_candidate','near_zero','above_floor')),
+  reasons_json TEXT NOT NULL DEFAULT '[]',
+  PRIMARY KEY(week, name, content_hash, generation_source, generation_op_id)
+);
+CREATE TABLE IF NOT EXISTS plugin_inventory_weekly (
+  week TEXT NOT NULL REFERENCES review_weeks(week),
+  name TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('unused','indeterminate')),
+  origin TEXT NOT NULL,
+  conditions_json TEXT NOT NULL,
+  proposable INTEGER NOT NULL CHECK(proposable IN (0,1)),
+  not_proposable TEXT,
+  is_new INTEGER NOT NULL DEFAULT 0 CHECK(is_new IN (0,1)),
+  PRIMARY KEY(week, name)
+);
+CREATE TRIGGER IF NOT EXISTS review_weeks_no_update
+BEFORE UPDATE ON review_weeks BEGIN SELECT RAISE(ABORT, 'review_weeks is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS review_weeks_no_delete
+BEFORE DELETE ON review_weeks BEGIN SELECT RAISE(ABORT, 'review_weeks is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS strategy_review_weekly_no_update
+BEFORE UPDATE ON strategy_review_weekly BEGIN
+  SELECT RAISE(ABORT, 'strategy_review_weekly is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS strategy_review_weekly_no_delete
+BEFORE DELETE ON strategy_review_weekly BEGIN
+  SELECT RAISE(ABORT, 'strategy_review_weekly is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS plugin_inventory_weekly_no_update
+BEFORE UPDATE ON plugin_inventory_weekly BEGIN
+  SELECT RAISE(ABORT, 'plugin_inventory_weekly is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS plugin_inventory_weekly_no_delete
+BEFORE DELETE ON plugin_inventory_weekly BEGIN
+  SELECT RAISE(ABORT, 'plugin_inventory_weekly is append-only'); END;
+"""
+
 TABLE_NAMES = frozenset({
     "ohlcv_cache", "ohlcv_history", "history_conflicts", "history_sync_runs",
     "history_sync_series", "history_sync_series_state", "history_sync_gaps",
@@ -941,6 +1019,7 @@ TABLE_NAMES = frozenset({
     "improve_run_summaries", "signal_decisions", "signal_shadow", "ohlcv_slice_sets", "ohlcv_slices",
     "ohlcv_slice_generations", "econ_reaction_keys", "econ_reaction_values",
     "kill_switch_hwm_rebases",
+    "review_weeks", "strategy_review_weekly", "plugin_inventory_weekly",
 })
 
 
@@ -2318,6 +2397,7 @@ def init_db(conn: sqlite3.Connection, *, root: Path | None = None) -> None:
     NULL のままにする (次に root つきで呼ばれたときに埋める)。"""
     conn.executescript(_SCHEMA)
     conn.executescript(_OPS_SCHEMA)
+    conn.executescript(_WEEKLY_REVIEW_DDL)
     if _ohlcv_legacy_exists(conn):
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(ohlcv)")}
         v1_leftover = conn.execute(

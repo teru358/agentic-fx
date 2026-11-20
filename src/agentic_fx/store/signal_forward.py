@@ -18,7 +18,10 @@ from datetime import datetime, timedelta, timezone
 
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.core import market_hours
+from agentic_fx.core.paper_fills import day_close_deadline
+from agentic_fx.store import signal_shadow
 from agentic_fx.store import signals as signal_store
+from agentic_fx.store.ohlcv_slices import FINALIZE_GRACE
 
 _log = logging.getLogger(__name__)
 
@@ -48,6 +51,8 @@ PF_UNKNOWN = "unknown"
 _NUMERIC = ("sl", "tp", "day_close")
 _OUTCOMES = (*_NUMERIC, "data_insufficient", "no_fill")
 _WEEK = timedelta(weeks=1)
+RECENT_DECISION_WEEKS = 2
+_LIMIT_WINDOW = timedelta(hours=4)
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +116,8 @@ def _series(rows: list[dict]) -> dict:
             "wins": wins, "losses": losses, "flats": len(rs) - wins - losses,
             "avg_r": avg if avg is not None and math.isfinite(avg) else None,
             "pf": pf, "pf_state": pf_state,
+            "r_profit": profit if math.isfinite(profit) else 0.0,
+            "r_loss": loss if math.isfinite(loss) else 0.0,
             "pips_sum": float(sum(row["pnl_pips"] for row in scored)),
             "level": _level(len(rs))}
 
@@ -131,10 +138,24 @@ def _parse(value: object) -> datetime | None:
     return parsed if parsed.tzinfo is not None else None
 
 
+def shadow_deadline(kind: object, decided_at: datetime, entry_at: datetime | None) -> datetime:
+    """終端していない shadow の、確定猶予を足した期限。成行は採否後の day close、指値は
+    約定済みなら約定の足の day close、未約定なら指値の有効時間の終わり。"""
+    t0 = signal_shadow.observation_start(decided_at)
+    if kind == "limit":
+        if entry_at is None:
+            return t0 + _LIMIT_WINDOW + FINALIZE_GRACE
+        return max(day_close_deadline(entry_at), entry_at + timedelta(minutes=1)) + FINALIZE_GRACE
+    return day_close_deadline(t0) + FINALIZE_GRACE
+
+
 def summarize(decided: list[dict], population: list[dict], *, target: ForwardTarget,
-              start: datetime, end: datetime, time_unreadable: int = 0) -> dict:
+              start: datetime, end: datetime, time_unreadable: int = 0,
+              evaluated_at: datetime | None = None) -> dict:
     """集計の純関数。`decided` は窓内の採否 1 行ずつ、`population` は窓内に出た signal。
-    `time_unreadable` は時刻を読めず、窓に入るか決められなかった行の数 (穴として数える)。"""
+    `time_unreadable` は時刻を読めず、窓に入るか決められなかった行の数 (穴として数える)。
+    `evaluated_at` は shadow の終端を数える時刻で、窓の終端以後。省略すると窓の終端。"""
+    evaluated = end if evaluated_at is None else evaluated_at
     scored = [row for row in decided if row["result_code"] in _NUMERIC]
     abandoned = Counter(row["abandon_reason"] for row in population
                         if row["status"] == "abandoned" and not row["abandon_unknown"])
@@ -150,8 +171,15 @@ def summarize(decided: list[dict], population: list[dict], *, target: ForwardTar
     previous = _rate([row for row in population
                       if previous_from <= row["created_at"] < recent_from])
     accepts = [row for row in decided if row["decision"] == "accept"]
+    two_weeks = end - RECENT_DECISION_WEEKS * _WEEK
     return {
         "name": target.name, "content_hash": target.content_hash,
+        "first_decided_at": (min(r["decided_at"] for r in decided).isoformat()
+                             if decided else None),
+        "recent_decisions": sum(1 for r in decided if r["decided_at"] > two_weeks),
+        "short_term": {"weeks": RECENT_WEEKS,
+                      **{key: _series([r for r in decided if r["decided_at"] > recent_from])[key]
+                         for key in ("n", "wins", "losses", "avg_r")}},
         "state": STATE_OK, "reason": None,
         "generation": {"started_at": target.started_at.isoformat(),
                        "source": GENERATION_SOURCE_NAMES.get(target.generation[0], "unknown"),
@@ -177,8 +205,11 @@ def summarize(decided: list[dict], population: list[dict], *, target: ForwardTar
             "unterminated": len(unterminated),
             "as_of_unknown": len(unknown) + abandon_unknown,
             "oldest_unterminated_sec": max(
-                ((end - r["decided_at"]).total_seconds() for r in unterminated),
+                ((evaluated - r["decided_at"]).total_seconds() for r in unterminated),
                 default=None),
+            "overdue_unterminated": sum(
+                1 for r in unterminated
+                if r["deadline"] is not None and evaluated > r["deadline"]),
             "r_unknown": sum(1 for r in scored if r["r"] is None),
             "time_unreadable": time_unreadable},
         "reach": _rate(population),
@@ -205,15 +236,18 @@ def _payload_stop(payload_json: object) -> object:
 
 
 def forward_summary(conn: sqlite3.Connection, target: ForwardTarget, *,
-                    now: datetime) -> dict:
+                    now: datetime, evaluated_at: datetime | None = None) -> dict:
     """配備中の戦略 1 本の、現世代内・最大 12 週の機械採点。
 
     `now` は評価時刻で、窓の終端であり、採否・abandon・shadow の終端のうち、これより
     後に起きたものは「まだ起きていない」ものとして数える。同じ DB を別の時刻で評価すると
-    その時点の姿になる (後から確定する集計も同じ関数を使う)。世代の開始時刻が読めない対象は数値を持たない (「判定不能」)。"""
+    その時点の姿になる (後から確定する集計も同じ関数を使う)。`evaluated_at` を渡すと、
+    採否・signal・abandon は窓の終端 (`now`) で切ったまま、shadow の終端だけをその時刻までに
+    起きたものとして数える。世代の開始時刻が読めない対象は数値を持たない (「判定不能」)。"""
     if target.started_at is None or target.generation is None or target.reason is not None:
         return _undetermined(target)
     end = now.astimezone(timezone.utc)
+    evaluated = end if evaluated_at is None else max(end, evaluated_at.astimezone(timezone.utc))
     begin = target.started_at.astimezone(timezone.utc)
     start = max(begin, end - WINDOW_WEEKS * _WEEK)
     # 期間は SQL で絞らない。SQLite は時差のない日時も解釈するが、ここの規則 (時差つき ISO)
@@ -225,7 +259,7 @@ def forward_summary(conn: sqlite3.Connection, target: ForwardTarget, *,
     for row in conn.execute(
             "SELECT d.id AS decision_id, s.id AS signal_id, d.decision, d.decided_at, "
             "ti.gate_result, sh.result_code, sh.entry_price, sh.pnl_pips, sh.pip_size, "
-            "sh.resolved_at, sh.updated_at, s.created_at, s.payload_json "
+            "sh.resolved_at, sh.updated_at, sh.entry_at, s.created_at, s.payload_json "
             "FROM signal_decisions d JOIN signals s ON s.id = d.signal_id "
             "LEFT JOIN signal_shadow sh ON sh.decision_id = d.id "
             "LEFT JOIN trade_intents ti ON ti.id = d.trade_intent_id "
@@ -242,11 +276,12 @@ def forward_summary(conn: sqlite3.Connection, target: ForwardTarget, *,
         when = when.astimezone(timezone.utc)
         if not (start <= when <= end) or created.astimezone(timezone.utc) < begin:
             continue
-        result, known = _result_as_of(row, end)
+        result, known = _result_as_of(row, evaluated)
         pips = row["pnl_pips"] if result in _NUMERIC else None
         decided.append({
             "decision": row["decision"], "decided_at": when, "gate_result": row["gate_result"],
             "result_code": result, "pnl_pips": pips, "as_of_unknown": not known,
+            "deadline": _deadline(row, when) if result is None and known else None,
             "r": (r_multiple(pips, entry=row["entry_price"],
                              stop_loss=_payload_stop(row["payload_json"]),
                              pip_size=row["pip_size"]) if result in _NUMERIC else None)})
@@ -279,7 +314,22 @@ def forward_summary(conn: sqlite3.Connection, target: ForwardTarget, *,
             "decided": decided_at is not None
             and decided_at.astimezone(timezone.utc) <= end})
     return summarize(decided, population, target=target, start=start, end=end,
-                     time_unreadable=len(unreadable))
+                     time_unreadable=len(unreadable), evaluated_at=evaluated)
+
+
+def _deadline(row: sqlite3.Row, decided: datetime) -> datetime | None:
+    """終端していない採否の期限。読めない値があれば None (期限超えと断定しない)。"""
+    try:
+        body = json.loads(row["payload_json"])
+    except (TypeError, ValueError):
+        return None
+    kind = body.get("entry_type") if isinstance(body, dict) else None
+    entry = _parse(row["entry_at"])
+    try:
+        return shadow_deadline(kind, decided,
+                               entry.astimezone(timezone.utc) if entry is not None else None)
+    except (ValueError, OverflowError):
+        return None
 
 
 def _result_as_of(row: sqlite3.Row, end: datetime) -> tuple[str | None, bool]:
@@ -302,13 +352,14 @@ def _result_as_of(row: sqlite3.Row, end: datetime) -> tuple[str | None, bool]:
 
 
 def summary_or_failed(conn: sqlite3.Connection, target: ForwardTarget, *, now: datetime,
-                      on_error: Callable[[Exception], None] | None = None) -> dict:
+                      on_error: Callable[[Exception], None] | None = None,
+                      evaluated_at: datetime | None = None) -> dict:
     """1 本の集計。失敗してもほかの戦略を隠さないよう、失敗は `failed` の行にする。
 
     `on_error` は失敗を握りつぶす前に呼ばれ、送出すれば失敗は呼び出し元へ伝わる (中断・
     busy など、行の不明にしてはいけないもの)。"""
     try:
-        return forward_summary(conn, target, now=now)
+        return forward_summary(conn, target, now=now, evaluated_at=evaluated_at)
     except Exception as exc:  # noqa: BLE001 - 1 本の失敗でほかの戦略を隠さない
         if on_error is not None:
             on_error(exc)
