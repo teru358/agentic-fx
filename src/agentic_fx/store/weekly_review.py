@@ -98,6 +98,12 @@ def recorded_weeks(conn: sqlite3.Connection) -> set[str]:
     return {row[0] for row in conn.execute("SELECT week FROM review_weeks")}
 
 
+def recent_weeks(conn: sqlite3.Connection, *, since: datetime) -> list[str]:
+    """`since` 以後に確定 (または打切り) した週の印を古い順に返す。"""
+    return [row[0] for row in conn.execute(
+        "SELECT week FROM review_weeks WHERE finalized_at>=? ORDER BY week", (_iso(since),))]
+
+
 def _previous_unused(conn: sqlite3.Connection, label: str) -> set[str] | None:
     """比較元の週の未使用の名前。比較元 (棚卸しが正常な直前の完了週) が無ければ None。"""
     base = conn.execute(

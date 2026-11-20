@@ -45,6 +45,7 @@ from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.notifier import Notifier
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.core.scheduler import TICK_INTERVAL_SEC, Scheduler
+from agentic_fx.core.weekly_review_tick import WeeklyReviewTick
 from agentic_fx.core.supervisor import MissionSupervisor, SubmitResult
 from agentic_fx.core.writer_admission import WriterAdmission
 from agentic_fx.datafeed import bridge_observe, cache_window, sources
@@ -64,7 +65,7 @@ from agentic_fx.ops.api_server import ApiLimits, ApiServer, ApiStartError
 from agentic_fx.ops.rebase_service import RebaseWiring
 from agentic_fx.ops.service import OpsLimits, OpsService, plan_kill_switch_notice
 from agentic_fx.ops.trade_event_sink import BUSY_RETRY_SEC, TradeEventEmitter, TradeEventSink
-from agentic_fx.loops import econ_signal_report, reflection_cycle
+from agentic_fx.loops import econ_signal_report, reflection_cycle, weekly_review, weekly_review_report
 from agentic_fx.loops.mission_watch import MissionWatch
 from agentic_fx.loops.reflection_cycle import ReflectionCycle
 from agentic_fx.loops.summary import ANSWER_SCHEMA, trade_intent_schema
@@ -790,6 +791,8 @@ class App:
     conn_econ_write: object | None = None
     econ_health: object | None = None
     econ_status_cache: object | None = None
+    # 週次の確定の専用 thread (scheduler の tick が起こす)
+    weekly_review_tick: object | None = None
 
     def close(self, *, busy_resources: frozenset[str] = frozenset()) -> list[str]:
         skipped: list[str] = []
@@ -1943,6 +1946,20 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             capacity=capacity_reader, worker=econ_health,
             admission_status=admission.status, pair_currencies=pair_currencies,
             forward_targets=read_model_inputs.forward_targets_reader(plugins_dir)))
+        # 週次の確定は日次 report とは別の専用 thread で動かす (scheduler は毎 tick 起こすだけ)。
+        weekly_reports_dir = (root / "data" / "improve_reports"
+                              / weekly_review_report.REPORT_DIR_NAME)
+        weekly_tick = WeeklyReviewTick(
+            open_conn=lambda: connect(root / "data" / "agentic.db"),
+            finalize=lambda conn, label, close_at, now: weekly_review.finalize_week(
+                conn, conn, label, close_at, now=now,
+                read_inputs=lambda c: read_model_inputs.collect_inputs(
+                    plugins_dir, c, raise_retryable=True),
+                settings=settings, write_scope=writer_admission.scheduler_write),
+            report=lambda conn, label: weekly_review_report.ensure_report(
+                conn, label, reports_dir=weekly_reports_dir, anchor=root),
+            write_scope=writer_admission.scheduler_write, stop_event=stop_event)
+        scheduler.register_weekly_review(weekly_tick.poll)
         # 取りこぼした改善通知と kill switch 遷移の event を、listener を開く前・
         # supervisor の開始前に出す。失敗は固定語で保留し、起動は続ける。
         ops_service.emit_pending_notices(improve_enabled=settings.notify.improve_events)
@@ -1990,7 +2007,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                    econ_worker=econ_worker, econ_measurer=econ_measurer,
                    conn_econ_read=conn_econ_read,
                    conn_econ_write=conn_econ_write, econ_health=econ_health,
-                   econ_status_cache=econ_status_cache)
+                   econ_status_cache=econ_status_cache, weekly_review_tick=weekly_tick)
         wait_budget.evaluate_wait_budget(clock.now(), trigger="startup")
         return app
     except BaseException:
@@ -3127,6 +3144,9 @@ def run_service(root: Path, *, daemon: bool = False,
         join_report = getattr(app.scheduler, "join_daily_report", None)
         report_still_busy = (join_report is not None
                              and not join_report(timeout=supervisor_join_timeout_sec))
+        weekly_tick = getattr(app, "weekly_review_tick", None)
+        if weekly_tick is not None:
+            weekly_tick.join(timeout=_ECON_WORKER_JOIN_TIMEOUT_SEC)
         # F3 (fix round 1): watchdog の join を service_stopped 記録より前に
         # 行う。notifier は最大 10 秒ブロックしうるため、記録を先にすると
         # 「graceful」記録の後に watchdog がまだ activity へ書き込める窓が

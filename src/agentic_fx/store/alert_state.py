@@ -15,10 +15,16 @@ WAIT_BUDGET_SNAPSHOT_KEY = "signal_wait_budget.snapshot"
 # 最後に通知した calendar の鮮度 (stale / fresh)
 CALENDAR_FRESHNESS_KEY = "econ_calendar.notified_freshness"
 
+# 週次の確定の運用開始週: JSON {"week": "YYYY-MM-DD"}
+WEEKLY_REVIEW_START_KEY = "weekly_review.start"
+# 週次の確定の試行: `<prefix><週>|<UTC 日>` ごとの JSON {"count", "attempts": [{"id", "state"}]}
+WEEKLY_REVIEW_ATTEMPT_PREFIX = "weekly_review.attempt."
+
 _KNOWN_KEYS = frozenset({
     GATE_REJECT_STREAK_KEY, DAILY_REPORT_KEY, WAIT_BUDGET_NOTIFIED_KEY,
-    WAIT_BUDGET_SNAPSHOT_KEY, CALENDAR_FRESHNESS_KEY})
-_KNOWN_PREFIXES = (LIMIT_SUPPRESS_PREFIX, WAIT_BUDGET_NOTIFIED_PREFIX)
+    WAIT_BUDGET_SNAPSHOT_KEY, CALENDAR_FRESHNESS_KEY, WEEKLY_REVIEW_START_KEY})
+_KNOWN_PREFIXES = (LIMIT_SUPPRESS_PREFIX, WAIT_BUDGET_NOTIFIED_PREFIX,
+                   WEEKLY_REVIEW_ATTEMPT_PREFIX)
 
 
 def _check(key: str) -> None:
@@ -35,6 +41,10 @@ def limit_suppress_key(order_id: int) -> str:
 
 def wait_budget_notified_key(day: str, fingerprint: str) -> str:
     return f"{WAIT_BUDGET_NOTIFIED_PREFIX}{day}|{fingerprint}"
+
+
+def weekly_review_attempt_key(week: str, day: str) -> str:
+    return f"{WEEKLY_REVIEW_ATTEMPT_PREFIX}{week}|{day}"
 
 
 def get(conn: sqlite3.Connection, key: str) -> str | None:

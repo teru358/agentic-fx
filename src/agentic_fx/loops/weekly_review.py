@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable
@@ -339,14 +340,16 @@ def evaluate_week(conn: sqlite3.Connection, label: date, close_at: datetime, *,
 def finalize_week(read_conn: sqlite3.Connection, write_conn: sqlite3.Connection,
                   label: date, close_at: datetime, *, now: datetime,
                   read_inputs: Callable[[sqlite3.Connection], ReadInputs],
-                  settings) -> str:
-    """週を評価して確定する。確定済みなら何もせず `EXISTS`。評価の例外は送出し、何も書かない。"""
+                  settings, write_scope: Callable | None = None) -> str:
+    """週を評価して確定する。確定済みなら何もせず `EXISTS`。評価の例外は送出し、何も書かない。
+    `write_scope` は、DB へ書く範囲 (確定の transaction) だけを包む。評価の読取は包まない。"""
     if store.week_exists(read_conn, label.isoformat()):
         return store.EXISTS
     evaluation = evaluate_week(read_conn, label, close_at, evaluated_at=now,
                                inputs=read_inputs(read_conn), settings=settings)
-    return store.commit_week(write_conn, evaluation.record, evaluation.strategies,
-                             evaluation.inventory)
+    with write_scope() if write_scope is not None else nullcontext():
+        return store.commit_week(write_conn, evaluation.record, evaluation.strategies,
+                                 evaluation.inventory)
 
 
 def abort_week(write_conn: sqlite3.Connection, label: date, close_at: datetime, *,

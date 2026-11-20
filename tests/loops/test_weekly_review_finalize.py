@@ -225,3 +225,25 @@ def test_no_money_amount_is_stored_in_the_strategy_rows(world, make):
     columns = [c[1] for c in world.conn.execute("PRAGMA table_info(strategy_review_weekly)")]
     assert not any(word in col for col in columns
                    for word in ("pnl", "amount", "balance", "equity", "money"))
+
+
+def test_the_write_scope_wraps_only_the_commit(world, make, monkeypatch):
+    meta = put(world, "strat", "strategy", at=END - 10 * WEEK)
+    make.decide(at=END - timedelta(days=1), content_hash=meta.content_hash)
+    events: list[str] = []
+
+    class Scope:
+        def __enter__(self):
+            events.append("enter")
+
+        def __exit__(self, *exc):
+            events.append("exit")
+    original = sf.forward_summary
+
+    def spy(*args, **kwargs):
+        events.append("read")
+        return original(*args, **kwargs)
+    monkeypatch.setattr(sf, "forward_summary", spy)
+    wk.finalize_week(world.conn, world.conn, LABEL, END, now=NOW, read_inputs=reader(world),
+                     settings=SETTINGS, write_scope=Scope)
+    assert events == ["read", "enter", "exit"]
