@@ -676,14 +676,21 @@ def _usage_review(inputs: ReadInputs, rows: Sequence[PluginRow], requests: Seque
     return usage_scan, facts
 
 
+class ForwardTargetsUnavailable(Exception):
+    """配備中の plugin を走査できず、対象の一覧を作れない (正常な空とは別)。"""
+
+
 def forward_targets(inputs: ReadInputs) -> ForwardTargets:
     """配備中の戦略ごとの前方成績の対象 (名前の順)。世代は棚卸しと同じ投影から取る。
 
     読める 1 本の strategy の entry は数える。同名が複数ある・strategy なのに link でも
     plain でもない名前は、時刻を持たず理由だけを持つ対象にして (正常な空の一覧と区別する)、
-    数値を出す側が「判定不能」にする。journal が読めない・遷移が合わない戦略も同じ。
+    数値を出す側が「判定不能」にする。live の走査自体が失敗したときは対象を読めないので
+    `ForwardTargetsUnavailable` を送出する (呼び出し元が節全体を不明にする)。journal が読めない・遷移が合わない戦略も同じ。
     種別を読めない entry は戦略かどうか決められないので行にせず、数だけ `unreadable_entries`
     に持つ (数値を出す側が「読めない entry があります」と注記する)。"""
+    if inputs.live.status == SOURCE_UNAVAILABLE:
+        raise ForwardTargetsUnavailable("live plugin scan unavailable")
     by_name: dict[str, list[LiveEntry]] = {}
     unreadable_entries = 0
     for entry in inputs.live.entries:

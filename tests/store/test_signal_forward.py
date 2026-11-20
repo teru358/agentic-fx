@@ -390,3 +390,69 @@ def test_a_signal_whose_creation_time_cannot_be_read_is_counted_once(conn, make)
 def test_readable_data_has_no_unreadable_time_hole(conn, make):
     make.decide(at=NOW - timedelta(days=1))
     assert summary(conn)["holes"]["time_unreadable"] == 0
+
+
+# ---------------------------------------------------------------- 時点を決める時刻の欠落
+
+@pytest.mark.parametrize("early_column", ["resolved_at", "updated_at"])
+def test_a_result_with_only_one_readable_end_time_is_not_counted_as_known(
+        conn, make, early_column):
+    shadow = make.decide(at=NOW - timedelta(hours=3), result="tp")
+    late = "updated_at" if early_column == "resolved_at" else "resolved_at"
+    conn.execute(f"UPDATE signal_shadow SET {early_column}=?, {late}='garbage' WHERE id=?",
+                 ((NOW - timedelta(hours=2)).isoformat(), shadow))
+    conn.commit()
+    out = summary(conn)
+    assert out["series"]["all"]["n"] == 0 and out["outcomes"]["tp"] == 0
+    assert out["holes"]["as_of_unknown"] == 1 and out["holes"]["unterminated"] == 0
+
+
+def test_a_result_without_a_resolved_time_by_nature_is_still_dated_by_its_update(conn, make):
+    make.decide(at=NOW - timedelta(hours=3), result="no_fill")
+    out = summary(conn)
+    assert out["outcomes"]["no_fill"] == 1 and out["holes"]["as_of_unknown"] == 0
+
+
+@pytest.mark.parametrize("value", ["garbage", "2027-01-30 10:00:00"])
+def test_an_abandon_whose_time_cannot_be_read_is_not_asserted_as_abandoned(
+        conn, make, value):
+    make.signal(at=NOW - timedelta(days=1), status="abandoned", reason="freshness_expired")
+    conn.execute("UPDATE signals SET abandoned_at=?", (value,))
+    conn.commit()
+    out = summary(conn)
+    assert out["holes"]["abandoned"] == {}
+    assert out["holes"]["as_of_unknown"] == 1
+    assert out["reach"]["signals"] == 1
+
+
+# ---------------------------------------------------------------- SQL の絞りより前に読めない時刻を拾う
+
+@pytest.mark.parametrize("hours", [-10, 10])
+def test_a_zoneless_decision_time_near_the_window_edge_is_counted_whatever_the_zone(
+        conn, make, hours):
+    make.decide(at=NOW - timedelta(days=1))
+    edge = (NOW - 12 * WEEK + timedelta(hours=hours)).replace(tzinfo=None)
+    conn.execute("UPDATE signal_decisions SET decided_at=?", (edge.isoformat(sep=" "),))
+    conn.commit()
+    out = summary(conn)
+    assert out["holes"]["time_unreadable"] == 1 and out["decisions"]["total"] == 0
+
+
+@pytest.mark.parametrize("hours", [-10, 10])
+def test_a_zoneless_creation_time_near_the_window_edge_is_counted_whatever_the_zone(
+        conn, make, hours):
+    make.signal(at=NOW - timedelta(days=1))
+    edge = (NOW - 12 * WEEK + timedelta(hours=hours)).replace(tzinfo=None)
+    conn.execute("UPDATE signals SET created_at=?", (edge.isoformat(sep=" "),))
+    conn.commit()
+    out = summary(conn)
+    assert out["holes"]["time_unreadable"] == 1 and out["reach"]["signals"] == 0
+
+
+def test_a_zoneless_creation_time_before_the_generation_start_is_counted(conn, make):
+    make.signal(at=NOW - timedelta(days=1))
+    begin = NOW - 2 * WEEK
+    conn.execute("UPDATE signals SET created_at=?",
+                 ((begin - timedelta(days=3)).replace(tzinfo=None).isoformat(sep=" "),))
+    conn.commit()
+    assert summary(conn, started=begin)["holes"]["time_unreadable"] == 1

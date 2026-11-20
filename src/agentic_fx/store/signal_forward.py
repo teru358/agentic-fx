@@ -137,7 +137,8 @@ def summarize(decided: list[dict], population: list[dict], *, target: ForwardTar
     `time_unreadable` は時刻を読めず、窓に入るか決められなかった行の数 (穴として数える)。"""
     scored = [row for row in decided if row["result_code"] in _NUMERIC]
     abandoned = Counter(row["abandon_reason"] for row in population
-                        if row["status"] == "abandoned")
+                        if row["status"] == "abandoned" and not row["abandon_unknown"])
+    abandon_unknown = sum(1 for row in population if row["abandon_unknown"])
     unknown = [row for row in decided if row["as_of_unknown"]]
     unterminated = [row for row in decided
                     if row["result_code"] is None and not row["as_of_unknown"]]
@@ -174,7 +175,7 @@ def summarize(decided: list[dict], population: list[dict], *, target: ForwardTar
             "data_insufficient": sum(1 for r in decided
                                      if r["result_code"] == "data_insufficient"),
             "unterminated": len(unterminated),
-            "as_of_unknown": len(unknown),
+            "as_of_unknown": len(unknown) + abandon_unknown,
             "oldest_unterminated_sec": max(
                 ((end - r["decided_at"]).total_seconds() for r in unterminated),
                 default=None),
@@ -215,10 +216,10 @@ def forward_summary(conn: sqlite3.Connection, target: ForwardTarget, *,
     end = now.astimezone(timezone.utc)
     begin = target.started_at.astimezone(timezone.utc)
     start = max(begin, end - WINDOW_WEEKS * _WEEK)
-    # SQL の datetime() は秒未満を落とす。単調なので、これで取りこぼしなく絞り、
-    # 境界の秒の内側は秒未満まで保った Python の比較で決める。
-    args = {"name": target.name, "hash": target.content_hash,
-            "start": start.isoformat(), "end": end.isoformat(), "begin": begin.isoformat()}
+    # 期間は SQL で絞らない。SQLite は時差のない日時も解釈するが、ここの規則 (時差つき ISO)
+    # は読めないものとして数えるので、SQL で先に除くと穴に入らず消える。対象は 1 本の
+    # 戦略 (名前 + 内容 hash) の行だけなので、全部読んで Python で決める。
+    args = {"name": target.name, "hash": target.content_hash}
     decided = []
     unreadable: set[tuple[str, int]] = set()     # 時刻を読めない signal / 採否 (重複して数えない)
     for row in conn.execute(
@@ -229,10 +230,6 @@ def forward_summary(conn: sqlite3.Connection, target: ForwardTarget, *,
             "LEFT JOIN signal_shadow sh ON sh.decision_id = d.id "
             "LEFT JOIN trade_intents ti ON ti.id = d.trade_intent_id "
             "WHERE s.plugin = :name AND s.content_hash = :hash "
-            "AND (datetime(s.created_at) IS NULL "
-            "OR datetime(s.created_at) >= datetime(:begin)) "
-            "AND (datetime(d.decided_at) IS NULL OR (datetime(d.decided_at) >= datetime(:start) "
-            "AND datetime(d.decided_at) <= datetime(:end))) "
             "ORDER BY d.decided_at, d.id", args):
         when = _parse(row["decided_at"])
         created = _parse(row["created_at"])
@@ -259,8 +256,6 @@ def forward_summary(conn: sqlite3.Connection, target: ForwardTarget, *,
             "d.decided_at AS decided_at "
             "FROM signals s LEFT JOIN signal_decisions d ON d.signal_id = s.id "
             "WHERE s.plugin = :name AND s.content_hash = :hash "
-            "AND (datetime(s.created_at) IS NULL OR (datetime(s.created_at) >= datetime(:start) "
-            "AND datetime(s.created_at) <= datetime(:end))) "
             f"AND ({signal_store.eligibility_case('s.')}) IN ('eligible', 'normalization_failed') "
             "ORDER BY s.id", args):
         created = _parse(row["created_at"])
@@ -271,13 +266,16 @@ def forward_summary(conn: sqlite3.Connection, target: ForwardTarget, *,
         if not (start <= created <= end):
             continue
         decided_at = _parse(row["decided_at"])
-        status, reason = row["status"], row["abandon_reason"]
+        status, reason, abandon_unknown = row["status"], row["abandon_reason"], False
         if status == "abandoned":
             abandoned_at = _parse(row["abandoned_at"])
-            if abandoned_at is not None and abandoned_at.astimezone(timezone.utc) > end:
+            if abandoned_at is None:
+                abandon_unknown = True       # 評価時刻に abandon 済みかを断定できない
+            elif abandoned_at.astimezone(timezone.utc) > end:
                 status, reason = "pending", None
         population.append({
             "created_at": created, "status": status, "abandon_reason": reason,
+            "abandon_unknown": abandon_unknown,
             "decided": decided_at is not None
             and decided_at.astimezone(timezone.utc) <= end})
     return summarize(decided, population, target=target, start=start, end=end,
@@ -292,10 +290,14 @@ def _result_as_of(row: sqlite3.Row, end: datetime) -> tuple[str | None, bool]:
     result = row["result_code"]
     if result is None:
         return None, True
-    stamps = [_parse(row["resolved_at"]), _parse(row["updated_at"])]
-    stamps = [s.astimezone(timezone.utc) for s in stamps if s is not None]
-    if not stamps:
+    updated = _parse(row["updated_at"])
+    resolved = _parse(row["resolved_at"])
+    # 結果の時点は、終端時刻の遅い方で決まる。updated_at は必ず要る。resolved_at は
+    # 値があるのに読めないときだけ不明 (no_fill などは持たない)。数値終端は両方要る。
+    if updated is None or (resolved is None and (
+            row["resolved_at"] is not None or result in _NUMERIC)):
         return None, False
+    stamps = [s.astimezone(timezone.utc) for s in (updated, resolved) if s is not None]
     return (result if max(stamps) <= end else None), True
 
 

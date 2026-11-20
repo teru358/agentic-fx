@@ -176,6 +176,23 @@ def test_a_readable_strategy_in_a_state_that_is_neither_link_nor_plain_is_undete
     assert found["strat"].started_at is None
 
 
+def test_a_live_scan_that_failed_is_not_an_empty_list_of_targets(world):
+    import dataclasses
+    inputs = read_model_inputs.collect_inputs(world.plugins, world.conn)
+    failed = dataclasses.replace(inputs, live=read_model.LiveScan(
+        read_model.SOURCE_UNAVAILABLE))
+    with pytest.raises(read_model.ForwardTargetsUnavailable):
+        read_model.forward_targets(failed)
+
+
+def test_a_missing_plugins_directory_is_a_normal_empty_list(world):
+    import dataclasses
+    inputs = read_model_inputs.collect_inputs(world.plugins, world.conn)
+    missing = dataclasses.replace(inputs, live=read_model.LiveScan(
+        read_model.SOURCE_MISSING))
+    assert list(read_model.forward_targets(missing)) == []
+
+
 def test_readable_entries_only_leave_no_unreadable_count(world):
     put_strategy(world, "good")
     inputs = read_model_inputs.collect_inputs(world.plugins, world.conn)

@@ -212,3 +212,18 @@ def test_the_count_of_unreadable_live_entries_is_carried_in_the_section(ops_env)
 def test_without_unreadable_entries_the_count_is_zero(ops_env):
     deploy(ops_env)
     assert read(ops_env)["forward"]["unreadable_entries"] == 0
+
+
+def test_a_plugins_directory_that_cannot_be_listed_makes_the_section_unavailable(ops_env):
+    import os
+    deploy(ops_env)
+    root = ops_env.plugins_root
+    os.chmod(root, 0o000)
+    try:
+        if os.access(root, os.R_OK):
+            pytest.skip("directory permissions are not enforced here")
+        data = read(ops_env)
+    finally:
+        os.chmod(root, 0o755)
+    assert data["forward"]["state"] == "unavailable"
+    assert data["forward"]["strategies"] == []
