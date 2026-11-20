@@ -1,9 +1,9 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 179 件。完了分は closed/。
+未完了: 178 件。完了分は closed/。
 
-## 実装中 (5)
+## 実装中 (4)
 
 ### 不具合 (1)
 
@@ -11,14 +11,13 @@
 |---|---|---|---|
 | [live-confirmed-bars-into-history](open/live-confirmed-bars-into-history.md) | 高 | 2026-09-21 | backtest の履歴が自動で更新されず、評価が古い入力で通る |
 
-### 機能 (4)
+### 機能 (3)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [strategy-attribution-and-shadow-evaluation](open/strategy-attribution-and-shadow-evaluation.md) | 中 | 2026-10-16 | 戦略ごとの帰属と影の評価 (共有建玉のまま戦略別の成績を出す) |
 | [weekly-improve-rebacktests-deployed-strategies](open/weekly-improve-rebacktests-deployed-strategies.md) | 中 | 2026-10-25 | 週次改善の冒頭で稼働中の戦略を再 backtest し、成績を改善の方向性の材料にする |
 | [weekly-plugin-inventory-notice](open/weekly-plugin-inventory-notice.md) | 中 | 2026-10-29 | 週次の棚卸し: 未使用の指標と成績の悪い戦略を停止の提案として通知する |
-| [web-ui-charts-equity-indicators](open/web-ui-charts-equity-indicators.md) | 低 | 2026-10-11 | 同梱 web に資金遷移グラフとチャート重ね表示 |
 
 ## 実装待ち (12)
 
