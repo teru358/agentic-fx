@@ -443,7 +443,7 @@ def test_the_figure_section_sits_between_the_current_state_and_the_numbers_with_
     assert "kill switch の印は記録がある分だけです" not in section
     assert "kill switch の印は記録がある分だけです" in html.split("<h2>注記</h2>", 1)[1]
     assert "横軸: 表示 tz の時刻 (2026-10-20 09:00:00 +09:00 〜 " in section and "(JPY)" in section
-    assert "束内の equity と作動の水準の厳密な交差は再現していません" in html
+    assert "同じ時間の中で equity が作動の水準をいつ割ったかまでは描いていません" in html
 
 
 def test_omitted_points_and_steps_are_counted_beside_the_figure():
