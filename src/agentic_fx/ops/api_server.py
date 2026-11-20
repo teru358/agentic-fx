@@ -272,14 +272,14 @@ def _route(method: str, path: str, scope: Scope, handler: str, accepted: int = 2
 
 
 _ACCEPTED_202 = frozenset({"ask", "approve", "reject", "retry", "improve"})
-_ENDPOINT_COUNT = 35
+_ENDPOINT_COUNT = 36
 
 
 def build_routes(endpoints: dict) -> tuple[Route, ...]:
     """Endpoint 表から route を作る。表と route が別々に変わらないよう、
     route の定義は表だけに置き、形が崩れていれば起動時に fail closed で止める。"""
     if len(endpoints) != _ENDPOINT_COUNT:
-        raise RuntimeError("endpoint table must hold exactly 35 entries")
+        raise RuntimeError("endpoint table must hold exactly 36 entries")
     routes = []
     for code, endpoint in endpoints.items():
         method, _, path = endpoint.route.partition(" ")
@@ -330,6 +330,8 @@ def _call(ops, route: Route, params: dict, request: Request, principal: Principa
     name = route.handler
     if name == "status":
         return ops.status(principal, deadline=deadline)
+    if name == "performance":
+        return ops.performance(principal, q.get("range", "30d"), deadline=deadline)
     if name == "log":
         return ops.log(principal, _int(q.get("n"), default=20))
     if name == "activity":

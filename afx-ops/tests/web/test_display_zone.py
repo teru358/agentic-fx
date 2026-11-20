@@ -59,6 +59,9 @@ class Client:
     def activity(self, *, n, category):
         return Reply(200, self.replies["activity"], None)
 
+    def performance(self, *, range):
+        return Reply(200, self.replies["performance"], None)
+
 
 def _get(client, path, query=None):
     response = handle_request(Request("GET", path, query or {}), client)
@@ -124,11 +127,14 @@ def test_a_zone_the_environment_cannot_read_is_shown_in_utc_and_logged_once(monk
 
 
 @pytest.mark.parametrize("path,key", [("/", "status"), ("/approvals", "approvals"),
-                                       ("/logs", "log"), ("/activity", "activity")])
+                                       ("/logs", "log"), ("/activity", "activity"),
+                                       ("/performance", "performance")])
 def test_every_page_has_the_zone_line_at_the_top(path, key):
     replies = {"status": _status(), "approvals": {"approvals": [], "display_timezone": TOKYO},
                "log": {"lines": [], "display_timezone": TOKYO},
-               "activity": {"lines": [], "display_timezone": TOKYO}}
+               "activity": {"lines": [], "display_timezone": TOKYO},
+               "performance": {"points": [], "hwm_steps": [], "marks": [], "strategies": [],
+                               "stats": {}, "display_timezone": TOKYO}}
     text = _get(Client(**replies), path)
     head = text.split("</nav>", 1)[1]
     assert re.match(r"<h1>[^<]*</h1>(<nav class=\"tabs\">.*?</nav>)?<p>表示 tz: Asia/Tokyo \(\+09:00\)</p>", head)

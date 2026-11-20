@@ -124,6 +124,7 @@ def _every_endpoint(service):
         "plugin_detail": lambda p: service.plugin_detail(p, "missing"),
         "reflection_status": lambda p: service.reflection_status(p, 9999),
         "whoami": lambda p: service.whoami(p),
+        "performance": lambda p: service.performance(p, "7d"),
         "job_get": lambda p: service.get_job(p, "missing"),
         "events": lambda p: service.events_after(p, after=0, limit=1),
         "ask": lambda p: service.ask(p, f"k-ask-{p}", "質問"),

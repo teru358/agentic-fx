@@ -566,6 +566,10 @@ class WebClient(_Client):
         """改善 mission 1 件の終端 snapshot と要約。"""
         return self._get(f"/v1/improve/runs/{_int_id(mission_id)}")
 
+    def performance(self, *, range: str = "30d") -> Reply:
+        """資金推移と戦略ごとの成績。期間は固定の 4 語だけ。"""
+        return self._get("/v1/performance", range=_performance_range(range))
+
     def log(self, *, n: int = 100) -> Reply:
         return self._get("/v1/log", n=n)
 
@@ -646,6 +650,15 @@ _PLUGIN_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")
 def _plugin_name(value: str) -> str:
     if type(value) is not str or _PLUGIN_NAME.fullmatch(value) is None:
         raise ValueError("plugin name")
+    return value
+
+
+_PERFORMANCE_RANGES = ("7d", "30d", "90d", "all")
+
+
+def _performance_range(value: str) -> str:
+    if type(value) is not str or value not in _PERFORMANCE_RANGES:
+        raise ValueError("performance range")
     return value
 
 

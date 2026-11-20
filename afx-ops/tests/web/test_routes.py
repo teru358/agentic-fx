@@ -9,6 +9,7 @@ def test_route_table_is_exactly_the_read_only_surface():
         ("/logs", "log"), ("/activity", "activity"),
         ("/plugins", "plugins"), ("/plugins/{name}", "plugin"),
         ("/improve", "improve_list"), ("/improve/{id}", "improve_detail"),
+        ("/performance", "performance"),
     ]
     assert resolve_route("/approvals/42").values == {"id": 42}
     assert resolve_route("/approvals/0") is None
@@ -35,10 +36,10 @@ def test_write_route_table_is_exactly_the_decision_improve_and_job_surface():
     assert resolve_route(f"/jobs/{job}") is None and resolve_route(f"/jobs/{job}/cancel") is None
     # 読取りの route と重ならず、対象外の path はどれも書込みの route にならない
     for path in ["/", "/approvals", "/approvals/42", "/logs", "/activity", "/plugins",
-                 "/plugins/x", "/approvals/42/retry", "/approvals/0/approve",
+                 "/plugins/x", "/performance", "/approvals/42/retry", "/approvals/0/approve",
                  "/approvals/042/approve", "/approvals/42/approve/", "/decide", "/jobs", "/jobs/x",
                  "/events", "/improve/", "/improve/run", "/confirm/", "/Confirm"]:
         assert resolve_write_route(path) is None, path
         if path in {"/", "/approvals", "/approvals/42", "/logs", "/activity", "/plugins",
-                    "/plugins/x"}:
+                    "/plugins/x", "/performance"}:
             assert resolve_route(path) is not None

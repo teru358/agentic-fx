@@ -5,6 +5,7 @@ query の検査・帯・renderer の振り分けは、この表だけを読む�
 from __future__ import annotations
 
 import html
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -32,6 +33,7 @@ class Tab:
 
 ACTIVITY_CATEGORIES = ("NEWS", "TECH", "AGGREGATE", "TRADE", "IMPROVE", "APPROVAL", "SYSTEM")
 ALL = "all"
+PERFORMANCE = "/performance"
 PLUGIN_DETAIL = "/plugins/{name}"
 IMPROVE_DETAIL = "/improve/{id}"
 APPROVAL_DETAIL = "/approvals/{id}"
@@ -71,6 +73,10 @@ TABS: dict[str, tuple[Tab, ...]] = {
         Tab("change", "変更", Link(TAB, "change")),
         Tab("claims", "申告", Link(TAB, "claims")),
     ),
+    "/performance": (
+        Tab("equity", "資金推移", Link(TAB, "equity")),
+        Tab("strategy", "戦略別", Link(TAB, "strategy")),
+    ),
     "/activity": (Tab(ALL, "全件", Link(CATEGORY, None)),)
     + tuple(Tab(name, name, Link(CATEGORY, name)) for name in ACTIVITY_CATEGORIES),
 }
@@ -86,24 +92,29 @@ def default_tab(path: str) -> str:
     return TABS[path][0].name
 
 
-def _href(path: str, item: Tab, carry: Mapping[str, int]) -> str:
+_CARRY_WORD = re.compile(r"[0-9a-z]{1,8}\Z")
+
+
+def _href(path: str, item: Tab, carry: Mapping[str, int | str],
+          *, omit_default: bool = False) -> str:
     params: list[tuple[str, str]] = []
     link = item.link
     if link.kind == PATH:
         path = link.value or path
     elif link.kind == TAB:
-        params.append(("tab", link.value or ""))
+        if not (omit_default and item.name == default_tab(path)):
+            params.append(("tab", link.value or ""))
     elif link.kind == CATEGORY and link.value is not None:
         params.append(("category", link.value))
     for key, number in carry.items():
-        if type(number) is int:
+        if type(number) is int or (type(number) is str and _CARRY_WORD.match(number)):
             params.append((key, str(number)))
     query = "&".join(f"{key}={value}" for key, value in params)
     return html.escape(path + ("?" + query if query else ""), quote=True)
 
 
-def bar(path: str, current: str, *, carry: Mapping[str, int] | None = None,
-        writable: bool = False, at: str | None = None) -> str:
+def bar(path: str, current: str, *, carry: Mapping[str, int | str] | None = None,
+        writable: bool = False, at: str | None = None, omit_default: bool = False) -> str:
     """h1 の下に置く帯。href は path・固定表の値・検査済みの整数だけで組む。
 
     `path` は表の key。表の key と実際の path が違う route (名前を含む path) は `at` に実際の path を渡す。
@@ -114,6 +125,6 @@ def bar(path: str, current: str, *, carry: Mapping[str, int] | None = None,
     links = []
     for item in items:
         mark = ' aria-current="page"' if item.name == current else ""
-        links.append(f'<a href="{_href(at or path, item, carry or {})}"{mark}>'
+        links.append(f'<a href="{_href(at or path, item, carry or {}, omit_default=omit_default)}"{mark}>'
                      f"{html.escape(item.label, quote=True)}</a>")
     return '<nav class="tabs">' + "".join(links) + "</nav>"

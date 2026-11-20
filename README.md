@@ -4,7 +4,7 @@
 
 停止中の設定・記録を診断するときは `afx status`、稼働中 daemon の状態と未完の手順を見るときは `afx ctl status` を使います。daemon の生きた状態が必要かで入口を選ぶ全体の規則は、[CLI の置き場の原則](docs/operations/ops-api-2026-10-09.md#cli-placement-principle)を参照してください。
 
-前提は Ubuntu 22 以降、Python 3.12 と uv、systemd user session、Node.js と `claude` または `codex` CLI、または llama-swap です。改善ループの隔離には Linux 6.18 以降 (Landlock ABI 8) が必要です。
+前提は Ubuntu 22 以降、Python 3.12 と uv、systemd user session、Node.js と `claude` または `codex` CLI、または llama-swap です。改善ループの隔離には Linux 6.18 以降 (Landlock ABI 8) が必要です。同梱 web の資金推移・戦略別の画面 (`GET /v1/performance`) を使うには、daemon が使う Python の SQLite が 3.42 以上である必要があります (Ubuntu 22.04 の標準は 3.37 なので、uv が入れる Python を使うか SQLite を更新します)。
 
 ```bash
 git clone <repository-url> agentic-fx

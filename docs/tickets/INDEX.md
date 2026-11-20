@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 178 件。完了分は closed/。
+未完了: 179 件。完了分は closed/。
 
 ## 実装中 (5)
 
@@ -72,9 +72,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (155)
+## 設計待ち (156)
 
-### 不具合 (83)
+### 不具合 (84)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -110,6 +110,7 @@
 | [improve-eval-window-reference-availability](open/improve-eval-window-reference-availability.md) | 中 | 2026-11-09 | 参照系列を宣言した候補の評価区間に、参照の履歴が無い先頭の足が入る |
 | [reference-daily-session-completeness](open/reference-daily-session-completeness.md) | 中 | 2026-11-14 | 非24時間銘柄の1d参照を取引セッションに沿って確定する |
 | [cancel-stall-in-cancelling-state](open/cancel-stall-in-cancelling-state.md) | 中 | 2026-11-16 | 取消の途中で DB 遷移に失敗した注文が CANCELLING に残り予約を占有する |
+| [account-snapshot-future-ts-treated-fresh](open/account-snapshot-future-ts-treated-fresh.md) | 中 | 2026-11-19 | 時計が戻ると未来時刻の口座 snapshot が新鮮と扱われ続ける |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
 | [tier-a-directive-ignored](open/tier-a-directive-ignored.md) | 中 |  | 自己テストの連続失敗の警告が無視され続け、止める仕組みが無い |

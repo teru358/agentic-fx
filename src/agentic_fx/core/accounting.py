@@ -86,12 +86,22 @@ def daily_start_equity(conn: sqlite3.Connection, now: datetime, *,
     return time_cutover.daily_base(conn, now, reference)
 
 
+SNAPSHOT_MAX_AGE_MIN = 10.0
+
+
+def is_stale(ts: datetime, now: datetime, *,
+             max_age_min: float = SNAPSHOT_MAX_AGE_MIN) -> bool:
+    """記録時刻から ``max_age_min`` 分を超えて経っていれば陳腐 (ちょうどは新鮮)。"""
+    return now - ts > timedelta(minutes=max_age_min)
+
+
 def current_account(conn: sqlite3.Connection, now: datetime, *,
-                    max_age_min: float = 10.0) -> tuple[float, float] | None:
+                    max_age_min: float = SNAPSHOT_MAX_AGE_MIN
+                    ) -> tuple[float, float] | None:
     now = as_utc(now)
     row = snapshots.latest(conn)
     if row is None:
         return None
-    if now - datetime.fromisoformat(row["ts"]) > timedelta(minutes=max_age_min):
+    if is_stale(datetime.fromisoformat(row["ts"]), now, max_age_min=max_age_min):
         return None  # 陳腐化 → fail closed
     return row["equity"], row["hwm"]

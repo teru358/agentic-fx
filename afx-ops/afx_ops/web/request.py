@@ -13,7 +13,8 @@ from dataclasses import dataclass
 from urllib.parse import parse_qsl
 
 from afx_ops.api_client import ApiError, with_detail
-from afx_ops.web import auth, improve_pages, plugin_pages, render, tabs, write, write_pages
+from afx_ops.web import (auth, improve_pages, perf_pages, plugin_pages, render, tabs, write,
+                         write_pages)
 from afx_ops.web.headers import response_headers
 from afx_ops.web.routes import RouteMatch, resolve_route
 
@@ -228,6 +229,10 @@ def _check_reply_shape(route: str, data: dict) -> None:
         valid = _list_of(data.get("runs"), dict) and type(data.get("has_more")) is bool
     elif route == "improve_detail":
         valid = type(data.get("id")) is int
+    elif route == "performance":
+        valid = (all(_list_of(data.get(key), dict) for key in
+                     ("points", "hwm_steps", "marks", "strategies"))
+                 and type(data.get("stats")) is dict)
     else:
         valid = False
     if not valid:
@@ -338,6 +343,17 @@ def _invoke(match: RouteMatch, query: dict[str, str], client, report: _Reporter,
             raise _Reject(400)
         return (_call(report, client.plugin, match.values["name"]),
                 functools.partial(plugin_pages.render_plugin, tab=tab, name=match.values["name"]))
+    if method == "performance":
+        if set(query) - {"tab", "range"}:
+            raise _Reject(400)
+        tab = query.get("tab", tabs.default_tab(tabs.PERFORMANCE))
+        if tab not in tabs.tab_names(tabs.PERFORMANCE):
+            raise _Reject(400)
+        range_key = query.get("range", perf_pages.DEFAULT_RANGE)
+        if range_key not in perf_pages.RANGES:
+            raise _Reject(400)
+        return (_call(report, client.performance, range=range_key),
+                functools.partial(perf_pages.render_performance, tab=tab, range_key=range_key))
     if method == "improve_list":
         return _improve_list(query, client, report, writable)
     if method == "improve_detail":

@@ -23,7 +23,7 @@ BOB = "web:bob"
 # ops-web-write が呼べる endpoint (handler 名)。ここに無いものはすべて 403。
 READS = {"status", "log", "activity", "approval_detail", "approval_change", "approval_list",
          "plugin_list", "plugin_detail", "improve_run", "improve_runs", "reflection_status",
-         "whoami", "job_get", "events"}
+         "whoami", "job_get", "events", "performance"}
 WRITES = {"approve", "reject", "retry", "improve", "job_cancel"}
 ALLOWED = READS | WRITES
 
@@ -53,7 +53,7 @@ def test_every_route_is_allowed_to_ops_web_write_exactly_as_designed(api5):
         else:
             assert response.status_code == 403 and code == "forbidden", route.handler
     assert seen >= ALLOWED
-    assert len(ROUTES) == 35
+    assert len(ROUTES) == 36
 
 
 def test_ops_web_write_cannot_reach_ask_backlog_policy_or_the_local_guard(api5, ops_env):

@@ -151,6 +151,7 @@ approve と retry は表示した `payload_json` の SHA-256 を必須とし、�
 |11d|`killswitch rebase <世代>`|`POST /v1/killswitch/rebase`|local_guard|UDS・approver のみ、非 idempotent（冪等 key なし）。本文は `expected_generation` と `preview_token` だけ。ラッチ・世代・発動時刻は変えず、HWM だけを現在 equity へ付け直す。成功は `rebase_id` / `snapshot_id` / `generation` / `latched`。不適格・値の変化は 409 `preview_changed`、閉場は 409 `market_closed`、ほかは既存 code。監査・event には金額を載せない|
 |12|`reflect retry <order_id>`|`POST /v1/reflections/{order_id}/retry`|operate|`Idempotency-Key` 必須。body に client が行 12b で見た試行記録の識別子 (`expected_attempts`、`expected_last_attempt_at`、記録なしは `0` / null) を必須で送り、台帳の現在値と一致する場合だけ clear する。不一致は 409 `attempt_changed` で無変更。closed かつ reflection 未済の条件は従来どおり|
 |12b|—|`GET /v1/reflections/{order_id}`|status.read|order の status、reflection の有無、試行台帳 (`attempts`、`last_attempt_at`) の現在値。自由文の `last_reason` は返さない|
+|12c|—|`GET /v1/performance?range=7d\|30d\|90d\|all`|status.read|同梱 web の Performance 画面の読取。読取専用の短命の接続で 1 本の transaction を張り、ops レーンも監査行も使わない。資金推移 (代表点・HWM の階段・印・統計)、今の資金保護の状態 (status と同じ kill switch の読取・同じ最新 snapshot・同じ DD 関数)、戦略ごとの成績を返す。range 省略は 30d、不正な値は 400。設計の正は [同梱 web のチャートの段](2026-11-19-web-charts-equity-strategy-design.md)|
 |13|`improve`|`POST /v1/improve/runs` → job|operate|冪等 key、同時 1 本、停止時 join|
 |14|`improve add <idea>`|`POST /v1/backlog`|operate|冪等 key、1〜2,000 文字|
 |15|`backlog reject <id>`|`POST /v1/backlog/{id}/reject`|operate|状態条件付き UPDATE|
@@ -171,7 +172,7 @@ approve と retry は表示した `payload_json` の SHA-256 を必須とし、�
 
 追補 (2026-10-25): 行 14 の現行名は `backlog add <idea>` である (`improve add` は旧名)。
 
-実装する endpoint は 35 本で、内訳は変更系 18 本 (POST: asks、data/resume、approve、reject、retry、killswitch/reset、killswitch/reconcile、killswitch/rebase、reflections retry、improve/runs、backlog add、backlog reject / reopen / note、policy add / remove / reconcile、jobs cancel) と読取 17 本 (status、log、activity、approval 詳細、approval 変更内容、approval 一覧、improve run 詳細・一覧、plugin 一覧・詳細、reflection 試行記録、whoami、job get、events、backlog list、policy show、killswitch rebase-preview) である。このうち冪等 key 必須は 7 本、`local_guard` は 5 本 (reset、reconcile、rebase、rebase-preview、data resume)、決定は 3 本である。
+実装する endpoint は 36 本で、内訳は変更系 18 本 (POST: asks、data/resume、approve、reject、retry、killswitch/reset、killswitch/reconcile、killswitch/rebase、reflections retry、improve/runs、backlog add、backlog reject / reopen / note、policy add / remove / reconcile、jobs cancel) と読取 18 本 (status、log、activity、approval 詳細、approval 変更内容、approval 一覧、improve run 詳細・一覧、plugin 一覧・詳細、reflection 試行記録、whoami、job get、events、backlog list、policy show、killswitch rebase-preview、performance) である。このうち冪等 key 必須は 7 本、`local_guard` は 5 本 (reset、reconcile、rebase、rebase-preview、data resume)、決定は 3 本である。
 
 ### 4.3 event 契約
 
@@ -460,3 +461,4 @@ C0 v0.3 の設計レビューで、plugin worker 隔離、世代 CAS、kind fail
 |2026-10-25|v1.21|backlog / policy の読取と policy の remove / reconcile を route・scope 表へ追加し、endpoint 数を 29 本に更新|CLI surface の現行運用名と API 契約を同期するため||
 |2026-10-27|v1.22|§5 に繰り返し improve の job 契約 (本文拡張、進捗 result、`stop_requested`、走行中 cancel の条件) を追記|`afx ctl improve` の繰り返し (-t / -c / -n) の操作面||
 |2026-11-15|v1.23|`GET /v1/killswitch/rebase-preview` と `POST /v1/killswitch/rebase` を追加 (endpoint 35 本、`local_guard` 5 本)。失敗 code に `preview_changed` / `market_closed` を追加。endpoint 数と内訳を現行の route 表に合わせて数え直した (旧 29 本は実装より少なかった)|kill switch 解除後の HWM 付け直し設計 C2.1 (T3)||
+|2026-11-19|v1.24|`GET /v1/performance` を追加 (endpoint 36 本、読取 18 本)。scope は `status.read`|同梱 web のチャートの段 (資金推移と戦略ごとの成績の読取)||

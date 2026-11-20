@@ -44,35 +44,37 @@
 
 ### 1.1 資金推移のタブ (既定)
 
-1. **期間を選ぶ**: 「7 日 / 30 日 / 90 日 / 全期間」の link (既定は 30 日)。link は `?range=` を付け替えるだけ。
+1. **期間を選ぶ**: 「7 日 / 30 日 / 90 日 / 全期間」の link (既定は 30 日)。link は `?range=` を付け替えるだけ。今の状態は期間によらないので、link は今の状態の枠の下、図の直前に置く。選んでいる期間は太字・文字色で示す (`aria-current="page"`)。
 2. **図を読む**: 横は時刻 (表示 tz)、縦は口座通貨の金額。
-   - **equity**: 実線。その後ろの薄い帯は、束ねた時間の中の最小〜最大。帯の下端がその時間の最も悪い equity。
+   - **equity**: 実線。その後ろの薄い帯 (凡例は「帯: その時間内の最小〜最大」) は、束ねた時間の中の最小〜最大。帯の下端がその時間の最も悪い equity。
    - **balance**: 破線。
    - **HWM**: 点線の階段線。上昇は束ごとに安全側へまとめ、下降は正確な位置に残す (§2.3)。
    - **作動の水準**: HWM × (1 − kill_pct / 100)。細い階段線。equity がここに届くと予約の約定が止まり、次に建てる判断が出たときに kill switch が作動する (F21)。**線を割っても、建てる判断が出る前に戻れば「✕」は付かない**。
    - **印** (縦線と記号): kill switch の作動「✕」、解除「↑」、HWM の付け直し「▽」、入出金「◇」、不明な HWM 下降「△」。
    - 記録の無い時間 (週末・停止) は線を切る。つないで埋めない。
-3. **今の状態** (図の上の別枠、毎回取得): Status と同じ「作動中 / 照合待ち / 解除 / 不明」の語と印、世代、状態取得時刻を出す。別に最新 snapshot の時刻・経過秒・鮮度、DD、作動水準、余裕を表示する。10 分超は「古い記録」。ラッチの有無と別に「新規の約定は停止中 (古い記録 / DD 到達 / 不明)」を出す。取得不能は「不明」とし、安全を示す表示にしない。
-4. **数字で読む** (図の下の表): 期間の初めと終わりの equity・balance、最大・最小、**最大 DD (率と時刻)**。間引く前の全行から計算する。
-5. **印の表**: 図と同じ最新 20 件。作動・解除は実時刻 / 記録時刻と出所、付け直しは「帳簿の位置」と「操作時刻」の 2 列。位置の新しい順、時刻は `YYYY-MM-DD HH:MM:SS +09:00`。
-6. **注記** (固定文): 「線は時間で束ねた表示で、判定の根拠ではありません」「kill switch は、equity が作動の水準以下のときに建てる判断が出ると作動します。線を割っただけでは印は付きません」「kill switch の印は記録がある分だけです。event の記録は <最初の記録の日> 以降です」「期間内にも履歴の欠けがあり得ます」「余裕が正でも解除されたとは限りません」「束内の厳密な交差は再現していません」。
+3. **今の状態** (図の上の別枠、表示した時点で 1 回取得。この画面は自動で更新しない。枠は文字色の 2px で、画面で目立たせるのはここだけ): 枠の先頭に状態の取得時刻と最新 snapshot の時刻 (読めなければ「不明」)、「この画面は自動で更新しません。今の状態は再読み込みか Status 画面 (自動で更新) で確かめてください」の固定文、Status への link を出す。時刻は先頭の行だけに出し、カードには出さない。カードは次の順 (9 枚): kill switch (Status と同じ「作動中 / 照合待ち / 解除 / 不明」の語と印)・新規の約定、DD・閾値 (DD)・作動の水準・余裕、最新記録の鮮度・最新記録からの経過、世代。経過は 60 秒以上なら大きい単位を先に出し秒を括弧に残す (例: 2 日 4 時間 30 分 (189000 秒))。10 分超は「古い記録」。ラッチの有無と別に「新規の約定」の欄に停止の理由を印と語で出す。語は daemon の生の値でなく使う人の言葉: 止めていない (none)・kill switch で停止・記録が古く停止 (stale)・DD 到達で停止 (drawdown)・不明。鮮度は新しい・古い・不明。語の表は `marks.py` の `FILL_HOLD_TEXT`・`WORD_TEXT` に 1 つだけ持ち、Status の鮮度・状態の印 (calendar・gateway・worker) も同じ `WORD_TEXT` から出す。表に無い値・欠損・型違いは「? 不明」とし、安全を示す表示にしない。
+4. **数字で読む** (図の下の表): 期間の初めと終わりの equity・balance、最大・最小、**最大 DD (率と時刻。時刻だけ読めないときは「(時刻は不明)」、率が読めなければ「不明」1 語)**。間引く前の全行から計算する。期間に記録が無いときは節ごと出さず、図の節に「この期間の記録はありません。期間を広げるか、daemon が動いているかを Status 画面で確かめてください」を 1 回だけ出す。
+5. **印の表**: 図と同じ最新 20 件。作動・解除は実時刻 / 記録時刻と出所、付け直しは「台帳の位置」と「操作時刻」の 2 列。出所の語は「今の状態の記録 / 付け直しの台帳 / 通知の記録 / 口座の記録」。位置の新しい順、時刻は `YYYY-MM-DD HH:MM:SS +09:00`。
+6. **固定文の置き場**: 図の下に「線は時間で束ねた表示で、判定の根拠ではありません」と、間引いたときだけ「図は一部を間引いています (線の点 N、HWM の段 N)。下の数字は間引く前の集計です」。今の状態の枠の中に「余裕が正でも解除されたとは限りません」(と古い記録の基準)。**注記**の節に「kill switch は、equity が作動の水準以下のときに建てる判断が出ると作動します。線を割っただけでは印は付きません」「kill switch の印は記録がある分だけです。event の記録は <最初の記録の日> 以降です」(記録が無ければ「event の記録はありません」)「期間内にも履歴の欠けがあり得ます」「同じ時間の中で equity が作動の水準をいつ割ったかまでは描いていません」「event だけから分かる印は、作動 / 解除を記録した時刻です。通知の時刻を状態が変わった時刻とは断定しません」。「印は記録がある分だけ」は注記だけに置く。
 
 ### 1.2 戦略別のタブ
 
-1. **見出しの下に必ず出す文**: 「**その戦略のシグナルで起きた判断の成績**です。建てる・決済する判断は LLM が行うので、戦略そのものの成績 (backtest) とは違います」。
+1. **タブの帯の下に必ず出す文** (見出しも枠も付けない 1 つの段落。期間の link はその下、図の直前): 「**その戦略のシグナルで起きた判断の成績**です。建てる・決済する判断は LLM が行うので、戦略そのものの成績 (backtest) とは違います」。
 2. **表** (1 行 = 起動理由。下の数字は架空の例):
 
-   | 起動理由 | 件数 | 勝 / 負 / 分 | 勝率 | PF | 平均 R | 損益の合計 | 決済の内訳 | 保有中 |
+   | 起動理由 | 件数 | 勝 / 負 / 分 | 勝率 | PF | 平均 R (手数料込み) | 損益の合計 | 決済の内訳 | 保有中 |
    |---|---|---|---|---|---|---|---|---|
-   | `signal:<plugin>` | 12 (参考) | 7 / 4 / 1 | 58.3% | 1.40 | +0.21 | +… | 判断 8 / SL 3 / TP 1 | 1 |
+   | `signal:<plugin>` | 12 | 7 / 4 / 1 | 58.3% (参考) | 1.40 (参考) | +0.21 (参考) | +… | 判断 8 / SL 3 / TP 1 | 1 |
    | `signal:<plugin>` | 3 | 2 / 1 / 0 | – | – | – | +… | 判断 3 | 0 |
    | 定期の判断 (`cron`、戦略に属さない) | 4 | … | – | – | – | … | … | 0 |
+
+   「(参考)」は件数の列でなく、各率の母数が基準に満たない率に付ける (§2.6)。補足は差があるときだけ出す: 損益不明の決済が 0 なら件数だけ (差があれば `5 (損益既知 3 / 損益不明 2)`)、R を算出できた件数が決済と同じなら平均 R の 2 行目は出さない (差があれば `R 算出 3 / 決済 5 件`)。内訳が全部読めない cell は「不明」1 語。ラベルの「不明」は「損益不明」。
 
    - **件数は必ず出す**。件数が少ないうちは率を出さない・参考と明記する (§2.6)。
    - 帰属は**建てた判断**で決める。決済を後の定期の判断が出しても、行は変わらない。
    - 指標の対象は期間内に**決済した**取引。保有中・決済未確定だけの起動理由も件数の行を出す。期間の link は資金推移と同じ。
-3. **累積損益の図**: 起動理由ごとの線 (決済のたびに段が動く)。期間の初めを 0 とし、最新 120 決済より前は累計始点 1 点にまとめる (§2.6)。線は色と線種で区別し、凡例に記号を添える。
-4. **注記** (固定文): 「累積損益の合計は equity の変化と一致しません (含み損益、期間の外で決済した取引、スワップを含まないため)」「同じ名前の plugin の版が変わっても、同じ行に数えます」。
+3. **累積損益の図**: 起動理由ごとの線 (決済のたびに段が動く)。期間の初めを 0 とし、最新 120 決済より前は累計始点 1 点にまとめる (§2.6)。線は色と線種の両方で区別する。凡例は線の見本・名前・終点の値で、記号は付けない (色だけの区別にならないため)。cron の行は表・凡例・図の下の文のどれも「定期の判断」と呼ぶ。行が 1 件も無いときの図の節は「この期間に決済した取引はありません。期間を広げると出ることがあります」。
+4. **注記** (固定文。先頭に率の規則の 1 文を足す: 「勝率・PF・平均 R は、もとになる件数 (勝率・PF は損益の分かる決済、平均 R は R を算出できた決済) が N 件未満だと出しません (–)。M 件未満は参考の値です」。N・M は daemon が返す閾値): 「累積損益の合計は equity の変化と一致しません (含み損益、期間の外で決済した取引、スワップを含まないため)」「同じ名前の plugin の版が変わっても、同じ行に数えます」。
 
 ### 1.3 変わらないもの
 
@@ -91,9 +93,12 @@ web (afx-ops) ──GET /v1/performance?range=30d──▶ daemon (ops API、sta
                                                    └ S/ops/performance_view.py が DB を読んで束ねる
 ```
 
+- **今の状態は表示時の 1 回だけ取得し、画面は自動で更新しない** (§2.8)。
 - **新しい読取 endpoint が 1 本要る**。今の `GET /v1/status` は今の値だけ、`GET /v1/events` は 10 月以降の event だけで、snapshot の列も注文の集計も返さない。
 - **集計は daemon 側**。web は DB を持たず、6 万行を渡すと応答が数 MB になる。daemon は束ねた代表点 (基本 280 束、分割後も最大 280 点) と集計済みの行だけを返す。
 - **scope は `status.read`**。口座の値は今も `status` で同じ principal に見せている (F20)。新しい scope は作らない。`ops-notify` (`events.read` だけ) には見えない。
+- **SQLite 3.42 以上が要る**。daemon の Python の SQLite が 3.42 未満なら 503 `unavailable`、detail は `sqlite_version_too_old: need 3.42, have <今の版>`。要件は README と `docs/operations/ops-api-2026-10-09.md` 付録に書く。
+- **期限・停止**。SQL の途中 (progress handler) に加え、SQL の外の大きな Python 処理 (決済の解析・集計・並べ替え) の途中と応答を返す直前にも確かめる。期限切れは `request_timeout`、停止は `unavailable`、部分の応答は返さない。
 - **読取専用**。監査行 (`ops_requests`) は書かない (ほかの GET と同じ)。DB への書込みは無い。
 - **CLI は足さない**。daemon の生きた状態を読むので、置くなら `afx ctl` の「稼働観測・実行追跡」だが、この段は web だけにする (§7)。`cli_surface` の検査は CLI の記録から endpoint を引く向きなので、記録の無い endpoint は通る (`tests/test_cli_surface.py:183-195`)。逆向きの検査が無いことは T1 で確かめる。
 - web 側: `WebClient.performance(range=)` を足す (`A/api_client.py:535-573`)。`WebWriteClient` は継承するので、書込みを有効にした web でも同じ。
@@ -112,25 +117,26 @@ web (afx-ops) ──GET /v1/performance?range=30d──▶ daemon (ops API、sta
 | `marks_since`, `other_sources` | 最古の kill switch event 記録時刻 (無しは null)、期間内の除外 source 行数 |
 | `strategies` | 下表の行、最大 32 (cron・帰属不明・合算行を含む)。順序は §2.6 |
 | `thresholds` | `{min_count:5,reference_count:30}` |
+| `series_limits` | `{events:120,series:4}`。累積点に使う系列ごとの決済の件数の上限と、図に出す起動理由の系列数の上限。web は点の読み取り上限 (events + 2)・色の数・古い決済の省略件数 (closed_count − events) にこの値を使い、読めなければ省略件数を書かない |
 | `omissions` | `{equity_points,hwm_steps,strategy_rows,strategy_series}`。図から省いた代表点・段、合算した元行、図に出さない系列の数。元 snapshot の集約数とは別 |
 | `quality` | `{partial,invalid_snapshots,invalid_marks,invalid_orders,unknown_hwm_drops,unplaced_closed_count}`。partial は bool、他は件数。正常なら false / 0 |
 
 | 入れ子 | 全 key と意味 |
 |---|---|
-| `current` | `kill_switch` (下記の status と同形 / 取得不能は null)、`state_fetched_at`、`snapshot_at` (最新行時刻 / null)、`snapshot_fetched_at`、`snapshot_age_sec` (非負秒 / null)、`snapshot_freshness` (`fresh/stale/unknown`)、`dd_pct,kill_level,headroom` (算出不能は null)、`kill_pct` (現閾値)、`fill_hold` (`stale/drawdown/none/unknown`) |
+| `current` | `kill_switch` (下記の status と同形 / 取得不能は null)、`state_fetched_at`、`snapshot_at` (最新行時刻 / null)、`snapshot_fetched_at`、`snapshot_age_sec` (非負秒 / null)、`snapshot_freshness` (`fresh/stale/unknown`)、`dd_pct,kill_level,headroom` (算出不能は null)、`kill_pct` (現閾値)、`fill_hold` (`kill_switch/stale/drawdown/none/unknown`、daemon が約定を止める理由の総合)、`snapshot_max_age_min` (陳腐化と扱う閾値・分。daemon の判定と同じ定数) |
 | 代表点 | `start_at,end_at,last_at` (部分束の実時刻)、`equity_min,equity_max,equity_last,balance_last`、`seg` (非負整数)。null 無し。帯は `[start_at,end_at]`、代表線は last_at に置く |
 | `stats` | `first_at,last_at,equity_first,equity_last,balance_first,balance_last,equity_min,equity_max,balance_min,balance_max,dd_max,dd_max_at`。期間が空・算出不能は null。極値同値は最初の `(ts,id)` |
-| 印 | `kind` (`latched/released/rebase/cashflow/unknown_hwm_drop`)、`plot_at`、`occurred_at,recorded_at` (実時刻 / 記録時刻、不明は null)、`source_snapshot_ts,applied_at` (付け直し専用、他は null)、`generation` (非該当は null)、`time_source` (`state/ledger/event_ts/snapshot`)。付け直しの occurred_at / recorded_at は共に null |
-| 戦略行 | `origin` (文法に合う最大 71 ASCII byte、帰属不明は unknown、合算は other)、`origin_count` (通常 1)、`closed_count,pnl_known_count,r_known_count,pnl_unknown_count,r_unknown_count,open_count,close_pending_count,wins,losses,flats`、`win_rate,pf,avg_r` (計算不能は null)、`total_pnl` (既知 0 件なら null)、`close_reasons` (`llm_close/sl/tp/other`)、`cumulative` (図の選外は空 list) |
+| 印 | `kind` (`latched/released/rebase/cashflow/unknown_hwm_drop`)、`plot_at`、`occurred_at,recorded_at` (実時刻 / 記録時刻、不明は null)、`book_at,applied_at` (付け直し専用、他は null)、`generation` (非該当は null)、`time_source` (`state/ledger/event_ts/snapshot`)。付け直しの occurred_at / recorded_at は共に null |
+| 戦略行 | `origin` (文法に合う最大 71 ASCII byte、帰属不明は unknown、合算は other)、`origin_count` (通常 1)、`closed_count,pnl_known_count,r_known_count,pnl_unknown_count,r_unknown_count,open_count,close_pending_count,wins,losses,flats`、`win_rate,pf,avg_r` (計算不能は null)、`pf_state` (`computed` = pf は有限の値、`no_losses` = 損失 0 件かつ総利益が正で pf は null (損益が全部 0 なら `unknown`)、`unknown` = 計算不能・非有限で pf は null。web は state と pf が噛み合わないとき PF を「不明」にする)、`total_pnl` (既知 0 件なら null)、`close_reasons` (`llm_close/sl/tp/other`)、`cumulative` (図の選外は空 list) |
 | 累積点 | `{t,pnl}`。系列ごとに最新 120 件の決済を使い、同時刻合算、t 昇順。以前の合計を持つ始点 1 点と期間終了点を加え最大 122 点。切捨て前の開始は from / 0、切捨て時は採用した最初の決済時刻 / 直前の累計を始点とする。同時刻は始点を先に置く |
 
 現在状態は status の読取部分 (`S/ops/service.py:1011-1024`) を関数に切り出して共用する。`kill_switch` は `latched,generation,latched_at,reconcile_required` と、marker がある場合の `requested_generation,started_at,file_latched`。web は `marks.classify_kill_switch` (`A/web/marks.py:83-95`) を使う。marker 投影で latched_at が無ければ作動印を合成しない。
 
-現在の口座は `snapshots.latest()` (`S/store/snapshots.py:20-24`) を source で絞らず読む。daemon と同じ `drawdown_pct`・`drawdown_kill_reached` (`S/core/accounting.py:44-52`) を使い、kill_level = HWM × (1 − kill_pct / 100)、headroom = equity − kill_level。10 分超は stale、欠損・不正値・非正 equity は unknown、他は閾値到達なら drawdown、それ以外 none (`S/core/scheduler.py:291-301`)。停止判定に余裕の表示値や符号を使わない。これは口座による停止理由で、ラッチによる停止は別に示す。
+現在の口座は `snapshots.latest()` (`S/store/snapshots.py:20-24`) を source で絞らず読む。daemon と同じ `drawdown_pct`・`drawdown_kill_reached` (`S/core/accounting.py:44-52`) を使い、kill_level = HWM × (1 − kill_pct / 100)、headroom = equity − kill_level。10 分超は stale、欠損・不正値・非正 equity は unknown、他は閾値到達なら drawdown、それ以外 none (`S/core/scheduler.py:291-301`)。停止判定に余裕の表示値や符号を使わない。`fill_hold` は daemon の約定停止の総合で、優先順は (1) kill switch がラッチ中、または解除途中の marker が残る (`kill_switch`)、(2) state を読めない・形が違う (`unknown`)、(3) 上の口座の理由 (`stale/drawdown/unknown`)。`none` は、約定を止める理由が一つも無いときだけ (`S/core/scheduler.py` の `_fills_allowed_by_state` と tick の account / DD の判定と同じ条件)。state を読めないときに `none` へ倒さない。`kill_switch` の表示も併せて出し、ラッチは別に示す。
 
 同時刻の順序は daemon が id で決める。pnl_unknown_count = closed_count − pnl_known_count、r_unknown_count = closed_count − r_known_count、wins + losses + flats = pnl_known_count。
-不正行の検証は daemon が担当する。snapshot は除外して区間を切り、印は除外、注文は件数を残して該当指標を不明にし quality へ数える。非有限値・bool、不正 JSON・SL 欠落は指標不明、closed_at 欠落・不正は期間へ割り当てず unplaced_closed_count へ。
-web は既存の `_check_reply_shape` (`A/web/request.py:206-234`) と同じ上位の型・形だけを検査し、違えば 502。個々の表示値の異常は「不明」。再集約・合算・行検証は繰り返さず、集計値を図から再計算しない。marks_since が null なら「event の記録はありません」。
+不正行の検証は daemon が担当する。snapshot は除外して区間を切り、印は除外、注文は件数を残して該当指標を不明にし quality へ数える。非有限値・bool、不正 JSON・SL 欠落は指標不明、closed_at 欠落・不正、および to より未来の closed_at は期間へ割り当てず unplaced_closed_count へ。`range=all` の始点は to 以下の候補だけから選ぶ (from <= to)。
+web は既存の `_check_reply_shape` (`A/web/request.py:206-234`) と同じ上位の型・形だけを検査し、違えば 502。個々の表示値の異常は「不明」。再集約・合算・行検証は繰り返さず、集計値を図から再計算しない。marks_since が null なら「event の記録はありません」。例外として `fill_hold` の `none` だけは、応答の中の鮮度・経過秒数と上限・DD と閾値・equity (kill_level + headroom) が停止条件に反しないと確かめられたときに限って正常に出し、欠ける・矛盾するなら「不明」に倒す。web が daemon の判定を作り直すのはここまでで、それ以上の不整合は daemon を正とする。
 
 ### 2.3 資金推移の間引き
 
@@ -147,7 +153,7 @@ web は既存の `_check_reply_shape` (`A/web/request.py:206-234`) と同じ上�
 
 | 印 | 実時刻・記録時刻と位置 |
 |---|---|
-| 付け直し ▽ | source_snapshot_ts (= 元 snapshot の ts) に段と印を置き、期間への採否もこの時刻。表には操作時刻 applied_at を別列に出す (`S/ops/rebase_accounting.py:198-214`) |
+| 付け直し ▽ | book_at (= 元 snapshot の ts) に段と印を置き、期間への採否もこの時刻。表には操作時刻 applied_at を別列に出す (`S/ops/rebase_accounting.py:198-214`) |
 | 作動 ✕・解除 ↑ | 同じ世代・状態の候補を期間抽出より先に統合。作動実時刻は state の latched_at → 台帳の latched_at の順。解除は event の記録時刻だけ。event の ts は recorded_at |
 | event のみ | occurred_at は null、plot_at = recorded_at。「作動 / 解除を記録した時刻」と明記。通知時刻を状態変化時刻と断定しない |
 | 入出金 ◇・不明な下降 △ | snapshot の ts に置く。台帳なしの manual_ks_rebase も確認不能として警告 |
@@ -201,7 +207,7 @@ marks_since に加え「期間内にも履歴の欠けがあり得ます」を�
 - **R の単位**: realized_pnl は口座通貨 (`S/core/paper_broker.py:17-32`)、`abs(avg_fill_price−SL)×quantity×contract_size` は quote 通貨 (`S/backtest/metrics.py:89-97`)。**quote 通貨 = 口座通貨の注文だけ**両者を割り、他は R 不明。example の既定は JPY・USDJPY (`config/settings.yaml.example:4-6`) で一致する。backtest の異通貨 avg_r は `backtest-avg-r-currency-mismatch` に起票済み。共通関数化だけでは正しくならず、この段で backtest の式は変えない。
 - 列名は「平均 R (手数料込み)」。通知の値幅 R と手数料などで異なる。異通貨なら換算の有無でも異なり、通知・backtest と無条件に一致するとはしない (§6 の問い 6)。
 - 初期 SL は orders と intent payload の一致を確認。payload 欠落・不正 JSON・SL 欠落・不一致、SL = 約定価格、非有限値・bool、不正数量、未知 pair、通貨不一致は R 不明。分母・結果の非有限値も不明。R 不明でも既知損益・勝敗は残す。現行呼出しでは SL は後から変わらないが store API の強制条件ではない (F14)。
-- **少数判定**: 勝率・PF は pnl_known_count、平均 R は r_known_count。各母数が 5 未満なら「–」、5〜29 は「(参考)」、30 以上は通常表示。平均の横に「R 算出 N / 決済 M 件」、損益既知・不明の件数も出す。しきい値は thresholds で返す (30 の根拠は `S/backtest/metrics.py:20,142`)。
+- **少数判定**: 勝率・PF は pnl_known_count、平均 R は r_known_count。各母数が 5 未満なら「–」、5〜29 は「(参考)」、30 以上は通常表示。平均 R の下に「R 算出 N / 決済 M 件」、件数の欄に損益既知・損益不明の件数を添える (どちらも差があるときだけ。§1.2.2)。しきい値は thresholds で返す (30 の根拠は `S/backtest/metrics.py:20,142`)。
 - **行の選抜**: closed_count 降順、同数は origin 昇順。対象の cron と帰属不明を保持し、32 行超なら残り枠から 1 行を「ほか N 件」に使う。daemon が選外の件数・既知損益・勝敗・保有・未確定・R の総和と母数を合算し、率は合算母数から出す。合計を失わない。期間不明決済は別枠。
 - **累積損益**: daemon が系列ごとに最新 120 件の決済を選び、それ以前は直前までの累計を持つ始点 1 点へまとめる。同時刻決済の既知損益を合算し、始点・終了点を含め最大 122 点。web は水平→垂直の階段線を描く。始点が from より後なら描画開始時刻と古い決済の省略件数を注記する (closed_count − 120、下限 0)。終点は表の既知損益合計と一致。既知なしは 0 の線と「損益不明」。
 - 成績に正常・危険の色や状態の印は付けず、損益は符号で示す。
@@ -220,29 +226,28 @@ marks_since に加え「期間内にも履歴の欠けがあり得ます」を�
 - **query**: `tab` と `range` だけ。`range` は `7d`・`30d`・`90d`・`all` の完全一致。ほかの key・値は 400 (ほかの route と同じ規律、`A/web/request.py:283-349`)。期間の link は `range` を、帯は `tab` を付け替え、互いの値を引き継ぐ。
 - **renderer**: 新しい module `A/web/perf_pages.py` (HTML) と `A/web/svg.py` (図)。`render.py` には足さない (1,334 行ある)。
 - **SVG の形**:
-  - `<svg viewBox="0 0 960 260" role="img" aria-label="…">`。幅は CSS で 100%。
-  - 線は `<polyline>` (切れ目ごとに 1 本)、帯は `<polygon>`、軸と印は `<line>`、目盛りと凡例は `<text>`。座標は整数、x は 0〜960、y は 0〜260。
+  - `<svg viewBox="0 0 960 H" role="img" aria-label="…">`。H は資金推移で 260、戦略別は凡例を 1 行 1 系列の縦並びにするので `226 + 16 × (凡例数 − 1) + 8` で最大 298。幅は CSS で 100%、最小 55rem (スマホ幅では節の中で横に動く)。
+  - 線は `<polyline>` (切れ目ごとに 1 本)、帯は `<polygon>`、軸と印は `<line>`、目盛りと凡例は `<text>`。座標は整数、x は 0〜960、y は 0〜H。
   - 使わない要素: `<script>`・`<foreignObject>`・`<image>`・`<use>`・`<a>`・`<style>`・event の属性。test で固定する。
   - 文字 (凡例の起動理由など) は `html.escape` を通す。起動理由は文法に合うものだけを出す (§2.5)。
 - **目盛り**: 横は表示 tz の日付 (4〜8 個)。同一年内は MM-DD、年をまたぐ期間は YYYY-MM-DD。図の横に tz と期間の両端を添える。縦は金額 (4〜5 本、丸めた値)。表の時刻は原則どおりの表記。
 - **数値**: 金額は小数 2 桁、勝率は既存の `_percent` (`A/metric_words.py:16-18`)、DD は百分率のまま `12.3%`、R は符号つき小数 2 桁。この画面の表は数値の列を右に寄せる (`table.num`、cell に class は付けない)。ほかの画面の表は変えない。
-- **再読込**: 30 秒の自動再読込はそのまま。操作の状態を持たない画面なので、読み直しで失うものは無い。
+- **再読込**: この画面は自動で更新しない (重い再集約を 30 秒ごとに走らせない)。開いたままの「今の状態」が今の安全状態に見えないよう、枠の先頭に取得時刻・最新 snapshot の時刻・自動で更新しない旨の固定文・Status への link を置く (§1.1)。文は固定文と 2 行の時刻で約 0.3 KiB、§2.10 の部品予算の余白に収まる。
 
 ### 2.9 CSS と CSP
 
 - **CSP は変えない**。inline の `<svg>` は文書の一部で、画像の読込み (`img-src`) にならない。`script-src` は足さない。
 - **色は class と `STYLE` の規則で付ける**。`style=""` 属性は CSP で効かず、test も無いことを見る (`T/web/test_render.py:125`)。色の presentation 属性 (`stroke="#…"`) は CSP の対象外だが、暗い配色に追従しないので使わない。
 - **系列色の token を出荷する**。値は CSS の段が決めた 4 色 (`2026-11-18-web-css-design.md` 付録 B、明・暗とも地と縞で 4.7 以上)。今の `STYLE` に系列色の token は無い (`render.py:33-39`)。
-- **色だけで区別しない**: 系列は線種 (実線・破線・点線・鎖線) も変え、凡例に記号を添える。作動は危険色 +「✕」、解除は中立色 +「↑」、付け直しは注意色 +「▽」、入出金は c2 +「◇」、不明な下降は注意色 +「△」。凡例にも同じ記号・色と text 用 class を使う。解除は既存状態印の ○・△・✕ (`A/web/marks.py:13`) と異なる ↑ にする。cron は中立色の長破線 (10 4)。軸は mut、文字は fg とし、明暗両方で軸・印・線は背景に 3:1、文字は 4.5:1 以上を確認する。
-- **`STYLE` に足す規則** (下書き。コメント・空白を除いた追加分は 981 byte、現在の STYLE と合わせて 3,943 byte。実装時も 4,096 byte 以下を確認):
+- **色だけで区別しない**: 系列は線種 (実線・破線・点線・鎖線) も変える。戦略別の凡例は線の見本・名前・終点の値で、記号は付けない (線の見本が色と線種の両方を示す)。作動は危険色 +「✕」、解除は中立色 +「↑」、付け直しは注意色 +「▽」、入出金は c2 +「◇」、不明な下降は注意色 +「△」。資金推移の印の凡例には同じ記号・色と text 用 class を使う。解除は既存状態印の ○・△・✕ (`A/web/marks.py:13`) と異なる ↑ にする。cron は中立色の長破線 (10 4)。軸は mut、文字は fg とし、明暗両方で軸・印・線は背景に 3:1、文字は 4.5:1 以上を確認する。
+- **`STYLE` に足す規則** (実装後の値。今の `STYLE` は全体で 3,967 byte。4,096 byte 以下を確認する。ほかに、今の状態の枠 `.now{border:2px solid var(--fg);}` を足し、選んでいる期間・タブの文字色の規則は `nav` の中に限らず `a[aria-current="page"]` とした):
 
 ```css
 --c1:#0969da;--c2:#bc4c00;--c3:#1a7f37;--c4:#8250df;/* 明の :root */
 --c1:#4493f8;--c2:#f0883e;--c3:#3fb950;--c4:#ab7df8;/* 暗の :root */
-svg{display:block;width:100%;max-width:60rem;height:auto;}
+svg{display:block;width:100%;min-width:55rem;max-width:60rem;height:auto;}
 svg *{fill:none;stroke:var(--mut);vector-effect:non-scaling-stroke;}
 svg text{fill:var(--fg);stroke:none;font-size:11px;}
-.ax{stroke:var(--mut);}
 .c1{stroke:var(--c1);}
 .c2{stroke:var(--c2);stroke-dasharray:6 3;}
 .c3{stroke:var(--c3);stroke-dasharray:2 3;}
@@ -257,7 +262,6 @@ text.ev{fill:var(--bad);stroke:none;}
 text.rb{fill:var(--warn);stroke:none;}
 text.rl{fill:var(--mut);stroke:none;}
 text.cf{fill:var(--c2);stroke:none;}
-text.cr{fill:var(--mut);stroke:none;}
 .num td:not(:first-child),.num th:not(:first-child){text-align:right;}
 ```
 
@@ -275,7 +279,7 @@ text.cr{fill:var(--mut);stroke:none;}
 | 資金推移の印 | escape 後 title 最大 160 byte と line・text の固定属性、1 印 279 byte × 20 = **5,580** | 6 KiB |
 | 印の表 | 1 行 280 byte × 20 + 見出し等 1,024 = **6,624** | 7 KiB |
 | 戦略の図 | 5 系列 × 122 点 × 2 頂点 × 8 byte + 要素の包み 160、軸 1,536、凡例 5×160 = **12,256** | 14 KiB |
-| 戦略の表 | 71 byte の名前、16 数値 cell (各 24 文字)、行の包みで 617 byte × 32 行 + 見出し等 2,048 = **21,792** | 22 KiB |
+| 戦略の表 | 71 byte の名前、9 列 (勝 / 負 / 分・決済の内訳・R 算出の併記は 1 cell にまとめる)、1 行 475 byte × 32 行 + 見出し等 2,048 = **17,248** (実測の最悪は 15,512) | 22 KiB |
 
 帯は部分束ごとに上下各 2 頂点を取り、上辺を時刻順・下辺を逆順に並べ、区間ごとに 1 polygon にする。頂点の区切り込みで最大 8 byte、要素の包みは 5 種合計 159 byte / 区間。階段の区間端も上の頂点数に含む。表は内訳を数値 cell に分け、不明・参考表示も各 24 byte 内。印の表は 7 cell (32 byte が 5 個、24 byte が 2 個) と包み 72 byte。見出しなどの固定部分も上限を実装時に固定する。
 
@@ -287,7 +291,7 @@ text.cr{fill:var(--mut);stroke:none;}
 - 表示名は最大 71 byte のまま切らない。title・凡例は escape 後 160 byte、数値・件数は最大 24 文字 (巨大な有限数は指数表記)。時刻・固定文は短縮しない。最大長・全上限を同時に与える test 1 本で、部品・完成ページの byte を確認する。
 - 再集約・戦略の合算は daemon だけ。web の予備動作は予算を超えた部品を丸ごと説明文へ置き換える 1 段のみ。固定文・現在状態・集計値・省略数を残す。`_page` の Output clipped (`A/web/render.py:197-202`) に頼らない。
 - 短命の `connect_readonly` (`S/store/db.py:1032-1061`、status の例は `S/service.py:2177-2180`) を使う。ops の lane・共有接続を使わず、BEGIN → snapshot・台帳・event・注文の読取を 1 本の transaction で行う。finally で ROLLBACK して close。共通の to と DB 視点を使い、現在の snapshot も同じ接続で読む。state は別取得で state_fetched_at を表示し、DB との同時性を主張しない。
-- F2 は snapshot 集約だけの値。T1・T2 で本番相当と 10 倍の行数の全経路 (event・台帳・帰属 JOIN・注文集計・整形) を計測し、**10 倍の全期間で 0.5 秒以下**を合格とする。closed_at 索引はこの段で足さない。超過時は日次集計を別途検討する。
+- F2 は snapshot 集約だけの値。T1・T2 で本番相当と 10 倍の行数の全経路 (event・台帳・帰属 JOIN・注文集計・整形) を計測し、**10 倍の全期間で 0.8 秒以下**を合格とする (全行の時刻を厳密に検査して約 0.6 秒。test の秒の上限は桁の退行だけを捕まえる 2.0 秒とし、0.8 秒の合格の線は merge 前に単独で測る。読取は API の thread で、scheduler の tick は 1 分ごとなので 1 秒未満の遅れは許す)。closed_at 索引はこの段で足さない。超過時は日次集計を別途検討する。
 
 ## 3. 失敗時・運用
 
@@ -352,7 +356,7 @@ web の test は 725 件 (`T/web/`)。影響する pin を grep で数えた。
 1. 資金推移: 4 つの期間。線 3 本と帯・作動の水準・印が見分けられる (色と線種の両方)。付け直しの段。週末の切れ目。
 2. 戦略別: 表の「–」と「(参考)」、固定文、累積損益の図と凡例。
 3. 印に pointer を置くと時刻が出る。
-4. スマホ幅 (LAN 越しを使っている場合): 図が幅に収まり、表は節の中で横にスクロールする。
+4. スマホ幅 (LAN 越しを使っている場合): 図は最小幅 55rem のまま節の中で横に動かして読む (幅に収めると文字が読めない)。表も節の中で横にスクロールする。ページ全体は横にあふれない。
 5. ブラウザの console に CSP の違反が出ない。
 6. ほかの画面 (Status・承認詳細) の見た目が変わっていない。承認詳細の申告が前より早く切れていないか、手元の承認 1 件で見る。
 7. 作動中・live の記録が混ざる・帰属不明がある、の見た目は本番で起こさない。fixture を実際の HTTP route で配信し、本番と同じ CSP 等の header を付けて見る。
@@ -443,3 +447,6 @@ T1 → T2、T1 → T3a → T3b、T2・T3b → T4 → T5 の順。
 | 2026-11-19 | C0.1 | 単位・時刻・集約・現在状態・R・応答契約・予算・検証・問い・関連文書の分類を改訂 | 設計レビュー 1 周目の指摘を反映 | |
 | 2026-11-19 | C0.2 | 現在状態・段・印・累積・応答契約を簡素化し、予算・検証・作業分割・関連文書を更新 | 設計レビュー 2 周目の指摘を反映 | |
 | 2026-11-19 | C1 | §6 を裁定済みにし、範囲外の 2 つをチケットへ | 利用者承認 (6 件とも推奨どおり) | |
+| 2026-11-19 | C1.1 | 計測の合格の線を 0.5 秒から 0.8 秒へ | 全行の時刻の厳密な検査で約 0.6 秒になった。検査は外さない | |
+| 2026-11-19 | C1.2 | test の秒の上限を 2.0 秒にする (0.8 秒の線は merge 前に単独で測る)。読取は SQLite 3.42 未満なら UNAVAILABLE、deadline・停止で打ち切る | 機械の速さ・負荷で test が揺れる。版・打ち切りの指摘 | |
+| 2026-11-20 | C1.3 | 画面の文言と視覚の優先度を直す | 実ブラウザの受入の前の見直し | |
