@@ -48,7 +48,7 @@ nav { display: flex; flex-wrap: wrap; gap: 1.25rem; padding: 0.6rem 0;
   border-bottom: 1px solid var(--line); margin-bottom: 0.75rem; }
 nav a { text-decoration: none; font-weight: 600; }
 nav a:hover { text-decoration: underline; }
-nav a[aria-current="page"] { color: var(--fg); }
+a[aria-current="page"] { color: var(--fg); }
 h1 { font-size: 1.25rem; margin: 0.5rem 0 0.75rem; }
 h2 { font-size: 1rem; margin: 0 0 0.4rem; }
 h3, h4 { font-size: 0.9rem; margin: 0.6rem 0 0.3rem; }
@@ -72,6 +72,7 @@ dd.warn, .st.warn { font-weight: 700; background: var(--warn-bg); }
 .kpi div { border: 1px solid var(--line); border-radius: 6px; padding: 0.4rem 0.75rem;
   background: var(--soft); }
 .kpi strong { display: block; font-size: 0.8rem; color: var(--mut); }
+.now{border:2px solid var(--fg);}
 table { border-collapse: collapse; font-size: 0.85rem; }
 th, td { border: 1px solid var(--line); padding: 0.15rem 0.45rem; text-align: left; }
 th { background: var(--soft); }
@@ -83,7 +84,6 @@ tbody tr:nth-child(even) { background: var(--soft); }
 svg{display:block;width:100%;min-width:55rem;max-width:60rem;height:auto;}
 svg *{fill:none;stroke:var(--mut);vector-effect:non-scaling-stroke;}
 svg text{fill:var(--fg);stroke:none;font-size:11px;}
-.ax{stroke:var(--mut);}
 .c1{stroke:var(--c1);}
 .c2{stroke:var(--c2);stroke-dasharray:6 3;}
 .c3{stroke:var(--c3);stroke-dasharray:2 3;}
@@ -98,7 +98,6 @@ text.ev{fill:var(--bad);stroke:none;}
 text.rb{fill:var(--warn);stroke:none;}
 text.rl{fill:var(--mut);stroke:none;}
 text.cf{fill:var(--c2);stroke:none;}
-text.cr{fill:var(--mut);stroke:none;}
 .num td:not(:first-child),.num th:not(:first-child){text-align:right;}
 form { margin: 0.5rem 0; }
 form + form { margin-top: 1.5rem; }
@@ -308,7 +307,7 @@ def _bot_cards(data: Mapping[str, object]) -> str:
     if type(health) is not dict:
         return ""
     return marks.cards([("gateway health", marks.render_verdict(
-        marks.classify_word(marks.BOT_HEALTH, health.get("state"))))])
+        marks.classify_word(marks.BOT_HEALTH, health.get("state"), marks.WORD_TEXT)))])
 
 
 def _bot_section(data: Mapping[str, object], tz: str = "UTC") -> str:
@@ -373,10 +372,10 @@ def _econ_cards(data: Mapping[str, object]) -> str:
     items = []
     if type(window) is dict:
         items.append(("calendar", marks.render_verdict(
-            marks.classify_word(marks.CALENDAR, window.get("freshness")))))
+            marks.classify_word(marks.CALENDAR, window.get("freshness"), marks.WORD_TEXT))))
     if type(econ) is dict:
         items.append(("worker", marks.render_verdict(
-            marks.classify_word(marks.WORKER, econ.get("slice_worker")))))
+            marks.classify_word(marks.WORKER, econ.get("slice_worker"), marks.WORD_TEXT))))
         capacity = econ.get("slice_capacity")
         if type(capacity) is dict:
             items.append(("slice 容量", marks.render_verdict(

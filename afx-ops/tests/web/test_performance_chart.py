@@ -118,8 +118,10 @@ def test_only_allowlisted_elements_attributes_and_classes_are_drawn_with_integer
 def test_every_class_the_figure_uses_has_a_rule_in_the_embedded_css():
     used = {c for _, a in parse(draw(full_data()).svg).elements for c in a.get("class", "").split()}
     assert used == ALLOWED_CLASSES
-    for css in used:
+    # 軸 (ax) の色は `svg *` の規則が決めるので、専用の規則は持たない
+    for css in used - {"ax"}:
         assert re.search(r"(^|\n)(text)?\." + css + r"\{", render.STYLE), css
+    assert ".ax{" not in render.STYLE
     for selector in ("svg{", "svg *{", "svg text{", ".num td:not(:first-child)"):
         assert selector in render.STYLE, selector
 
@@ -252,7 +254,7 @@ def test_each_mark_kind_has_its_symbol_color_class_and_a_title_with_the_display_
 
 def test_the_legend_lists_every_line_and_every_symbol_with_its_color_class():
     markup = draw(full_data()).svg
-    for word in ("equity", "balance", "HWM", "作動の水準", "束内の最小〜最大"):
+    for word in ("equity", "balance", "HWM", "作動の水準", "その時間内の最小〜最大"):
         assert word in markup, word
     for symbol, word, css in svg.MARK_STYLE.values():
         assert f'<text class="{css}" x=' in markup and f">{symbol} {word}</text>" in markup
@@ -438,7 +440,8 @@ def test_the_figure_section_sits_between_the_current_state_and_the_numbers_with_
     assert html.index("今の状態") < html.index("資金推移の図") < html.index("数字で読む")
     section = html.split("<h2>資金推移の図</h2>", 1)[1].split("</section>", 1)[0]
     assert "線は時間で束ねた表示で、判定の根拠ではありません" in section
-    assert "kill switch の印は記録がある分だけです" in section
+    assert "kill switch の印は記録がある分だけです" not in section
+    assert "kill switch の印は記録がある分だけです" in html.split("<h2>注記</h2>", 1)[1]
     assert "横軸: 表示 tz の時刻 (2026-10-20 09:00:00 +09:00 〜 " in section and "(JPY)" in section
     assert "束内の equity と作動の水準の厳密な交差は再現していません" in html
 
@@ -447,8 +450,8 @@ def test_omitted_points_and_steps_are_counted_beside_the_figure():
     data = full_data()
     data["omissions"] = {"equity_points": 3, "hwm_steps": 4, "strategy_rows": 0, "strategy_series": 0}
     section = page(data).split("<h2>資金推移の図</h2>", 1)[1].split("</section>", 1)[0]
-    assert "代表点 3" in section and "階段の段 4" in section
-    assert "省いたもの" not in page(full_data())
+    assert "図は一部を間引いています (線の点 3、HWM の段 4)。下の数字は間引く前の集計です" in section
+    assert "間引いています" not in page(full_data())
 
 
 def test_a_period_with_no_record_says_so_instead_of_a_figure_and_keeps_the_notes():
@@ -637,7 +640,7 @@ def test_the_legend_lists_only_the_series_and_marks_that_were_drawn(monkeypatch)
     bare = bare[len(svg.OPENING):]
     for absent in ("balance", "HWM", "作動の水準", "↑ 解除", "▽", "◇ 入出金", "△"):
         assert f">{absent}" not in bare and absent not in bare.replace("HWM の付け直し", ""), absent
-    for present in (">equity<", "束内の最小〜最大", ">✕ 作動<"):
+    for present in (">equity<", "その時間内の最小〜最大", ">✕ 作動<"):
         assert present in bare, present
     monkeypatch.setattr(svg, "MARKS_BUDGET_BYTES", 100)
     dropped = draw(full_data()).svg

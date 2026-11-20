@@ -87,10 +87,11 @@ def test_the_strategy_tab_answers_get_and_head(method):
 
 # --- 固定文 ---------------------------------------------------------------------------------
 
-def test_the_fixed_sentence_sits_under_the_heading_and_the_two_notes_are_always_shown():
+def test_the_fixed_sentence_sits_under_the_tab_bar_and_the_two_notes_are_always_shown():
     for data in (data_of(row()), data_of(), payload(strategies=[])):
         html = strategy_page(data)
-        assert f"<h2>戦略別の成績</h2><p>{SENTENCE}</p>" in html
+        assert f"<p>{SENTENCE}</p>" in html and "戦略別の成績</h2>" not in html
+        assert html.index("</nav>") < html.index(SENTENCE) < html.index("期間:")
         for note in ("累積損益の合計は equity の変化と一致しません (含み損益、期間の外で決済した取引、"
                      "スワップを含まないため)", "同じ名前の plugin の版が変わっても、同じ行に数えます"):
             assert note in html.split("<h2>注記</h2>")[1]
@@ -116,13 +117,13 @@ def test_the_table_has_the_nine_columns_with_the_unit_and_a_right_aligned_class(
 
 def test_a_row_with_twelve_closed_shows_the_rates_as_reference_and_the_counts():
     cells = table_cells(strategy_page(data_of(row())))[0]
-    assert cells == ["signal:rsi", "12 (損益既知 12 / 不明 0)", "7 / 4 / 1", "58.3% (参考)", "1.40 (参考)",
-                     "+0.21 (参考)|R 算出 12 / 決済 12 件", "+123.45", "判断 8 / SL 3 / TP 1", "1"]
+    assert cells == ["signal:rsi", "12", "7 / 4 / 1", "58.3% (参考)", "1.40 (参考)",
+                     "+0.21 (参考)", "+123.45", "判断 8 / SL 3 / TP 1", "1"]
 
 
 def test_fewer_than_five_known_hides_the_rates_and_thirty_or_more_drops_the_reference_mark():
     few = table_cells(strategy_page(data_of(row(closed=4, wins=2, losses=1, flats=1))))[0]
-    assert few[3] == "–" and few[4] == "–" and few[5].startswith("–|")
+    assert few[3] == "–" and few[4] == "–" and few[5] == "–"
     exact = table_cells(strategy_page(data_of(row(closed=5, wins=3, losses=1, flats=1))))[0]
     assert exact[3] == "58.3% (参考)"
     edge = table_cells(strategy_page(data_of(row(closed=30, wins=15, losses=10, flats=5))))[0]
@@ -136,7 +137,7 @@ def test_each_rate_uses_its_own_denominator():
     assert cells[3] == "58.3%" and cells[4] == "1.40" and cells[5].startswith("–|") \
         and "R 算出 4 / 決済 40 件" in cells[5]
     unknown = table_cells(strategy_page(data_of(row(closed=40, known=3, r_known=40))))[0]
-    assert unknown[1] == "40 (損益既知 3 / 不明 37)" and unknown[3] == "–" and unknown[5].startswith("+0.21|")
+    assert unknown[1] == "40 (損益既知 3 / 損益不明 37)" and unknown[3] == "–" and unknown[5] == "+0.21"
 
 
 def test_the_thresholds_come_from_the_daemon_and_unreadable_ones_make_the_rates_unknown():
@@ -148,7 +149,7 @@ def test_the_thresholds_come_from_the_daemon_and_unreadable_ones_make_the_rates_
                 {"min_count": True, "reference_count": 30}, None):
         data["thresholds"] = bad
         cells = table_cells(strategy_page(data))[0]
-        assert cells[3] == cells[4] == "不明" and cells[5].startswith("不明|")
+        assert cells[3] == cells[4] == cells[5] == "不明"
 
 
 def test_a_profit_factor_without_losses_is_told_so_and_not_shown_as_a_number():
@@ -182,7 +183,7 @@ def test_the_close_reasons_list_the_nonzero_ones_and_a_holding_only_row_still_ap
                holding=2, pending=1, cumulative=[])
     html = strategy_page(data_of(held))
     cells = table_cells(html)[0]
-    assert cells[1:] == ["0 (損益既知 0 / 不明 0)", "0 / 0 / 0", "–", "–", "–|R 算出 0 / 決済 0 件", "–", "–", "2 (決済未確定 1)"]
+    assert cells[1:] == ["0", "0 / 0 / 0", "–", "–", "–", "–", "–", "2 (決済未確定 1)"]
     assert "この期間に決済した取引はありません" in html and "<svg" not in html
     assert svg.NOTE_NO_SERIES in figure_part(html)
 
@@ -190,21 +191,22 @@ def test_the_close_reasons_list_the_nonzero_ones_and_a_holding_only_row_still_ap
 def test_no_row_at_all_says_so_and_keeps_the_sentences():
     html = strategy_page(data_of())
     assert "この期間に決済した取引も、保有中の取引もありません" in html and "<table" not in html
-    assert SENTENCE in html and svg.NOTE_NO_SERIES in figure_part(html)
+    assert SENTENCE in html and perf_pages.NO_STRATEGY_FIGURE in figure_part(html)
+    assert "下の表" not in figure_part(html)
 
 
 def test_unreadable_values_are_unknown_never_a_normal_looking_number():
     bad = row(closed=40, rate="x", pf=float("nan"), avg_r=True, total=float("inf"),
               wins=-1, losses=None, flats=1.5, reasons={"llm_close": -2, "sl": "1"}, holding="3")
     cells = table_cells(strategy_page(data_of(bad)))[0]
-    assert cells[3] == cells[4] == "不明" and cells[5].startswith("不明|") and cells[6] == "不明"
+    assert cells[3] == cells[4] == cells[5] == cells[6] == "不明"
     assert cells[2] == "不明 / 不明 / 不明" and cells[8] == "不明"
-    assert cells[7] == "判断 不明 / SL 不明 / TP 不明 / その他 不明"
+    assert cells[7] == "不明"
 
 
 def test_a_missing_close_reasons_table_is_unknown_and_the_page_never_raises():
     cells = table_cells(strategy_page(data_of(row(close_reasons=None))))[0]
-    assert cells[7] == "判断 不明 / SL 不明 / TP 不明 / その他 不明"
+    assert cells[7] == "不明"
     for junk in ([{}], [{"origin": "cron"}], [{"origin": "cron", "cumulative": "x"}]):
         assert strategy_page(data_of() | {"strategies": junk})
 
@@ -350,7 +352,7 @@ def test_the_figure_has_only_allowlisted_elements_with_integer_coordinates_insid
                       " on", "fill=", "stroke=", "#"):
         assert forbidden not in markup, forbidden
     used = {c for _, a in parse(markup).elements for c in a.get("class", "").split()}
-    for css in used:
+    for css in used - {"ax"}:
         assert re.search(r"(^|\n)\." + css + r"\{", render.STYLE), css
 
 
@@ -535,10 +537,14 @@ def test_a_response_with_unreadable_rows_among_readable_ones_says_how_many_were_
 
 def test_a_row_always_states_both_the_known_and_the_unknown_pnl_counts():
     cells = table_cells(strategy_page(data_of(row(closed=10, known=10))))[0]
-    assert cells[1] == "10 (損益既知 10 / 不明 0)"
+    assert cells[1] == "10"
+    cells = table_cells(strategy_page(data_of(row(closed=10, known=6))))[0]
+    assert cells[1] == "10 (損益既知 6 / 損益不明 4)"
     for bad in ("x", None, -1, True):
         cells = table_cells(strategy_page(data_of(row(closed=10, pnl_known_count=bad, pnl_unknown_count=bad))))[0]
-        assert cells[1] == "10 (損益既知 不明 / 不明 不明)"
+        assert cells[1] == "10 (損益の内訳は不明)"
+        cells = table_cells(strategy_page(data_of(row(closed=10, closed_count=bad, pnl_known_count=bad, pnl_unknown_count=bad))))[0]
+        assert cells[1] == "不明"
 
 
 @pytest.mark.parametrize("bad", [None, "x", {}, 5, [5, "x"]])
@@ -598,3 +604,86 @@ def test_an_origin_that_only_starts_like_the_grammar_is_neither_drawn_nor_writte
 def test_a_close_that_may_be_unsettled_is_called_unsettled_not_waiting():
     cells = table_cells(strategy_page(data_of(row(holding=0, pending=1))))[0]
     assert cells[8] == "0 (決済未確定 1)" and "待ち" not in "".join(cells)
+
+
+# --- 文言と視覚の優先度 ------------------------------------------------------------------------
+
+def test_the_notes_open_with_the_rule_for_the_dash_and_the_reference_mark_using_the_daemon_numbers():
+    notes = strategy_page(data_of(row())).split("<h2>注記</h2>", 1)[1]
+    assert notes.index("勝率・PF・平均 R は、もとになる件数") < notes.index("累積損益の合計は")
+    assert ("勝率・PF・平均 R は、もとになる件数 (勝率・PF は損益の分かる決済、平均 R は R を算出できた"
+            "決済) が 5 件未満だと出しません (–)。30 件未満は参考の値です") in notes
+    data = data_of(row())
+    data["thresholds"] = {"min_count": 3, "reference_count": 6}
+    assert "が 3 件未満だと出しません (–)。6 件未満は参考の値です" in strategy_page(data)
+    data["thresholds"] = {"min_count": 9, "reference_count": 3}
+    html = strategy_page(data)
+    assert "件数の基準を読めないため、勝率・PF・平均 R は不明にしました" in html
+    assert "未満だと出しません" not in html
+
+
+def test_an_empty_period_points_the_figure_at_the_range_and_not_at_a_table_that_has_no_numbers():
+    figure = figure_part(strategy_page(data_of()))
+    assert perf_pages.NO_STRATEGY_FIGURE == (
+        "この期間に決済した取引はありません。期間を広げると出ることがあります")
+    assert f"<p>{perf_pages.NO_STRATEGY_FIGURE}</p>" in figure and "下の表" not in figure
+    held = row("signal:macd", closed=0, known=0, wins=0, losses=0, flats=0, rate=None, pf=None,
+               avg_r=None, total=None, holding=2, cumulative=[])
+    assert svg.NOTE_NO_SERIES in figure_part(strategy_page(data_of(held)))
+
+
+def test_a_cron_row_is_called_the_regular_decision_in_the_table_the_legend_and_the_sentences():
+    cron = row("cron", closed=4, wins=2, losses=2, flats=0,
+               cumulative=[{"t": iso(500), "pnl": 0.0}, {"t": iso(3000), "pnl": 10.0}])
+    html = strategy_page(data_of(row(), cron))
+    figure = figure_part(html)
+    assert "定期の判断 終点 " in figure and "cron 終点" not in figure
+    assert "cron:" not in html and "定期の判断: 線は " in figure
+    assert table_cells(html)[1][0] == "定期の判断 (cron、戦略に属さない)"
+    no_pnl = row("cron", closed=4, known=0, wins=0, losses=0, flats=0, rate=None, pf=None,
+                 avg_r=None, total=None)
+    assert "定期の判断: 損益が不明のため、0 の線です" in figure_part(strategy_page(data_of(no_pnl)))
+
+
+@pytest.mark.parametrize("over,cell", [
+    ({"closed": 10, "known": 10}, "10"),
+    ({"closed": 10, "known": 6}, "10 (損益既知 6 / 損益不明 4)"),
+    ({"closed": 10, "known": 0}, "10 (損益既知 0 / 損益不明 10)")])
+def test_the_pnl_breakdown_is_shown_only_when_some_closes_have_unknown_pnl(over, cell):
+    assert table_cells(strategy_page(data_of(row(**over))))[0][1] == cell
+
+
+def test_the_r_line_is_shown_only_when_fewer_closes_have_an_r_than_were_closed():
+    same = table_cells(strategy_page(data_of(row(closed=12, r_known=12))))[0][5]
+    assert same == "+0.21 (参考)"
+    fewer = table_cells(strategy_page(data_of(row(closed=12, r_known=6))))[0][5]
+    assert fewer == "+0.21 (参考)|R 算出 6 / 決済 12 件"
+    for bad in (None, "x", -1):
+        cell = table_cells(strategy_page(data_of(row(closed=12, r_known_count=bad))))[0][5]
+        assert "R 算出 不明 / 決済 12 件" in cell
+
+
+def test_a_holding_cell_with_nothing_readable_is_one_unknown_and_a_partial_one_keeps_what_is_known():
+    both = table_cells(strategy_page(data_of(row(open_count="x", close_pending_count=None))))[0]
+    assert both[8] == "不明"
+    partial = table_cells(strategy_page(data_of(row(open_count=3, close_pending_count=None))))[0]
+    assert partial[8] == "3 (決済未確定 不明)"
+    pending = table_cells(strategy_page(data_of(row(holding=2, pending=1))))[0]
+    assert pending[8] == "2 (決済未確定 1)"
+
+
+def test_the_close_reasons_with_no_readable_count_are_one_unknown_and_a_partial_one_keeps_the_rest():
+    none = table_cells(strategy_page(data_of(row(reasons={"llm_close": "x", "sl": None, "tp": -1,
+                                                       "other": True}))))[0]
+    assert none[7] == "不明"
+    partial = table_cells(strategy_page(data_of(row(reasons={"llm_close": 5, "sl": "x", "tp": 0,
+                                                          "other": 0}))))[0]
+    assert partial[7] == "判断 5 / SL 不明"
+
+
+def test_the_strategy_page_has_no_heading_for_the_fixed_sentence_and_puts_the_range_before_the_figure():
+    html = strategy_page(data_of(row()))
+    assert "<h2>戦略別の成績</h2>" not in html
+    assert html.index(SENTENCE) < html.index("期間:") < html.index("累積損益の図")
+    links = re.search(r"<p>期間: (.*?)</p>", html).group(1)
+    assert links.count("aria-current=\"page\"><strong>30 日</strong>") == 1

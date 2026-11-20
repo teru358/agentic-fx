@@ -73,16 +73,29 @@ FILL_HOLD = {"kill_switch": DANGER, "unknown": UNKNOWN, "stale": WARN, "drawdown
              "none": OK}
 FRESHNESS = {"fresh": OK, "stale": WARN, "unknown": UNKNOWN}
 
+# --- 表示の語。daemon の生の語を使う人の言葉に替える (分類はこの語に依らない)。Status と
+# Performance はどちらもここから出す ---
+
+# 鮮度・状態の語 (経済指標の calendar・bot の gateway・worker・最新記録の鮮度)
+WORD_TEXT = {"fresh": "新しい", "stale": "古い", "unknown": UNKNOWN_WORD}
+# 新規の約定を止めている理由。停止の語は弱めない
+FILL_HOLD_TEXT = {"none": "止めていない", "kill_switch": "kill switch で停止",
+                  "stale": "記録が古く停止", "drawdown": "DD 到達で停止", "unknown": UNKNOWN_WORD}
+
 
 def level_of(table: Mapping[str, str], raw: object) -> str:
     """表にある語の level。表に無い値・型違いは不明 (正常に倒さない)。"""
     return table[raw] if type(raw) is str and raw in table else UNKNOWN
 
 
-def classify_word(table: Mapping[str, str], raw: object) -> Verdict:
-    """表にある語だけを、語そのままで分類する。表に無い値・型違いは不明。"""
+def classify_word(table: Mapping[str, str], raw: object,
+                  shown: Mapping[str, str] | None = None) -> Verdict:
+    """表にある語だけを分類する。表に無い値・型違いは不明。
+
+    語は既定ではそのまま出し、`shown` があれば分類の後に表示だけをその語に替える
+    (替えた語は分類に使わない)。"""
     if type(raw) is str and raw in table:
-        return table[raw], raw
+        return table[raw], (shown.get(raw, raw) if shown else raw)
     return _UNKNOWN
 
 

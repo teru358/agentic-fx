@@ -28,6 +28,8 @@ STRATEGY_PAGE_BUDGET_BYTES = 48 * 1024
 STRATEGY_TABLE_BUDGET_BYTES = 22 * 1024
 
 UNKNOWN = "不明"
+EQUITY_EMPTY = ("この期間の記録はありません。期間を広げるか、daemon が動いているかを "
+                "Status 画面で確かめてください")
 NONE_TEXT = "–"
 BIG = 1e12
 COUNT_LIMIT = 10 ** 15
@@ -43,9 +45,9 @@ FILL_HOLD_NOTE = {
 MARK_KINDS = {"latched": ("✕", "作動"), "released": ("↑", "解除"),
               "rebase": ("▽", "HWM の付け直し"), "cashflow": ("◇", "入出金"),
               "unknown_hwm_drop": ("△", "不明な HWM 下降")}
-TIME_SOURCES = {"state": "state", "ledger": "台帳", "event_ts": "event の記録",
-                "snapshot": "snapshot"}
-MARK_HEADERS = ("種別", "位置", "実時刻", "記録時刻", "帳簿の位置", "操作時刻", "世代", "出所")
+TIME_SOURCES = {"state": "今の状態の記録", "ledger": "付け直しの台帳", "event_ts": "通知の記録",
+                "snapshot": "口座の記録"}
+MARK_HEADERS = ("種別", "位置", "実時刻", "記録時刻", "台帳の位置", "操作時刻", "世代", "出所")
 
 
 def _esc(text: str) -> str:
@@ -92,11 +94,20 @@ def _count(value: object) -> str:
         return UNKNOWN
 
 
-def _seconds(value: object) -> str:
+def _elapsed(value: object) -> str:
+    """経過の長さ。60 秒以上は大きい単位 (日・時間・分) を先に出し、秒は括弧に残す。"""
     number = _number(value)
     if number is None or number < 0:
         return UNKNOWN
-    return f"{number:.0f} 秒" if number < BIG else f"{number:.2e} 秒"
+    if number >= BIG:
+        return f"{number:.2e} 秒"
+    seconds = round(number)
+    if seconds < 60:
+        return f"{seconds} 秒"
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    parts = [f"{n} {unit}" for n, unit in ((days, "日"), (hours, "時間"), (rest // 60, "分")) if n]
+    return " ".join(parts) + f" ({seconds} 秒)"
 
 
 def _time(value: object, tz: str) -> str:
@@ -127,8 +138,12 @@ def range_href(tab: str, range_key: str) -> str:
 def _range_links(tab: str, range_key: str) -> str:
     links = []
     for key in RANGES:
-        mark = ' aria-current="page"' if key == range_key else ""
-        links.append(f'<a href="{range_href(tab, key)}"{mark}>{RANGE_LABELS[key]}</a>')
+        label = RANGE_LABELS[key]
+        if key == range_key:
+            links.append(f'<a href="{range_href(tab, key)}" aria-current="page">'
+                         f"<strong>{label}</strong></a>")
+        else:
+            links.append(f'<a href="{range_href(tab, key)}">{label}</a>')
     return "<p>期間: " + " / ".join(links) + "</p>"
 
 
@@ -146,8 +161,8 @@ def _warnings(data: Mapping[str, object]) -> str:
     if quality.get("partial") is True:
         lines.append("一部の記録を読めていません。集計は読めた分だけです")
     bad = [(label, quality.get(key)) for label, key in
-           (("snapshot", "invalid_snapshots"), ("印", "invalid_marks"))]
-    shown = [f"{label} {_count(value)}" for label, value in bad if type(value) is int and value > 0]
+           (("口座の記録", "invalid_snapshots"), ("印", "invalid_marks"))]
+    shown = [f"{label} {_count(value)} 件" for label, value in bad if type(value) is int and value > 0]
     if shown:
         lines.append("読めない記録は除外しました (" + "、".join(shown) + ")")
     return "".join(f'<p><span class="st warn">△ 注意</span> {_esc(line)}</p>' for line in lines)
@@ -155,10 +170,11 @@ def _warnings(data: Mapping[str, object]) -> str:
 
 # --- 今の状態 ---------------------------------------------------------------------------
 
-def _word_card(table: Mapping[str, str], raw: object) -> tuple[str, str | None]:
-    """表にある語だけ分類し、語そのままの印を返す。表に無い値は不明 (正常に倒さない)。"""
+def _word_card(table: Mapping[str, str], raw: object,
+               shown: Mapping[str, str]) -> tuple[str, str | None]:
+    """表にある語だけ分類し、表示の語に替えた印を返す。表に無い値は不明 (正常に倒さない)。"""
     known = raw if type(raw) is str and raw in table else None
-    return marks.render_verdict(marks.classify_word(table, raw)), known
+    return marks.render_verdict(marks.classify_word(table, raw, shown)), known
 
 
 def _supports_none(current: Mapping[str, object], tz: str) -> bool:
@@ -189,12 +205,13 @@ def _current(data: Mapping[str, object], tz: str) -> str:
     generation = _dict(kill_switch).get("generation")
     raw_hold = current.get("fill_hold")
     contradicted = raw_hold == "none" and not _supports_none(current, tz)
-    hold, hold_word = _word_card(marks.FILL_HOLD, None if contradicted else raw_hold)
+    hold, hold_word = _word_card(marks.FILL_HOLD, None if contradicted else raw_hold,
+                                 marks.FILL_HOLD_TEXT)
     if hold_word is not None:
         hold += " " + _esc(FILL_HOLD_NOTE[hold_word])
     elif contradicted:
         hold += " " + _esc("他の値と合わず、止める理由がないとは言えません")
-    fresh, _ = _word_card(marks.FRESHNESS, current.get("snapshot_freshness"))
+    fresh, _ = _word_card(marks.FRESHNESS, current.get("snapshot_freshness"), marks.WORD_TEXT)
 
     def money(value: object) -> str:
         text = _amount(value)
@@ -202,16 +219,14 @@ def _current(data: Mapping[str, object], tz: str) -> str:
 
     items = [
         ("kill switch", marks.render_verdict(marks.classify_kill_switch(kill_switch))),
-        ("世代", _count(generation)),
-        ("状態の取得時刻", _time(current.get("state_fetched_at"), tz)),
         ("新規の約定", hold),
-        ("最新記録", _time(current.get("snapshot_at"), tz)),
-        ("最新記録の鮮度", fresh),
-        ("最新記録からの経過", _esc(_seconds(current.get("snapshot_age_sec")))),
         ("DD", _esc(_percent(current.get("dd_pct")))),
+        ("閾値 (DD)", _esc(_percent(current.get("kill_pct")))),
         ("作動の水準", money(current.get("kill_level"))),
         ("余裕", money(current.get("headroom"))),
-        ("閾値 (DD)", _esc(_percent(current.get("kill_pct")))),
+        ("最新記録の鮮度", fresh),
+        ("最新記録からの経過", _esc(_elapsed(current.get("snapshot_age_sec")))),
+        ("世代", _count(generation)),
     ]
     limit = _number(current.get("snapshot_max_age_min"))
     if type(current.get("snapshot_max_age_min")) is bool or limit is None or limit <= 0:
@@ -224,7 +239,7 @@ def _current(data: Mapping[str, object], tz: str) -> str:
               f"最新記録の時刻: {_time(current.get('snapshot_at'), tz)}</p>"
               "<p>この画面は自動で更新しません。今の状態は再読み込みか Status 画面 (自動で更新) で"
               '確かめてください (<a href="/">Status 画面を開く</a>)</p>')
-    return "<section><h2>今の状態</h2>" + notice + marks.cards(items) + notes + "</section>"
+    return '<section class="now"><h2>今の状態</h2>' + notice + marks.cards(items) + notes + "</section>"
 
 
 # --- 数字で読む ------------------------------------------------------------------------
@@ -233,7 +248,7 @@ def _stats(data: Mapping[str, object], tz: str) -> str:
     stats = _dict(data.get("stats"))
     if "first_at" in stats and "last_at" in stats and stats["first_at"] is None \
             and stats["last_at"] is None:
-        return "<section><h2>数字で読む</h2><p>この期間の記録はありません</p></section>"
+        return ""
     unit = _currency(data)
     rows = []
     for label, name in (("equity", "equity"), ("balance", "balance")):
@@ -242,10 +257,15 @@ def _stats(data: Mapping[str, object], tz: str) -> str:
                     + "</tr>")
     table = ('<table class="num"><thead><tr><th>項目</th><th>期間の初め</th><th>期間の終わり</th>'
              "<th>最小</th><th>最大</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
-    span = (f"<p>記録の範囲: {_time(stats.get('first_at'), tz)} 〜 {_time(stats.get('last_at'), tz)}"
-            + (f" (単位: {_esc(unit)})" if unit else "") + "</p>")
-    drawdown = (f"<p>最大 DD: {_esc(_percent(stats.get('dd_max')))} "
-                f"({_time(stats.get('dd_max_at'), tz)})</p>")
+    first, last = _time(stats.get("first_at"), tz), _time(stats.get("last_at"), tz)
+    scope = UNKNOWN if first == last == UNKNOWN else f"{first} 〜 {last}"
+    span = (f"<p>記録の範囲: {scope}" + (f" (単位: {_esc(unit)})" if unit else "") + "</p>")
+    peak, peak_at = _esc(_percent(stats.get("dd_max"))), _time(stats.get("dd_max_at"), tz)
+    if peak == UNKNOWN:
+        peak_text = UNKNOWN
+    else:
+        peak_text = f"{peak} ({peak_at})" if peak_at != UNKNOWN else f"{peak} (時刻は不明)"
+    drawdown = f"<p>最大 DD: {peak_text}</p>"
     return "<section><h2>数字で読む</h2>" + table + span + drawdown + "</section>"
 
 
@@ -315,22 +335,21 @@ def _figure(data: Mapping[str, object], tz: str, *, draw: bool = True) -> str:
     if chart.svg:
         lines = list(chart.notes)
     else:
-        lines = ["この期間の記録はありません" if empty and not chart.span else chart.notes[0]]
+        lines = [EQUITY_EMPTY if empty and not chart.span else chart.notes[0]]
     body = ('<div class="scroll">' + chart.svg + "</div>" if chart.svg else "") + "".join(f"<p>{_esc(line)}</p>" for line in lines)
     if chart.svg and chart.span is not None:
         unit = _currency(data)
         body += (f"<p>横軸: 表示 tz の時刻 ({_esc(chart.span[0])} 〜 {_esc(chart.span[1])})、"
                  "縦軸: 口座通貨の金額" + (f" ({_esc(unit)})" if unit else "") + "</p>")
     omissions = _dict(data.get("omissions"))
-    omitted = [(label, omissions.get(key)) for label, key in (("代表点", "equity_points"),
-                                                              ("階段の段", "hwm_steps"))]
+    omitted = [(label, omissions.get(key)) for label, key in (("線の点", "equity_points"),
+                                                              ("HWM の段", "hwm_steps"))]
     shown = [f"{label} {_count(value)}" for label, value in omitted
              if type(value) is int and value > 0]
     if shown:
-        body += ("<p>図から省いたもの: " + _esc("、".join(shown))
-                 + " (下の数字は省く前の全期間の集計です)</p>")
-    body += ("<p>線は時間で束ねた表示で、判定の根拠ではありません。"
-             "kill switch の印は記録がある分だけです。</p>")
+        body += ("<p>図は一部を間引いています (" + _esc("、".join(shown))
+                 + ")。下の数字は間引く前の集計です</p>")
+    body += "<p>線は時間で束ねた表示で、判定の根拠ではありません。</p>"
     return "<section><h2>資金推移の図</h2>" + body + "</section>"
 
 
@@ -339,7 +358,7 @@ def _figure(data: Mapping[str, object], tz: str, *, draw: bool = True) -> str:
 def _notes(data: Mapping[str, object], tz: str) -> str:
     since = data.get("marks_since")
     if since is None:
-        history = "event の記録はありません"
+        history = "kill switch の印は記録がある分だけです。event の記録はありません"
     else:
         history = f"kill switch の印は記録がある分だけです。event の記録は {_time(since, tz)} 以降です"
     items = [
@@ -369,8 +388,8 @@ def _render_equity(data: Mapping[str, object], range_key: str) -> bytes:
     tz = zone_of(data)
     bar = tabs.bar(PATH, tab, carry={"range": range_key} if range_key != DEFAULT_RANGE else None,
                    omit_default=True)
-    head = "<p>paper の記録です</p>" + _warnings(data) + _range_links(tab, range_key)
-    current = _current(data, tz)
+    head = "<p>paper の記録です</p>" + _warnings(data)
+    current = _current(data, tz) + _range_links(tab, range_key)
     stats = _stats(data, tz)
     tail = _notes(data, tz)
 
@@ -398,7 +417,7 @@ STRATEGY_NOTES = (
     "スワップを含まないため)",
     "同じ名前の plugin の版が変わっても、同じ行に数えます",
 )
-CRON_LABEL = "定期の判断 (cron、戦略に属さない)"
+CRON_LABEL = f"{svg.CRON_NAME} (cron、戦略に属さない)"
 UNKNOWN_LABEL = "帰属不明"
 REASON_LABELS = (("llm_close", "判断"), ("sl", "SL"), ("tp", "TP"), ("other", "その他"))
 STRATEGY_HEADERS = ("起動理由", "件数", "勝 / 負 / 分", "勝率", "PF", "平均 R (手数料込み)",
@@ -406,6 +425,7 @@ STRATEGY_HEADERS = ("起動理由", "件数", "勝 / 負 / 分", "勝率", "PF",
 NOTE_STRATEGIES_UNKNOWN = "戦略別の成績を読めません。数字は不明です"
 NOTE_ROWS_DROPPED = "読めない行が {} 件あります。表と図には読めた行だけを出しています"
 NOTE_CLOSED_UNKNOWN = "決済の件数を読めない行があります"
+NO_STRATEGY_FIGURE = "この期間に決済した取引はありません。期間を広げると出ることがあります"
 NOTE_TABLE_OVER = "戦略の表は表示の上限を超えたため省きました"
 _ORIGIN = re.compile(r"signal:[a-z][a-z0-9_]{0,63}\Z")
 
@@ -445,6 +465,14 @@ def _rated(value: str, count: object, limits: tuple[int, int] | None) -> str:
     return value if count >= limits[1] or value == UNKNOWN else value + " (参考)"
 
 
+def _rate_note(limits: tuple[int, int] | None) -> str:
+    """率が「–」や「(参考)」になる規則。件数の基準は daemon が返した値。"""
+    if limits is None:
+        return "件数の基準を読めないため、勝率・PF・平均 R は不明にしました"
+    return (f"勝率・PF・平均 R は、もとになる件数 (勝率・PF は損益の分かる決済、平均 R は R を算出できた"
+            f"決済) が {limits[0]} 件未満だと出しません (–)。{limits[1]} 件未満は参考の値です")
+
+
 def _origin_cell(row: Mapping[str, object]) -> str:
     origin = row.get("origin")
     if origin == "cron":
@@ -480,8 +508,11 @@ def _profit_factor(row: Mapping[str, object], limits: tuple[int, int] | None) ->
 def _average_r(row: Mapping[str, object], limits: tuple[int, int] | None) -> str:
     known = row.get("r_known_count")
     value = "–" if row.get("avg_r") is None and known == 0 else _signed_r(row.get("avg_r"))
-    cell = _rated(value, known, limits)
-    return _esc(cell) + f"<br>R 算出 {_count(known)} / 決済 {_count(row.get('closed_count'))} 件"
+    cell = _esc(_rated(value, known, limits))
+    closed = row.get("closed_count")
+    if type(known) is int and type(closed) is int and known == closed:
+        return cell
+    return cell + f"<br>R 算出 {_count(known)} / 決済 {_count(closed)} 件"
 
 
 def _reasons_cell(row: Mapping[str, object]) -> str:
@@ -491,22 +522,36 @@ def _reasons_cell(row: Mapping[str, object]) -> str:
         value = reasons.get(key)
         if type(value) is int and value == 0:
             continue
-        shown.append(f"{label} {_count(value)}")
-    return _esc(" / ".join(shown)) if shown else NONE_TEXT
+        shown.append((label, _count(value)))
+    if shown and all(count == UNKNOWN for _, count in shown):
+        return UNKNOWN
+    return _esc(" / ".join(f"{label} {count}" for label, count in shown)) if shown else NONE_TEXT
 
 
 def _holding_cell(row: Mapping[str, object]) -> str:
     text = _count(row.get("open_count"))
     pending = row.get("close_pending_count")
+    if text == UNKNOWN and _count(pending) == UNKNOWN:
+        return UNKNOWN
     if type(pending) is not int or pending != 0:
         text += f" (決済未確定 {_count(pending)})"
     return _esc(text)
 
 
+def _closed_cell(row: Mapping[str, object]) -> str:
+    """件数。損益が不明な決済が無いと分かるときは件数だけ、差があるか読めないときは内訳を添える。"""
+    closed = _count(row.get("closed_count"))
+    known, unknown = _count(row.get("pnl_known_count")), _count(row.get("pnl_unknown_count"))
+    if unknown == "0":
+        return closed
+    if known == unknown == UNKNOWN:
+        return closed if closed == UNKNOWN else f"{closed} (損益の内訳は不明)"
+    return f"{closed} (損益既知 {known} / 損益不明 {unknown})"
+
+
 def _strategy_row(row: Mapping[str, object], limits: tuple[int, int] | None) -> str:
     known = row.get("pnl_known_count")
-    closed = (f"{_count(row.get('closed_count'))} (損益既知 {_count(known)} / "
-              f"不明 {_count(row.get('pnl_unknown_count'))})")
+    closed = _closed_cell(row)
     wins, losses, flats = (_count(row.get(k)) for k in ("wins", "losses", "flats"))
     total = NONE_TEXT if row.get("total_pnl") is None and known == 0 \
         else _signed_amount(row.get("total_pnl"))
@@ -566,7 +611,11 @@ def _strategy_figure(data: Mapping[str, object], tz: str, *, draw: bool = True) 
     else:
         chart = svg.Chart("", None, (svg.NOTE_STRATEGY_OVER,))
     body = '<div class="scroll">' + chart.svg + "</div>" if chart.svg else ""
-    body += "".join(f"<p>{_esc(line)}</p>" for line in chart.notes)
+    notes = chart.notes
+    if notes == (svg.NOTE_NO_SERIES,) and type(data.get("strategies")) is list \
+            and not data["strategies"]:
+        notes = (NO_STRATEGY_FIGURE,)
+    body += "".join(f"<p>{_esc(line)}</p>" for line in notes)
     if chart.svg and chart.span is not None:
         unit = _currency(data)
         body += (f"<p>横軸: 表示 tz の時刻 ({_esc(chart.span[0])} 〜 {_esc(chart.span[1])})、"
@@ -582,7 +631,7 @@ def _strategy_figure(data: Mapping[str, object], tz: str, *, draw: bool = True) 
         for item in chosen:
             body += _series_start_note(item, data, tz, limits)
             if item.row.get("pnl_known_count") == 0 and item.row.get("closed_count"):
-                body += f"<p>{_esc(item.origin)}: 損益が不明のため、0 の線です</p>"
+                body += f"<p>{_esc(svg.origin_name(item.origin))}: 損益が不明のため、0 の線です</p>"
     return "<section><h2>累積損益の図</h2>" + body + "</section>"
 
 
@@ -599,7 +648,7 @@ def _series_start_note(item: svg.Series, data: Mapping[str, object], tz: str,
     if not late and not omitted:
         return ""
     start = svg._full(points[0][0], tz) or UNKNOWN
-    name = _esc(item.origin)
+    name = _esc(svg.origin_name(item.origin))
     if omitted is None:
         head = f"古い決済の件数は不明です。{_esc(start)} の始点 1 点にまとめています"
     elif omitted:
@@ -627,9 +676,10 @@ def _render_strategy(data: Mapping[str, object], range_key: str) -> bytes:
     tz = zone_of(data)
     bar = tabs.bar(PATH, "strategy", carry={"range": range_key} if range_key != DEFAULT_RANGE
                    else None, omit_default=True)
-    head = ("<p>paper の記録です</p>" + _strategy_warnings(data) + _range_links("strategy", range_key)
-            + "<section><h2>戦略別の成績</h2><p>" + _esc(STRATEGY_INTRO) + "</p></section>")
-    tail = ("<section><h2>注記</h2><ul>" + "".join(f"<li>{_esc(line)}</li>" for line in STRATEGY_NOTES)
+    head = ("<p>paper の記録です</p>" + _strategy_warnings(data) + "<p>" + _esc(STRATEGY_INTRO)
+            + "</p>" + _range_links("strategy", range_key))
+    notes = (_rate_note(_thresholds(data)),) + STRATEGY_NOTES
+    tail = ("<section><h2>注記</h2><ul>" + "".join(f"<li>{_esc(line)}</li>" for line in notes)
             + "</ul></section>")
 
     def build(figure: str, table: str) -> bytes:

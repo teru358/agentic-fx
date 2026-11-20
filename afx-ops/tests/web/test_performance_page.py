@@ -122,7 +122,8 @@ def test_an_unknown_key_or_value_is_400_without_calling_the_daemon(query, method
 
 def test_the_range_links_swap_range_and_keep_the_tab_and_the_tab_bar_keeps_the_range():
     html = page(query={"range": "7d", "tab": "equity"})
-    links = re.findall(r'<a href="([^"]*)"[^>]*>([^<]*)</a>', after_bars(html))
+    links = re.findall(r'<a href="([^"]*)"[^>]*>(?:<strong>)?([^<]*)(?:</strong>)?</a>',
+                       after_bars(html))
     assert [text for _href, text in links if text in {"7 日", "30 日", "90 日", "全期間"}] \
         == ["7 日", "30 日", "90 日", "全期間"]
     hrefs = {text: href for href, text in links}
@@ -198,9 +199,11 @@ def test_the_generation_and_the_state_time_are_shown_beside_the_kill_switch():
 
 
 @pytest.mark.parametrize("hold,word,level", [
-    ("kill_switch", "kill_switch", "danger"), ("unknown", "unknown", None),
-    ("stale", "stale", "warn"), ("drawdown", "drawdown", "danger"), ("none", "none", "ok")])
-def test_the_fill_hold_word_is_the_daemon_value_with_its_own_mark(hold, word, level):
+    ("kill_switch", "kill switch で停止", "danger"), ("unknown", "不明", None),
+    ("stale", "記録が古く停止", "warn"), ("drawdown", "DD 到達で停止", "danger"),
+    ("none", "止めていない", "ok")])
+def test_the_fill_hold_word_is_the_users_word_for_the_daemon_value_with_its_own_mark(
+        hold, word, level):
     html = page(payload(current=current(fill_hold=hold)))
     card = re.search(r"<strong>新規の約定</strong>(.*?)</div>", html, re.S).group(1)
     assert f"{word}" in card
@@ -330,7 +333,7 @@ def test_none_must_agree_with_the_age_and_drawdown_in_the_same_reply(field, valu
 def test_a_reason_other_than_none_is_still_shown_whatever_the_other_fields_say(
         hold, mark, kill_switch, freshness):
     card = _hold_card(payload(current=_hold_current(kill_switch, hold, freshness)))
-    assert hold in card
+    assert marks.FILL_HOLD_TEXT[hold] in card
     if mark:
         assert f'class="st {mark}"' in card
 
@@ -340,7 +343,7 @@ def test_the_account_numbers_are_formatted_and_a_stale_or_unknown_freshness_is_n
                                         fill_hold="stale")))
     assert "9,000.00" not in html and "9000.00" in html and "500.00" in html
     assert "2.5%" in html and "10.0%" in html
-    assert re.search(r"<strong>最新記録の鮮度</strong><span class=\"st warn\">△ stale", html)
+    assert re.search(r"<strong>最新記録の鮮度</strong><span class=\"st warn\">△ 古い", html)
     odd = page(payload(current=current(snapshot_freshness="fresh!", snapshot_age_sec=True,
                                        dd_pct=float("nan"), headroom="x", kill_level=None)))
     card = re.search(r"<strong>最新記録の鮮度</strong>(.*?)</div>", odd, re.S).group(1)
@@ -402,7 +405,7 @@ def test_the_marks_table_has_the_kind_words_the_times_and_the_two_rebase_columns
     html = page(payload(marks=marks_, marks_omitted=3))
     section = html.split("<h2>印</h2>", 1)[1].split("</section>", 1)[0]
     head = re.findall(r"<th>([^<]*)</th>", section)
-    assert head == ["種別", "位置", "実時刻", "記録時刻", "帳簿の位置", "操作時刻", "世代", "出所"]
+    assert head == ["種別", "位置", "実時刻", "記録時刻", "台帳の位置", "操作時刻", "世代", "出所"]
     rows = re.findall(r"<tr><td>.*?</tr>", section, re.S)
     assert len(rows) == 5
     assert "✕ 作動" in rows[0] and "↑ 解除" in rows[1] and "▽ HWM の付け直し" in rows[2]
@@ -777,3 +780,117 @@ def test_the_frame_notice_survives_the_replacement_page():
     finally:
         perf_pages.PAGE_BUDGET_BYTES = big
     assert NOT_REFRESHED in current_frame(html)
+
+
+# --- 文言と視覚の優先度 ------------------------------------------------------------------
+
+@pytest.mark.parametrize("seconds,text", [
+    (0, "0 秒"), (59, "59 秒"), (59.4, "59 秒"),
+    (60, "1 分 (60 秒)"), (700.0, "11 分 (700 秒)"), (3600, "1 時間 (3600 秒)"),
+    (189000, "2 日 4 時間 30 分 (189000 秒)"), (86400, "1 日 (86400 秒)"),
+    (1e12, "1.00e+12 秒"), (-1, "不明"), (None, "不明"), (True, "不明"), ("x", "不明"),
+    (float("nan"), "不明")])
+def test_the_elapsed_time_puts_the_large_unit_first_and_keeps_the_seconds(seconds, text):
+    assert perf_pages._elapsed(seconds) == text
+
+
+def test_the_elapsed_card_shows_days_hours_minutes_and_the_seconds():
+    html = page(payload(current=current(snapshot_age_sec=189000.0)))
+    assert re.search(r"<strong>最新記録からの経過</strong>2 日 4 時間 30 分 \(189000 秒\)</div>", html)
+
+
+def test_the_current_cards_are_in_reading_order_without_the_two_times_already_in_the_head():
+    frame = current_frame(page())
+    labels = re.findall(r"<strong>([^<]*)</strong>", frame)
+    assert labels == ["kill switch", "新規の約定", "DD", "閾値 (DD)", "作動の水準", "余裕",
+                      "最新記録の鮮度", "最新記録からの経過", "世代"]
+    assert "状態の取得時刻</strong>" not in frame and "<strong>最新記録</strong>" not in frame
+
+
+def test_the_current_frame_alone_carries_the_emphasis_class_and_the_page_has_one():
+    html = page()
+    assert html.count('<section class="now">') == 1
+    assert html.split('<section class="now">', 1)[1].startswith("<h2>今の状態</h2>")
+    assert "<section><h2>資金推移の図</h2>" in html
+
+
+def test_the_range_links_sit_below_the_current_frame_and_above_the_figure():
+    html = page()
+    assert html.index("今の状態") < html.index("期間:") < html.index("資金推移の図")
+    assert html.index("</section>", html.index("今の状態")) < html.index("期間:")
+
+
+def test_the_chosen_range_is_bold_and_the_others_are_plain_links():
+    html = page(query={"range": "7d"})
+    links = re.search(r"<p>期間: (.*?)</p>", html).group(1)
+    assert '<a href="/performance?range=7d" aria-current="page"><strong>7 日</strong></a>' in links
+    assert links.count("<strong>") == 1
+
+
+def test_the_users_words_are_shown_for_the_freshness_and_an_unreadable_one_is_unknown():
+    html = page(payload(current=current(snapshot_freshness="stale", fill_hold="stale")))
+    assert '<span class="st warn">△ 古い</span>' in html
+    odd = page(payload(current=current(snapshot_freshness="unknown")))
+    assert re.search(r"<strong>最新記録の鮮度</strong><span class=\"st\">\? 不明</span>", odd)
+    assert "fresh" not in html.split("<h2>今の状態</h2>", 1)[1].split("</section>", 1)[0]
+
+
+def test_an_empty_period_says_so_once_with_what_to_do_and_hides_the_numbers_section():
+    data = payload(stats={"first_at": None, "last_at": None})
+    html = page(data)
+    assert html.count("この期間の記録はありません") == 1
+    assert "期間を広げるか、daemon が動いているかを Status 画面で確かめてください" in html
+    assert "数字で読む" not in html
+    assert "資金推移の図" in html and "判定の根拠ではありません" in html
+
+
+@pytest.mark.parametrize("stats,text", [
+    ({"dd_max": 9.5, "dd_max_at": "2026-11-10T00:00:00+00:00"}, "最大 DD: 9.5% (2026-11-10 09:00:00 +09:00)"),
+    ({"dd_max": 9.5, "dd_max_at": "bad"}, "最大 DD: 9.5% (時刻は不明)"),
+    ({"dd_max": "x", "dd_max_at": "bad"}, "最大 DD: 不明"),
+    ({"dd_max": "x", "dd_max_at": "2026-11-10T00:00:00+00:00"}, "最大 DD: 不明")])
+def test_the_max_drawdown_never_stacks_two_unknowns(stats, text):
+    data = payload()
+    data["stats"].update(stats)
+    html = page(data)
+    assert f"<p>{text}</p>" in html
+
+
+def test_an_unreadable_range_is_one_unknown_not_two():
+    data = payload()
+    data["stats"].update(first_at="bad", last_at=None)
+    assert "<p>記録の範囲: 不明 (単位: JPY)</p>" in page(data)
+
+
+def test_the_figure_says_what_was_thinned_in_the_users_words_and_the_marks_note_stays_in_the_notes():
+    data = payload(omissions={"equity_points": 12, "hwm_steps": 4, "strategy_rows": 0,
+                              "strategy_series": 0})
+    html = page(data)
+    assert "図は一部を間引いています (線の点 12、HWM の段 4)。下の数字は間引く前の集計です" in html
+    assert "代表点" not in html and "階段の段" not in html
+    assert html.count("kill switch の印は記録がある分だけです") == 1
+    assert page(payload(marks_since=None)).count("kill switch の印は記録がある分だけです") == 1
+
+
+def test_the_marks_sources_and_the_ledger_column_use_the_users_words():
+    marks_ = [mark("latched", time_source=source)
+              for source in ("state", "ledger", "event_ts", "snapshot")]
+    section = page(payload(marks=marks_)).split("<h2>印</h2>", 1)[1].split("</section>", 1)[0]
+    for word in ("今の状態の記録", "付け直しの台帳", "通知の記録", "口座の記録"):
+        assert f"<td>{word}</td>" in section
+    assert "<th>台帳の位置</th>" in section and "帳簿" not in section
+
+
+def test_the_excluded_record_counts_name_what_was_excluded():
+    data = payload()
+    data["quality"].update(invalid_snapshots=14, invalid_marks=2)
+    assert "読めない記録は除外しました (口座の記録 14 件、印 2 件)" in page(data)
+
+
+def test_the_embedded_css_keeps_the_frame_the_current_mark_and_drops_the_unused_rules():
+    style = render.STYLE
+    assert ".now{border:2px solid var(--fg);}" in style
+    assert '\na[aria-current="page"] { color: var(--fg); }' in style
+    assert "nav a[aria-current" not in style
+    assert "text.cr{" not in style and ".ax{" not in style
+    assert len(style.encode("utf-8")) == 3967

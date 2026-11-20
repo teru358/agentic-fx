@@ -38,7 +38,7 @@ MARK_STYLE = {"latched": ("✕", "作動", "ev"), "released": ("↑", "解除", 
               "rebase": ("▽", "HWM の付け直し", "rb"), "cashflow": ("◇", "入出金", "cf"),
               "unknown_hwm_drop": ("△", "不明な HWM 下降", "rb")}
 LINE_LEGEND = (("c1", "equity"), ("c2", "balance"), ("c3", "HWM"), ("c4", "作動の水準 (今の閾値)"))
-BAND_LEGEND = "帯: 束内の最小〜最大"
+BAND_LEGEND = "帯: その時間内の最小〜最大"
 LEGEND_STEP = 176
 # 印の記号 1 つぶんの文字幅 (図の単位)。段の数は図の高さに収まる範囲
 MARK_WIDTH = 12
@@ -413,6 +413,8 @@ HISTORY_EXTRA_POINTS = 2
 SERIES_CSS = ("c1", "c2", "c3", "c4")
 CRON_CSS = "cr"
 CRON_ORIGIN = "cron"
+# 起動理由 cron の表示名 (表・凡例・図の下の文で同じ語)
+CRON_NAME = "定期の判断"
 _ORIGIN = re.compile(r"cron|signal:[a-z][a-z0-9_]{0,63}")
 LEGEND_TOP = 226
 LEGEND_ROW = 16
@@ -524,6 +526,11 @@ def _strategy_legend(items: Sequence[tuple[str, str]]) -> str:
     return "".join(out)
 
 
+def origin_name(origin: str) -> str:
+    """図と図の下の文に出す起動理由の名前。cron は「定期の判断」。"""
+    return CRON_NAME if origin == CRON_ORIGIN else origin
+
+
 def draw_strategies(data: Mapping[str, object], tz: str, amount) -> Chart:
     """起動理由ごとの累積損益の階段線。期間の初めを 0 とする daemon の点をそのまま描く。
 
@@ -551,7 +558,7 @@ def draw_strategies(data: Mapping[str, object], tz: str, amount) -> Chart:
         else:
             last = _end_value(points, item.row.get("total_pnl"))
             end = NO_END if last is None else f"終点 {amount(last)}"
-        legend.append((item.css, f"{item.origin} {end}"))
+        legend.append((item.css, f"{origin_name(item.origin)} {end}"))
     height = LEGEND_TOP + LEGEND_ROW * (len(legend) - 1) + 8
     opening = (f'<svg viewBox="0 0 {VIEW_W} {height}" role="img" '
                'aria-label="戦略別の累積損益の図 (起動理由ごとの階段線)">')
