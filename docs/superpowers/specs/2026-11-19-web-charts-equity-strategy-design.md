@@ -115,6 +115,7 @@ web (afx-ops) ──GET /v1/performance?range=30d──▶ daemon (ops API、sta
 | `marks_since`, `other_sources` | 最古の kill switch event 記録時刻 (無しは null)、期間内の除外 source 行数 |
 | `strategies` | 下表の行、最大 32 (cron・帰属不明・合算行を含む)。順序は §2.6 |
 | `thresholds` | `{min_count:5,reference_count:30}` |
+| `series_limits` | `{events:120,series:4}`。累積点に使う系列ごとの決済の件数の上限と、図に出す起動理由の系列数の上限。web は点の読み取り上限 (events + 2)・色の数・古い決済の省略件数 (closed_count − events) にこの値を使い、読めなければ省略件数を書かない |
 | `omissions` | `{equity_points,hwm_steps,strategy_rows,strategy_series}`。図から省いた代表点・段、合算した元行、図に出さない系列の数。元 snapshot の集約数とは別 |
 | `quality` | `{partial,invalid_snapshots,invalid_marks,invalid_orders,unknown_hwm_drops,unplaced_closed_count}`。partial は bool、他は件数。正常なら false / 0 |
 
@@ -124,7 +125,7 @@ web (afx-ops) ──GET /v1/performance?range=30d──▶ daemon (ops API、sta
 | 代表点 | `start_at,end_at,last_at` (部分束の実時刻)、`equity_min,equity_max,equity_last,balance_last`、`seg` (非負整数)。null 無し。帯は `[start_at,end_at]`、代表線は last_at に置く |
 | `stats` | `first_at,last_at,equity_first,equity_last,balance_first,balance_last,equity_min,equity_max,balance_min,balance_max,dd_max,dd_max_at`。期間が空・算出不能は null。極値同値は最初の `(ts,id)` |
 | 印 | `kind` (`latched/released/rebase/cashflow/unknown_hwm_drop`)、`plot_at`、`occurred_at,recorded_at` (実時刻 / 記録時刻、不明は null)、`source_snapshot_ts,applied_at` (付け直し専用、他は null)、`generation` (非該当は null)、`time_source` (`state/ledger/event_ts/snapshot`)。付け直しの occurred_at / recorded_at は共に null |
-| 戦略行 | `origin` (文法に合う最大 71 ASCII byte、帰属不明は unknown、合算は other)、`origin_count` (通常 1)、`closed_count,pnl_known_count,r_known_count,pnl_unknown_count,r_unknown_count,open_count,close_pending_count,wins,losses,flats`、`win_rate,pf,avg_r` (計算不能は null)、`pf_state` (`computed` = pf は有限の値、`no_losses` = 損失 0 件で pf は null、`unknown` = 計算不能・非有限で pf は null。web は state と pf が噛み合わないとき PF を「不明」にする)、`total_pnl` (既知 0 件なら null)、`close_reasons` (`llm_close/sl/tp/other`)、`cumulative` (図の選外は空 list) |
+| 戦略行 | `origin` (文法に合う最大 71 ASCII byte、帰属不明は unknown、合算は other)、`origin_count` (通常 1)、`closed_count,pnl_known_count,r_known_count,pnl_unknown_count,r_unknown_count,open_count,close_pending_count,wins,losses,flats`、`win_rate,pf,avg_r` (計算不能は null)、`pf_state` (`computed` = pf は有限の値、`no_losses` = 損失 0 件かつ総利益が正で pf は null (損益が全部 0 なら `unknown`)、`unknown` = 計算不能・非有限で pf は null。web は state と pf が噛み合わないとき PF を「不明」にする)、`total_pnl` (既知 0 件なら null)、`close_reasons` (`llm_close/sl/tp/other`)、`cumulative` (図の選外は空 list) |
 | 累積点 | `{t,pnl}`。系列ごとに最新 120 件の決済を使い、同時刻合算、t 昇順。以前の合計を持つ始点 1 点と期間終了点を加え最大 122 点。切捨て前の開始は from / 0、切捨て時は採用した最初の決済時刻 / 直前の累計を始点とする。同時刻は始点を先に置く |
 
 現在状態は status の読取部分 (`S/ops/service.py:1011-1024`) を関数に切り出して共用する。`kill_switch` は `latched,generation,latched_at,reconcile_required` と、marker がある場合の `requested_generation,started_at,file_latched`。web は `marks.classify_kill_switch` (`A/web/marks.py:83-95`) を使う。marker 投影で latched_at が無ければ作動印を合成しない。

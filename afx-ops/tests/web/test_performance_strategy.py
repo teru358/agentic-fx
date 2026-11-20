@@ -309,7 +309,7 @@ def test_series_past_the_four_colors_and_the_daemons_hidden_series_are_counted_a
     data["omissions"]["strategy_series"] = 3
     figure = figure_part(strategy_page(data))
     assert len(re.findall(r"<polyline", figure)) == 4
-    assert "ほか 5 戦略は表のみです" in figure
+    assert "ほか 5 行は表のみです" in figure
     assert "表のみ" not in figure_part(strategy_page(data_of(row())))
 
 
@@ -484,6 +484,54 @@ def test_the_profit_factor_is_told_by_the_daemons_state_and_an_unreadable_pair_i
     missing = row(closed=40, wins=40, losses=0, flats=0, pf=None)
     del missing["pf_state"]
     assert table_cells(strategy_page(data_of(missing)))[0][4] == "不明"
+
+
+def test_a_tiny_positive_amount_that_rounds_to_zero_has_no_plus_sign():
+    assert perf_pages._signed_amount(0.004) == perf_pages._signed_amount(-0.004) == "0.00"
+    assert perf_pages._signed_amount(1.5) == "+1.50"
+    assert table_cells(strategy_page(data_of(row(total=0.004))))[0][6] == "0.00"
+
+
+def test_an_unreadable_rate_in_the_reference_band_is_unknown_without_the_reference_mark():
+    cells = table_cells(strategy_page(data_of(row(closed=12, rate=None, pf=None))))[0]
+    assert cells[3] == cells[4] == "不明"
+
+
+def test_the_series_history_limit_comes_from_the_daemon_and_a_missing_one_names_no_count():
+    cumulative = [{"t": iso(4000 + i), "pnl": 500.0 + i} for i in range(6)]
+
+    def figure(limits, closed=150):
+        data = data_of(row(closed=closed, cumulative=cumulative))
+        if limits is None:
+            del data["series_limits"]
+        else:
+            data["series_limits"] = limits
+        return figure_part(strategy_page(data))
+    assert "古い決済 30 件は" in figure({"events": 120, "series": 4})
+    assert "古い決済 50 件は" in figure({"events": 100, "series": 4})
+    assert "古い決済" not in figure({"events": 200, "series": 4})
+    for bad in (None, {}, {"events": "120", "series": 4}, {"events": True, "series": 4},
+                {"events": 0, "series": 4}):
+        text = figure(bad)
+        assert "古い決済の件数は不明です" in text and "古い決済 " not in text
+
+
+def test_the_drawn_points_follow_the_daemons_history_limit():
+    cumulative = [{"t": iso(100 + i), "pnl": float(i)} for i in range(250)]
+    data = data_of(row(closed=250, total=249.0, cumulative=cumulative))
+    data["series_limits"] = {"events": 200, "series": 4}
+    wide = svg.draw_strategies(data, "Asia/Tokyo", perf_pages._signed_amount)
+    data["series_limits"] = {"events": 120, "series": 4}
+    narrow = svg.draw_strategies(data, "Asia/Tokyo", perf_pages._signed_amount)
+    assert len(polylines(wide.svg, "c1")[0]) > len(polylines(narrow.svg, "c1")[0])
+
+
+def test_a_response_with_unreadable_rows_among_readable_ones_says_how_many_were_dropped():
+    data = data_of(row(), "garbage", row("signal:b"), None)
+    html = strategy_page(data)
+    assert len(table_cells(html)) == 2
+    assert "読めない行が 2 件あります" in html
+    assert "読めない行" not in strategy_page(data_of(row(), row("signal:b")))
 
 
 def test_a_row_always_states_both_the_known_and_the_unknown_pnl_counts():

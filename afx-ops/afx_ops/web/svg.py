@@ -409,6 +409,7 @@ def _full(at: float, tz: str) -> str:
 
 STRATEGY_BUDGET_BYTES = 14 * 1024
 MAX_SERIES_POINTS = 122
+HISTORY_EXTRA_POINTS = 2
 SERIES_CSS = ("c1", "c2", "c3", "c4")
 CRON_CSS = "cr"
 CRON_ORIGIN = "cron"
@@ -427,14 +428,29 @@ class Series(NamedTuple):
     row: Mapping[str, object]
 
 
-def series_rows(rows: object) -> tuple[list[Series], int]:
+def series_limits(data: Mapping[str, object]) -> tuple[int, int] | None:
+    """daemon が返す、系列ごとの決済の件数の上限と系列の数の上限。読めなければ None。"""
+    raw = data.get("series_limits")
+    raw = raw if type(raw) is dict else {}
+    events, series = raw.get("events"), raw.get("series")
+    if type(events) is int and type(series) is int and events > 0 and series > 0:
+        return events, series
+    return None
+
+
+def point_cap(limits: tuple[int, int] | None) -> int:
+    """系列 1 本で読む点の数。daemon の決済の上限に始点と終了点を足す。上限が無ければ既定。"""
+    return limits[0] + HISTORY_EXTRA_POINTS if limits else MAX_SERIES_POINTS
+
+
+def series_rows(rows: object, max_series: int | None = None) -> tuple[list[Series], int]:
     """図に描く系列と、色が足りず描かなかった系列の数。
 
     起動理由が文法に合い、累積の点を持つ行だけ。定期の判断は中立色の長破線、ほかは件数の多い順
     (行の並び順) に 4 色を割り当てる。"""
     chosen: list[Series] = []
     skipped = 0
-    colors = iter(SERIES_CSS)
+    colors = iter(SERIES_CSS[:max_series])
     for row in rows if type(rows) is list else []:
         if type(row) is not dict or type(row.get("cumulative")) is not list \
                 or not row["cumulative"]:
@@ -453,10 +469,10 @@ def series_rows(rows: object) -> tuple[list[Series], int]:
     return chosen, skipped
 
 
-def _cumulative(raw: object) -> list[tuple[float, float] | None]:
+def _cumulative(raw: object, cap: int = MAX_SERIES_POINTS) -> list[tuple[float, float] | None]:
     """読めない点は None のまま残し、線を切る位置にする。"""
     out: list[tuple[float, float] | None] = []
-    for item in (raw if type(raw) is list else [])[-MAX_SERIES_POINTS:]:
+    for item in (raw if type(raw) is list else [])[-cap:]:
         at = _epoch(item.get("t")) if type(item) is dict else None
         pnl = _number(item.get("pnl")) if type(item) is dict else None
         out.append(None if at is None or pnl is None else (at, pnl))
@@ -513,8 +529,10 @@ def draw_strategies(data: Mapping[str, object], tz: str, amount) -> Chart:
 
     `amount` は金額の書式 (表と同じ関数)。凡例は描いた系列だけで、終点の値を添える。
     予算を超えたら図を丸ごと説明文に置き換える。"""
-    chosen, _ = series_rows(data.get("strategies"))
-    drawn = [(item, _cumulative(item.row.get("cumulative"))) for item in chosen]
+    limits = series_limits(data)
+    chosen, _ = series_rows(data.get("strategies"), limits[1] if limits else None)
+    cap = point_cap(limits)
+    drawn = [(item, _cumulative(item.row.get("cumulative"), cap)) for item in chosen]
     drawn = [(item, points) for item, points in drawn if any(p is not None for p in points)]
     if not drawn:
         return Chart("", None, (NOTE_NO_SERIES,))

@@ -490,6 +490,13 @@ def test_the_profit_factor_state_tells_no_losses_from_computed_from_unknown(ops_
     assert (got["signal:none_known"]["pf"], got["signal:none_known"]["pf_state"]) == (None, "unknown")
 
 
+def test_a_row_of_only_flat_trades_has_an_unknown_profit_factor_and_not_no_losses(ops_env):
+    put(ops_env.conn, "signal:flat", pnl=0.0)
+    put(ops_env.conn, "signal:flat", pnl=0.0)
+    got = rows(ops_env)["signal:flat"]
+    assert got["pf"] is None and got["pf_state"] == "unknown"
+
+
 def test_a_profit_factor_that_overflows_is_unknown_and_never_a_number_or_no_losses(ops_env):
     put(ops_env.conn, pnl=100.0)
     put(ops_env.conn, pnl=-1e308)

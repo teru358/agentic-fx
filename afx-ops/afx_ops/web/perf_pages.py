@@ -401,10 +401,10 @@ STRATEGY_NOTES = (
 CRON_LABEL = "定期の判断 (cron、戦略に属さない)"
 UNKNOWN_LABEL = "帰属不明"
 REASON_LABELS = (("llm_close", "判断"), ("sl", "SL"), ("tp", "TP"), ("other", "その他"))
-SERIES_HISTORY = 120
 STRATEGY_HEADERS = ("起動理由", "件数", "勝 / 負 / 分", "勝率", "PF", "平均 R (手数料込み)",
                     "損益の合計", "決済の内訳", "保有中")
 NOTE_STRATEGIES_UNKNOWN = "戦略別の成績を読めません。数字は不明です"
+NOTE_ROWS_DROPPED = "読めない行が {} 件あります。表と図には読めた行だけを出しています"
 NOTE_CLOSED_UNKNOWN = "決済の件数を読めない行があります"
 NOTE_TABLE_OVER = "戦略の表は表示の上限を超えたため省きました"
 _ORIGIN = re.compile(r"signal:[a-z][a-z0-9_]{0,63}\Z")
@@ -414,7 +414,7 @@ def _signed_amount(value: object) -> str:
     text = _amount(value)
     number = _number(value)
     return "+" + text if number is not None and text != UNKNOWN and not text.startswith("-") \
-        and number > 0 else text
+        and number > 0 and any(c in "123456789" for c in text) else text
 
 
 def _signed_r(value: object) -> str:
@@ -442,7 +442,7 @@ def _rated(value: str, count: object, limits: tuple[int, int] | None) -> str:
         return UNKNOWN
     if count < limits[0]:
         return NONE_TEXT
-    return value if count >= limits[1] else value + " (参考)"
+    return value if count >= limits[1] or value == UNKNOWN else value + " (参考)"
 
 
 def _origin_cell(row: Mapping[str, object]) -> str:
@@ -532,6 +532,8 @@ def _strategy_table(data: Mapping[str, object], *, table: bool = True) -> str:
     heading = "<section><h2>起動理由ごとの表</h2>"
     if type(raw) is not list or (raw and not rows):
         return heading + f"<p>{NOTE_STRATEGIES_UNKNOWN}</p></section>"
+    dropped = len(raw) - len(rows)
+    dropped_note = f"<p>{NOTE_ROWS_DROPPED.format(dropped)}</p>" if dropped else ""
     if not rows:
         return heading + "<p>この期間に決済した取引も、保有中の取引もありません</p></section>"
     counts = [r.get("closed_count") for r in rows]
@@ -550,14 +552,15 @@ def _strategy_table(data: Mapping[str, object], *, table: bool = True) -> str:
                 + "".join(f"<th>{_esc(name)}</th>" for name in heads)
                 + "</tr></thead><tbody>" + "".join(_strategy_row(r, limits) for r in rows)
                 + "</tbody></table></div>")
-        text = heading + empty + body + merged + "</section>"
+        text = heading + empty + dropped_note + body + merged + "</section>"
         if len(text.encode("utf-8")) <= STRATEGY_TABLE_BUDGET_BYTES:
             return text
-    return heading + empty + f"<p>{NOTE_TABLE_OVER}</p>" + merged + "</section>"
+    return heading + empty + dropped_note + f"<p>{NOTE_TABLE_OVER}</p>" + merged + "</section>"
 
 
 def _strategy_figure(data: Mapping[str, object], tz: str, *, draw: bool = True) -> str:
-    chosen, skipped = svg.series_rows(data.get("strategies"))
+    limits = svg.series_limits(data)
+    chosen, skipped = svg.series_rows(data.get("strategies"), limits[1] if limits else None)
     if draw:
         chart = svg.draw_strategies(data, tz, _signed_amount)
     else:
@@ -574,22 +577,23 @@ def _strategy_figure(data: Mapping[str, object], tz: str, *, draw: bool = True) 
     if type(series_hidden) is int and series_hidden > 0:
         hidden += series_hidden
     if hidden:
-        body += f"<p>ほか {_count(hidden)} 戦略は表のみです</p>"
+        body += f"<p>ほか {_count(hidden)} 行は表のみです</p>"
     if chart.svg:
         for item in chosen:
-            body += _series_start_note(item, data, tz)
+            body += _series_start_note(item, data, tz, limits)
             if item.row.get("pnl_known_count") == 0 and item.row.get("closed_count"):
                 body += f"<p>{_esc(item.origin)}: 損益が不明のため、0 の線です</p>"
     return "<section><h2>累積損益の図</h2>" + body + "</section>"
 
 
-def _series_start_note(item: svg.Series, data: Mapping[str, object], tz: str) -> str:
+def _series_start_note(item: svg.Series, data: Mapping[str, object], tz: str,
+                       limits: tuple[int, int] | None) -> str:
     """線が期間の初めから始まらない系列の、描画開始時刻と省いた古い決済の件数。"""
     points = [p for p in svg._cumulative(item.row.get("cumulative")) if p is not None]
     if not points:
         return ""
     closed = item.row.get("closed_count")
-    omitted = max(closed - SERIES_HISTORY, 0) if type(closed) is int else None
+    omitted = max(closed - limits[0], 0) if type(closed) is int and limits else None
     period_start = svg._epoch(data.get("from"))
     late = period_start is not None and points[0][0] > period_start
     if not late and not omitted:

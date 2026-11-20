@@ -47,6 +47,7 @@ def payload(**over):
             "marks": [], "marks_omitted": 0, "marks_since": "2026-10-05T00:00:00+00:00",
             "other_sources": 0, "strategies": [],
             "thresholds": {"min_count": 5, "reference_count": 30},
+            "series_limits": {"events": 120, "series": 4},
             "omissions": {"equity_points": 0, "hwm_steps": 0, "strategy_rows": 0,
                           "strategy_series": 0},
             "quality": {"partial": False, "invalid_snapshots": 0, "invalid_marks": 0,

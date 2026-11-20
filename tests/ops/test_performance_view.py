@@ -21,7 +21,7 @@ FREE = {"latched": False, "generation": 0, "latched_at": None, "reconcile_requir
 
 TOP_KEYS = {"range", "from", "to", "bucket_sec", "account_currency", "current", "points",
             "hwm_steps", "stats", "marks", "marks_omitted", "marks_since", "other_sources",
-            "strategies", "thresholds", "omissions", "quality"}
+            "strategies", "thresholds", "series_limits", "omissions", "quality"}
 CURRENT_KEYS = {"kill_switch", "state_fetched_at", "snapshot_at", "snapshot_fetched_at",
                 "snapshot_age_sec", "snapshot_freshness", "dd_pct", "kill_level", "headroom",
                 "kill_pct", "fill_hold", "snapshot_max_age_min"}
@@ -105,6 +105,7 @@ def test_an_empty_database_returns_every_key_and_an_unknown_current(ops_env):
         "equity_min", "equity_max", "balance_min", "balance_max", "dd_max", "dd_max_at"}
     assert all(value is None for value in data["stats"].values())
     assert data["thresholds"] == {"min_count": 5, "reference_count": 30}
+    assert data["series_limits"] == {"events": pv.SERIES_EVENTS, "series": pv.MAX_SERIES}
     assert data["quality"] == {"partial": False, "invalid_snapshots": 0, "invalid_marks": 0,
                                "invalid_orders": 0, "unknown_hwm_drops": 0,
                                "unplaced_closed_count": 0}

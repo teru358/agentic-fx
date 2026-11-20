@@ -850,13 +850,13 @@ def _finite(value: float | None) -> float | None:
 
 
 def _profit_factor(acc: _Acc) -> tuple[float | None, str]:
-    """PF と、その null の理由。損失が 0 件なら `no_losses`、計算できたら `computed`、
+    """PF と、その null の理由。損失が 0 件で利益があれば `no_losses` (損益が全部 0 なら `unknown`)、計算できたら `computed`、
     損益が既知でない・合計が有限でないなど読めないときは `unknown`。"""
     if not acc.pnl_known or not math.isfinite(acc.gross_profit) \
             or not math.isfinite(acc.gross_loss):
         return None, "unknown"
     if acc.losses == 0 and acc.gross_loss == 0:
-        return None, "no_losses"
+        return (None, "no_losses") if acc.gross_profit > 0 else (None, "unknown")
     if acc.gross_loss > 0:
         value = _finite(acc.gross_profit / acc.gross_loss)
         if value is not None:
@@ -1092,6 +1092,7 @@ def build(conn: sqlite3.Connection, *, range_key: str, now: datetime, kill_pct: 
         "other_sources": equity.other_sources,
         "strategies": strategies,
         "thresholds": {"min_count": MIN_COUNT, "reference_count": REFERENCE_COUNT},
+        "series_limits": {"events": SERIES_EVENTS, "series": MAX_SERIES},
         "omissions": {"equity_points": equity.omitted_points, "hwm_steps": equity.omitted_steps,
                       "strategy_rows": merged_rows, "strategy_series": hidden_series},
         "quality": quality.dto(),
