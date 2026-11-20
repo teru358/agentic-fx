@@ -34,10 +34,12 @@ REFRESH_SECONDS = 30
 STYLE = """
 :root { color-scheme: light dark; --bg: #fff; --fg: #1f2328; --mut: #57606a; --line: #d0d7de;
   --soft: #f6f8fa; --link: #0969da; --ok: #116329; --ok-bg: #dafbe1; --warn: #7d4e00;
-  --warn-bg: #fff8c5; --bad: #cf222e; --bad-bg: #ffebe9; }
+  --warn-bg: #fff8c5; --bad: #cf222e; --bad-bg: #ffebe9; --c1: #0969da; --c2: #bc4c00;
+  --c3: #1a7f37; --c4: #8250df; }
 @media (prefers-color-scheme: dark) { :root { --bg: #0d1117; --fg: #e6edf3; --mut: #9198a1;
   --line: #3d444d; --soft: #161b22; --link: #4493f8; --ok: #3fb950; --ok-bg: #12261e;
-  --warn: #d29922; --warn-bg: #2a2111; --bad: #ff7b72; --bad-bg: #2d1316; } }
+  --warn: #d29922; --warn-bg: #2a2111; --bad: #ff7b72; --bad-bg: #2d1316; --c1: #4493f8;
+  --c2: #f0883e; --c3: #3fb950; --c4: #ab7df8; } }
 body { margin: 0; padding: 0 1rem 2rem; color: var(--fg); background: var(--bg);
   font: 14px/1.45 system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
   font-variant-numeric: tabular-nums; }
@@ -46,7 +48,7 @@ nav { display: flex; flex-wrap: wrap; gap: 1.25rem; padding: 0.6rem 0;
   border-bottom: 1px solid var(--line); margin-bottom: 0.75rem; }
 nav a { text-decoration: none; font-weight: 600; }
 nav a:hover { text-decoration: underline; }
-nav a[aria-current="page"] { color: var(--fg); }
+a[aria-current="page"] { color: var(--fg); }
 h1 { font-size: 1.25rem; margin: 0.5rem 0 0.75rem; }
 h2 { font-size: 1rem; margin: 0 0 0.4rem; }
 h3, h4 { font-size: 0.9rem; margin: 0.6rem 0 0.3rem; }
@@ -70,6 +72,7 @@ dd.warn, .st.warn { font-weight: 700; background: var(--warn-bg); }
 .kpi div { border: 1px solid var(--line); border-radius: 6px; padding: 0.4rem 0.75rem;
   background: var(--soft); }
 .kpi strong { display: block; font-size: 0.8rem; color: var(--mut); }
+.now{border:2px solid var(--fg);}
 table { border-collapse: collapse; font-size: 0.85rem; }
 th, td { border: 1px solid var(--line); padding: 0.15rem 0.45rem; text-align: left; }
 th { background: var(--soft); }
@@ -78,13 +81,32 @@ tbody tr:nth-child(even) { background: var(--soft); }
 .tabs a[aria-current="page"] { border-bottom-color: var(--link); }
 .scroll { max-height: 70vh; overflow: auto; }
 .scroll th { position: sticky; top: 0; }
+svg{display:block;width:100%;min-width:55rem;max-width:60rem;height:auto;}
+svg *{fill:none;stroke:var(--mut);vector-effect:non-scaling-stroke;}
+svg text{fill:var(--fg);stroke:none;font-size:11px;}
+.c1{stroke:var(--c1);}
+.c2{stroke:var(--c2);stroke-dasharray:6 3;}
+.c3{stroke:var(--c3);stroke-dasharray:2 3;}
+.c4{stroke:var(--c4);stroke-dasharray:8 3 2 3;}
+.bd{fill:var(--c1);stroke:none;opacity:0.15;}
+.ev{stroke:var(--bad);stroke-dasharray:3 3;}
+.rb{stroke:var(--warn);stroke-dasharray:3 3;}
+.rl{stroke:var(--mut);stroke-dasharray:2 3;}
+.cf{stroke:var(--c2);stroke-dasharray:6 3;}
+.cr{stroke:var(--mut);stroke-dasharray:10 4;}
+text.ev{fill:var(--bad);stroke:none;}
+text.rb{fill:var(--warn);stroke:none;}
+text.rl{fill:var(--mut);stroke:none;}
+text.cf{fill:var(--c2);stroke:none;}
+.num td:not(:first-child),.num th:not(:first-child){text-align:right;}
 form { margin: 0.5rem 0; }
 form + form { margin-top: 1.5rem; }
 button, input { font: inherit; padding: 0.25rem 0.6rem; }
 """
 
 # nav に出す静的な route (表示順)。/approvals は /plugins から辿り、詳細は一覧の各項目から辿る
-_NAV_LABELS = {"/": "Status", "/plugins": "Plugins", "/improve": "Improve", "/logs": "Log", "/activity": "Activity"}
+_NAV_LABELS = {"/": "Status", "/plugins": "Plugins", "/improve": "Improve",
+                "/performance": "Performance", "/logs": "Log", "/activity": "Activity"}
 _STATIC_ROUTES = frozenset(route.path for route in ROUTE_TABLE if "{" not in route.path)
 if not set(_NAV_LABELS) <= _STATIC_ROUTES:
     raise RuntimeError("nav label without a route")
@@ -195,11 +217,11 @@ def _document(title: str, body: str, tz: str | None = None, *, refresh: bool = T
 
 
 def _page(title: str, body: str, tz: str | None = None, *, current: str | None = None,
-          tabs: str = "") -> bytes:
-    document = _document(title, body, tz, current=current, tabs=tabs)
+          tabs: str = "", refresh: bool = True) -> bytes:
+    document = _document(title, body, tz, refresh=refresh, current=current, tabs=tabs)
     if len(document) <= MAX_RESPONSE_BYTES:
         return document
-    return _page(title, "<p>Output clipped</p>", tz, current=current, tabs=tabs)
+    return _page(title, "<p>Output clipped</p>", tz, current=current, tabs=tabs, refresh=refresh)
 
 
 # Status の概要の群と、群の中の並び。allowlist (STATUS_FIELDS) と同じ集合を並べる
@@ -285,7 +307,7 @@ def _bot_cards(data: Mapping[str, object]) -> str:
     if type(health) is not dict:
         return ""
     return marks.cards([("gateway health", marks.render_verdict(
-        marks.classify_word(marks.BOT_HEALTH, health.get("state"))))])
+        marks.classify_word(marks.BOT_HEALTH, health.get("state"), marks.WORD_TEXT)))])
 
 
 def _bot_section(data: Mapping[str, object], tz: str = "UTC") -> str:
@@ -350,10 +372,10 @@ def _econ_cards(data: Mapping[str, object]) -> str:
     items = []
     if type(window) is dict:
         items.append(("calendar", marks.render_verdict(
-            marks.classify_word(marks.CALENDAR, window.get("freshness")))))
+            marks.classify_word(marks.CALENDAR, window.get("freshness"), marks.WORD_TEXT))))
     if type(econ) is dict:
         items.append(("worker", marks.render_verdict(
-            marks.classify_word(marks.WORKER, econ.get("slice_worker")))))
+            marks.classify_word(marks.WORKER, econ.get("slice_worker"), marks.WORD_TEXT))))
         capacity = econ.get("slice_capacity")
         if type(capacity) is dict:
             items.append(("slice 容量", marks.render_verdict(

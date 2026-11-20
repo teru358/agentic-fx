@@ -418,7 +418,8 @@ def test_ac13_the_approval_routes_are_unchanged_and_new_ones_are_appended():
         ("/", "status"), ("/approvals", "approvals"), ("/approvals/{id}", "approval"),
         ("/logs", "log"), ("/activity", "activity"),
         ("/plugins", "plugins"), ("/plugins/{name}", "plugin"),
-        ("/improve", "improve_list"), ("/improve/{id}", "improve_detail")]
+        ("/improve", "improve_list"), ("/improve/{id}", "improve_detail"),
+        ("/performance", "performance")]
     assert resolve_route("/approvals/7/change") is None
     assert handle_request(Request("GET", "/approvals/7/change", {}), Client()).status == 404
     assert handle_request(Request("POST", "/approvals/7", {}), Client()).status == 405

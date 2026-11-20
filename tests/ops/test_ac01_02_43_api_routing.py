@@ -48,6 +48,7 @@ def _calls(api, env):
         ("improve_runs", "GET", "/v1/improve/runs?limit=5", None, {}, 200),
         ("reflection_status", "GET", f"/v1/reflections/{order_id}", None, {}, 200),
         ("whoami", "GET", "/v1/whoami", None, {}, 200),
+        ("performance", "GET", "/v1/performance?range=7d", None, {}, 200),
         ("events", "GET", "/v1/events?after=0&limit=10", None, {}, 200),
         ("ask", "POST", "/v1/asks", {"question": "q"}, key, 202),
         ("job_get", "GET", "/v1/jobs/{ask_job}", None, {}, 200),
@@ -103,7 +104,7 @@ def test_ac1_all_endpoints_over_real_uds(api):
             _wait_job(client, ask_job)
         if expected == 202:
             jobs.append(payload["data"]["job_id"])
-    assert len(ROUTES) == 35 and seen == set(ROUTES)
+    assert len(ROUTES) == 36 and seen == set(ROUTES)
     for job_id in jobs:
         assert _wait_job(client, job_id)["state"] in ("done", "failed")
     codes = {client.post("/v1/killswitch/reset", json={"expected_generation": 0})
@@ -275,6 +276,7 @@ _EXPECTED_TABLE = {
     "activity": ("GET", "/v1/activity", Scope.LOGS_READ),
     "approval_list": ("GET", "/v1/approvals", Scope.APPROVALS_LIST),
     "approval_detail": ("GET", "/v1/approvals/{id}", Scope.APPROVALS_DETAIL),
+    "performance": ("GET", "/v1/performance", Scope.STATUS_READ),
     "plugin_list": ("GET", "/v1/plugins", Scope.APPROVALS_LIST),
     "plugin_detail": ("GET", "/v1/plugins/{name}", Scope.APPROVALS_DETAIL),
     "approval_change": ("GET", "/v1/approvals/{id}/change", Scope.APPROVALS_DETAIL),
@@ -310,7 +312,7 @@ _EXPECTED_TABLE = {
 
 def test_ac1_routes_and_endpoints_match_the_independent_table_exactly():
     from agentic_fx.ops.service import ENDPOINTS
-    assert len(_EXPECTED_TABLE) == 35
+    assert len(_EXPECTED_TABLE) == 36
     assert {code: (e.route.split(" ", 1)[0], e.route.split(" ", 1)[1], e.scope)
             for code, e in ENDPOINTS.items()} == _EXPECTED_TABLE
     assert {r.handler: (r.method, r.scope) for r in ROUTES} == {

@@ -85,6 +85,11 @@ class FakeClient:
     def improve_detail(self, mission_id):
         return self._go("improve_detail", mission_id, reply=Reply(404, None, "not_found"))
 
+    def performance(self, *, range="30d"):
+        return self._go("performance", range, reply=Reply(
+            200, {"points": [], "hwm_steps": [], "marks": [], "strategies": [], "stats": {},
+                  "display_timezone": "Asia/Tokyo"}, None))
+
     def approval_change(self, approval_id):
         return self._go("approval_change", approval_id, reply=Reply(404, None, "not_found"))
 

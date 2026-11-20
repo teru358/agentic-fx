@@ -48,7 +48,19 @@ CHANGE = {"id": 7, "change": {"classification": "new", "name": "ema_cross", "kin
                               "candidate_hash": "ef" * 32, "params": {"items": []}},
           "claims": {"summary": "one", "selection_rationale": "two"},
           "diff": {"files": [], "omitted_lines": 0}}
-ROUTES = {"/v1/status": STATUS, "/v1/approvals": APPROVALS, "/v1/approvals/{id}": DETAIL,
+PERFORMANCE = {
+    "range": "30d", "from": "2026-10-20T03:00:00+00:00", "to": "2026-11-19T03:00:00+00:00",
+    "account_currency": "JPY",
+    "current": {"kill_switch": {"latched": False, "generation": 3, "reconcile_required": False},
+                "fill_hold": "none", "snapshot_freshness": "fresh", "dd_pct": 2.5,
+                "snapshot_at": "2026-11-19T02:59:30+00:00"},
+    "points": [], "hwm_steps": [], "marks": [], "strategies": [], "marks_since": None,
+    "stats": {"first_at": "2026-10-20T03:01:00+00:00", "last_at": "2026-11-19T02:59:30+00:00",
+              "equity_first": 10000.0, "equity_last": 9500.5, "balance_first": 10000.0,
+              "balance_last": 9400.25, "equity_min": 9100.0, "equity_max": 10400.0,
+              "balance_min": 9000.0, "balance_max": 10300.0, "dd_max": 12.3,
+              "dd_max_at": "2026-11-10T00:00:00+00:00"}}
+ROUTES = {"/v1/performance": PERFORMANCE, "/v1/status": STATUS, "/v1/approvals": APPROVALS, "/v1/approvals/{id}": DETAIL,
           "/v1/approvals/{id}/change": CHANGE, "/v1/log": LOG, "/v1/activity": ACTIVITY}
 
 
@@ -174,7 +186,8 @@ READS = [("/", "/v1/status", b"paper"),
          ("/approvals", "/v1/approvals?status=pending&limit=20", b"ema_cross"),
          ("/approvals/7", "/v1/approvals/7", b"cd" * 32),
          ("/logs", "/v1/log?n=100", b"order none"),
-         ("/activity", "/v1/activity?n=100", b"TRADE 2")]
+         ("/activity", "/v1/activity?n=100", b"TRADE 2"),
+         ("/performance", "/v1/performance?range=30d", b"9500.50")]
 
 
 def test_each_route_answers_get_and_head_with_the_web_principal_only(root, daemon, child_env):
@@ -406,6 +419,14 @@ HOSTILE = {
                            "exception": f"Traceback {SECRET_MARK}"},
     "/v1/log": {"lines": ["<script>" + "y" * 5000, SECRET_MARK + "\x00\x1b[31m"]},
     "/v1/activity": {"lines": ["</pre><script>z</script>"]},
+    "/v1/performance": {**PERFORMANCE, "account_currency": "<svg onload=alert(5)>",
+                        "display_timezone": "<script>x</script>",
+                        "current": {"kill_switch": "<b>bold</b>", "fill_hold": "<i>x</i>",
+                                    "snapshot_freshness": SECRET_MARK},
+                        "marks": [{"kind": "<img src=x onerror=alert(6)>", "plot_at": "<b>",
+                                   "time_source": SECRET_MARK}] * 30,
+                        "strategies": [{"origin": "<b>bold</b>", "detail": SECRET_MARK}] * 40,
+                        "quality": {"partial": "<script>"}},
 }
 
 
@@ -674,3 +695,18 @@ def test_a_pipelined_second_request_on_one_connection_is_not_answered(root, daem
     replies, done = serve(root, port, child_env, [raw])
     assert_finished(done)
     assert replies[0].count(b"HTTP/1.1 ") == 1
+
+
+def test_a_non_utc_display_zone_converts_without_loading_modules_after_isolation(
+        root, daemon, child_env):
+    zoned = {"display_timezone": "Asia/Tokyo"}
+    daemon.set({**ROUTES, "/v1/performance": {**PERFORMANCE, **zoned},
+                "/v1/status": {**STATUS, **zoned}})
+    port = free_port()
+    replies, done = serve(root, port, child_env, [get("/performance"), get("/")])
+    assert_finished(done)
+    for reply in replies:
+        status, _headers, body = parse(reply)
+        assert status == 200
+        assert b"+09:00" in body
+    assert b"2026-11-19 11:59:30 +09:00" in parse(replies[0])[2]

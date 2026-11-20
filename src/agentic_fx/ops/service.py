@@ -50,7 +50,7 @@ from .contracts import (ACTOR_PRINCIPALS, IMPROVE_RUNS_DEFAULT_LIMIT,
                         Principal, Scope, ShellCaller, assert_authorized,
                         validate_asserted_actor)
 from .events import EventSchemaError, EventStore
-from . import rebase_service
+from . import performance_view, rebase_service
 from .rebase_accounting import RebaseOutcomeUnknown, apply_rebase
 from .rebase_service import RebaseWiring
 from .jobs import Job, JobRegistry, JobState, new_job_id
@@ -171,6 +171,7 @@ ENDPOINTS: dict[str, Endpoint] = {e.code: e for e in (
     Endpoint("improve_run", "GET /v1/improve/runs/{id}", Scope.APPROVALS_DETAIL, False),
     Endpoint("improve_runs", "GET /v1/improve/runs", Scope.APPROVALS_LIST, False),
     Endpoint("reflection_status", "GET /v1/reflections/{order_id}", Scope.STATUS_READ, False),
+    Endpoint("performance", "GET /v1/performance", Scope.STATUS_READ, False),
     Endpoint("whoami", "GET /v1/whoami", Scope.STATUS_READ, False),
     Endpoint("job_get", "GET /v1/jobs/{id}", Scope.JOBS_OWN, False),
     Endpoint("events", "GET /v1/events", Scope.EVENTS_READ, False),
@@ -744,6 +745,7 @@ class OpsService:
         self.stop_event = stop_event or threading.Event()
         self._owns_decide_conn = decide_conn is None
         raw_decide = decide_conn if decide_conn is not None else self._open_peer(conn)
+        self._db_path = self._file_path(conn)
         self._conn = _PatientConnection(
             conn, stop_event=self.stop_event, monotonic=monotonic,
             default_wait=limits.request_deadline_seconds,
@@ -791,6 +793,13 @@ class OpsService:
     def lane_connection(self):
         """ops レーンの接続 (deadline と停止合図に従う)。レーンの中で呼ぶ callback 用。"""
         return self._conn
+
+    @staticmethod
+    def _file_path(conn: sqlite3.Connection) -> Path | None:
+        """接続の DB file。無い (メモリ DB など) ときは None。読取専用の別接続を開くのに使う。"""
+        row = conn.execute("PRAGMA database_list").fetchone()
+        path = row[2] if row is not None else ""
+        return Path(path) if path else None
 
     @staticmethod
     def _open_peer(conn: sqlite3.Connection) -> sqlite3.Connection:
@@ -1010,18 +1019,7 @@ class OpsService:
                 data["econ_signal"] = view
         if self._state_store is not None:
             try:
-                state = self._state_store.load(deadline=self._foreign(deadline), stop_event=self.stop_event)
-                marker = self._state_store.reconcile_marker()
-                kill_switch = {"latched": state.kill_switch_latched,
-                               "generation": state.kill_switch_generation,
-                               "latched_at": state.kill_switch_latched_at,
-                               "reconcile_required": marker is not None}
-                if marker is not None:
-                    raw = self._state_store.file_value(deadline=self._foreign(deadline),
-                                                       stop_event=self.stop_event)
-                    kill_switch.update({"requested_generation": marker.get("requested_generation"),
-                                        "started_at": marker.get("started_at"),
-                                        "file_latched": raw.kill_switch_latched})
+                state, kill_switch = self._read_kill_switch(deadline)
             except BaseException as exc:
                 code = self._map_exception(exc)
                 if code is None or isinstance(exc, OpsError):
@@ -1036,6 +1034,66 @@ class OpsService:
         if repeat is not None:
             data["improve_repeat"] = self._job_view(repeat)
         return data
+
+    def _read_kill_switch(self, deadline: float) -> tuple[object, dict]:
+        """state file と解除途中の marker から、今の kill switch の状態を読む。
+
+        status と performance が同じ材料・同じ形で使う。失敗は例外のまま返す。"""
+        state = self._state_store.load(deadline=self._foreign(deadline),
+                                       stop_event=self.stop_event)
+        marker = self._state_store.reconcile_marker()
+        kill_switch = {"latched": state.kill_switch_latched,
+                       "generation": state.kill_switch_generation,
+                       "latched_at": state.kill_switch_latched_at,
+                       "reconcile_required": marker is not None}
+        if marker is not None:
+            raw = self._state_store.file_value(deadline=self._foreign(deadline),
+                                               stop_event=self.stop_event)
+            kill_switch.update({"requested_generation": marker.get("requested_generation"),
+                                "started_at": marker.get("started_at"),
+                                "file_latched": raw.kill_switch_latched})
+        return state, kill_switch
+
+    def performance(self, principal: Caller, range_: str = performance_view.DEFAULT_RANGE, *,
+                    deadline: float | None = None) -> dict:
+        """資金推移と戦略ごとの成績。読取専用の短命の接続で読み、ops レーンも監査行も使わない。"""
+        _authorize(principal, "performance")
+        if range_ not in performance_view.RANGES:
+            raise OpsError(ErrorCode.INVALID_ARGUMENT)
+        deadline = self._deadline(deadline)
+        settings = self._settings
+        if self._db_path is None or settings is None:
+            raise OpsError(ErrorCode.UNAVAILABLE)
+        kill_switch = None
+        if self._state_store is not None:
+            try:
+                kill_switch = self._read_kill_switch(deadline)[1]
+            except Exception as exc:  # noqa: BLE001 - 読めない状態は「不明」として返す
+                if isinstance(exc, OpsError):
+                    raise
+                code = self._map_exception(exc)
+                if code in (ErrorCode.REQUEST_TIMEOUT, ErrorCode.UNAVAILABLE):
+                    raise OpsError(code) from None
+                kill_switch = None
+        state_fetched_at = self._wall_clock()
+
+        def interrupt() -> OpsError | None:
+            if self.stop_event.is_set():
+                return OpsError(ErrorCode.UNAVAILABLE)
+            if self._monotonic() >= deadline:
+                return OpsError(ErrorCode.REQUEST_TIMEOUT)
+            return None
+
+        try:
+            return performance_view.read_performance(
+                self._db_path, range_key=range_, now=self._wall_clock(),
+                kill_pct=float(settings.risk.drawdown_kill_pct),
+                account_currency=settings.account_currency, kill_switch=kill_switch,
+                state_fetched_at=state_fetched_at, interrupt=interrupt)
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise OpsError(ErrorCode.DATABASE_BUSY) from None
+            raise OpsError(ErrorCode.INTERNAL) from None
 
     def _deploy_ops_status(self, deadline: float) -> dict | None:
         """Blocking deploy ops and ops needing attention, or an ``unavailable`` marker."""

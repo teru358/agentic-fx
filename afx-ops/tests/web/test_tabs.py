@@ -98,9 +98,9 @@ def test_the_group_table_and_the_allowlist_hold_the_same_keys():
 
 def test_a_group_without_values_has_no_heading_and_empty_values_make_no_row():
     page = get("/", {}, Client({"mode": "paper", "mission": {"loop": "x"}, "pnl": None,
-                                "performance": ""}))[0].body.decode()
+                                "latency": ""}))[0].body.decode()
     assert headings(page) == ["稼働"]
-    assert "pnl" not in page and "performance" not in page
+    assert "pnl" not in page and "latency" not in page
 
 
 def test_the_emphasis_is_kept_in_the_overview():
@@ -178,13 +178,16 @@ def test_the_href_is_built_from_the_table_and_escaped():
 @pytest.mark.parametrize("path,current", [
     ("/", "/"), ("/plugins", "/plugins"), ("/approvals", "/plugins"),
     ("/approvals/7", "/plugins"), ("/plugins/rsi", "/plugins"), ("/improve", "/improve"),
-    ("/improve/3", "/improve"), ("/logs", "/logs"), ("/activity", "/activity")])
+    ("/improve/3", "/improve"), ("/performance", "/performance"), ("/logs", "/logs"),
+    ("/activity", "/activity")])
 def test_the_nav_marks_the_screen_it_belongs_to(path, current):
     class Any:
         def __getattr__(self, name):
             def call(*args, **kwargs):
                 return Reply(200, {"mode": "paper", "plugins": [], "approvals": [], "runs": [],
-                                   "has_more": False, "lines": [], "id": 3, "plugin": {"name": "rsi"}},
+                                   "has_more": False, "lines": [], "id": 3, "plugin": {"name": "rsi"},
+                                   "points": [], "hwm_steps": [], "marks": [], "strategies": [],
+                                   "stats": {}},
                              None)
             return call
 

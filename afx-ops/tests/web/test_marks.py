@@ -220,7 +220,7 @@ BOT = {"state": "healthy", "alternate_push": "configured"}
 
 
 @pytest.mark.parametrize(("state", "text"), [
-    ("healthy", "○ healthy"), ("stale", "△ stale"), ("unknown", "△ unknown"),
+    ("healthy", "○ healthy"), ("stale", "△ 古い"), ("unknown", "△ 不明"),
     ("unhealthy", "✕ unhealthy"), ("stalled", "✕ stalled"),
     ("permanent-failure", "✕ permanent-failure"), ("not_configured", "– not_configured")])
 def test_the_bot_card_marks_each_known_gateway_state(state, text):
@@ -238,7 +238,7 @@ def test_an_unrecognised_gateway_state_is_an_unknown_mark_but_the_word_stays_unk
 
 def test_a_real_unknown_gateway_state_is_a_warning_not_an_unknown_mark():
     body = _body(_page({"mode": "paper", "bot_health": dict(BOT, state="unknown")}, "bot"))
-    assert "△ unknown" in body and UNKNOWN_MARK not in body
+    assert "△ 不明" in body and UNKNOWN_MARK not in body
 
 
 def _econ_status(**over):
@@ -251,12 +251,12 @@ def test_the_economic_cards_come_before_the_sections_and_show_each_level():
     body = _body(_page(_econ_status(), "econ")).split("</p>", 1)[1]
     assert body.startswith('<div class="kpi">')
     head = body.split("<section>")[0]
-    for text in ("<strong>calendar</strong>", "○ fresh", "<strong>worker</strong>", "○ alive", "○ ok"):
+    for text in ("<strong>calendar</strong>", "○ 新しい", "<strong>worker</strong>", "○ alive", "○ ok"):
         assert text in head
     status = _econ_status(slice_worker="stopped", slice_capacity={"level": "full"})
     status["window"] = {"freshness": "stale"}
     head = _body(_page(status, "econ")).split("<section>")[0]
-    assert "△ stale" in head and "✕ stopped" in head and "✕ full" in head
+    assert "△ 古い" in head and "✕ stopped" in head and "✕ full" in head
 
 
 @pytest.mark.parametrize("bad", ["paused", None, 1, [], True])
@@ -271,7 +271,7 @@ def test_a_real_unknown_calendar_and_worker_are_neutral_with_their_word():
     status = _econ_status(slice_worker="unknown")
     status["window"] = {"freshness": "unknown"}
     head = _body(_page(status, "econ")).split("<section>")[0]
-    assert head.count('<span class="st">– unknown</span>') == 2
+    assert head.count('<span class="st">– 不明</span>') == 2
 
 
 def test_the_reaction_tab_has_no_cards():
@@ -327,3 +327,29 @@ def test_each_status_card_and_its_hidden_row_come_from_one_classification(monkey
     monkeypatch.setattr(marks, "classify_kill_switch", lambda raw: calls.append(raw) or real(raw))
     _page(FULL)
     assert len(calls) == 1
+
+
+# --- 表示の語 ---------------------------------------------------------------------------------
+
+def test_the_display_words_replace_only_the_shown_word_and_never_the_level():
+    for raw in ("fresh", "stale", "unknown"):
+        level, word = marks.classify_word(marks.CALENDAR, raw, marks.WORD_TEXT)
+        assert level == marks.CALENDAR[raw] and word == marks.WORD_TEXT[raw]
+        assert marks.classify_word(marks.CALENDAR, raw) == (marks.CALENDAR[raw], raw)
+    assert marks.classify_word(marks.WORKER, "alive", marks.WORD_TEXT) == ("ok", "alive")
+
+
+@pytest.mark.parametrize("raw", JUNK + ["FRESH", "paused"])
+def test_a_word_outside_the_table_is_unknown_whatever_the_display_words(raw):
+    assert marks.classify_word(marks.CALENDAR, raw, marks.WORD_TEXT) == ("unknown", "不明")
+    assert marks.classify_word(marks.FILL_HOLD, raw, marks.FILL_HOLD_TEXT) == ("unknown", "不明")
+
+
+def test_the_fill_hold_words_name_each_reason_and_every_stop_keeps_its_level():
+    assert marks.FILL_HOLD_TEXT == {"none": "止めていない", "kill_switch": "kill switch で停止",
+                                    "stale": "記録が古く停止", "drawdown": "DD 到達で停止",
+                                    "unknown": "不明"}
+    assert set(marks.FILL_HOLD_TEXT) == set(marks.FILL_HOLD)
+    for raw, text in marks.FILL_HOLD_TEXT.items():
+        assert marks.classify_word(marks.FILL_HOLD, raw, marks.FILL_HOLD_TEXT) \
+            == (marks.FILL_HOLD[raw], text)

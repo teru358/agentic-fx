@@ -735,11 +735,11 @@ def test_the_store_and_context_reprs_do_not_carry_a_token():
 
 def test_a_get_never_changes_the_store():
     rig = _rig()
-    for path in ("/", "/approvals", "/approvals/7", "/improve", "/plugins"):
+    for path in ("/", "/approvals", "/approvals/7", "/improve", "/plugins", "/performance"):
         rig.send(rig.request("GET", path))
     assert rig.store.counts() == (0, 0)
     assert all(call[0] in {"status", "approvals", "approval", "approval_change", "plugins",
-                              "improve_list"}
+                              "improve_list", "performance"}
                for call in rig.client.calls)
 
 
