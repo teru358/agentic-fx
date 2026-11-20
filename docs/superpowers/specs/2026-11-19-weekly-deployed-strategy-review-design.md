@@ -1,9 +1,9 @@
-# 週次の稼働中戦略の評価と棚卸し — 設計 C0.2
+# 週次の稼働中戦略の評価と棚卸し — 設計 C0.3
 
 チケット: `weekly-improve-rebacktests-deployed-strategies`、`strategy-attribution-and-shadow-evaluation`、`weekly-plugin-inventory-notice` (3 件を束ね、3 段で実装する)。
 関連: `improve-daily-params-weekly-algorithm`、`per-strategy-virtual-books`、`plugin-naming-lifecycle-policy`。
 
-パスの略記: `S/` = `src/agentic_fx/`、`A/` = `afx-ops/afx_ops/`、`W/` = `tmp/wt/webcharts/src/agentic_fx/` (branch `webcharts`、未統合)。DB の件数は 2026-11-19 に本番 DB を読取専用で確認した値。
+パスの略記: `S/` = `src/agentic_fx/`、`A/` = `afx-ops/afx_ops/`、`W/` = `tmp/wt/webcharts/src/agentic_fx/` (branch `webcharts`、未統合)。根拠はコードの file:line で示す。
 
 ## 0. 何が起きているか
 
@@ -13,10 +13,10 @@
 
 ### 0.1 今のコードで確かめた前提
 
-| 前提 | コード・DB | 帰結 |
+| 前提 | コード | 帰結 |
 |---|---|---|
-| 帰属 | `signal_decisions(signal_id UNIQUE, trade_intent_id)` が signal の plugin・hash と建玉を結ぶ。trigger は `signal:<plugin>` (`S/store/db.py:175`、`S/store/signal_decisions.py:92-112`、`S/ops/trade_events.py:184-188`) | 帰属の列は足さない |
-| 機械採点 | decision 行から shadow を作る (`S/store/signal_shadow.py:121-137`)。accept 51・reject 6、shadow 57 件。採否前に abandoned となる signal は含まれない。配備中の 1 本では 125 件中 55 件が abandoned | 全 signal の成績とは呼ばず、穴と採否到達率を併記する |
+| 帰属 | `signal_decisions(signal_id UNIQUE, trade_intent_id)` が signal の plugin・hash と建玉を結ぶ。trigger は `signal:<plugin>` (`S/store/db.py:175-183`、`S/store/signal_decisions.py:92-112`、`S/ops/trade_events.py:43,184-188`) | 帰属の列は足さない |
+| 機械採点 | decision 行から shadow を作る (`S/store/signal_shadow.py:121-137`)。採否前に abandoned となる signal は含まれない | 全 signal の成績とは呼ばず、穴と採否到達率を併記する |
 | 採点規則 | 観測開始は採否時刻以後の UTC 分境界 (`S/store/signal_shadow.py:99-108`)。entry は成行の最初の 1 分足 open か指値到達、exit は SL / TP / day close。spread は quote か仮定値 (`S/store/signal_shadow.py:80-96`、`S/core/paper_fills.py:201-245`、設計 2026-11-01 §3.4) | 規則は変えない。戦略の exit_mode は levels のみ (`S/plugin/loader.py:291-293`) |
 | 人間の表示 | 実取引の戦略行はチャートの変更が提供する (`W/ops/performance_view.py:868-879`)。日次 report の shadow は採否種別 × 状態 (`S/loops/econ_signal_report.py:325-334,552-585`) | 実取引を作り直さず、機械採点を並べる |
 | 再評価 | `afx plugin reevaluate` と同名候補との同条件の再生がある (`S/cli_surface.py:315`、`S/plugin/strategy_gate.py:86-89,226`) | 最終判断は既存の操作を使う |
@@ -24,9 +24,8 @@
 | 前方 backtest | 期間の入口は run_in_sample / run_holdout_gate のみ (`S/backtest/holdout.py:180,216`) | 任意の前方区間の再生は別起票 |
 | 改善入力 | 既に 90 日の実取引の勝率・PF・ペア別損益と件数を渡す (`S/loops/improve_context.py:146-179`、`S/loops/prompts/improve_mission.md:10-18`) | 「shadow を足さない」と「前方情報を全面遮断」は別。既存入力は §6 問 5 |
 | 起動 | mission は手動・繰り返しでも走り (`S/loops/improve_loop.py:906`)、cadence は weekly / daily (`S/config.py:460`) | 週次確定を mission と切り離す |
-| 棚卸し | 配備中の指標 94 本、戦略 2 本、参照する指標 3 本 (`plugins/` の symlink と plugin の config) | 参照なしだけで不要としない |
-| 候補の記録 | 直近 8 週 672 行中 family_key が NULL は 32 行。保存 API は NULL を許し、依存なしの legacy 戦略・非対応 kind・読取失敗は key を持たない (`S/store/candidate_archives.py:64-84`、`S/plugin/logic_identity.py:160-178,413-430`) | NULL 行は依存の根拠から外し件数を report に出す |
-| 配備・出所 | journal の時刻は updated_at だけ (`S/store/db.py:508-520`)。承認済み依頼の origin は human 9・staging 96・reevaluation 8、指標の名前は 94 (現版 hash との対応は未照合) | 完了した配備変更と元の版の出所を使う |
+| 候補の記録 | 保存 API は NULL を許し、依存なしの legacy 戦略・非対応 kind・読取失敗は key を持たない (`S/store/candidate_archives.py:64-84`、`S/plugin/logic_identity.py:160-178,413-430`) | NULL 行は依存の根拠から外し件数を report に出す |
+| 配備・出所 | journal の時刻は updated_at だけ (`S/store/db.py:508-520`)。出所は staging / human / reevaluation (`S/plugin/read_model.py:63-65`) | 完了した配備変更と元の版の出所を使う |
 | 操作の置き場 | disable / retire は最上位 `afx plugin` (`S/cli_surface.py:307-310`) | 保存結果の読取も同じ場所に置く |
 | 通知 | 開始通知は mission ごとで、event は固定語と整数の投影 (`A/gate/improve_render.py:691`、`S/ops/events.py:54,85`) | 週次は専用 event |
 | データ | shadow は live の 1 分足を使い、評価履歴の同期とは別 (設計 2026-11-01 §3.5-2) | 履歴の鮮度の守りは変えない |
@@ -36,7 +35,7 @@
 ### 1.1 利用者が受け取るもの
 
 1. **いつでも (web・CLI)**: plugin 一覧で未使用の指標と条件が読め、絞れる。戦略別画面では、実取引の隣に「採否できた signal の、採否時点からの仮想成績」(以下、機械採点)、採否、穴の件数が並ぶ。「実約定を含まず楽観側に出ます」「採否前に abandoned となった signal は含みません」を固定表示する。
-2. **週に 1 回**: 取引週の終わりから通常の確定猶予を経て、親専有の週次 report ができる。停止候補・要確認・新規未使用のいずれかがあれば Discord に 1 通届く (§6 問 6 の推奨)。週末から 3 日超の未確定は失敗を知らせる。最初の数週の「標本不足」と件数は report に出るが、通知は保証しない。
+2. **週に 1 回**: 取引週の終わりから通常の確定猶予を経て、親専有の週次 report ができる。停止候補・要確認・新規の停止提案可能な指標があれば Discord に 1 通届く (§6 問 6 の推奨)。劣化・3 日超の未完了・打切りは選択に関わらず通知する。標本不足と初回の未使用一覧は report に出し、単独では通知しない。
 3. **人間の判断**: 戦略の停止は `afx plugin disable <name>`、履歴での確認は `afx plugin reevaluate <name>`。指標は disable / retire。自動停止・削除はせず、提案を放置しても取引は変わらない。
 
 判定は符号と信頼性の 2 軸とする (§2.4)。要確認は床超えだけを保留し、停止候補は理由を併記して残す。床超えは機械採点上の意味に限り、実運用の収益性を保証しない。
@@ -66,9 +65,9 @@ live の指標で、次のすべてを満たすものを未使用とする。
 
 K の推奨は 8 (§6 問 3)。NULL の family_key はその行を依存の根拠から外し、除外件数を report に出す。不正な非 NULL key は判定不能とする。改善休止も暦の K 週に含むが、候補生成 0 件と明示する。配備時刻不明も判定不能。時刻は §2.3 の完了した配備変更から取り、既存入力 (`S/plugin/read_model.py:106-123`) に時刻の投影を足す。
 
-現版に対応する承認済み依頼の `candidate_origin=human` なら印を付け、停止提案から除外する。名前全体を永久に除外しない。reevaluation は元の版の出所を継ぎ、確認できなければ出所不明とする。現版の出所不明も提案から除外する。
+未使用と停止提案可能を分ける。停止提案可能は「未使用かつ現版の出所が staging と確認できる指標」だけとする。出所の語彙は `S/plugin/read_model.py:63-65,274-281`。reevaluation は元の版の出所を継ぎ、確認できなければ出所不明とする。human・出所不明は未使用でも「提案対象外」を付ける。除外は名前全体でなく現版に適用する。
 
-read model の行に `inventory` (未使用 / 判定不能、満たした条件) を加える (`S/plugin/read_model.py:573`)。web は列と絞り込み (`A/web/plugin_pages.py:185-196`)、CLI は `afx plugin list --unused`。段 1 は読取時の集計で保存しない。
+read model の行に `inventory` (未使用 / 判定不能、条件、出所、停止提案可否) を加える (`S/plugin/read_model.py:573`)。web は列と絞り込み (`A/web/plugin_pages.py:185-196`)、CLI は `afx plugin list --unused`。段 1 は読取時の集計で保存しない。
 
 この read model は操作 API と plugin CLI が読む (`S/ops/plugins_view.py:58-59`、`S/backtest/plugin_deploy_cli.py:113`)。改善は別の一覧 (`S/loops/improve_loop.py:985`) を使い、inventory を渡さない。
 
@@ -90,23 +89,25 @@ read model の行に `inventory` (未使用 / 判定不能、満たした条件)
 
 率の隣に abandoned (理由別。`S/store/signals.py:477`)、no_fill、data_insufficient、未終端、R 不明を出す。採否別件数、accept のうち risk gate 通過数、signal に対する採否到達率、未終端の最古の経過時間も出す。集中度は採点のある取引日数と日別最大件数の割合だけとする。到達率は同じ発生期間の signal に対する decision ありの割合。現世代内の直近 4 週と前 4 週を表示で比較し、空の期間は比較不能とする。自動判定には使わない。
 
-**経路。** 純関数と読取専用接続で集計する。pips だけを返す `period_summary` (`S/store/signal_shadow.py:316`、src の呼出し元なし) を置き換える。web の列を足し、親専有の日次 report の shadow 節も戦略別にする (`S/loops/econ_signal_report.py:552`)。
+**経路。** 純関数と読取専用接続で集計する。pips だけを返す `period_summary` (`S/store/signal_shadow.py:316`) を置き換える。web の列を足し、親専有の日次 report の shadow 節も戦略別にする (`S/loops/econ_signal_report.py:552`)。
 
 ### 2.4 週次の確定と判定 (段 3)
 
-**境界と確定時刻。** NY 取引日で月〜金の暦週の最後の取引日を market_hours の暦から決める。開場の観測を待たず、平日の休場で週を割らない (`S/core/market_hours.py:16,25-43`)。週の印は `trading_date(close_at − 1 分)` (`S/core/scheduler.py:486-488`)。窓終端はこの close に固定し、確定は close + FINALIZE_GRACE (1 日) 以後。未終端の期限は signal ごとの `day_close_deadline(t0) + FINALIZE_GRACE`、指値は 2 段目の期限を使う (`S/store/ohlcv_slices.py:47`、`S/core/econ_slice_worker.py:774-796`)。期限超えが残っても理由・経過時間を残して確定する。
+**境界と確定時刻。** NY 取引日で月〜金の暦週の最後の取引日を market_hours の暦から決める。開場の観測を待たず、平日の休場で週を割らない (`S/core/market_hours.py:16,25-43`)。週の印は `trading_date(close_at − 1 分)` (`S/core/scheduler.py:486-488`)。窓終端はこの close に固定し、確定は close + FINALIZE_GRACE (1 日) 以後。未終端の期限は signal ごとの `day_close_deadline(t0) + FINALIZE_GRACE`、指値は 2 段目の期限を使う (`S/store/ohlcv_slices.py:47`、`S/core/econ_slice_worker.py:774-799`)。期限超えが残っても理由・経過時間を残して確定する。
 
-**起動。** 独自の tick 判定と alert_state key を追加する。直近の対象週が未完了・猶予到来・当日の試行 3 回未満なら専用 thread 1 本に積む。作成途中の週は翌日・起動時も再試行する。日次 hook の契約 (`S/core/scheduler.py:450-468,508-530`) は変えない。mission に依らず発注 tick を塞がない。週末から 3 日超の未完了は tick・起動時の監視で通知する (§2.5)。
+**起動と再試行。** 独自の tick と alert_state key を使い、起動時・tick で運用開始週から猶予到来済みの週を暦から列挙する。運用開始週は機能の初回起動時に直近の猶予到来済み週として保存する。週の記録がないものを未完了とし、窓終端から 14 日以内は古い週から専用 thread 1 本で処理する。試行回数は「対象週 × UTC 日」で最大 3 回。投入前に alert_state に加算し、再起動でも引き継ぐ。同じ週の実行を重ねない。上限到達週は翌日に回し、後続週は処理できる。窓終端から 14 日超の未完了週は打切り記録を確定し、以後再試行しない。日次 hook (`S/core/scheduler.py:450-468,508-530`) は変えず、mission に依らず発注 tick を塞がない。
 
-**保存。** 既存表は変えず、週の完了記録と集計 2 表を 1 transaction で確定する。途中保存は持たず、失敗時は全体を rollback して新しい評価時刻で再計算する。
+**保存と状態。** 既存表は変えず、週の記録と集計 2 表を 1 transaction で確定する。処理例外は全体を rollback して再計算し、計算不能として返せる結果は劣化で確定する。
 
 | 記録 | 内容 |
 |---|---|
-| 週の完了記録 | 一意な週、窓終端、評価時刻、対象の名前・hash・世代、規則版 |
+| 週の記録 | 一意な週、窓終端、確定時刻、評価時刻、対象の名前・hash・世代、規則版、確定状態 (完了 / 打切り)、評価状態 (正常 / 劣化 / 未評価)、固定の劣化理由と件数、棚卸し状態 |
 | strategy_review_weekly | 週・名前・hash・世代で一意。最初の採否、N、勝敗、R の利益・損失合計、穴・採否・集中度、短期表示、符号と理由。金額なし |
-| plugin_inventory_weekly | 週・名前、未使用 / 判定不能、現版の出所、条件。直前の正常な確定との差を新規とする。比較元なしは初回一覧で新規扱いしない |
+| plugin_inventory_weekly | 週・名前、未使用 / 判定不能、現版の出所、条件、停止提案可否。棚卸しが正常な直前の完了週と比べ、未使用への移行を新規とする。比較元なしは初回一覧で新規扱いしない。初回は指標の通知件数・名前も抽出しない |
 
-戦略対象は窓終端時点の配備記録から復元し、signal・採否・abandoned は各時刻で窓終端の as-of に切る。shadow は窓内の採否に属し評価時刻までに終端したものを採点する (`S/store/db.py:183,208`、`S/store/signals.py:477`)。棚卸しは実行時の live scan・保留候補から作り、評価時刻を完了記録に書く。正常な空集合は完了・0 件。scan 失敗は完了・棚卸し判定不能として新規を通知せず、次週の比較元にしない。実取引は読取時の値と注記する。
+確定状態と評価状態は独立に扱う。完了でも scan 失敗・不正 key・集計不能・配備時刻不明があれば劣化とし、対象の系列と理由を保存して通知する。正常な空集合・標本不足は劣化にしない。実取引だけ読取不能でも劣化理由を残し、機械採点と混ぜない。打切りは未評価・集計なしとし、対象週と期間超過を report に残して失敗通知する。
+
+戦略対象は窓終端時点の配備記録から復元し、signal・採否・abandoned は各時刻で窓終端の as-of に切る。shadow は窓内の採否に属し評価時刻までに終端したものを採点する (`S/store/db.py:183,208`、`S/store/signals.py:477`)。棚卸しは実行時の live scan・保留候補から作り、評価時刻を完了記録に書く。scan 失敗は棚卸し判定不能とし、新規の抽出・次週の棚卸し比較元から外す。実取引は読取時の値と注記する。
 
 **判定の方針案 (§6 問 2)。** 主窓は現世代内の最大 12 週、短期 4 週は件数・平均 R の表示だけ。符号の軸は次の表を上から評価する。
 
@@ -122,16 +123,17 @@ read model の行に `inventory` (未使用 / 判定不能、満たした条件)
 
 前週の語と承認時 holdout は判定に使わず、重なる窓を独立の確認としない。28 日は最低経過期間で、到達率比較のために 8 週を要求しない。
 
-**report と操作。** `data/improve_reports/` の専用 dir に既存どおり owner-only で書く (`S/loops/econ_signal_report.py:779`)。判定、3 系列、穴・到達率・集中度、承認時の成績、未使用と停止済みの一覧を載せる。書込み失敗は同じ確定から再生成する。提案の採用・却下ボタンは作らず、停止は既存操作。止めれば次の対象から外れる。
+**report と操作。** `data/improve_reports/` の専用 dir に既存どおり owner-only で書く (`S/loops/econ_signal_report.py:779`)。確定・評価状態と理由、判定、3 系列、穴・到達率・集中度、承認時の成績、未使用と停止済みの一覧を載せる。初回一覧は report だけに出し、人間由来・出所不明の行には「提案対象外」を付ける。書込み失敗は同じ確定から再生成する。提案の採用・却下ボタンは作らず、停止は既存操作。止めれば次の対象から外れる。
 
 ### 2.5 通知 (段 3)
 
-- event は `weekly_review_ready`。週は実在日を検証した `ref=weekly:YYYY-MM-DD` に置く。fields は固定語と非負整数 (state=ready / failed、停止候補・要確認・未使用・新規未使用の本数、棚卸し状態) のみ。failed では本数を省く。名前・成績の数値は入れない。専用の文法検査を置く (`S/ops/events.py:54,85`)。
-- ready の本文は必ず `GET /v1/review/weekly?week=YYYY-MM-DD` で指定週を読む。応答の週が違う・取得不能なら見出しと本数だけに縮退する。failed は詳細を取得せず、週と失敗の固定文だけを出す。詳細は保持しない。
-- 起動時と tick で直近 14 日の通知要の完了記録を `NOT EXISTS (code, ref, state=ready)` で回収し、emit_best_effort で出す。event 行を発行の記録とする (`S/ops/events.py:199-211`、`S/ops/service.py:1430-1445`)。同じ 14 日内の週末から 3 日超の未完了も同じ型で state=failed を 1 回通知する。後に確定すれば、通常の通知条件を満たす ready を別に通知できる。
+- event は `weekly_review_ready`。週は実在日を検証した `ref=weekly:YYYY-MM-DD` に置く。fields は固定語と非負整数 (state=ready / degraded / failed、停止候補・要確認・停止提案可能・新規の停止提案可能の本数、評価状態、棚卸し状態 (正常 / 判定不能)、固定の劣化理由別件数) のみ。failed は未完了 / 打切りの固定理由だけで、本数を省く。名前・成績の数値は入れない。専用の文法検査を置く (`S/ops/events.py:54,85`)。
+- ready / degraded の本文は必ず `GET /v1/review/weekly?week=YYYY-MM-DD` で指定週を読む。応答の週が違う・取得不能なら event の状態・固定理由・本数だけに縮退し、劣化の見出しを残す。failed は詳細を取得せず、週と失敗の固定文だけを出す。詳細は保持しない。
+- 起動時と tick で確定時刻が直近 14 日以内の通知要の週を回収する。完了・正常は通常条件で ready、完了・劣化は必ず degraded、打切りは必ず failed とする。`NOT EXISTS (code, ref, state)` で未発行を選び、emit_best_effort で出す。event 行を発行記録とする既存の方式に従う (`S/ops/events.py:199-211`、`S/ops/service.py:1430-1445`)。
+- 未完了で窓終端から 3 日超・14 日以内の週も同じ監視で failed を 1 回発行する。打切り時は同じ failed の未発行分だけ回収する。後に完了すれば通知要の ready / degraded を別に出せる。回収期間を過ぎた記録は report・web・CLI で読む。
 - bot は既存の event 配送・cursor 保存・送信 retry 経路 (`A/bot/adapter.py:871-892,971-975`、`A/gate/service.py:153-167`) に接続する。送信失敗では cursor を進めない。成功直後・cursor 保存前の停止による重複は許容する。初回接続は既存どおり末尾からで、過去週は web・CLI・report で読む (`A/gate/state.py:149-172`)。
 - 本文の成績は **pf / avg_r / 件数 / 評価不能** の 4 項目だけ。勝率・DD・金額・閾値は載せず、機械採点と明記する。既存通知の本文 2000 文字上限、escape、mention 無効、低優先段落からの省略を継承する (`A/gate/render.py:41,77,88,234`、`A/gate/improve_render.py:4-6`)。
-- 通常は停止候補 ≥1 または要確認 ≥1 または新規未使用 ≥1 で通知する (§6 問 6)。初回一覧は本数だけ、新規の名前は最大 5 件、残りは本数。失敗通知に成績・名前は付けない。
+- 通常は停止候補 ≥1 または要確認 ≥1 または新規の停止提案可能 ≥1 で通知する (§6 問 6)。指標の通知件数は未使用かつ現版の出所が staging の行だけ、名前はそのうち新規だけを最大 5 件抽出し、残りは本数にする。human・出所不明は件数にも名前にも入れない。初回一覧は report のみで、通知条件・本文に入れない。failed に成績・名前は付けない。
 - OPS_EVENT_SPECS に既定 True で登録する (`A/gate/render.py:470-477,511-513`)。ops_notices は default / all だけで、止めるには bot 自体を止める (`A/config.py:42,81`)。設定・送信先を増やさず、webhook も同じ fields だけとする。
 
 本文例 (架空):
@@ -140,7 +142,7 @@ read model の行に `inventory` (未使用 / 判定不能、満たした条件)
 [週次] 停止の提案 2026-11-20
 戦略 (機械採点、現配備以後・最大 12 週)
   <name>: pf 0.82 avg_r -0.11 採点 34 件 — 停止候補
-未使用の指標 14 本 (新規 2: <name>, <name>)
+停止提案可能な指標 14 本 (新規 2: <name>, <name>)
 確認: afx plugin review / web の plugin 一覧
 ```
 
@@ -162,8 +164,8 @@ help は `cli_surface.py` の記録から生成する。web からの停止操�
 | 機械採点 | 全指標 | 4 項目だけ | 出さない | 出さない |
 | 採否・穴・到達率・集中度 | 出す | 出さない | 出さない | 出さない |
 | 実取引の戦略別成績 | 出す | 出さない | 出さない | 出さない |
-| 週次判定 | 出す | 停止候補・要確認 | 本数・状態だけ | 出さない |
-| 未使用の指標 | 名前・条件 | 本数・新規の名前 | 本数・状態だけ | 出さない |
+| 週次判定・評価状態 | 出す | 停止候補・要確認・劣化・失敗 | 本数・固定理由・状態だけ | 出さない |
+| 未使用の指標 | 名前・条件・提案可否、初回一覧は report | 停止提案可能の本数・新規名だけ | 同じ対象の本数・状態だけ | 出さない |
 | 停止済みの名前 | 出す | 出さない | 既存 plugin_disabled のまま | 例外採用時、改善だけ名前・kind |
 | 止めた理由・経路、承認・却下の reason | 既存の面 | 出さない | 新規には出さない | 出さない |
 | 承認時の成績 | report | 出さない | 出さない | 出さない |
@@ -184,7 +186,7 @@ kind は検証済み保存版の config から取得し、親側で `{name, kind
 
 | 事象 | 動き |
 |---|---|
-| 集計例外・DB busy | 集計と完了を rollback。新しい評価時刻で次の tick に再計算、同日最大 3 回。翌日・起動時も確認し、週末から 3 日超で失敗通知 |
+| 集計例外・DB busy | 全体を rollback。§2.4 の週別再試行・14 日超の打切りに従い、3 日超から失敗通知 |
 | report 書込み失敗 | 確定から再生成。通知は指定週の API を読む |
 | 確定後・event 前に停止 | 未発行の確定を回収 |
 | bot の詳細取得失敗 | 指定週の見出し・本数に縮退。送信失敗なら retry |
@@ -192,19 +194,18 @@ kind は検証済み保存版の config から取得し、親側で `{name, kind
 | 期限超えの未終端・直近 2 週 signal 無し | 床超えを保留し、停止候補は残す。到達率低下だけでは自動判定を変えない |
 | 版変更・rollback | 世代ごとに再開始。以前の確定は保存し、現在の判定に流用しない |
 | 週の途中で停止 | 週末の対象から外す。確定済みの週は書き換えない |
-| scan 失敗 | 棚卸し判定不能。正常な空集合と区別 |
-| 実取引の集計失敗 | 実取引の列だけ読取不能。機械採点と混ぜない |
+| scan 失敗・集計不能・配備時刻不明 | 完了しても劣化。通常条件に関わらず通知 |
 | 新しい表が無い | 未確定を返す。表は既存の追加の慣行で作る |
 
 ## 4. 検証と受入
 
 ### 追加する検証
 
-1. **棚卸し**: 各条件、現版の出所・reevaluation の継承、保留候補、legacy / v2 の依存、指標の再提出、不正 key、休止、K の境界、時刻不明、scan 失敗。NULL が常在しても判定不能に固定されず、除外件数が report に出ること。
+1. **棚卸し**: 各条件、現版の出所・reevaluation の継承、保留候補、legacy / v2 の依存、指標の再提出、不正 key、休止、K の境界、時刻不明、scan 失敗。NULL 行の除外件数が report に出ること。human・出所不明が未使用でも通知件数・名前から除外され、report では提案対象外となること。
 2. **集計**: R 不明と穴、PF と平均 R、世代分離・A→B→A。失敗・取消・bless・reverted・needs_retry・foreign・revoke で標本が再開始しないこと。窓境界・集中度 2 項目。
 3. **判定**: 30 件・28 日・±0.05、判定不能、各符号と要確認理由の組合せ。負の主窓に滞留・直近 0 件が重なっても停止候補と通知を残す。到達率低下・比較不能・短期の負だけでは変わらず、配備 30 日でも床超え可能。前週語に依存せず、現配備と違う hash・世代は `-`。
-4. **確定と起動**: 猶予前の完了禁止、週末 as-of と評価時刻、翌週混入防止、全体 rollback、空集合と判定不能、再試行中の配備変更から週末対象の復元。夏冬時間・平日休場で週を割らないこと、独自 key と同日最大 3 回。
-5. **通知**: event 前後・送信失敗・cursor 保存前の停止、14 日の回収境界、週の一致、許容重複・初回 cursor。確定不能・処理停止の 3 日超通知と後の ready、未知 event、fields・ref、本文 4 項目・escape・mention 無効・上限、初回一覧・名前 5 件・通知不要週。
+4. **確定と起動**: 猶予前の完了禁止、週末 as-of と評価時刻、翌週混入防止、全体 rollback、正常な空集合・標本不足と劣化の分離、再試行中の配備変更から週末対象の復元。夏冬時間・平日休場、翌週を越す障害からの古い週順の回復、週 × UTC 日の試行上限と再起動時の継承、14 日の境界・打切り・再試行停止。
+5. **通知**: event 前後・送信失敗・cursor 保存前の停止、14 日の回収境界、週の一致、許容重複・初回 cursor。3 日超の未完了・打切りの failed、停止候補等が 0 でも scan 失敗・集計不能・時刻不明の degraded と未発行回収、後の ready / degraded、未知 event、fields・ref、本文 4 項目・escape・mention 無効・上限、初回一覧だけでは通知も名前表示もしないこと、名前 5 件・通知不要週。
 6. **情報経路**: 週次表・停止 reason・report の canary が改善 context・prompt に出ず、読取依存経路も無いこと。report dir が guarded data dir の子孫であること。既存全体集計は問 5 に応じて別に検証する。停止名は名前・kind 以外を受け取れず、scan 失敗・操作途中では出ないこと。
 7. **CLI**: help の記録、daemon なしの読取、指定週・未確定。
 
@@ -212,7 +213,7 @@ kind は検証済み保存版の config から取得し、親側で `{name, kind
 
 1. web で未使用に絞り、3 本の参照元・戦略候補への登場を読取だけで照合する。disable / retire は隔離した fixture で確かめ、本番での停止は条件にしない。
 2. 戦略別画面の件数を読取専用 DB と照合し、穴・到達率・集中度・世代を確認する。
-3. 実週では通常猶予後の report と初回一覧 (本数だけ) を確認する。fixture では通知要・不要週、失敗通知、指定週・4 項目・未終端を確かめる。
+3. 実週では通常猶予後の report に初回一覧が出て、一覧単独では通知されないことを確認する。fixture では通知要・不要週、劣化・打切りと未発行回収、翌週を越す再試行、提案対象外の除外、指定週・4 項目・未終端を確かめる。
 4. 改善 prompt に週次の数値・判定語がなく、停止名は名前・kind だけであることを確認する。
 
 ## 5. 実装の分け方
@@ -224,8 +225,8 @@ kind は検証済み保存版の config から取得し、親側で `{name, kind
 | 2 | R・穴・採否の集計、period_summary の置換 | `S/store/signal_shadow.py`、集計 module | なし |
 | 2 | 日次 report の戦略別化 | `S/loops/econ_signal_report.py` | 集計だけ |
 | 2 | 成績応答・web 列 | `W/ops/performance_view.py` (統合後は S/)、`A/web/` | 集計とチャートの統合。この項目だけ統合待ち |
-| 3 | 週の記録・集計表・判定・原子的保存・report | `S/store/db.py`、新 module | 両集計。scheduler から独立に検証可能 |
-| 3 | 独自 tick・alert_state key、猶予後の起動・再試行・失敗監視 | `S/core/scheduler.py`、`S/service.py` | 週次保存 |
+| 3 | 週の状態・集計表・判定・原子的保存・report | `S/store/db.py`、新 module | 両集計。scheduler から独立に検証可能 |
+| 3 | 独自 tick・alert_state key、暦週列挙・週別再試行・打切り・状態監視 | `S/core/scheduler.py`、`S/service.py` | 週次保存 |
 | 3 | 指定週の API・CLI・web | `S/ops/`、`S/cli_surface.py`、`A/web/` | 週次保存 |
 | 3 | event・未発行回収・bot 配送と本文 | `S/ops/events.py`、`A/gate/` | 週次保存と指定週 API |
 | 独立 | 停止名の投影と掲示 | `S/loops/improve_context.py`、`S/loops/prompts/improve_mission.md` | 週次判定への依存なし |
@@ -239,47 +240,19 @@ kind は検証済み保存版の config から取得し、親側で `{name, kind
 | 3 | 未使用。(a) K=8 週、現版が人間由来なら提案除外。(b) K=4 週。(c) live 戦略の参照なしだけ | (a) | 試行期間を取る。休止も暦週に含め明示し、現版の出所不明も除外 |
 | 4 | 停止名の掲示。(a) 前方成績に基づく人間の判断の写しとして例外を許す。(b) agent には掲示しない | (a)、例外と記録し名前・kind に限定 | 停止行為も前方情報を運ぶ。同名の自動再配備の抑止に限り、時刻・理由は渡さない |
 | 5 | 既存の 90 日の実取引全体成績。(a) 例外として残す。(b) 件数・hold 率だけにする | (a)、前方情報の例外と記録 | 勝率・PF・ペア別損益が既に渡る。3 段の着手は止めず、既存集計の検証の期待値を決める |
-| 6 | 通常の通知頻度。(a) 内容のある週だけ。(b) 毎週必ず 1 通 | (a) | 停止候補・要確認は続く限り再掲。無音は失敗と区別できないため、3 日超の未完了は選択に関わらず通知する。report は毎週残る |
+| 6 | 通常の通知頻度。(a) 内容のある週だけ。(b) 毎週必ず 1 通 | (a) | 停止候補・要確認は続く限り再掲。劣化・3 日超の未完了・打切りは選択に関わらず通知する。初回一覧は report のみ |
 
-技術で決めるもの: 帰属・採点規則の維持、mission との分離、R と成功した配備変更による世代、2 軸の評価順、NULL key の除外、原子的な確定、指定週・14 日の通知回収と失敗通知。前方 backtest は期間の入口と遮断を別設計する (`S/backtest/holdout.py:180,216`)。窓・閾値・正の意味は上の方針案とする。
+技術で決めるもの: 帰属・採点規則の維持、mission との分離、R と成功した配備変更による世代、2 軸の評価順、NULL key の除外、原子的な確定、暦週列挙と週別の試行上限・打切り、指定週・14 日の通知回収、劣化・失敗通知。前方 backtest は期間の入口と遮断を別設計する (`S/backtest/holdout.py:180,216`)。窓・閾値・正の意味は上の方針案とする。
 
 ## 7. 残余・やらないこと
 
 - **abandoned の採点**: 採否の正規形と shadow の外部キーに触れるため行わない。欠測の原因の是正は別課題。
-- **自動停止・削除**: 行わない。
 - **前方 backtest**: 別起票。機械採点で欠測を埋めたことにはしない。
 - **戦略ごとの枠・実帳簿**: 関連チケットのまま。機械採点が正というだけで着手条件を満たしたとは扱わない。
 - **改善の日次化**: 週次確定は mission と独立なので影響しない。
 - **命名・保有上限**: 関連チケットのまま。停止名は同名の自動再配備だけを抑止し、仮説の禁止は別の人間方針とする。
 - **採点の偏りと誤差**: spread は採否時の 1 点、swap・手数料なし、同時保有の制約なし。30 件・28 日でも独立性・符号の安定は保証しない。停止前には reevaluate で履歴も確かめる手順を運用文書に書く。
-- **将来の方向語**: 入れるなら「前方成績による適応を例外として許す」と記録して別設計する。低頻度だから安全とは扱わない。
 - **人間による数値の転記**: 防げない。holdout の数値を方針に書かない運用上の注記の対象に週次の数値を足す。
-
-## 付録 A. 文書とコードの食い違い
-
-| 文書の記述 | 現状・根拠 |
-|---|---|
-| 帰属・影の帳簿は設計待ち | decision が signal と建玉を結び、accept / reject の shadow は 57 件。帰属の追加は不要 (`S/store/db.py:175,198`、`S/store/signal_decisions.py:92-112`) |
-| 全 signal を採点 | abandoned は decision が無く採点されない (`S/store/signal_shadow.py:129-137`) |
-| entry はバー終値・固定費用、exit は戦略の規則 | entry は採否後の 1 分足 open か指値到達、spread は quote か仮定値、exit は SL / TP / day close (`S/core/paper_fills.py:201-245`)。exit_mode は levels のみ (`S/plugin/loader.py:291-293`) |
-| 戦略別の表示を ctl status に追加 | status は採否種別 × 状態。実取引の戦略行はチャートが提供する (`S/loops/econ_signal_report.py:325-334`、`W/ops/performance_view.py:868-879`) |
-| 稼働中戦略は配備時の成績だけを持つ | reevaluate と同名候補の同条件再生がある (`S/cli_surface.py:315`、`S/plugin/strategy_gate.py:86-89,226`) |
-| 族の表に成績を渡す | 設計 2026-10-24 §1.2-5 と 2026-11-01 §3.6 は成績を渡さない。表は 5 列固定 (`S/loops/improve_context.py:259-266`、`S/loops/prompts/improve_mission.md:31-33`)。将来の方向語は §7 |
-| 前方区間の数値を agent に見せない | 90 日の実取引集計は既存入力 (§6 問 5)。主源の違いは文書の矛盾ではなく測る対象の違い (§6 問 1) |
-| 週次 mission の冒頭で評価 | 手動・繰り返しでも走るため週 1 回を保証しない (`S/loops/improve_loop.py:906`) |
-| baseline replay と任意期間再生を共有 | 期間の入口は in_sample / holdout だけ。共有できるのは再生 core まで (`S/backtest/holdout.py:180,216`) |
-| 指標 50 本・参照 9 本、配備中戦略 6 本 | 指標 94 本・参照 3 本・戦略 2 本。停止操作は ctl ではなく plugin (`S/cli_surface.py:307-322`) |
-| 停止名は改善 prompt に表示済み | 現在は項目が無い (`S/loops/improve_context.py:710-733`、`S/loops/prompts/improve_mission.md:37-42`) |
-| cadence は週次だけ | weekly / daily を受ける (`S/config.py:460`) |
-| 親 report は戦略別の採否・shadow を持つ | 現在は合計のみ。abandoned の集計関数は戦略別を返す (`S/loops/econ_signal_report.py:297-307,325-334,552-585`、`S/store/signals.py:477,531`) |
-| period_summary を人間面に使用 | src の呼出し元は無く、test だけ (`S/store/signal_shadow.py:316`、`tests/store/test_signal_shadow.py:321`) |
-
-## 付録 B. 確かめていないこと
-
-- 指標への `afx plugin disable` / `retire` を本番で実行したことは無い (操作と依存の検査のコードがあることだけを見た。`S/plugin/deploy_disable.py:123-131`)。本番での停止を受入条件にせず、隔離した fixture で検証する。
-- 暦週の最後の取引日と signal ごとの指値の期限は、休場・夏冬時間を含めて検証する。
-- 判定の最低条件を満たすまでの週数は戦略ごとの採否頻度で変わる。経過週数だけでは判定可能とはしない。
-- bot の未知 event の扱いは通知の検証で確かめる。
 
 ## 変更履歴
 
@@ -288,3 +261,4 @@ kind は検証済み保存版の config から取得し、親側で `{name, kind
 | 2026-11-19 | C0 | 初版 (下書き) | 3 チケットを束ねて設計する | — |
 | 2026-11-19 | C0.1 | 判定・週次確定・通知・棚卸しと情報経路を明確化し、3 段に整理 | 設計レビュー 1 周目の指摘を反映 | |
 | 2026-11-19 | C0.2 | 判定を 2 軸化し、配備世代・棚卸し・失敗通知を整理、保存と起動を簡素化 | 設計レビュー 2 周目の指摘を反映 | |
+| 2026-11-20 | C0.3 | 評価状態・提案対象・週別再試行と通知を明確化し、重複記述を整理 | 設計レビュー 3 周目の指摘を反映 | |
