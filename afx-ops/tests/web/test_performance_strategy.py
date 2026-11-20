@@ -527,11 +527,10 @@ def test_the_drawn_points_follow_the_daemons_history_limit():
 
 
 def test_a_response_with_unreadable_rows_among_readable_ones_says_how_many_were_dropped():
-    data = data_of(row(), "garbage", row("signal:b"), None)
-    html = strategy_page(data)
+    html = perf_pages._strategy_table(data_of(row(), "garbage", row("signal:b"), None))
     assert len(table_cells(html)) == 2
     assert "読めない行が 2 件あります" in html
-    assert "読めない行" not in strategy_page(data_of(row(), row("signal:b")))
+    assert "読めない行" not in perf_pages._strategy_table(data_of(row(), row("signal:b")))
 
 
 def test_a_row_always_states_both_the_known_and_the_unknown_pnl_counts():

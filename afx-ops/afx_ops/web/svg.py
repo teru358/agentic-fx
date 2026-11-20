@@ -432,9 +432,9 @@ def series_limits(data: Mapping[str, object]) -> tuple[int, int] | None:
     """daemon が返す、系列ごとの決済の件数の上限と系列の数の上限。読めなければ None。"""
     raw = data.get("series_limits")
     raw = raw if type(raw) is dict else {}
-    events, series = raw.get("events"), raw.get("series")
-    if type(events) is int and type(series) is int and events > 0 and series > 0:
-        return events, series
+    per_series, series = raw.get("events"), raw.get("series")
+    if type(per_series) is int and type(series) is int and per_series > 0 and series > 0:
+        return per_series, series
     return None
 
 
