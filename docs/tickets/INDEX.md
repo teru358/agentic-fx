@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 178 件。完了分は closed/。
+未完了: 180 件。完了分は closed/。
 
 ## 実装中 (4)
 
@@ -71,7 +71,7 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (156)
+## 設計待ち (158)
 
 ### 不具合 (84)
 
@@ -162,7 +162,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (42)
+### 機能 (44)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -177,6 +177,8 @@
 | [web-https-for-writes](open/web-https-for-writes.md) | 中 | 2026-11-08 | 同梱 web を HTTPS で動かし LAN から書込めるようにする |
 | [killswitch-reset-implicit-generation-and-dd-preview](open/killswitch-reset-implicit-generation-and-dd-preview.md) | 中 | 2026-11-16 | kill switch の解除で世代の入力を不要にし、確認画面に現在の DD と再ラッチの予告を出す |
 | [indicator-forward-response-evaluation](open/indicator-forward-response-evaluation.md) | 中 | 2026-11-18 | 指標の計算値を数学的な計算にかけ、通貨ペアの傾向を改善 agent に見せる分析の道具 |
+| [datafeed-pending-auto-release-when-flat](open/datafeed-pending-auto-release-when-flat.md) | 中 | 2026-11-21 | 建玉が全部決済されデータが健全に戻ったら、人の再開なしで戻すか |
+| [datafeed-rollover-band-expected-gap](open/datafeed-rollover-band-expected-gap.md) | 中 | 2026-11-21 | 日次ロールオーバー帯の 1 分足の無 tick を停止とみなすか |
 | [improve-targeted-run](open/improve-targeted-run.md) | 低 | 2026-09-12 | 現状は `improve add <text>` + 引数なし `improve` で LLM が open から自分… |
 | [pine-script-to-plugin](open/pine-script-to-plugin.md) | 低 | 2026-09-12 | Pine script を plugin に変換する手段が無い |
 | [indicator-reference-oracle-gate](open/indicator-reference-oracle-gate.md) | 低 | 2026-09-15 | indicator の正しさを確かめる門が無い |
