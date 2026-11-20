@@ -166,12 +166,12 @@
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
+| [datafeed-outage-discord-notice](open/datafeed-outage-discord-notice.md) | 高 | 2026-10-31 | MT5 不通 (degraded) と復帰待ちを Discord に通知する |
 | [backtest-history-snapshot-reproducibility](open/backtest-history-snapshot-reproducibility.md) | 高 | 2026-11-14 | 履歴が変わった後も同じ入力で backtest を再現できるようにする |
 | [backtest-dedup-cache](open/backtest-dedup-cache.md) | 中 | 2026-09-08 | 同一 (候補, config) の backtest 再実行で予算を消費しない (run6: 6 枠中 3 枠がビット… |
 | [indicator-update-dependent-relock-flow](open/indicator-update-dependent-relock-flow.md) | 中 | 2026-10-27 | 指標更新時に依存する戦略の再ロックを手順化する |
 | [plugin-naming-lifecycle-policy](open/plugin-naming-lifecycle-policy.md) | 中 | 2026-10-27 | plugin の命名・引退・保有上限の方針 (同名更新か新名作成か) |
 | [indicator-params-not-new-plugin](open/indicator-params-not-new-plugin.md) | 中 | 2026-10-29 | 既存の指標の params で表せる指標を新規として提出させない |
-| [datafeed-outage-discord-notice](open/datafeed-outage-discord-notice.md) | 中 | 2026-10-31 | MT5 不通 (degraded) と復帰待ちを Discord に通知する |
 | [multi-input-indicator-relations](open/multi-input-indicator-relations.md) | 中 | 2026-10-31 | 多入力 indicator: 2 銘柄の生系列から関係 (相関・スプレッド・β) を指標として計算する |
 | [improve-runner-choice](open/improve-runner-choice.md) | 中 | 2026-11-08 | 改善の実行ごとに backend / model の候補を選べるようにする |
 | [web-https-for-writes](open/web-https-for-writes.md) | 中 | 2026-11-08 | 同梱 web を HTTPS で動かし LAN から書込めるようにする |
