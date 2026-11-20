@@ -7,16 +7,19 @@ unavailable) に落とす。loader の自由文は読み取らず、読めない
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from agentic_fx.plugin import loader
+from agentic_fx.plugin import loader, usage_review
 from agentic_fx.plugin.read_model import (
     ENTITY_PLAIN, ENTITY_SYMLINK, ENTITY_UNREADABLE, SOURCE_MISSING, SOURCE_OK,
     SOURCE_UNAVAILABLE, ApprovalRow, DeployOpRow, JournalRow, LiveEntry, LiveScan, ReadInputs,
 )
+from agentic_fx.plugin.usage_review import CandidateRow
 from agentic_fx.store.db import connect_observer_readonly
 
 _VERSION_DIR = re.compile(r"[0-9a-f]{64}")
@@ -162,7 +165,8 @@ def _file_stamps(entry: Path) -> tuple:
 def read_db_inputs(conn: sqlite3.Connection) -> dict:
     """承認・配備 op・switch journal の行を読む。表ごとに失敗を状態に落とす。"""
     result: dict = {"approvals": (), "deploy_ops": (), "journals": (),
-                    "pending_status": SOURCE_OK, "journal_status": SOURCE_OK}
+                    "pending_status": SOURCE_OK, "journal_status": SOURCE_OK,
+                    "candidates": (), "candidates_status": SOURCE_OK}
     try:
         result["approvals"] = tuple(
             ApprovalRow(row["id"], row["status"], row["decided_at"],
@@ -176,27 +180,47 @@ def read_db_inputs(conn: sqlite3.Connection) -> dict:
         result["deploy_ops"] = tuple(
             DeployOpRow(row["op_id"], row["op_kind"], row["name"], row["phase"],
                         row["fail_reason"], row["subject_content_hash"],
-                        row["target_content_hash"])
+                        row["target_content_hash"], row["target_artifact_hash"],
+                        row["updated_at"])
             for row in conn.execute(
                 "SELECT op_id,op_kind,name,phase,fail_reason,subject_content_hash,"
-                "target_content_hash FROM plugin_deploy_ops ORDER BY op_id").fetchall())
+                "target_content_hash,target_artifact_hash,updated_at "
+                "FROM plugin_deploy_ops ORDER BY op_id").fetchall())
     except sqlite3.Error:
         result["journal_status"] = SOURCE_UNAVAILABLE
     try:
         result["journals"] = tuple(
             JournalRow(row["op_id"], row["kind"], row["approval_id"], row["name"],
-                       row["phase"], row["new_target"])
+                       row["phase"], row["new_target"], row["switch_required"],
+                       row["updated_at"])
             for row in conn.execute(
-                "SELECT op_id,kind,approval_id,name,phase,new_target "
-                "FROM plugin_switch_journal ORDER BY op_id").fetchall())
+                "SELECT op_id,kind,approval_id,name,phase,new_target,switch_required,"
+                "updated_at FROM plugin_switch_journal ORDER BY op_id").fetchall())
     except sqlite3.Error:
         result["journal_status"] = SOURCE_UNAVAILABLE
+    try:
+        result["candidates"] = tuple(
+            CandidateRow(row["id"], row["family_key"], row["created_at"])
+            for row in conn.execute(
+                "SELECT id,family_key,created_at FROM candidate_archives "
+                "ORDER BY id").fetchall())
+    except sqlite3.Error:
+        result["candidates_status"] = SOURCE_UNAVAILABLE
     return result
 
 
-def db_generation(conn: sqlite3.Connection) -> tuple:
+# 窓の始点より前の候補は判定に効かない。作成時刻の書式や時差の違いを吸収するため、
+# 日付で 2 日分の余裕を見て絞る。
+_WINDOW_MARGIN = timedelta(days=2)
+
+
+def db_generation(conn: sqlite3.Connection, now: datetime | None = None) -> tuple:
     """承認の行と配備・切替の行の最終更新の署名。中身は読まず、件数・最大 id・状態別の
-    件数・最後の更新時刻だけで作る。表が読めないときは None を含む。"""
+    件数・最後の更新時刻だけで作る。表が読めないときは None を含む。
+
+    戦略候補は、全体の件数・最大 id・最大作成時刻と、直近の窓にかかる行 (作成時刻が
+    読めない行を含む) の key の digest だけを見る。窓の始点の日付も署名に入れる (日が
+    変われば窓の中の行が変わる)。窓の外の行の key は判定に効かないので読まない。"""
     parts: list = []
     queries = (
         "SELECT COUNT(*), COALESCE(MAX(id),0), COALESCE(MAX(decided_at),''), "
@@ -214,7 +238,31 @@ def db_generation(conn: sqlite3.Connection) -> tuple:
             parts.append(tuple(conn.execute(query).fetchone()))
         except sqlite3.Error:
             parts.append(None)
+    parts.append(_candidate_generation(conn, now or datetime.now(timezone.utc)))
     return tuple(parts)
+
+
+# 書込みが作る UTC の ISO 日時の形。この形で窓より古い行だけを digest から外す。形が違う
+# (時差なし・壊れた文字列など) 行は読めない時刻として判定に効くので、古く見えても digest に含める
+_CANONICAL_UTC_TIME = ("[0-9][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9]"
+                       "*+00:00")
+
+
+def _candidate_generation(conn: sqlite3.Connection, now: datetime) -> tuple | None:
+    bound = (usage_review.window_start(now) - _WINDOW_MARGIN).date().isoformat()
+    try:
+        total = tuple(conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(id),0), COALESCE(MAX(created_at),'') "
+            "FROM candidate_archives").fetchone())
+        joined = conn.execute(
+            "SELECT COALESCE(group_concat(id || char(31) || COALESCE(created_at, char(30)) "
+            "|| char(31) || COALESCE(family_key, char(30)), char(0)), '') "
+            "FROM (SELECT id, created_at, family_key FROM candidate_archives "
+            "WHERE created_at IS NULL OR created_at >= ? OR created_at NOT GLOB ? ORDER BY id)",
+            (bound, _CANONICAL_UTC_TIME)).fetchone()[0]
+    except sqlite3.Error:
+        return None
+    return (*total, bound, hashlib.sha256(str(joined).encode()).hexdigest())
 
 
 def collect_inputs(plugins_root: Path, conn: sqlite3.Connection | None, *,
@@ -222,7 +270,8 @@ def collect_inputs(plugins_root: Path, conn: sqlite3.Connection | None, *,
     """FS と DB から入力を集める。``conn`` が None のとき DB の 2 source は ``db_status``。"""
     live = scan_live(plugins_root)
     if conn is None:
-        return ReadInputs(live=live, pending_status=db_status, journal_status=db_status)
+        return ReadInputs(live=live, pending_status=db_status, journal_status=db_status,
+                          candidates_status=db_status)
     return assemble_inputs(live, read_db_inputs(conn))
 
 
@@ -234,7 +283,8 @@ def assemble_inputs(live: LiveScan, db_rows: dict) -> ReadInputs:
 def is_degraded(inputs: ReadInputs) -> bool:
     """読み損ねた入力を含むか。一時的な失敗かもしれないので、結果を覚えてはいけない。"""
     return (inputs.live.status == SOURCE_UNAVAILABLE
-            or SOURCE_UNAVAILABLE in (inputs.pending_status, inputs.journal_status)
+            or SOURCE_UNAVAILABLE in (inputs.pending_status, inputs.journal_status,
+                                      inputs.candidates_status)
             or inputs.live.versions_unread
             or any(entry.reason == "io_error" for entry in inputs.live.entries))
 

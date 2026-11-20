@@ -405,11 +405,13 @@ def test_the_dto_has_allowlisted_closed_fields(world):
     request = world.request(rsi, status="approved")
     world.journal("rsi", request)
     dto = model_to_dto(model_of(world))
-    assert set(dto) == {"sources", "plugins", "invalid_pending", "unknown_submissions"}
+    assert set(dto) == {"sources", "plugins", "invalid_pending", "unknown_submissions",
+                        "usage_inventory"}
     assert dto["sources"] == {"live": "ok", "pending": "ok", "journal": "ok"}
     assert set(dto["plugins"][0]) == {
         "name", "kind", "entity", "admission", "pending_count", "pending", "open_ops",
-        "issues", "dependencies", "dependencies_set_state", "dependents", "usefulness"}
+        "issues", "dependencies", "dependencies_set_state", "dependents", "usefulness",
+        "usage_review"}
     detail = detail_to_dto(model_of(world), "rsi")
     assert set(detail) == {"sources", "plugin", "unknown_submissions"}
     assert {"history", "history_total", "versions"} <= set(detail["plugin"])

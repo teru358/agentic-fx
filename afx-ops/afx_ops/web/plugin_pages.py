@@ -12,10 +12,12 @@ from afx_ops.web import marks, render, tabs
 from afx_ops.web.common import approval_link, display_time, pick, plugin_link
 
 # server DTO の新 field を表示面へ自動的に広げないための allowlist (入れ子の object ごと)。
-LISTING_FIELDS = frozenset({"sources", "plugins", "invalid_pending", "unknown_submissions"})
+LISTING_FIELDS = frozenset({"sources", "plugins", "invalid_pending", "unknown_submissions",
+                            "usage_inventory"})
 ROW_FIELDS = frozenset({"name", "kind", "entity", "admission", "pending_count", "pending",
                         "open_ops", "issues", "dependencies", "dependencies_set_state",
-                        "dependents", "usefulness", "history", "history_total", "versions"})
+                        "dependents", "usefulness", "history", "history_total", "versions",
+                        "usage_review"})
 ENTITY_FIELDS = frozenset({"state", "artifact_hash", "content_hash", "reason"})
 ADMISSION_FIELDS = frozenset({"state", "reason", "alias", "detail"})
 PENDING_FIELDS = frozenset({"id", "content_hash", "kind"})
@@ -27,6 +29,12 @@ BY_PIN_FIELDS = frozenset({"content_hash", "submitted", "deployed"})
 HISTORY_FIELDS = frozenset({"id", "status", "kind", "content_hash", "origin", "mission_id",
                             "decided_at", "created_at"})
 VERSION_FIELDS = frozenset({"artifact_hash", "is_live", "approval_id", "status", "content_hash"})
+USAGE_FIELDS = frozenset({"state", "conditions", "origin", "proposable", "not_proposable",
+                          "k_weeks"})
+USAGE_CONDITION_FIELDS = frozenset({"id", "result", "reason"})
+USAGE_INVENTORY_FIELDS = frozenset({"status", "reason", "k_weeks", "candidates_readable",
+                                    "window_candidates", "excluded"})
+USAGE_EXCLUDED_FIELDS = frozenset(plugin_text.USAGE_EXCLUDED)
 
 # 一覧の 1 行に出す、参照する strategy・途中の操作・注意の件数の上限
 CELL_ITEMS = 5
@@ -36,6 +44,7 @@ SECTION_BUDGET = {"overview": 6 * 1024, "pending": 3 * 1024, "dependencies": 12 
                   "dependents": 10 * 1024, "usefulness": 4 * 1024, "versions": 8 * 1024,
                   "history": 14 * 1024}
 OMIT_CLI = "全件は afx plugin list で確認してください"
+OMIT_CLI_UNUSED = "全件は afx plugin list --unused で確認してください"
 
 
 def _items(value: object, allowed: frozenset[str]) -> list[dict]:
@@ -146,6 +155,49 @@ def _usefulness_text(usefulness: object) -> str:
     return f"提出 {_count(useful.get('submitted'))} / 配備成功 {_count(useful.get('deployed'))}"
 
 
+def _weeks(review: dict) -> str:
+    weeks = review.get("k_weeks")
+    return _count(weeks) if type(weeks) is int and weeks > 0 else "-"
+
+
+def _unknown_reasons(review: dict) -> list[str]:
+    """判定できなかった条件の理由 (重複なし、並びは条件の順)。"""
+    reasons: list[str] = []
+    for item in _items(review.get("conditions"), USAGE_CONDITION_FIELDS):
+        if item.get("result") == "unknown" and item.get("reason") is not None:
+            text = label(plugin_text.USAGE_REASON, item["reason"])
+            if text not in reasons:
+                reasons.append(text)
+    return reasons
+
+
+def _usage_cell(row: dict) -> str:
+    """一覧の「使われ方」。印は記号の文字だけで、色の class は付けない。"""
+    if row.get("kind") != "indicator":
+        return "-"
+    review = pick(row.get("usage_review"), USAGE_FIELDS)
+    state = review.get("state")
+    if not review:
+        return "-"
+    if state == "used":
+        return html.escape(label(plugin_text.USAGE_STATE, state), quote=True)
+    if state == "unused":
+        proposal = "停止の提案: 可" if review.get("proposable") is True else "停止の提案の対象外"
+        return html.escape(f"△ 未使用 (参照なし・配備から {_weeks(review)} 週以上。{proposal})",
+                           quote=True)
+    if state == "indeterminate":
+        reasons = "・".join(_unknown_reasons(review)[:CELL_ITEMS]) or "理由不明"
+        return html.escape(f"? 判定不能 ({reasons})", quote=True)
+    return html.escape(label(plugin_text.USAGE_STATE, state), quote=True)
+
+
+def _is_unused(row: object) -> bool:
+    """未使用の指標か (絞り込みの条件)。語が表に無い・型違いは未使用に数えない。"""
+    if type(row) is not dict or row.get("kind") != "indicator":
+        return False
+    return pick(row.get("usage_review"), USAGE_FIELDS).get("state") == "unused"
+
+
 def table_with_count(headers: tuple[str, ...], rows: list[list[str]], budget: int, hidden: int = 0,
            cli: str = OMIT_CLI) -> tuple[str, int]:
     """cell は escape 済み。budget の byte に収まる行までを出し、残り (hidden を含む) は件数だけ示す。"""
@@ -195,6 +247,7 @@ def _list_row(raw: dict) -> list[str]:
         _dependents_text(dependents) if is_indicator else "-",
         _usefulness_text(row.get("usefulness")) if is_indicator else "-",
         _issues_text(row.get("issues")),
+        _usage_cell(row),
     ]
 
 
@@ -284,13 +337,15 @@ def sort_link(label_text: str, key: str, sort: str | None, direction: str | None
     return f'<a href="{html.escape(f"{path}?{query}", quote=True)}">{html.escape(label_text, quote=True)}{mark}</a>'
 
 
-def _list_headers(sort: str | None, direction: str | None) -> tuple[str, ...]:
+def _list_headers(sort: str | None, direction: str | None,
+                  carry: tuple[tuple[str, str], ...] = ()) -> tuple[str, ...]:
     def link(text: str, key: str) -> str:
-        return sort_link(text, key, sort, direction)
+        return sort_link(text, key, sort, direction, carry=carry)
 
     return (link("名前", "name"), link("kind", "kind"), link("配備", "state"), "承認と読込",
             link("承認待ち", "pending"), "配備中の版", "途中の操作", "参照する strategy",
-            f'有用性 ({link("提出", "submitted")} / {link("配備成功", "deployed")})', "注意")
+            f'有用性 ({link("提出", "submitted")} / {link("配備成功", "deployed")})',
+            "注意", "使われ方")
 
 
 def _sources_note(sources: object) -> str:
@@ -318,20 +373,78 @@ def _header_section(data: Mapping[str, object]) -> str:
     return "".join(parts)
 
 
+def _no_unused_text(listing: dict) -> str:
+    """未使用に絞って 0 件のときの文言。「無い」と「判定できなかった」を分ける。"""
+    inventory = pick(listing.get("usage_inventory"), USAGE_INVENTORY_FIELDS)
+    if not inventory:
+        return "未使用かどうかの判定を受け取れませんでした"
+    plugins = listing.get("plugins")
+    unknown = sum(1 for row in plugins if _usage_state(row) == "indeterminate") \
+        if type(plugins) is list else 0
+    if inventory.get("status") != "ok" or unknown:
+        suffix = f" (判定できなかった指標 {unknown} 件)" if unknown else ""
+        return "未使用と決まった指標はありません" + suffix
+    return "未使用の指標はありません"
+
+
+def _usage_state(row: object) -> object:
+    if type(row) is not dict or row.get("kind") != "indicator":
+        return None
+    return pick(row.get("usage_review"), USAGE_FIELDS).get("state")
+
+
+def _usage_note(listing: dict, unused: bool) -> str:
+    """未使用の判定の見方と、全体で読み損ねたこと。絞り込みの link も添える。"""
+    inventory = pick(listing.get("usage_inventory"), USAGE_INVENTORY_FIELDS)
+    if not inventory:
+        return ""
+    weeks = _weeks(inventory)
+    parts = [
+        "<p>未使用: 配備から " + weeks + " 週以上たち、配備中の strategy・承認待ち・直近 "
+        + weeks + " 週の戦略候補のどれからも参照されない指標。"
+        + ('<a href="/plugins">すべて表示</a>' if unused
+           else '<a href="/plugins?unused=1">未使用だけ表示</a>') + "</p>"]
+    if inventory.get("status") != "ok":
+        reason = label(plugin_text.USAGE_INVENTORY_REASON, inventory.get("reason"))
+        parts.append('<p class="warn">' + html.escape("棚卸し全体を判定できませんでした: " + reason,
+                                                  quote=True) + "</p>")
+    elif inventory.get("candidates_readable") is False:
+        parts.append('<p class="warn">戦略候補の記録を読めなかったため、判定できない指標があります</p>')
+    excluded = pick(inventory.get("excluded"), USAGE_EXCLUDED_FIELDS)
+    shown = [f"{plugin_text.USAGE_EXCLUDED[word]} {_count(excluded.get(word))}"
+             for word in plugin_text.USAGE_EXCLUDED if type(excluded.get(word)) is int
+             and excluded[word] > 0]
+    if inventory.get("candidates_readable") is False:
+        parts.append(f"<p>直近 {weeks} 週の戦略候補: 不明</p>")
+    elif type(inventory.get("window_candidates")) is int:
+        text = f"直近 {weeks} 週の戦略候補: {_count(inventory.get('window_candidates'))} 件"
+        if shown:
+            text += " (除外した行: " + "、".join(shown) + ")"
+        parts.append("<p>" + html.escape(text, quote=True) + "</p>")
+    return "".join(parts)
+
+
 def render_plugins(data: Mapping[str, object], sort: str | None = None,
-                   direction: str | None = None) -> bytes:
+                   direction: str | None = None, unused: bool = False) -> bytes:
     tz = zone_of(data)
     listing = pick(data, LISTING_FIELDS)
     plugins = listing.get("plugins")
     given = [row for row in plugins if type(row) is dict] if type(plugins) is list else []
+    if unused:
+        given = [row for row in given if _is_unused(row)]
+    carry = (("unused", "1"),) if unused else ()
     rows = [_list_row(row) for row in sort_rows(given, sort, direction)]
-    head = _header_section(data)
+    head = _header_section(data) + _usage_note(listing, unused)
     bar = tabs.bar("/plugins", "list")
     frame = '<div class="scroll"></div>'
     budget = render.MAX_RESPONSE_BYTES - len(
         render._document("Plugins", head + frame, tz, current="/plugins", tabs=bar))
     if rows:
-        table = '<div class="scroll">' + _table(_list_headers(sort, direction), rows, budget) + "</div>"
+        table = '<div class="scroll">' + _table(
+            _list_headers(sort, direction, carry), rows, budget,
+            cli=OMIT_CLI_UNUSED if unused else OMIT_CLI) + "</div>"
+    elif unused:
+        table = "<p>" + _no_unused_text(listing) + "</p>"
     else:
         table = "<p>plugin はありません</p>"
     return render._page("Plugins", head + table, tz, current="/plugins", tabs=bar)
@@ -354,10 +467,46 @@ def _overview(row: dict, entity: dict, admission: dict, tz: str) -> str:
         ("承認待ち", _count(row.get("pending_count"))),
         ("途中の操作", _open_ops_text(ops)),
         ("注意", _issues_text(row.get("issues"))),
+        *_usage_pairs(row),
     ]
     head = marks.cards([("配備", _entity_mark(entity)), ("承認と読込", _admission_mark(admission)),
                         ("承認待ち", _count(row.get("pending_count")))])
     return _section("概要", head + render._rows(pairs))
+
+
+def _usage_pairs(row: dict) -> list[tuple[str, str]]:
+    """概要に足す「使われ方」の行: 判定、4 つの条件ごとの結果、停止の提案にできるか。"""
+    review = pick(row.get("usage_review"), USAGE_FIELDS)
+    if row.get("kind") != "indicator" or not review:
+        return []
+    weeks = _weeks(review)
+    pairs = [("使われ方", html.escape(label(plugin_text.USAGE_STATE, review.get("state")),
+                                    quote=True))]
+    seen = {item.get("id"): item for item in _items(review.get("conditions"),
+                                                    USAGE_CONDITION_FIELDS)}
+    for key in plugin_text.USAGE_CONDITION:
+        item = seen.get(key)
+        if item is None:
+            continue
+        holds_text, clear_text = plugin_text.USAGE_CONDITION[key]
+        result = item.get("result")
+        if result == "holds":
+            text = holds_text
+        elif result == "clear":
+            text = clear_text
+        else:
+            reason = label(plugin_text.USAGE_REASON, item.get("reason")) \
+                if item.get("reason") is not None else "理由不明"
+            text = f"判定不能 ({reason})"
+        pairs.append(("使われ方: " + plugin_text.USAGE_CONDITION_NAME[key],
+                      html.escape(text.replace("{k}", weeks), quote=True)))
+    if review.get("state") == "unused":
+        proposal = ("停止の提案にできる" if review.get("proposable") is True
+                    else label(plugin_text.USAGE_NOT_PROPOSABLE, review.get("not_proposable")))
+        pairs.append(("使われ方: 停止の提案", html.escape(proposal, quote=True)))
+    pairs.append(("いまの版の出所", html.escape(
+        label(plugin_text.USAGE_ORIGIN, review.get("origin")), quote=True)))
+    return pairs
 
 
 def _pending_section(row: dict) -> str:

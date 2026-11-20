@@ -24,7 +24,7 @@ from agentic_fx.activity import ActivityLog
 from agentic_fx.core.display_time import effective_tz_name
 from agentic_fx.plugin import deploy_disable, deploy_ops, deploy_retire, deploy_rollback
 from agentic_fx.plugin import deploy_versions, read_model, read_model_inputs
-from agentic_fx.plugin import strategy_gate
+from agentic_fx.plugin import strategy_gate, usage_review
 from agentic_fx.plugin import switch as plugin_switch
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 
@@ -33,6 +33,7 @@ LOCK_WAIT_SECONDS = 30.0
 RC_OK = 0
 RC_FAILED = 1
 RC_USE_REVOKE = 2
+RC_USAGE = 2
 
 UNRESOLVED_JOURNAL_RECOVERY_HINT = (
     "  収束手順: サービスの対話シェルで `approval list` → "
@@ -98,11 +99,71 @@ def _plugin_list_print(model, kind: str | None) -> list:
     return rows
 
 
-def plugin_list(root: Path, *, kind: str | None = None, settings=None) -> int:
+_PROPOSAL_TEXT = {
+    "human_origin": "対象外 (人が提出した版)",
+    "unknown_origin": "対象外 (出所を確認できない版)",
+}
+_ORIGIN_TEXT = {"staging": "改善の提出", "human": "人の提出", "unknown": "不明"}
+
+
+def _unused_lines(dto: dict, kind: str | None) -> list[str]:
+    """棚卸しの結果 (未使用の指標と、判定できなかったもの) を行にする。"""
+    inventory = dto["usage_inventory"]
+    weeks = inventory["k_weeks"]
+    rows = [row for row in dto["plugins"]
+            if row["usage_review"] is not None and (kind is None or row["kind"] == kind)]
+    unused = [row for row in rows if row["usage_review"]["state"] == "unused"]
+    unknown = [row for row in rows if row["usage_review"]["state"] == "indeterminate"]
+    lines = [f"未使用の指標 (読取時刻から {weeks} 週。配備から {weeks} 週以上たち、配備中の "
+             f"strategy・承認待ち・直近 {weeks} 週の戦略候補のどれからも参照されない)"]
+    if unused:
+        table = [("NAME", "停止の提案", "由来")]
+        for row in unused:
+            review = row["usage_review"]
+            proposal = "可" if review["proposable"] else _PROPOSAL_TEXT[review["not_proposable"]]
+            table.append((row["name"], proposal, _ORIGIN_TEXT[review["origin"]]))
+        widths = [max(len(item[index]) for item in table) for index in range(3)]
+        lines.extend("  ".join(cell.ljust(width) for cell, width in zip(item, widths)).rstrip()
+                     for item in table)
+    elif unknown or inventory["status"] != "ok":
+        lines.append("未使用と決まった指標はありません")
+    else:
+        lines.append("未使用の指標はありません")
+    if unknown:
+        lines.append(f"判定できなかった指標: {len(unknown)} 件")
+        for row in unknown:
+            reasons = sorted({item["reason"] for item in row["usage_review"]["conditions"]
+                              if item["result"] == "unknown" and item["reason"]})
+            lines.append(f"  {row['name']}: " + " / ".join(
+                usage_review.REASON_TEXT.get(reason, reason) for reason in reasons))
+    if inventory["status"] != "ok":
+        lines.append("注意: " + usage_review.INVENTORY_REASON_TEXT.get(
+            inventory["reason"], "棚卸し全体を判定できませんでした"))
+    excluded = ", ".join(f"{text} {inventory['excluded'][word]}"
+                         for word, text in usage_review.EXCLUDED_TEXT)
+    if inventory["window_candidates"] is None:
+        lines.append(f"直近 {weeks} 週の戦略候補: 不明")
+    else:
+        lines.append(f"直近 {weeks} 週の戦略候補: {inventory['window_candidates']} 件 "
+                     f"(除外した行: {excluded})")
+    if not inventory["candidates_readable"]:
+        lines.append("注意: 戦略候補の記録を読めませんでした")
+    lines.append("停止は `afx plugin disable <name>` で行います。提案は自動では実行されません")
+    return lines
+
+
+def plugin_list(root: Path, *, kind: str | None = None, settings=None,
+                unused: bool = False, now: datetime | None = None) -> int:
     """Render the independent live, approval and deployment read model.
 
     ``settings`` is only used to resolve strategy dependencies; without it those
-    states are reported as unknown. Nothing is created, written or migrated."""
+    states are reported as unknown. Nothing is created, written or migrated.
+    ``unused`` shows the unused indicators instead of the table; the K weeks are
+    measured from ``now`` (the read time)."""
+    if unused and kind == "strategy":
+        print("エラー: --unused は指標だけを調べます。--kind strategy とは同時に指定できません "
+              "(--kind indicator か、--kind なしで指定してください)", file=sys.stderr)
+        return RC_USAGE
     conn, db_status = read_model_inputs.open_observer(root)
     try:
         inputs = read_model_inputs.collect_inputs(
@@ -111,6 +172,15 @@ def plugin_list(root: Path, *, kind: str | None = None, settings=None) -> int:
         if conn is not None:
             conn.close()
     model = read_model.build_read_model(inputs, settings=settings)
+    if unused:
+        dto = read_model.model_to_dto(model, now=now or datetime.now(timezone.utc))
+        for source in ("live", "pending", "journal"):
+            print(f"source {source}: {model.sources[source]}")
+        for line in _unused_lines(dto, kind):
+            print(line)
+        return 1 if ("unavailable" in model.sources.values()
+                     or not dto["usage_inventory"]["candidates_readable"]
+                     or dto["usage_inventory"]["status"] != "ok") else 0
     shown = _plugin_list_print(model, kind)
     return 1 if ("unavailable" in model.sources.values()
                  or any(row[5] for row in shown)) else 0

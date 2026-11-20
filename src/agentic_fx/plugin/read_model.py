@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from agentic_fx.plugin import usage_review
 from agentic_fx.plugin.loader import PluginMeta, is_canonical_plugin_name
 from agentic_fx.plugin.resolve import (
     STATE_MATCH, STATE_UNKNOWN, AliasState, ApprovedInventory, enumerate_indicator_states,
@@ -111,6 +113,8 @@ class DeployOpRow:
     fail_reason: str | None
     subject_content_hash: str | None
     target_content_hash: str | None
+    target_artifact_hash: str | None = None
+    updated_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +125,8 @@ class JournalRow:
     name: str
     phase: str
     new_target: str
+    switch_required: int = 1
+    updated_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +137,8 @@ class ReadInputs:
     journals: tuple[JournalRow, ...] = ()
     pending_status: str = SOURCE_OK
     journal_status: str = SOURCE_OK
+    candidates: tuple[usage_review.CandidateRow, ...] = ()
+    candidates_status: str = SOURCE_OK
 
 
 # ---------------------------------------------------------------- 出力
@@ -220,6 +228,8 @@ class PluginRow:
     history: tuple[HistoryItem, ...]
     history_total: int
     versions: tuple[VersionItem, ...]
+    # 配備中の指標だけが持つ、棚卸しの事実 (判定は読む時刻で行う)
+    usage: usage_review.UsageFacts | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +238,7 @@ class ReadModel:
     rows: tuple[PluginRow, ...]
     invalid_pending: tuple[int, ...]
     unknown_submissions: int
+    usage: usage_review.UsageScan = field(default_factory=usage_review.UsageScan)
 
     def by_name(self, name: str) -> PluginRow | None:
         for row in self.rows:
@@ -437,6 +448,11 @@ def build_read_model(inputs: ReadInputs, *, settings) -> ReadModel:
             scan, approved, phase1_keys, dependency, dependents, usefulness,
             open_deploy.get(name, []), settings)
         for name in sorted(names)]
+    usage_scan, usage_facts = _usage_review(
+        inputs, rows, requests, dependents,
+        scan_failed=_scan_failed(scan), live_unreadable=_live_unreadable(scan))
+    rows = [replace(row, usage=usage_facts[row.name]) if row.name in usage_facts else row
+            for row in rows]
 
     invalid_pending = tuple(
         request.id for request in requests
@@ -445,7 +461,7 @@ def build_read_model(inputs: ReadInputs, *, settings) -> ReadModel:
         sources={"live": scan.status, "pending": inputs.pending_status,
                  "journal": inputs.journal_status},
         rows=tuple(rows), invalid_pending=invalid_pending,
-        unknown_submissions=unknown_submissions)
+        unknown_submissions=unknown_submissions, usage=usage_scan)
 
 
 def _build_row(name, entries, requests, scan, approved, phase1_keys, dependency,
@@ -544,6 +560,121 @@ def _build_row(name, entries, requests, scan, approved, phase1_keys, dependency,
         history=history, history_total=len(history_all), versions=versions)
 
 
+# ---------------------------------------------------------------- 指標の棚卸し
+
+def _scan_failed(scan: LiveScan) -> bool:
+    """配備の走査を読み切れなかったか (一時的な失敗かもしれない entry を含む)。"""
+    return scan.status == SOURCE_UNAVAILABLE or any(
+        entry.reason == "io_error" for entry in scan.entries)
+
+
+def _live_unreadable(scan: LiveScan) -> bool:
+    """読めない配備中の entry があるか。meta が無いと kind を知れず、strategy かもしれない。"""
+    return any(entry.meta is None and entry.reason != "non_canonical_name"
+               for entry in scan.entries)
+
+
+def _pending_condition(inputs: ReadInputs, requests: Sequence[_Request]
+                       ) -> tuple[dict[str, bool], str | None]:
+    """承認待ちの依頼が参照する指標名と、読み切れない依頼があるときの理由。
+
+    戦略の依頼で依存の記録が読めないもの、記録の一部が壊れているものは、どの指標を参照
+    するか分からない。"""
+    referenced: dict[str, bool] = {}
+    if inputs.pending_status == SOURCE_UNAVAILABLE:
+        return referenced, usage_review.REASON_PENDING_SOURCE
+    unreadable = False
+    for request in requests:
+        if request.status != "pending":
+            continue
+        if request.payload is None:
+            unreadable = True
+            continue
+        refs = request.payload.get("indicator_deps")
+        if isinstance(refs, dict):
+            for ref in refs.values():
+                if isinstance(ref, dict) and isinstance(ref.get("plugin"), str):
+                    referenced[ref["plugin"]] = True
+                else:
+                    unreadable = True      # 読める参照は使用中とし、残りは決められない
+        elif request.kind in (KIND_STRATEGY, None):
+            unreadable = True
+    return referenced, (usage_review.REASON_PENDING_REQUEST if unreadable else None)
+
+
+def _current_origin(requests: Sequence[_Request], content_hash: str) -> str:
+    """いまの版の出所。同じ内容の承認済みの提出 (改善か人) のうち最新のもの。
+
+    再評価の依頼は元の版の出所を継ぐので、提出の依頼が見つからなければ不明。"""
+    candidates = [request for request in requests
+                  if request.status == "approved" and request.content_hash == content_hash
+                  and request.origin in SUBMISSION_ORIGINS]
+    if not candidates:
+        return usage_review.ORIGIN_UNKNOWN
+    return max(candidates, key=lambda request: request.id).origin
+
+
+def _transitions(inputs: ReadInputs) -> dict[str, list[usage_review.Transition]]:
+    """配備を実際に変えた成功操作を名前ごとに集める。
+
+    切替は承認・bless が decided で、かつ実際に切り替えたもの (同じ版の bless は含めない)。
+    配備操作は rollback が done のもの。"""
+    result: dict[str, list[usage_review.Transition]] = {}
+    for journal in inputs.journals:
+        if (journal.phase == "decided" and journal.kind in ("approve", "bless")
+                and journal.switch_required):
+            result.setdefault(journal.name, []).append(usage_review.Transition(
+                journal.updated_at, str(journal.new_target).rsplit("/", 1)[-1],
+                (0, journal.op_id)))
+    for op in inputs.deploy_ops:
+        if (op.op_kind == "rollback_symlink" and op.phase == "done"
+                and op.target_artifact_hash is not None):
+            result.setdefault(op.name, []).append(usage_review.Transition(
+                op.updated_at, op.target_artifact_hash, (1, op.op_id)))
+    return result
+
+
+def _usage_review(inputs: ReadInputs, rows: Sequence[PluginRow], requests: Sequence[_Request],
+                  dependents: Mapping[str, list[Dependent]], *, scan_failed: bool,
+                  live_unreadable: bool
+                  ) -> tuple[usage_review.UsageScan, dict[str, usage_review.UsageFacts]]:
+    """読める配備中の指標ごとの事実と、棚卸し全体の事実。"""
+    indicators = [row for row in rows
+                  if row.kind == KIND_INDICATOR and row.entity.state in (ENTITY_SYMLINK, ENTITY_PLAIN)
+                  and row.entity.content_hash is not None]
+    live_names = frozenset(row.name for row in indicators)
+    records = usage_review.parse_candidates(inputs.candidates, live_names)
+    journal_readable = inputs.journal_status != SOURCE_UNAVAILABLE   # 無い DB は記録が無いだけ
+    usage_scan = usage_review.build_scan(
+        records, candidates_readable=inputs.candidates_status != SOURCE_UNAVAILABLE,
+        journal_readable=journal_readable, scan_failed=scan_failed)
+    referenced, pending_reason = _pending_condition(inputs, requests)
+    transitions = _transitions(inputs)
+    requests_by_name: dict[str, list[_Request]] = {}
+    for request in requests:
+        if request.name is not None:
+            requests_by_name.setdefault(request.name, []).append(request)
+    facts: dict[str, usage_review.UsageFacts] = {}
+    for row in indicators:
+        if row.name in referenced:
+            pending, reason = usage_review.RESULT_HOLDS, None
+        elif pending_reason is not None:
+            pending, reason = usage_review.RESULT_UNKNOWN, pending_reason
+        else:
+            pending, reason = usage_review.RESULT_CLEAR, None
+        if journal_readable:
+            started, started_reason = usage_review.generation_start(
+                transitions.get(row.name, ()), row.entity.artifact_hash)
+        else:
+            started, started_reason = None, usage_review.REASON_JOURNAL_SOURCE
+        facts[row.name] = usage_review.UsageFacts(
+            row.name, bool(dependents.get(row.name)), pending, reason, started,
+            started_reason,
+            _current_origin(requests_by_name.get(row.name, ()), row.entity.content_hash),
+            scan_failed, live_unreadable)
+    return usage_scan, facts
+
+
 # ---------------------------------------------------------------- DTO
 
 def _safe_name(name: str) -> str:
@@ -570,8 +701,20 @@ def _usefulness_dto(useful: Usefulness | None) -> dict | None:
                        for pin, counts in useful.by_pin.items()]}
 
 
-def row_to_dto(row: PluginRow, *, detail: bool = False) -> dict:
-    """1 件の JSON 化。値はすべて固定語・数・hash・日時・文法で縛った名前だけ。"""
+# 棚卸しの scan を渡されなかった行は、候補を調べていないので「当てはまらない」と決めない。
+_UNSCANNED = usage_review.UsageScan(candidates_readable=False)
+
+
+def _now(now: datetime | None) -> datetime:
+    return now if now is not None else datetime.now(timezone.utc)
+
+
+def row_to_dto(row: PluginRow, *, detail: bool = False,
+               usage: usage_review.UsageScan | None = None,
+               now: datetime | None = None) -> dict:
+    """1 件の JSON 化。値はすべて固定語・数・hash・日時・文法で縛った名前だけ。
+
+    ``usage`` と ``now`` は棚卸しの判定に使う (読む時刻)。"""
     dto = {
         "name": _safe_name(row.name), "kind": row.kind,
         "entity": {"state": row.entity.state,
@@ -594,6 +737,9 @@ def row_to_dto(row: PluginRow, *, detail: bool = False) -> dict:
                         "pin": _hash(item.pin), "state": item.state}
                        for item in row.dependents],
         "usefulness": _usefulness_dto(row.usefulness),
+        "usage_review": (usage_review.classify(row.usage, usage if usage is not None
+                                               else _UNSCANNED, _now(now))
+                         if row.usage is not None else None),
     }
     if detail:
         dto["history"] = [
@@ -610,16 +756,19 @@ def row_to_dto(row: PluginRow, *, detail: bool = False) -> dict:
     return dto
 
 
-def model_to_dto(model: ReadModel) -> dict:
+def model_to_dto(model: ReadModel, *, now: datetime | None = None) -> dict:
+    when = _now(now)
     return {"sources": dict(model.sources),
-            "plugins": [row_to_dto(row) for row in model.rows],
+            "plugins": [row_to_dto(row, usage=model.usage, now=when) for row in model.rows],
             "invalid_pending": list(model.invalid_pending),
-            "unknown_submissions": model.unknown_submissions}
+            "unknown_submissions": model.unknown_submissions,
+            "usage_inventory": usage_review.window_summary(model.usage, when)}
 
 
-def detail_to_dto(model: ReadModel, name: str) -> dict | None:
+def detail_to_dto(model: ReadModel, name: str, *, now: datetime | None = None) -> dict | None:
     row = model.by_name(name)
     if row is None:
         return None
-    return {"sources": dict(model.sources), "plugin": row_to_dto(row, detail=True),
+    return {"sources": dict(model.sources),
+            "plugin": row_to_dto(row, detail=True, usage=model.usage, now=_now(now)),
             "unknown_submissions": model.unknown_submissions}

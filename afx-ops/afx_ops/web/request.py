@@ -322,7 +322,7 @@ def _invoke(match: RouteMatch, query: dict[str, str], client, report: _Reporter,
                 functools.partial(render.render_activity, category=category,
                                   n=n if "n" in query else None))
     if method == "plugins":
-        if set(query) - {"tab", "sort", "dir"}:
+        if set(query) - {"tab", "sort", "dir", "unused"}:
             raise _Reject(400)
         if query.get("tab", tabs.default_tab("/plugins")) not in tabs.tab_names("/plugins"):
             raise _Reject(400)
@@ -330,8 +330,11 @@ def _invoke(match: RouteMatch, query: dict[str, str], client, report: _Reporter,
         if (sort is not None and sort not in plugin_pages.SORT_COLUMNS) or (
                 direction is not None and (sort is None or direction not in plugin_pages.DIRECTIONS)):
             raise _Reject(400)
+        if query.get("unused", "1") != "1":
+            raise _Reject(400)
         return (_call(report, client.plugins),
-                functools.partial(plugin_pages.render_plugins, sort=sort, direction=direction))
+                functools.partial(plugin_pages.render_plugins, sort=sort, direction=direction,
+                                  unused="unused" in query))
     if method == "plugin":
         if set(query) - {"tab"}:
             raise _Reject(400)

@@ -30,6 +30,7 @@
     }
    ],
    "pending_count": 1,
+   "usage_review": null,
    "usefulness": {
     "by_pin": [],
     "deployed": 0,
@@ -65,6 +66,7 @@
    "open_ops": [],
    "pending": [],
    "pending_count": 0,
+   "usage_review": null,
    "usefulness": null
   },
   {
@@ -89,6 +91,7 @@
    "open_ops": [],
    "pending": [],
    "pending_count": 0,
+   "usage_review": null,
    "usefulness": null
   },
   {
@@ -115,6 +118,7 @@
    "open_ops": [],
    "pending": [],
    "pending_count": 0,
+   "usage_review": null,
    "usefulness": null
   },
   {
@@ -146,6 +150,7 @@
    "open_ops": [],
    "pending": [],
    "pending_count": 0,
+   "usage_review": null,
    "usefulness": null
   },
   {
@@ -170,6 +175,7 @@
    "open_ops": [],
    "pending": [],
    "pending_count": 0,
+   "usage_review": null,
    "usefulness": null
   },
   {
@@ -213,6 +219,35 @@
     }
    ],
    "pending_count": 1,
+   "usage_review": {
+    "conditions": [
+     {
+      "id": "live_strategy",
+      "reason": null,
+      "result": "holds"
+     },
+     {
+      "id": "pending_approval",
+      "reason": null,
+      "result": "clear"
+     },
+     {
+      "id": "recent_candidate",
+      "reason": null,
+      "result": "clear"
+     },
+     {
+      "id": "recent_deploy",
+      "reason": "no_generation_record",
+      "result": "unknown"
+     }
+    ],
+    "k_weeks": 8,
+    "not_proposable": null,
+    "origin": "human",
+    "proposable": false,
+    "state": "used"
+   },
    "usefulness": {
     "by_pin": [
      {
@@ -231,5 +266,17 @@
   "live": "ok",
   "pending": "ok"
  },
- "unknown_submissions": 1
+ "unknown_submissions": 1,
+ "usage_inventory": {
+  "candidates_readable": true,
+  "excluded": {
+   "null_key": 0,
+   "unreadable_key": 0,
+   "unreadable_time": 0
+  },
+  "k_weeks": 8,
+  "reason": null,
+  "status": "ok",
+  "window_candidates": 0
+ }
 }
