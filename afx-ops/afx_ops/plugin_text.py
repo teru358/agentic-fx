@@ -53,6 +53,39 @@ OPEN_OP_KIND = {"disable": "停止", "rollback": "巻き戻し", "retire_plain":
                 "revoke": "承認の取り消し", "approve": "承認", "bless": "bless"}
 SOURCE_STATE = {"ok": "読めた", "missing": "なし", "unavailable": "読めない"}
 
+# 指標の棚卸し (usage_review)。語の正本は daemon の plugin/usage_review.py
+USAGE_STATE = {"used": "使用中", "unused": "未使用", "indeterminate": "判定不能"}
+USAGE_RESULT = {"holds": "当てはまる", "clear": "当てはまらない", "unknown": "判定不能"}
+USAGE_ORIGIN = {"staging": "改善の提出", "human": "人の提出", "unknown": "出所不明"}
+USAGE_NOT_PROPOSABLE = {"human_origin": "人が提出した版なので、停止の提案の対象外",
+                        "unknown_origin": "出所を確認できない版なので、停止の提案の対象外"}
+USAGE_REASON = {
+    "scan_failed": "配備の走査を読み切れなかった",
+    "pending_source_unreadable": "承認待ちを読めなかった",
+    "pending_request_unreadable": "依存を読めない承認待ちがある",
+    "candidates_unreadable": "戦略候補の記録を読めなかった",
+    "key_mentioned": "読めない候補の key にこの名前が出てくる",
+    "time_unreadable": "時刻を読めなかった",
+    "journal_unreadable": "切替の記録を読めなかった",
+    "no_generation_record": "配備した記録が見つからない",
+    "generation_mismatch": "最後の配備記録がいまの版を指していない",
+}
+# 条件ごとの文言 (k は未使用と見なすまでの週数)。当てはまる / 当てはまらない
+USAGE_CONDITION = {
+    "live_strategy": ("配備中の strategy が参照している", "参照する配備中の strategy はない"),
+    "pending_approval": ("承認待ちの依頼が参照している", "参照する承認待ちはない"),
+    "recent_candidate": ("直近 {k} 週の戦略候補に登場する", "直近 {k} 週の戦略候補には登場しない"),
+    "recent_deploy": ("配備から {k} 週たっていない (試行期間中)", "配備から {k} 週以上たっている"),
+}
+USAGE_CONDITION_NAME = {"live_strategy": "配備中の strategy", "pending_approval": "承認待ち",
+                        "recent_candidate": "戦略候補", "recent_deploy": "配備時期"}
+USAGE_INVENTORY_REASON = {
+    "scan_failed": "配備の走査を読み切れなかったため、参照の有無を確かめきれません",
+    "journal_unreadable": "切替の記録を読めなかったため、配備時期を確かめきれません",
+}
+USAGE_EXCLUDED = {"null_key": "key なし", "unreadable_key": "key を読めない",
+                  "unreadable_time": "作成時刻を読めない"}
+
 _WORD = re.compile(r"[a-z][a-z0-9_:]{0,39}\Z")
 
 
