@@ -26,3 +26,4 @@ related: [improve-objective-filtered-signal-quality, bot-readonly-slash-commands
 - 2026-10-16: 起票。
 - 2026-10-29: 関連: [improve-objective-filtered-signal-quality, bot-readonly-slash-commands, per-strategy-virtual-books, plugin-naming-lifecycle-policy] — 2026-10-29 棚卸し: 関連を束ねる先に張る
 - 2026-11-20: 状態: 実装中 — 設計 docs/superpowers/specs/2026-11-19-weekly-deployed-strategy-review-design.md C1 を利用者承認 (§6 は 6 件とも推奨どおり)。3 チケットを 1 設計の 3 段 (指標の棚卸しの読取面 / 戦略別の前方成績 = 機械採点 / 週次の確定・判定・停止の提案の通知) で実装する
+- 2026-11-20: 状態: 実装中 — 段 2 (戦略別の機械採点の集計・日次 report の戦略別化・Performance の機械採点の表) を main に merge b7fde39c、2026-11-20 22:2x に afx と afx-ops@web/bot を再起動。週次の確定・判定・通知は段 3
