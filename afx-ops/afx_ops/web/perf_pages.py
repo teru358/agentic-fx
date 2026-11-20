@@ -444,6 +444,9 @@ FORWARD_SCOPE = (f"実取引の表とは集計の範囲が違います。上の�
 FORWARD_HEADERS = ("戦略", "配備世代の開始", "窓の始点", "N (R 既知)", "勝 / 負 / 分", "平均 R", "PF",
                    "採否", "risk gate 通過", "signal 到達率", "穴", "集中度",
                    "到達率 直近 4 週 / 前 4 週")
+FORWARD_SIDE_HEADERS = ("戦略", "採否", "N (R 既知)", "勝 / 負 / 分", "平均 R", "PF")
+FORWARD_SIDE_HEADING = "採否別 (採用した側と見送った側を分けた成績)"
+FORWARD_SIDES = (("accept", "accept (採用)"), ("reject", "reject (見送り)"))
 NOTE_FORWARD_UNKNOWN = "機械採点を読めません。数字は不明です"
 NOTE_FORWARD_NONE = "配備中の戦略はありません"
 NOTE_FORWARD_OVER = "機械採点の表は表示の上限を超えたため省きました"
@@ -456,6 +459,7 @@ FORWARD_REASONS = {
     "generation_mismatch": "最後の切替の記録が今の版と合いません",
     "time_unreadable": "配備時刻を読めません",
     "journal_unreadable": "切替の記録を読めません",
+    "strategy_unreadable": "配備中の entry を読めない、または同名が複数あります",
     "summary_failed": "集計できませんでした"}
 _NAME = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _HEX = re.compile(r"[0-9a-f]{12,64}\Z")
@@ -682,7 +686,8 @@ def _forward_holes(row: Mapping[str, object]) -> str:
             continue
         parts.append(f"abandoned {label} {_count(abandoned[key])}")
     for key, label in (("no_fill", "約定なし"), ("data_insufficient", "データ不足"),
-                       ("unterminated", "未終端"), ("r_unknown", "R 不明")):
+                       ("unterminated", "未終端"), ("as_of_unknown", "時点不明"),
+                       ("r_unknown", "R 不明")):
         value = holes.get(key)
         if type(value) is int and value == 0:
             continue
@@ -728,6 +733,31 @@ def _forward_row(row: Mapping[str, object], tz: str) -> str:
     return "<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>"
 
 
+def _forward_side_rows(row: Mapping[str, object]) -> str:
+    """accept・reject それぞれの成績の行。数値を持たない戦略は出さない。"""
+    if row.get("state") != "ok":
+        return ""
+    limits = _forward_limits(row)
+    out = []
+    for key, label in FORWARD_SIDES:
+        series = _forward_series(row, key)
+        cells = [_forward_name(row), _esc(label), _esc(_count(series.get("n"))),
+                 _forward_win_loss(series), _forward_average_r(series, limits),
+                 _forward_profit_factor(series, limits)]
+        out.append("<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>")
+    return "".join(out)
+
+
+def _forward_side_table(rows: list[dict]) -> str:
+    body = "".join(_forward_side_rows(r) for r in rows)
+    if not body:
+        return ""
+    return (f"<h3>{_esc(FORWARD_SIDE_HEADING)}</h3>"
+            '<div class="scroll"><table class="num"><thead><tr>'
+            + "".join(f"<th>{_esc(name)}</th>" for name in FORWARD_SIDE_HEADERS)
+            + "</tr></thead><tbody>" + body + "</tbody></table></div>")
+
+
 def _forward_section(data: Mapping[str, object], tz: str) -> str:
     """配備中の戦略ごとの機械採点。読めない値は「不明」にし、正常には倒さない。"""
     heading = f"<section><h2>{_esc(FORWARD_HEADING)}</h2>"
@@ -748,7 +778,7 @@ def _forward_section(data: Mapping[str, object], tz: str) -> str:
     body = ('<div class="scroll"><table class="num"><thead><tr>'
             + "".join(f"<th>{_esc(name)}</th>" for name in FORWARD_HEADERS)
             + "</tr></thead><tbody>" + "".join(_forward_row(r, tz) for r in rows)
-            + "</tbody></table></div>")
+            + "</tbody></table></div>") + _forward_side_table(rows)
     text = heading + notes + dropped_note + body + tail + "</section>"
     if len(text.encode("utf-8")) <= FORWARD_TABLE_BUDGET_BYTES:
         return text

@@ -131,3 +131,40 @@ def test_the_response_carries_counts_and_values_only(ops_env):
     assert set(row) == {"name", "content_hash", "state", "reason", "generation", "window",
                         "thresholds", "series", "decisions", "outcomes", "holes", "reach",
                         "concentration", "comparison"}
+
+
+def test_a_local_sql_failure_of_one_strategy_makes_only_that_row_unavailable(ops_env, monkeypatch):
+    import sqlite3
+    for name in ("alpha", "bravo"):
+        meta = deploy(ops_env, name)
+        decisions(ops_env, meta, 2, name=name)
+    real = pv.signal_forward.forward_summary
+
+    def broken_for_alpha(conn, target, **kwargs):
+        if target.name == "alpha":
+            raise sqlite3.OperationalError("database disk image is malformed")
+        return real(conn, target, **kwargs)
+
+    monkeypatch.setattr(pv.signal_forward, "forward_summary", broken_for_alpha)
+    data = read(ops_env)
+    rows = forward(data)
+    assert rows["alpha"]["state"] == "failed" and rows["alpha"]["reason"] == "summary_failed"
+    assert rows["bravo"]["state"] == "ok" and rows["bravo"]["decisions"]["total"] == 2
+    assert data["forward"]["state"] == "ok"
+
+
+def test_an_interrupted_query_still_refuses_the_whole_response(ops_env, monkeypatch):
+    import sqlite3
+    meta = deploy(ops_env)
+    decisions(ops_env, meta, 2)
+    error = OpsError(ErrorCode.UNAVAILABLE)
+    calls = []
+
+    def interrupted(*args, **kwargs):
+        calls.append(True)
+        raise sqlite3.OperationalError("interrupted")
+
+    monkeypatch.setattr(pv.signal_forward, "forward_summary", interrupted)
+    with pytest.raises(OpsError) as raised:
+        read(ops_env, interrupt=lambda: error if calls else None)
+    assert raised.value.code is ErrorCode.UNAVAILABLE

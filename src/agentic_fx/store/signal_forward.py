@@ -121,7 +121,9 @@ def summarize(decided: list[dict], population: list[dict], *, target: ForwardTar
     scored = [row for row in decided if row["result_code"] in _NUMERIC]
     abandoned = Counter(row["abandon_reason"] for row in population
                         if row["status"] == "abandoned")
-    unterminated = [row for row in decided if row["result_code"] is None]
+    unknown = [row for row in decided if row["as_of_unknown"]]
+    unterminated = [row for row in decided
+                    if row["result_code"] is None and not row["as_of_unknown"]]
     days = Counter(market_hours.trading_date(row["decided_at"]) for row in scored)
     top = max(days.values(), default=0)
     recent_from = max(start, end - RECENT_WEEKS * _WEEK)
@@ -155,6 +157,7 @@ def summarize(decided: list[dict], population: list[dict], *, target: ForwardTar
             "data_insufficient": sum(1 for r in decided
                                      if r["result_code"] == "data_insufficient"),
             "unterminated": len(unterminated),
+            "as_of_unknown": len(unknown),
             "oldest_unterminated_sec": max(
                 ((end - r["decided_at"]).total_seconds() for r in unterminated),
                 default=None),
@@ -186,18 +189,23 @@ def forward_summary(conn: sqlite3.Connection, target: ForwardTarget, *,
                     now: datetime) -> dict:
     """配備中の戦略 1 本の、現世代内・最大 12 週の機械採点。
 
-    世代の開始時刻が読めない対象は数値を持たない (「判定不能」)。"""
+    `now` は評価時刻で、窓の終端であり、採否・abandon・shadow の終端のうち、これより
+    後に起きたものは「まだ起きていない」ものとして数える。同じ DB を別の時刻で評価すると
+    その時点の姿になる (後から確定する集計も同じ関数を使う)。世代の開始時刻が読めない対象は数値を持たない (「判定不能」)。"""
     if target.started_at is None or target.generation is None or target.reason is not None:
         return _undetermined(target)
     end = now.astimezone(timezone.utc)
-    start = max(target.started_at.astimezone(timezone.utc), end - WINDOW_WEEKS * _WEEK)
+    begin = target.started_at.astimezone(timezone.utc)
+    start = max(begin, end - WINDOW_WEEKS * _WEEK)
+    # SQL の datetime() は秒未満を落とす。単調なので、これで取りこぼしなく絞り、
+    # 境界の秒の内側は秒未満まで保った Python の比較で決める。
     args = {"name": target.name, "hash": target.content_hash,
-            "start": start.isoformat(), "end": end.isoformat(),
-            "begin": target.started_at.astimezone(timezone.utc).isoformat()}
+            "start": start.isoformat(), "end": end.isoformat(), "begin": begin.isoformat()}
     decided = []
     for row in conn.execute(
             "SELECT d.decision, d.decided_at, ti.gate_result, sh.result_code, "
-            "sh.entry_price, sh.pnl_pips, sh.pip_size, s.payload_json "
+            "sh.entry_price, sh.pnl_pips, sh.pip_size, sh.resolved_at, sh.updated_at, "
+            "s.created_at, s.payload_json "
             "FROM signal_decisions d JOIN signals s ON s.id = d.signal_id "
             "LEFT JOIN signal_shadow sh ON sh.decision_id = d.id "
             "LEFT JOIN trade_intents ti ON ti.id = d.trade_intent_id "
@@ -207,19 +215,24 @@ def forward_summary(conn: sqlite3.Connection, target: ForwardTarget, *,
             "AND datetime(d.decided_at) <= datetime(:end) "
             "ORDER BY d.decided_at, d.id", args):
         when = _parse(row["decided_at"])
-        if when is None:
+        created = _parse(row["created_at"])
+        if when is None or created is None:
             continue
-        pips = row["pnl_pips"]
-        result = row["result_code"]
+        when = when.astimezone(timezone.utc)
+        if not (start <= when <= end) or created.astimezone(timezone.utc) < begin:
+            continue
+        result, known = _result_as_of(row, end)
+        pips = row["pnl_pips"] if result in _NUMERIC else None
         decided.append({
             "decision": row["decision"], "decided_at": when, "gate_result": row["gate_result"],
-            "result_code": result, "pnl_pips": pips,
+            "result_code": result, "pnl_pips": pips, "as_of_unknown": not known,
             "r": (r_multiple(pips, entry=row["entry_price"],
                              stop_loss=_payload_stop(row["payload_json"]),
                              pip_size=row["pip_size"]) if result in _NUMERIC else None)})
     population = []
     for row in conn.execute(
-            "SELECT s.created_at, s.status, s.abandon_reason, d.id IS NOT NULL AS decided "
+            "SELECT s.created_at, s.status, s.abandon_reason, s.abandoned_at, "
+            "d.decided_at AS decided_at "
             "FROM signals s LEFT JOIN signal_decisions d ON d.signal_id = s.id "
             "WHERE s.plugin = :name AND s.content_hash = :hash "
             "AND datetime(s.created_at) >= datetime(:start) "
@@ -229,10 +242,35 @@ def forward_summary(conn: sqlite3.Connection, target: ForwardTarget, *,
         created = _parse(row["created_at"])
         if created is None:
             continue
-        population.append({"created_at": created.astimezone(timezone.utc),
-                           "status": row["status"], "abandon_reason": row["abandon_reason"],
-                           "decided": bool(row["decided"])})
+        created = created.astimezone(timezone.utc)
+        if not (start <= created <= end):
+            continue
+        decided_at = _parse(row["decided_at"])
+        status, reason = row["status"], row["abandon_reason"]
+        if status == "abandoned":
+            abandoned_at = _parse(row["abandoned_at"])
+            if abandoned_at is not None and abandoned_at.astimezone(timezone.utc) > end:
+                status, reason = "pending", None
+        population.append({
+            "created_at": created, "status": status, "abandon_reason": reason,
+            "decided": decided_at is not None
+            and decided_at.astimezone(timezone.utc) <= end})
     return summarize(decided, population, target=target, start=start, end=end)
+
+
+def _result_as_of(row: sqlite3.Row, end: datetime) -> tuple[str | None, bool]:
+    """shadow の終端を、評価時刻の時点の姿にする。(結果, 時点を決められたか)。
+
+    終端が評価時刻より後なら、その時点ではまだ終端していない (結果なし)。終端の時刻が
+    読めないものは時点に戻せないので、結果なし・時点不明にする。"""
+    result = row["result_code"]
+    if result is None:
+        return None, True
+    stamps = [_parse(row["resolved_at"]), _parse(row["updated_at"])]
+    stamps = [s.astimezone(timezone.utc) for s in stamps if s is not None]
+    if not stamps:
+        return None, False
+    return (result if max(stamps) <= end else None), True
 
 
 def forward_summaries(conn: sqlite3.Connection, targets: list[ForwardTarget], *,

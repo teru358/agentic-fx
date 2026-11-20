@@ -187,3 +187,13 @@ def test_the_forward_values_reach_no_improve_surface(tmp_path):
         assert [word for word in _CANARIES if word in surface] == []
     c.close()
 
+
+
+def test_a_result_that_came_after_the_report_time_is_not_shown_as_a_win(conn):
+    make = Maker(conn)
+    make.decide(at=NOW - timedelta(minutes=30), pnl=100.0)
+    make.decide(at=NOW - timedelta(days=1), pnl=100.0)
+    facts = esr.collect_report_facts(conn, now=NOW, capacity=None, worker=None,
+                                     forward_targets=lambda c: [target()])
+    text = section(report(facts))
+    assert "全採否: N=1 " in text and "未終端=1" in text

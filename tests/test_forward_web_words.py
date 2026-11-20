@@ -44,7 +44,7 @@ def test_every_reason_the_daemon_can_give_has_words():
     words = set(_literals()["FORWARD_REASONS"])
     assert {usage_review.REASON_NO_GENERATION, usage_review.REASON_GENERATION_MISMATCH,
             usage_review.REASON_TIME_UNREADABLE, usage_review.REASON_JOURNAL_SOURCE,
-            "summary_failed"} <= words
+            usage_review.REASON_STRATEGY_UNREADABLE, "summary_failed"} <= words
 
 
 def test_the_fields_the_page_reads_exist_in_a_real_row():
@@ -56,7 +56,7 @@ def test_the_fields_the_page_reads_exist_in_a_real_row():
                  ("reach", "signals"), ("reach", "decided"), ("reach", "rate"),
                  ("holes", "abandoned"), ("holes", "no_fill"), ("holes", "data_insufficient"),
                  ("holes", "unterminated"), ("holes", "oldest_unterminated_sec"),
-                 ("holes", "r_unknown"), ("concentration", "days"),
+                 ("holes", "r_unknown"), ("holes", "as_of_unknown"), ("concentration", "days"),
                  ("concentration", "max_day_count"), ("concentration", "max_day_share"),
                  ("comparison", "recent"), ("comparison", "previous"),
                  ("comparison", "comparable")) + tuple(

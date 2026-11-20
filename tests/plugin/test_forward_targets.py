@@ -131,3 +131,34 @@ def test_the_reader_scans_the_plugins_and_reads_the_journal_through_the_given_co
     found = read_model_inputs.forward_targets_reader(world.plugins)(world.conn)
     assert [(t.name, t.content_hash, t.generation) for t in found] == [
         ("strat", meta.content_hash, (0, op))]
+
+
+def _with_entries(world, mutate):
+    import dataclasses
+    inputs = read_model_inputs.collect_inputs(world.plugins, world.conn)
+    entries = mutate(list(inputs.live.entries))
+    live = dataclasses.replace(inputs.live, entries=tuple(entries))
+    return {t.name: t for t in read_model.forward_targets(
+        dataclasses.replace(inputs, live=live))}
+
+
+def test_an_unreadable_live_entry_is_an_undetermined_target_not_a_missing_one(world):
+    put_strategy(world, "good")
+    found = _with_entries(world, lambda es: es + [read_model.LiveEntry(
+        "broken", "unreadable", None, None, "invalid_manifest")])
+    assert found["broken"].reason == usage_review.REASON_STRATEGY_UNREADABLE
+    assert found["broken"].started_at is None and found["broken"].generation is None
+    assert found["good"].reason is None and found["good"].started_at is not None
+
+
+def test_two_readable_entries_with_the_same_name_make_that_name_undetermined(world):
+    put_strategy(world, "dup")
+    found = _with_entries(world, lambda es: es + [es[0]])
+    assert found["dup"].reason == usage_review.REASON_STRATEGY_UNREADABLE
+    assert found["dup"].started_at is None
+
+
+def test_a_single_unreadable_entry_is_not_an_empty_list(world):
+    found = _with_entries(world, lambda es: [read_model.LiveEntry(
+        "broken", "unreadable", None, None, "io_error")])
+    assert list(found) == ["broken"]

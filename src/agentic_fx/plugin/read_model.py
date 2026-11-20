@@ -679,8 +679,9 @@ def _usage_review(inputs: ReadInputs, rows: Sequence[PluginRow], requests: Seque
 def forward_targets(inputs: ReadInputs) -> list[ForwardTarget]:
     """配備中の戦略ごとの前方成績の対象 (名前の順)。世代は棚卸しと同じ投影から取る。
 
-    読める 1 本の live entry を持つ戦略だけを数える。journal が読めない・遷移が合わない
-    戦略は、時刻を持たず理由だけを持つ (数値を出す側が「判定不能」にする)。"""
+    読める 1 本の live entry を持つ戦略は数える。読めない entry がある・同名の entry が
+    複数ある名前は、時刻を持たず理由だけを持つ対象にして (正常な空の一覧と区別する)、数値を
+    出す側が「判定不能」にする。journal が読めない・遷移が合わない戦略も同じ。"""
     by_name: dict[str, list[LiveEntry]] = {}
     for entry in inputs.live.entries:
         key = entry.meta.name if entry.meta is not None else entry.entry_name
@@ -689,8 +690,11 @@ def forward_targets(inputs: ReadInputs) -> list[ForwardTarget]:
     transitions = transitions_by_name(inputs)
     result = []
     for name in sorted(by_name):
-        readable = [entry for entry in by_name[name] if entry.meta is not None]
-        if len(readable) != 1:
+        entries = by_name[name]
+        readable = [entry for entry in entries if entry.meta is not None]
+        if len(readable) != len(entries) or len(readable) > 1:
+            result.append(ForwardTarget(name, "", None, None,
+                                        usage_review.REASON_STRATEGY_UNREADABLE))
             continue
         entry = readable[0]
         if entry.meta.kind != KIND_STRATEGY or entry.state not in (ENTITY_SYMLINK, ENTITY_PLAIN):

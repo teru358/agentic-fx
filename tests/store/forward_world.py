@@ -90,14 +90,14 @@ class Maker:
         if result in ("sl", "tp", "day_close"):
             self.conn.execute(
                 "UPDATE signal_shadow SET state='resolved', result_code=?, entry_price=?, "
-                "entry_at=?, exit_price=?, pnl_pips=?, resolved_at=? WHERE id=?",
-                (result, entry, stamp, entry + pnl * 0.01, pnl, stamp, shadow_id))
+                "entry_at=?, exit_price=?, pnl_pips=?, resolved_at=?, updated_at=? WHERE id=?",
+                (result, entry, stamp, entry + pnl * 0.01, pnl, stamp, stamp, shadow_id))
         elif result == "data_insufficient":
-            self.conn.execute("UPDATE signal_shadow SET state='resolved', result_code=? "
-                              "WHERE id=?", (result, shadow_id))
+            self.conn.execute("UPDATE signal_shadow SET state='resolved', result_code=?, "
+                              "updated_at=? WHERE id=?", (result, stamp, shadow_id))
         elif result == "no_fill":
-            self.conn.execute("UPDATE signal_shadow SET state='expired', result_code=? "
-                              "WHERE id=?", (result, shadow_id))
+            self.conn.execute("UPDATE signal_shadow SET state='expired', result_code=?, "
+                              "updated_at=? WHERE id=?", (result, stamp, shadow_id))
         elif result == "filled":
             self.conn.execute("UPDATE signal_shadow SET state='filled', entry_price=?, "
                               "entry_at=? WHERE id=?", (entry, stamp, shadow_id))

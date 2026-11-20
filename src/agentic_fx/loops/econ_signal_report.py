@@ -603,7 +603,7 @@ def _forward_lines(forward) -> list[str]:
             f"- 穴: abandoned: {aband} / no_fill={holes['no_fill']} / "
             f"data_insufficient={holes['data_insufficient']} / 未終端={holes['unterminated']}"
             f" (最古 {'–' if oldest is None else f'{oldest / 3600:.1f} 時間'}) / "
-            f"R不明={holes['r_unknown']}",
+            f"時点不明={holes['as_of_unknown']} / R不明={holes['r_unknown']}",
             f"- 集中度: 採点のある取引日={row['concentration']['days']} / 日別最大="
             f"{row['concentration']['max_day_count']} 件 "
             f"({_percent(row['concentration']['max_day_share'])})",

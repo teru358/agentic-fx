@@ -41,7 +41,7 @@ def forward_row(name="alpha", *, n=6, abandoned=2, pnl=1.0, hash_="a" * 64):
                      "unterminated": 0},
         "holes": {"abandoned": {"freshness_expired": abandoned} if abandoned else {},
                   "no_fill": 0, "data_insufficient": 0, "unterminated": 0,
-                  "oldest_unterminated_sec": None, "r_unknown": 0},
+                  "as_of_unknown": 0, "oldest_unterminated_sec": None, "r_unknown": 0},
         "reach": {"signals": n + abandoned, "decided": n,
                   "rate": n / (n + abandoned) if n + abandoned else None},
         "concentration": {"days": n, "max_day_count": 1, "max_day_share": 1 / n if n else None},
@@ -177,3 +177,45 @@ def test_the_real_trade_table_is_unchanged_by_the_new_section():
     html = strategy_page(with_forward(forward_row()))
     assert "<h2>起動理由ごとの表</h2>" in html and html.index("起動理由ごとの表") < html.index(
         "機械採点 (配備中の戦略ごと)")
+
+
+def _split_row():
+    row = forward_row(n=40)
+    row["series"]["accept"] = _series(12, pnl=-1.0)
+    row["series"]["reject"] = _series(3, pnl=1.0)
+    return row
+
+
+def side_rows(html):
+    return [c for c in cells(html) if len(c) == 6]
+
+
+def test_the_accept_and_reject_series_are_shown_in_their_own_rows():
+    rows = side_rows(strategy_page(with_forward(_split_row())))
+    assert len(rows) == 2
+    accept, reject = rows
+    assert "alpha" in accept[0] and "accept" in accept[1]
+    assert "12" in accept[2] and "0 / 12 / 0" in accept[3]
+    assert "-1.00" in accept[4] and "損失なし" not in accept[5]
+    assert "reject" in reject[1] and "3" in reject[2] and "3 / 0 / 0" in reject[3]
+
+
+def test_a_small_side_series_shows_a_dash_and_a_reference_mark():
+    rows = side_rows(strategy_page(with_forward(_split_row())))
+    accept, reject = rows
+    assert "(参考)" in accept[4]                      # 12 件は参考
+    assert "–" in reject[4]                           # 3 件は「–」
+    assert "+1.00" not in reject[4]
+
+
+def test_the_side_rows_are_not_drawn_for_a_strategy_without_numbers():
+    undetermined = {"name": "alpha", "content_hash": "a" * 64, "state": "undetermined",
+                    "reason": "no_generation_record",
+                    "thresholds": {"min_count": 5, "reference_count": 30}}
+    assert side_rows(strategy_page(with_forward(undetermined))) == []
+
+
+def test_the_side_rows_stay_within_the_same_budget():
+    rows = [forward_row(name=f"s{i:02d}" + "x" * 40) for i in range(32)]
+    section = perf_pages._forward_section(with_forward(*rows), "Asia/Tokyo")
+    assert len(section.encode("utf-8")) <= perf_pages.FORWARD_TABLE_BUDGET_BYTES

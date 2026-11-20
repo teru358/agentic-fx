@@ -257,3 +257,77 @@ def test_counts_by_strategy_and_outcome_survive_the_move_from_period_summary(con
 
 def test_period_summary_is_gone_so_no_second_aggregate_can_drift():
     assert not hasattr(ss, "period_summary")
+
+
+# ---------------------------------------------------------------- 秒未満の境界
+
+SUB = timedelta(milliseconds=800)
+
+
+def test_a_signal_of_an_earlier_generation_within_the_same_second_is_not_counted(conn, make):
+    start = (NOW - 3 * WEEK).replace(microsecond=900_000)
+    make.decide(at=start + timedelta(hours=1), signal_at=start - SUB)
+    make.decide(at=start + timedelta(hours=2), signal_at=start + timedelta(milliseconds=50))
+    out = summary(conn, started=start)
+    assert out["decisions"]["total"] == 1
+    assert out["reach"]["signals"] == 1
+
+
+def test_a_decision_within_the_same_second_outside_the_window_is_not_counted(conn, make):
+    end = NOW.replace(microsecond=100_000)
+    start = end - 12 * WEEK
+    make.decide(at=start - timedelta(milliseconds=50), signal_at=start + timedelta(hours=1))
+    make.decide(at=end + timedelta(milliseconds=50), signal_at=start + timedelta(hours=1))
+    make.decide(at=end - timedelta(milliseconds=50), signal_at=start + timedelta(hours=1))
+    assert sf.forward_summary(conn, target(), now=end)["decisions"]["total"] == 1
+
+
+# ---------------------------------------------------------------- 評価時刻より後に起きたこと
+
+def test_a_decision_made_after_the_evaluation_time_is_not_yet_a_reach(conn, make):
+    make.decide(at=NOW + timedelta(hours=1), signal_at=NOW - timedelta(hours=1))
+    out = summary(conn)
+    assert out["decisions"]["total"] == 0
+    assert out["reach"] == {"signals": 1, "decided": 0, "rate": 0.0}
+
+
+def test_an_abandon_after_the_evaluation_time_is_not_a_hole_yet(conn, make):
+    make.signal(at=NOW + timedelta(hours=1), status="abandoned", reason="freshness_expired",
+                created_text=(NOW - timedelta(hours=1)).isoformat())
+    out = summary(conn)
+    assert out["holes"]["abandoned"] == {}
+    assert out["reach"]["signals"] == 1
+
+
+@pytest.mark.parametrize("result", ["tp", "no_fill", "data_insufficient"])
+def test_a_result_that_came_after_the_evaluation_time_is_still_unterminated(conn, make, result):
+    make.decide(at=NOW - timedelta(minutes=30), result=result)
+    out = summary(conn)
+    assert out["series"]["all"]["n"] == 0 and out["series"]["all"]["scored"] == 0
+    assert out[ "outcomes"][result] == 0
+    assert out["holes"]["unterminated"] == 1
+    assert out["holes"]["as_of_unknown"] == 0
+
+
+def test_a_result_before_the_evaluation_time_is_kept(conn, make):
+    make.decide(at=NOW - timedelta(hours=3), result="tp")
+    assert summary(conn)["series"]["all"]["n"] == 1
+
+
+def test_the_same_data_gives_an_earlier_picture_for_an_earlier_evaluation_time(conn, make):
+    make.decide(at=NOW - timedelta(hours=3), result="tp")
+    later = NOW - timedelta(hours=2)
+    early = sf.forward_summary(conn, target(), now=later - timedelta(hours=5))
+    assert early["decisions"]["total"] == 0
+    assert early["reach"]["decided"] == 0
+    assert sf.forward_summary(conn, target(), now=NOW)["series"]["all"]["n"] == 1
+
+
+def test_a_result_whose_time_cannot_be_read_is_unknown_not_a_win(conn, make):
+    shadow = make.decide(at=NOW - timedelta(hours=3), result="tp")
+    conn.execute("UPDATE signal_shadow SET resolved_at='garbage', updated_at='garbage' "
+                 "WHERE id=?", (shadow,))
+    conn.commit()
+    out = summary(conn)
+    assert out["series"]["all"]["n"] == 0
+    assert out["holes"]["as_of_unknown"] == 1 and out["holes"]["unterminated"] == 0
