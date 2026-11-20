@@ -179,6 +179,39 @@ def test_a_recording_gap_cuts_the_lines_and_the_bands_and_joins_nothing():
     assert len(bands) == 2
 
 
+def test_an_unreadable_row_between_readable_ones_cuts_every_series_and_joins_nothing():
+    good = [point(1000, 1100, 9000, 9100, 9050), point(3000, 3100, 9300, 9400, 9350)]
+    steps = [step(1000, 9500), step(3000, 9600)]
+    junk_row = {**point(2000, 2100, 9100, 9200, 9150), "equity_last": "bad"}
+    junk_step = {"t": iso(2000), "hwm": "bad", "seg": 0}
+    for css in ("c1", "c2", "c3", "c4"):
+        markup = draw(data_with([good[0], junk_row, good[1]], [steps[0], junk_step, steps[1]])).svg
+        lines = polylines(markup, css)
+        assert len(lines) == 2, css
+        assert max(x for x, _ in lines[0]) < min(x for x, _ in lines[1]), css
+    markup = draw(data_with([good[0], junk_row, good[1]])).svg
+    bands = [a for t, a in parse(markup).elements if t == "polygon" and a["class"] == "bd"
+             and "216" not in a["points"]]
+    assert len(bands) == 2
+    # 数値でない行も境界になる
+    assert len(polylines(draw(data_with([good[0], None, good[1]])).svg, "c1")) == 2
+
+
+def test_an_unreadable_balance_alone_cuts_the_balance_line_and_not_the_equity_line():
+    rows = [point(1000, 1100, 9000, 9100, 9050), {**point(2000, 2100, 9100, 9200, 9150), "balance_last": "x"},
+            point(3000, 3100, 9300, 9400, 9350)]
+    markup = draw(data_with(rows)).svg
+    assert len(polylines(markup, "c1")) == 1 and len(polylines(markup, "c2")) == 2
+
+
+def test_a_non_positive_hwm_ends_the_kill_level_and_a_later_positive_one_starts_a_new_line():
+    steps = [step(1000, 100), step(2000, 0), step(3000, 80), step(3100, 80)]
+    markup = draw(data_with(SIMPLE, steps)).svg
+    kill = polylines(markup, "c4")
+    assert len(kill) == 2 and max(x for x, _ in kill[0]) < min(x for x, _ in kill[1])
+    assert len(polylines(markup, "c3")) == 1
+
+
 def test_a_run_of_one_point_is_drawn_as_a_short_visible_line_not_dropped():
     parts = [point(1000, 1100, 9000, 9100, 9050, seg=0), point(5000, 5100, 9300, 9400, 9350, seg=1)]
     lines = polylines(draw(data_with(parts)).svg, "c1")
@@ -241,8 +274,21 @@ def test_an_equal_position_mark_is_staggered_so_the_symbols_do_not_overlap():
     assert len(set(ys)) == 3
 
 
+def test_four_or_more_marks_at_one_position_are_each_identifiable():
+    kinds = ["latched", "released", "rebase", "cashflow", "unknown_hwm_drop"]
+    marks = [mark(kind=k, plot_at=iso(1500)) for k in kinds]
+    markup = draw(data_with(SIMPLE, STEPS, marks)).svg
+    ys = re.findall(r'<text class="\w+" x="\d+" y="(\d+)" text-anchor="middle">', markup)
+    assert len(ys) == 5 and len(set(ys)) == 5
+    # 同じ種別は 1 つの記号に件数をまとめる
+    many = [mark(kind="latched", plot_at=iso(1500)) for _ in range(4)] + [mark(kind="cashflow", plot_at=iso(1500))]
+    markup = draw(data_with(SIMPLE, STEPS, many)).svg
+    assert markup.count("<title>") == 2 and "✕×4" in markup and "ほか 3 件" in markup
+    assert ">◇</text>" in markup
+
+
 def test_only_the_marks_the_table_shows_are_drawn_in_the_same_order_and_number():
-    marks = [mark(kind="latched", plot_at=iso(1000 + i)) for i in range(30)]
+    marks = [mark(kind="latched", plot_at=iso(1000 + 100 * i)) for i in range(30)]
     html = page(data_with(SIMPLE, STEPS, marks))
     assert len(re.findall(r"<title>[✕↑▽◇△] ", html)) == perf_pages.MAX_MARKS
     assert len(re.findall(r"<tr><td>", html.split("<h2>印</h2>")[1])) == perf_pages.MAX_MARKS

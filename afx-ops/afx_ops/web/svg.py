@@ -79,6 +79,7 @@ def _integer(value: object) -> int | None:
 
 class _Part(NamedTuple):
     seg: int
+    gap: int
     start: float
     end: float
     last: float
@@ -90,33 +91,43 @@ class _Part(NamedTuple):
 
 class _Step(NamedTuple):
     seg: int
+    gap: int
     at: float
     hwm: float
 
 
 def _parts(raw: object) -> list[_Part]:
-    items = [item for item in raw if type(item) is dict] if type(raw) is list else []
     parts = []
-    for item in items:
+    gap = 0  # 読めない行を飛ばした回数。前後の行を線でつながない境界に使う
+    for item in raw if type(raw) is list else []:
+        if type(item) is not dict:
+            gap += 1
+            continue
         seg = _integer(item.get("seg"))
         start, end, last = (_epoch(item.get(k)) for k in ("start_at", "end_at", "last_at"))
         low, high, equity = (_number(item.get(k)) for k in
                              ("equity_min", "equity_max", "equity_last"))
         if seg is None or None in (start, end, last, low, high, equity) or start > end \
                 or low > high:
+            gap += 1
             continue
-        parts.append(_Part(seg, start, end, last, low, high, equity,
+        parts.append(_Part(seg, gap, start, end, last, low, high, equity,
                            _number(item.get("balance_last"))))
     return parts[-MAX_POINTS:]
 
 
 def _steps(raw: object) -> list[_Step]:
-    items = [item for item in raw if type(item) is dict] if type(raw) is list else []
     steps = []
-    for item in items:
+    gap = 0
+    for item in raw if type(raw) is list else []:
+        if type(item) is not dict:
+            gap += 1
+            continue
         seg, at, hwm = _integer(item.get("seg")), _epoch(item.get("t")), _number(item.get("hwm"))
         if seg is not None and at is not None and hwm is not None:
-            steps.append(_Step(seg, at, hwm))
+            steps.append(_Step(seg, gap, at, hwm))
+        else:
+            gap += 1
     return steps[-MAX_STEPS:]
 
 
@@ -206,14 +217,29 @@ def _line(css: str, pairs: Sequence[tuple[int, int]]) -> str:
     return f'<polyline class="{css}" points="{_vertices(pairs)}"/>'
 
 
-def _runs(parts: Sequence, key: str = "seg") -> list[list]:
+def _runs(parts: Sequence) -> list[list]:
     runs: list[list] = []
     for part in parts:
-        if runs and getattr(runs[-1][-1], key) == getattr(part, key):
+        if runs and (runs[-1][-1].seg, runs[-1][-1].gap) == (part.seg, part.gap):
             runs[-1].append(part)
         else:
             runs.append([part])
     return runs
+
+
+def _chunks(items: Sequence, keep) -> list[list]:
+    """keep を満たす連続した要素ごとに分ける。満たさない要素の位置で切る。"""
+    chunks: list[list] = []
+    cut = True
+    for item in items:
+        if not keep(item):
+            cut = True
+            continue
+        if cut:
+            chunks.append([])
+            cut = False
+        chunks[-1].append(item)
+    return chunks
 
 
 def _plot(scale: _Scale, parts: list[_Part], steps: list[_Step], ratio: float | None) -> str:
@@ -228,18 +254,16 @@ def _plot(scale: _Scale, parts: list[_Part], steps: list[_Step], ratio: float | 
         for css, level in (("c4", ratio), ("c3", 1.0)):
             if level is None:
                 continue
-            usable = [s for s in run if css == "c3" or s.hwm > 0]
-            pairs = []
-            for index, step in enumerate(usable):
-                if index:
-                    pairs.append((scale.x(step.at), scale.y(usable[index - 1].hwm * level)))
-                pairs.append((scale.x(step.at), scale.y(step.hwm * level)))
-            if pairs:
+            for usable in _chunks(run, lambda s: css == "c3" or s.hwm > 0):
+                pairs = []
+                for index, step in enumerate(usable):
+                    if index:
+                        pairs.append((scale.x(step.at), scale.y(usable[index - 1].hwm * level)))
+                    pairs.append((scale.x(step.at), scale.y(step.hwm * level)))
                 out.append(_line(css, pairs))
     for run in _runs(parts):
-        balance = [(scale.x(p.last), scale.y(p.balance)) for p in run if p.balance is not None]
-        if balance:
-            out.append(_line("c2", balance))
+        for chunk in _chunks(run, lambda p: p.balance is not None):
+            out.append(_line("c2", [(scale.x(p.last), scale.y(p.balance)) for p in chunk]))
     for run in _runs(parts):
         out.append(_line("c1", [(scale.x(p.last), scale.y(p.equity)) for p in run]))
     return "".join(out)
@@ -283,14 +307,22 @@ def _legend(show_kill: bool) -> str:
 
 
 def _marks_part(scale: _Scale, marks: list[_Marks]) -> str:
+    """同じ x 位置・同じ種別の印は 1 つの記号にまとめて件数を添える。位置ごとに種別を縦にずらす。"""
+    groups: dict[tuple[int, str], list[_Marks]] = {}
+    rows: dict[int, int] = {}
+    for mark in marks:
+        groups.setdefault((scale.x(mark.at), mark.kind), []).append(mark)
     out = []
-    for index, mark in enumerate(marks):
-        symbol, _, css = MARK_STYLE[mark.kind]
-        x = scale.x(mark.at)
-        title = _esc(mark.title.encode("utf-8")[:_TITLE_MAX_BYTES].decode("utf-8", "ignore"))
+    for (x, kind), members in groups.items():
+        row = rows[x] = rows.get(x, -1) + 1
+        symbol, _, css = MARK_STYLE[kind]
+        count = len(members)
+        base = members[0].title.encode("utf-8")[:_TITLE_MAX_BYTES - 16].decode("utf-8", "ignore")
+        title = _esc(base + (f" ほか {count - 1} 件" if count > 1 else ""))
+        shown = f"{symbol}×{count}" if count > 1 else symbol
         out.append(f'<line class="{css}" x1="{x}" y1="{Y0}" x2="{x}" y2="{Y1}"/>'
-                   f'<text class="{css}" x="{x}" y="{Y0 + 10 + 12 * (index % 3)}" '
-                   f'text-anchor="middle"><title>{title}</title>{symbol}</text>')
+                   f'<text class="{css}" x="{x}" y="{Y0 + 10 + 12 * row}" '
+                   f'text-anchor="middle"><title>{title}</title>{shown}</text>')
     return "".join(out)
 
 
