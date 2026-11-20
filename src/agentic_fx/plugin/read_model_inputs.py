@@ -242,6 +242,12 @@ def db_generation(conn: sqlite3.Connection, now: datetime | None = None) -> tupl
     return tuple(parts)
 
 
+# 書込みが作る UTC の ISO 日時の形。この形で窓より古い行だけを digest から外す。形が違う
+# (時差なし・壊れた文字列など) 行は読めない時刻として判定に効くので、古く見えても digest に含める
+_CANONICAL_UTC_TIME = ("[0-9][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9]"
+                       "*+00:00")
+
+
 def _candidate_generation(conn: sqlite3.Connection, now: datetime) -> tuple | None:
     bound = (usage_review.window_start(now) - _WINDOW_MARGIN).date().isoformat()
     try:
@@ -252,9 +258,8 @@ def _candidate_generation(conn: sqlite3.Connection, now: datetime) -> tuple | No
             "SELECT COALESCE(group_concat(id || char(31) || COALESCE(created_at, char(30)) "
             "|| char(31) || COALESCE(family_key, char(30)), char(0)), '') "
             "FROM (SELECT id, created_at, family_key FROM candidate_archives "
-            "WHERE created_at IS NULL OR created_at >= ? "
-            "OR created_at NOT GLOB '[0-9][0-9][0-9][0-9]-*' ORDER BY id)",
-            (bound,)).fetchone()[0]
+            "WHERE created_at IS NULL OR created_at >= ? OR created_at NOT GLOB ? ORDER BY id)",
+            (bound, _CANONICAL_UTC_TIME)).fetchone()[0]
     except sqlite3.Error:
         return None
     return (*total, bound, hashlib.sha256(str(joined).encode()).hexdigest())

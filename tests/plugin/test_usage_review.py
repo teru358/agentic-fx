@@ -745,3 +745,13 @@ def test_unreadable_and_null_key_rows_are_not_counted_as_strategy_candidates(wor
     assert summary["window_candidates"] == 1
     assert summary["excluded"]["null_key"] == 1
     assert summary["excluded"]["unreadable_key"] == 1
+
+
+@pytest.mark.parametrize("created_at", ["2020-bad", "2020-01-01T00:00:00", "2020-13-45"])
+def test_a_key_change_on_a_row_whose_time_cannot_be_read_changes_the_generation(world, created_at):
+    row_id = world.candidate(legacy_key(["rsi"]), created_at)
+    before = read_model_inputs.db_generation(world.conn, NOW)
+    world.conn.execute("UPDATE candidate_archives SET family_key=? WHERE id=?",
+                       (legacy_key(["ema"]), row_id))
+    world.conn.commit()
+    assert read_model_inputs.db_generation(world.conn, NOW) != before
