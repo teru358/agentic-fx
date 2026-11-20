@@ -275,6 +275,15 @@ def collect_inputs(plugins_root: Path, conn: sqlite3.Connection | None, *,
     return assemble_inputs(live, read_db_inputs(conn))
 
 
+def forward_targets_reader(plugins_root: Path):
+    """前方成績の対象を、渡された読取接続で読む関数。呼ぶたびに live の plugin を走査する。"""
+    from agentic_fx.plugin import read_model
+
+    def read(conn: sqlite3.Connection):
+        return read_model.forward_targets(collect_inputs(plugins_root, conn))
+    return read
+
+
 def assemble_inputs(live: LiveScan, db_rows: dict) -> ReadInputs:
     """FS の走査結果と、``read_db_inputs`` が返した DB の行から入力を組む。"""
     return ReadInputs(live=live, **db_rows)

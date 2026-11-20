@@ -213,24 +213,36 @@ class Transition:
     order: tuple[int, int]             # (source, op_id)。同時刻の並べ替えだけに使う
 
 
-def generation_start(transitions: Sequence[Transition], live_artifact: str | None
-                     ) -> tuple[datetime | None, str | None]:
-    """いまの版に至った最後の遷移の時刻。読めないときは (None, 理由)。
+SOURCE_JOURNAL = 0
+SOURCE_DEPLOY_OP = 1
+
+
+def generation_of(transitions: Sequence[Transition], live_artifact: str | None
+                  ) -> tuple[datetime | None, tuple[int, int] | None, str | None]:
+    """いまの版に至った最後の遷移の (時刻, (source, op_id), 理由)。読めないときは時刻と
+    世代が None で理由を返す。
 
     最後の遷移がいまの版を指していない・遷移が無い・時刻が読めないものは、配備時刻不明。"""
     if live_artifact is None or not transitions:
-        return None, REASON_NO_GENERATION
+        return None, None, REASON_NO_GENERATION
     parsed: list[tuple[datetime, tuple[int, int], Transition]] = []
     for item in transitions:
         when = parse_time(item.at)
         if when is None:
-            return None, REASON_TIME_UNREADABLE
+            return None, None, REASON_TIME_UNREADABLE
         parsed.append((when, item.order, item))
     parsed.sort(key=lambda entry: (entry[0], entry[1]))
-    when, _order, last = parsed[-1]
+    when, order, last = parsed[-1]
     if last.artifact_hash != live_artifact:
-        return None, REASON_GENERATION_MISMATCH
-    return when, None
+        return None, None, REASON_GENERATION_MISMATCH
+    return when, order, None
+
+
+def generation_start(transitions: Sequence[Transition], live_artifact: str | None
+                     ) -> tuple[datetime | None, str | None]:
+    """いまの版に至った最後の遷移の時刻。読めないときは (None, 理由)。"""
+    when, _order, reason = generation_of(transitions, live_artifact)
+    return when, reason
 
 
 # ---------------------------------------------------------------- 事実と判定

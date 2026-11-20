@@ -29,6 +29,7 @@ from agentic_fx.plugin.resolve import (
     STATE_MATCH, STATE_UNKNOWN, AliasState, ApprovedInventory, enumerate_indicator_states,
 )
 from agentic_fx.store import plugin_deploy_ops as deploy_store
+from agentic_fx.store.signal_forward import ForwardTarget
 from agentic_fx.tools.plugin_loader import approved_hashes_from_rows
 
 KIND_STRATEGY = "strategy"
@@ -614,7 +615,7 @@ def _current_origin(requests: Sequence[_Request], content_hash: str) -> str:
     return max(candidates, key=lambda request: request.id).origin
 
 
-def _transitions(inputs: ReadInputs) -> dict[str, list[usage_review.Transition]]:
+def transitions_by_name(inputs: ReadInputs) -> dict[str, list[usage_review.Transition]]:
     """配備を実際に変えた成功操作を名前ごとに集める。
 
     切替は承認・bless が decided で、かつ実際に切り替えたもの (同じ版の bless は含めない)。
@@ -625,12 +626,12 @@ def _transitions(inputs: ReadInputs) -> dict[str, list[usage_review.Transition]]
                 and journal.switch_required):
             result.setdefault(journal.name, []).append(usage_review.Transition(
                 journal.updated_at, str(journal.new_target).rsplit("/", 1)[-1],
-                (0, journal.op_id)))
+                (usage_review.SOURCE_JOURNAL, journal.op_id)))
     for op in inputs.deploy_ops:
         if (op.op_kind == "rollback_symlink" and op.phase == "done"
                 and op.target_artifact_hash is not None):
             result.setdefault(op.name, []).append(usage_review.Transition(
-                op.updated_at, op.target_artifact_hash, (1, op.op_id)))
+                op.updated_at, op.target_artifact_hash, (usage_review.SOURCE_DEPLOY_OP, op.op_id)))
     return result
 
 
@@ -649,7 +650,7 @@ def _usage_review(inputs: ReadInputs, rows: Sequence[PluginRow], requests: Seque
         records, candidates_readable=inputs.candidates_status != SOURCE_UNAVAILABLE,
         journal_readable=journal_readable, scan_failed=scan_failed)
     referenced, pending_reason = _pending_condition(inputs, requests)
-    transitions = _transitions(inputs)
+    transitions = transitions_by_name(inputs)
     requests_by_name: dict[str, list[_Request]] = {}
     for request in requests:
         if request.name is not None:
@@ -673,6 +674,36 @@ def _usage_review(inputs: ReadInputs, rows: Sequence[PluginRow], requests: Seque
             _current_origin(requests_by_name.get(row.name, ()), row.entity.content_hash),
             scan_failed, live_unreadable)
     return usage_scan, facts
+
+
+def forward_targets(inputs: ReadInputs) -> list[ForwardTarget]:
+    """配備中の戦略ごとの前方成績の対象 (名前の順)。世代は棚卸しと同じ投影から取る。
+
+    読める 1 本の live entry を持つ戦略だけを数える。journal が読めない・遷移が合わない
+    戦略は、時刻を持たず理由だけを持つ (数値を出す側が「判定不能」にする)。"""
+    by_name: dict[str, list[LiveEntry]] = {}
+    for entry in inputs.live.entries:
+        key = entry.meta.name if entry.meta is not None else entry.entry_name
+        by_name.setdefault(key, []).append(entry)
+    journal_readable = inputs.journal_status != SOURCE_UNAVAILABLE
+    transitions = transitions_by_name(inputs)
+    result = []
+    for name in sorted(by_name):
+        readable = [entry for entry in by_name[name] if entry.meta is not None]
+        if len(readable) != 1:
+            continue
+        entry = readable[0]
+        if entry.meta.kind != KIND_STRATEGY or entry.state not in (ENTITY_SYMLINK, ENTITY_PLAIN):
+            continue
+        content = entry.meta.content_hash
+        if not journal_readable:
+            result.append(ForwardTarget(name, content, None, None,
+                                        usage_review.REASON_JOURNAL_SOURCE))
+            continue
+        started, order, reason = usage_review.generation_of(
+            transitions.get(name, ()), entry.artifact_hash)
+        result.append(ForwardTarget(name, content, started, order, reason))
+    return result
 
 
 # ---------------------------------------------------------------- DTO
