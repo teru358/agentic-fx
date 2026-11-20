@@ -311,28 +311,3 @@ def unresolved_candidates(conn: sqlite3.Connection, *,
         "AND d.decided_at <= ? " + keyset +
         "ORDER BY d.decided_at, sh.id LIMIT ?",
         (STATE_PENDING_ENTRY, STATE_FILLED, cutoff, *extra, int(limit)))]
-
-
-def period_summary(conn: sqlite3.Connection, *, since: datetime,
-                   until: datetime) -> list[dict]:
-    """人間面用の期間集計。decision 時刻 `[since, until)` の shadow を strategy・
-    採否・actor・reject_code・state・result_code ごとに数える。
-
-    `n` は行数、`numeric_n` / `pnl_pips_sum` / `win_n` は数値終端だけを数える。
-    agent 面へ渡さない値であり、渡す経路は呼び出し側が持たない。
-    """
-    return [dict(r) for r in conn.execute(
-        "SELECT s.plugin, sh.decision, sh.actor, sh.reject_code, sh.state, "
-        "sh.result_code, COUNT(*) AS n, "
-        "SUM(CASE WHEN sh.pnl_pips IS NOT NULL THEN 1 ELSE 0 END) AS numeric_n, "
-        "TOTAL(sh.pnl_pips) AS pnl_pips_sum, "
-        "SUM(CASE WHEN sh.pnl_pips > 0 THEN 1 ELSE 0 END) AS win_n "
-        "FROM signal_shadow sh "
-        "JOIN signal_decisions d ON d.id = sh.decision_id "
-        "JOIN signals s ON s.id = sh.signal_id "
-        "WHERE d.decided_at >= ? AND d.decided_at < ? "
-        "GROUP BY s.plugin, sh.decision, sh.actor, sh.reject_code, sh.state, "
-        "sh.result_code "
-        "ORDER BY s.plugin, sh.decision, sh.actor, sh.reject_code, sh.state, "
-        "sh.result_code",
-        (utc_iso(since), utc_iso(until)))]

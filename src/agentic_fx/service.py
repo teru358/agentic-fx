@@ -69,7 +69,7 @@ from agentic_fx.loops.mission_watch import MissionWatch
 from agentic_fx.loops.reflection_cycle import ReflectionCycle
 from agentic_fx.loops.summary import ANSWER_SCHEMA, trade_intent_schema
 from agentic_fx.loops.trade_loop import _TRADE_TOOLS, TradeLoop
-from agentic_fx.plugin import deploy_reconcile, switch
+from agentic_fx.plugin import deploy_reconcile, read_model_inputs, switch
 from agentic_fx.plugin.sandbox import reap_orphans, startup_diagnostics
 from agentic_fx.plugin.signal_producer import SignalProducer
 from agentic_fx.policy import Policy, directives_path
@@ -1941,7 +1941,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             anchor=root,
             open_conn=lambda: connect_readonly(root / "data" / "agentic.db"),
             capacity=capacity_reader, worker=econ_health,
-            admission_status=admission.status, pair_currencies=pair_currencies))
+            admission_status=admission.status, pair_currencies=pair_currencies,
+            forward_targets=read_model_inputs.forward_targets_reader(plugins_dir)))
         # 取りこぼした改善通知と kill switch 遷移の event を、listener を開く前・
         # supervisor の開始前に出す。失敗は固定語で保留し、起動は続ける。
         ops_service.emit_pending_notices(improve_enabled=settings.notify.improve_events)

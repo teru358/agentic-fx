@@ -15,7 +15,7 @@ from pathlib import Path
 
 from agentic_fx.core import accounting
 from agentic_fx.datafeed.price_provider import _SPECS
-from agentic_fx.store import snapshots
+from agentic_fx.store import signal_forward, snapshots
 from agentic_fx.store.db import connect_readonly
 
 from . import events as ops_events
@@ -30,6 +30,7 @@ MAX_STEPS = 320
 MAX_SEGS = 32
 MAX_MARKS = 20
 MAX_STRATEGY_ROWS = 32
+MAX_FORWARD_ROWS = 32
 SERIES_EVENTS = 120
 MAX_SERIES = 4
 GAP_SEC = 600.0
@@ -964,12 +965,58 @@ def _strategy_section(conn, start: datetime, end: datetime, account_currency: st
     return out, merged, hidden
 
 
+# --- 機械採点 (配備中の戦略ごとの前方成績) ----------------------------------------------------
+
+def _is_busy(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
+
+
+def _raise_if_not_local(exc: Exception, check: Callable[[], None] | None) -> None:
+    """中断要求・busy は伝播する (応答を作り直せる失敗を、行の不明にしない)。
+    ほかの局所的な SQL エラーは呼び元で行の不明にする。"""
+    if check is not None:
+        check()
+    if isinstance(exc, sqlite3.OperationalError) and (
+            "interrupted" in str(exc) or _is_busy(exc)):
+        raise exc
+
+
+def _forward_section(conn: sqlite3.Connection, plugins_root: Path | None, now: datetime,
+                     check: Callable[[], None] | None) -> dict:
+    """配備中の戦略ごとの機械採点。期間 (range) とは別に、現世代内・最大 12 週で集計する。
+
+    対象を読めなければ節ごと `unavailable` (実取引の応答は変えない)。世代の開始時刻が
+    読めない戦略は数値を持たず `undetermined`。DB の読取は呼び出し元と同じ 1 本の transaction。
+    種別を読めない entry の数は `unreadable_entries` に載せる。"""
+    from agentic_fx.plugin import read_model_inputs
+    if plugins_root is None:
+        return {"state": "unavailable", "strategies": [], "omitted": 0, "unreadable_entries": 0}
+    try:
+        targets = read_model_inputs.forward_targets_reader(plugins_root)(conn)
+    except sqlite3.OperationalError as exc:
+        _raise_if_not_local(exc, check)
+        return {"state": "unavailable", "strategies": [], "omitted": 0, "unreadable_entries": 0}
+    except Exception:  # noqa: BLE001 - 読めない面は「不明」にし、実取引の応答は返す
+        return {"state": "unavailable", "strategies": [], "omitted": 0, "unreadable_entries": 0}
+    shown = targets[:MAX_FORWARD_ROWS]
+    out = []
+    for target in shown:
+        if check is not None:
+            check()
+        out.append(signal_forward.summary_or_failed(
+            conn, target, now=now, on_error=lambda exc: _raise_if_not_local(exc, check)))
+    return {"state": "ok", "strategies": out, "omitted": len(targets) - len(shown),
+            "unreadable_entries": getattr(targets, "unreadable_entries", 0)}
+
+
 # --- 入口 -----------------------------------------------------------------------------
 
 def read_performance(db_path: Path, *, range_key: str, now: datetime, kill_pct: float,
                      account_currency: str, kill_switch: dict | None,
                      state_fetched_at: datetime,
-                     interrupt: Callable[[], OpsError | None] | None = None) -> dict:
+                     interrupt: Callable[[], OpsError | None] | None = None,
+                     plugins_root: Path | None = None) -> dict:
     """短命の読取専用の接続で 1 本の transaction を張り、集計して閉じる。
 
     ``interrupt`` は問合せの途中で定期的に呼ばれ、エラーを返すと読取を打ち切ってそれを送出する
@@ -1007,7 +1054,8 @@ def read_performance(db_path: Path, *, range_key: str, now: datetime, kill_pct: 
         try:
             return build(conn, range_key=range_key, now=now, kill_pct=kill_pct,
                          account_currency=account_currency, kill_switch=kill_switch,
-                         state_fetched_at=state_fetched_at, check=check)
+                         state_fetched_at=state_fetched_at, check=check,
+                         plugins_root=plugins_root)
         except sqlite3.OperationalError:
             if stopped:
                 raise stopped[0] from None
@@ -1021,7 +1069,8 @@ def read_performance(db_path: Path, *, range_key: str, now: datetime, kill_pct: 
 def build(conn: sqlite3.Connection, *, range_key: str, now: datetime, kill_pct: float,
           account_currency: str, kill_switch: dict | None,
           state_fetched_at: datetime,
-          check: Callable[[], None] | None = None) -> dict:
+          check: Callable[[], None] | None = None,
+          plugins_root: Path | None = None) -> dict:
     """``check`` は SQL の外の長い処理の途中と、応答を返す直前に呼ばれる。送出すれば読取は打ち切り。"""
     if range_key not in RANGES:
         raise ValueError("range")
@@ -1077,6 +1126,7 @@ def build(conn: sqlite3.Connection, *, range_key: str, now: datetime, kill_pct: 
     shown, omitted = _select_marks(marks, start, to)
     strategies, merged_rows, hidden_series = _strategy_section(
         conn, start, to, account_currency, quality, check)
+    forward = _forward_section(conn, plugins_root, to, check)
     steps = _steps(equity.parts)
     poll()
     result = {
@@ -1090,7 +1140,7 @@ def build(conn: sqlite3.Connection, *, range_key: str, now: datetime, kill_pct: 
         "marks": [m.dto() for m in shown], "marks_omitted": omitted,
         "marks_since": since,
         "other_sources": equity.other_sources,
-        "strategies": strategies,
+        "strategies": strategies, "forward": forward,
         "thresholds": {"min_count": MIN_COUNT, "reference_count": REFERENCE_COUNT},
         "series_limits": {"events": SERIES_EVENTS, "series": MAX_SERIES},
         "omissions": {"equity_points": equity.omitted_points, "hwm_steps": equity.omitted_steps,

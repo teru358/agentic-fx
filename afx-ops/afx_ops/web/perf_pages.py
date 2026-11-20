@@ -429,6 +429,44 @@ NO_STRATEGY_FIGURE = "この期間に決済した取引はありません。期�
 NOTE_TABLE_OVER = "戦略の表は表示の上限を超えたため省きました"
 _ORIGIN = re.compile(r"signal:[a-z][a-z0-9_]{0,63}\Z")
 
+# --- 機械採点 (配備中の戦略ごと) --------------------------------------------------------------
+
+# 機械採点の節の予算 (UTF-8 byte)。実取引の部分の予算とは別に数える
+FORWARD_TABLE_BUDGET_BYTES = 12 * 1024
+# daemon 側 (agentic_fx.store.signal_forward) の定義の写し。test が突き合わせる
+FORWARD_WINDOW_WEEKS = 12
+FORWARD_HEADING = "機械採点 (配備中の戦略ごと)"
+FORWARD_CAVEATS = ("機械採点は実約定を含まないので楽観側に出ます",
+                   "採否に至らなかった signal は含みません")
+FORWARD_SCOPE = (f"実取引の表とは集計の範囲が違います。上の表は選んだ期間・すべての版の取引、"
+                 f"この表は今の版に限り、今の配備世代の開始から最大 {FORWARD_WINDOW_WEEKS} 週 "
+                 "(期間の切替の影響は受けません) の、採否できた signal を採否時点から仮想的に採点したものです")
+FORWARD_HEADERS = ("戦略", "配備世代の開始", "窓の始点", "N (R 既知)", "勝 / 負 / 分", "平均 R", "PF",
+                   "採否", "risk gate 通過", "signal 到達率", "穴", "集中度",
+                   "到達率 直近 4 週 / 前 4 週")
+FORWARD_SIDE_HEADERS = ("戦略", "採否", "N (R 既知)", "勝 / 負 / 分", "平均 R", "PF")
+FORWARD_SIDE_HEADING = "採否別 (採用した側と見送った側を分けた成績)"
+FORWARD_SIDES = (("accept", "accept (採用)"), ("reject", "reject (見送り)"))
+NOTE_FORWARD_UNKNOWN = "機械採点を読めません。数字は不明です"
+NOTE_FORWARD_NONE = "配備中の戦略はありません"
+NOTE_FORWARD_ENTRIES = ("読めない配備の entry が {} 件あります "
+                        "(戦略かどうか決められないので、この表に含まれない戦略があるかもしれません)")
+NOTE_FORWARD_ENTRIES_UNKNOWN = "読めない配備の entry が不明です (この表に含まれない戦略があるかもしれません)"
+NOTE_FORWARD_OVER = "機械採点の表は表示の上限を超えたため省きました"
+ABANDON_LABELS = {
+    "freshness_expired": "鮮度切れ", "requeued_expired": "再投入の期限切れ",
+    "retry_exhausted": "再試行の上限", "source_inactive": "元の戦略が停止",
+    "normalization_failed": "正規化の失敗", "deploy_op": "配備操作", "deploy_linked": "配備に連動"}
+FORWARD_REASONS = {
+    "no_generation_record": "配備の記録がありません",
+    "generation_mismatch": "最後の切替の記録が今の版と合いません",
+    "time_unreadable": "配備時刻を読めません",
+    "journal_unreadable": "切替の記録を読めません",
+    "strategy_unreadable": "配備中の entry を読めない、または同名が複数あります",
+    "summary_failed": "集計できませんでした"}
+_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+_HEX = re.compile(r"[0-9a-f]{12,64}\Z")
+
 
 def _signed_amount(value: object) -> str:
     text = _amount(value)
@@ -603,6 +641,163 @@ def _strategy_table(data: Mapping[str, object], *, table: bool = True) -> str:
     return heading + empty + dropped_note + f"<p>{NOTE_TABLE_OVER}</p>" + merged + "</section>"
 
 
+def _forward_name(row: Mapping[str, object]) -> str:
+    name, digest = row.get("name"), row.get("content_hash")
+    text = _esc(name) if type(name) is str and _NAME.match(name) else UNKNOWN
+    if type(digest) is str and _HEX.match(digest):
+        text += f"<br>{_esc(digest[:12])}"
+    return text
+
+
+def _forward_limits(row: Mapping[str, object]) -> tuple[int, int] | None:
+    return _thresholds({"thresholds": row.get("thresholds")})
+
+
+def _forward_series(row: Mapping[str, object], key: str) -> dict:
+    return _dict(_dict(row.get("series")).get(key))
+
+
+def _forward_win_loss(series: Mapping[str, object]) -> str:
+    return _esc(" / ".join(_count(series.get(k)) for k in ("wins", "losses", "flats")))
+
+
+def _forward_average_r(series: Mapping[str, object], limits) -> str:
+    return _average_r({"r_known_count": series.get("n"), "avg_r": series.get("avg_r"),
+                       "closed_count": series.get("scored")}, limits)
+
+
+def _forward_profit_factor(series: Mapping[str, object], limits) -> str:
+    return _esc(_profit_factor({"pnl_known_count": series.get("n"), "pf_state": series.get("pf_state"),
+                                "pf": series.get("pf")}, limits))
+
+
+def _rate_text(part: object) -> str:
+    part = _dict(part)
+    decided, total, rate = part.get("decided"), part.get("signals"), part.get("rate")
+    if rate is None and total == 0:
+        return NONE_TEXT
+    return f"{_count(decided)} / {_count(total)} ({_ratio_percent(rate)})"
+
+
+def _forward_holes(row: Mapping[str, object]) -> str:
+    holes = _dict(row.get("holes"))
+    parts = []
+    abandoned = _dict(holes.get("abandoned"))
+    for key in sorted(abandoned):
+        label = ABANDON_LABELS.get(key, "その他")
+        if type(abandoned[key]) is int and abandoned[key] == 0:
+            continue
+        parts.append(f"abandoned {label} {_count(abandoned[key])}")
+    for key, label in (("no_fill", "約定なし"), ("data_insufficient", "データ不足"),
+                       ("unterminated", "未終端"), ("as_of_unknown", "時点不明"),
+                       ("r_unknown", "R 不明"), ("time_unreadable", "時刻不明")):
+        value = holes.get(key)
+        if type(value) is int and value == 0:
+            continue
+        text = f"{label} {_count(value)}"
+        if key == "unterminated" and holes.get("oldest_unterminated_sec") is not None:
+            text += f" (最古 {_elapsed(holes.get('oldest_unterminated_sec'))})"
+        parts.append(text)
+    if "abandoned" not in holes and not parts:
+        return UNKNOWN
+    return _esc(" / ".join(parts)) if parts else _esc("なし")
+
+
+def _forward_concentration(row: Mapping[str, object]) -> str:
+    conc = _dict(row.get("concentration"))
+    share = conc.get("max_day_share")
+    return _esc(f"{_count(conc.get('days'))} 日 / 日別最大 {_count(conc.get('max_day_count'))} 件 "
+                f"({NONE_TEXT if share is None else _ratio_percent(share)})")
+
+
+def _forward_row(row: Mapping[str, object], tz: str) -> str:
+    if row.get("state") == "undetermined" or row.get("state") == "failed":
+        words = FORWARD_REASONS.get(row.get("reason"), UNKNOWN)
+        label = "判定不能" if row.get("state") == "undetermined" else "集計不可"
+        return (f"<tr><td>{_forward_name(row)}</td><td colspan=\"{len(FORWARD_HEADERS) - 1}\">"
+                f"{_esc(label)} ({_esc(words)})</td></tr>")
+    if row.get("state") != "ok":
+        return (f"<tr><td>{_forward_name(row)}</td><td colspan=\"{len(FORWARD_HEADERS) - 1}\">"
+                f"{UNKNOWN}</td></tr>")
+    limits = _forward_limits(row)
+    allv = _forward_series(row, "all")
+    decisions = _dict(row.get("decisions"))
+    comparison = _dict(row.get("comparison"))
+    cells = [
+        _forward_name(row), _optional_time(_dict(row.get("generation")).get("started_at"), tz),
+        _optional_time(_dict(row.get("window")).get("start"), tz), _esc(_count(allv.get("n"))),
+        _forward_win_loss(allv), _forward_average_r(allv, limits),
+        _forward_profit_factor(allv, limits),
+        _esc(f"accept {_count(decisions.get('accept'))} / reject {_count(decisions.get('reject'))}"),
+        _esc(_count(decisions.get("gate_passed"))), _esc(_rate_text(row.get("reach"))),
+        _forward_holes(row), _forward_concentration(row),
+        _esc(_rate_text(comparison.get("recent")) + " / " + _rate_text(comparison.get("previous"))
+             + ("" if comparison.get("comparable") is True else " (比較不能)"))]
+    return "<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>"
+
+
+def _forward_side_rows(row: Mapping[str, object]) -> str:
+    """accept・reject それぞれの成績の行。数値を持たない戦略は出さない。"""
+    if row.get("state") != "ok":
+        return ""
+    limits = _forward_limits(row)
+    out = []
+    for key, label in FORWARD_SIDES:
+        series = _forward_series(row, key)
+        cells = [_forward_name(row), _esc(label), _esc(_count(series.get("n"))),
+                 _forward_win_loss(series), _forward_average_r(series, limits),
+                 _forward_profit_factor(series, limits)]
+        out.append("<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>")
+    return "".join(out)
+
+
+def _forward_side_table(rows: list[dict]) -> str:
+    body = "".join(_forward_side_rows(r) for r in rows)
+    if not body:
+        return ""
+    return (f"<h3>{_esc(FORWARD_SIDE_HEADING)}</h3>"
+            '<div class="scroll"><table class="num"><thead><tr>'
+            + "".join(f"<th>{_esc(name)}</th>" for name in FORWARD_SIDE_HEADERS)
+            + "</tr></thead><tbody>" + body + "</tbody></table></div>")
+
+
+def _forward_section(data: Mapping[str, object], tz: str) -> str:
+    """配備中の戦略ごとの機械採点。読めない値は「不明」にし、正常には倒さない。"""
+    heading = f"<section><h2>{_esc(FORWARD_HEADING)}</h2>"
+    notes = ("<ul>" + "".join(f"<li>{_esc(line)}</li>" for line in (*FORWARD_CAVEATS, FORWARD_SCOPE))
+             + "</ul>")
+    forward = _dict(data.get("forward"))
+    raw = forward.get("strategies")
+    if forward.get("state") != "ok" or type(raw) is not list:
+        return heading + notes + f"<p>{NOTE_FORWARD_UNKNOWN}</p></section>"
+    rows = [item for item in raw if type(item) is dict]
+    entries = forward.get("unreadable_entries")
+    if type(entries) is int and entries > 0:
+        entries_note = f"<p>{_esc(NOTE_FORWARD_ENTRIES.format(entries))}</p>"
+    elif "unreadable_entries" in forward and (type(entries) is not int or entries < 0):
+        entries_note = f"<p>{_esc(NOTE_FORWARD_ENTRIES_UNKNOWN)}</p>"
+    else:
+        entries_note = ""
+    if not raw:
+        return heading + notes + (entries_note or f"<p>{NOTE_FORWARD_NONE}</p>") + "</section>"
+    if not rows:
+        return heading + notes + f"<p>{NOTE_FORWARD_UNKNOWN}</p></section>"
+    notes += entries_note
+    omitted = forward.get("omitted")
+    tail = (f"<p>ほか {_count(omitted)} 件の戦略は表に出していません</p>"
+            if type(omitted) is int and omitted > 0 else "")
+    dropped = len(raw) - len(rows)
+    dropped_note = f"<p>{NOTE_ROWS_DROPPED.format(dropped)}</p>" if dropped else ""
+    body = ('<div class="scroll"><table class="num"><thead><tr>'
+            + "".join(f"<th>{_esc(name)}</th>" for name in FORWARD_HEADERS)
+            + "</tr></thead><tbody>" + "".join(_forward_row(r, tz) for r in rows)
+            + "</tbody></table></div>") + _forward_side_table(rows)
+    text = heading + notes + dropped_note + body + tail + "</section>"
+    if len(text.encode("utf-8")) <= FORWARD_TABLE_BUDGET_BYTES:
+        return text
+    return heading + notes + f"<p>{NOTE_FORWARD_OVER}</p>" + tail + "</section>"
+
+
 def _strategy_figure(data: Mapping[str, object], tz: str, *, draw: bool = True) -> str:
     limits = svg.series_limits(data)
     chosen, skipped = svg.series_rows(data.get("strategies"), limits[1] if limits else None)
@@ -682,17 +877,22 @@ def _render_strategy(data: Mapping[str, object], range_key: str) -> bytes:
     tail = ("<section><h2>注記</h2><ul>" + "".join(f"<li>{_esc(line)}</li>" for line in notes)
             + "</ul></section>")
 
+    forward = _forward_section(data, tz)
+    # 機械採点の節は自分の予算 (FORWARD_TABLE_BUDGET_BYTES) で収まっている。実取引の図と表の
+    # 予算には数えない (大きい節が実取引の図を押し出さない)。
+    allowance = len(forward.encode("utf-8"))
+
     def build(figure: str, table: str) -> bytes:
-        return render._document("Performance", head + figure + table + tail, tz, current=PATH,
-                                tabs=bar, refresh=False)
+        return render._document("Performance", head + figure + table + forward + tail, tz,
+                                current=PATH, tabs=bar, refresh=False)
     figure, table = _strategy_figure(data, tz), _strategy_table(data)
     document = build(figure, table)
-    if len(document) <= STRATEGY_PAGE_BUDGET_BYTES:
+    if len(document) - allowance <= STRATEGY_PAGE_BUDGET_BYTES:
         return document
     figure = _strategy_figure(data, tz, draw=False)
     document = build(figure, table)
-    if len(document) <= STRATEGY_PAGE_BUDGET_BYTES:
+    if len(document) - allowance <= STRATEGY_PAGE_BUDGET_BYTES:
         return document
     table = _strategy_table(data, table=False)
-    return render._page("Performance", head + figure + table + tail, tz, current=PATH, tabs=bar,
-                        refresh=False)
+    return render._page("Performance", head + figure + table + forward + tail, tz, current=PATH,
+                        tabs=bar, refresh=False)

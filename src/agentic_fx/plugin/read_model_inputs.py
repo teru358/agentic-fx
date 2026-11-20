@@ -162,8 +162,18 @@ def _file_stamps(entry: Path) -> tuple:
     return tuple(stamps)
 
 
-def read_db_inputs(conn: sqlite3.Connection) -> dict:
-    """承認・配備 op・switch journal の行を読む。表ごとに失敗を状態に落とす。"""
+def _retryable(exc: sqlite3.Error) -> bool:
+    """あとで読み直せば読める失敗 (他の書込みとの競合、中断要求による打ち切り)。"""
+    text = str(exc).lower()
+    return isinstance(exc, sqlite3.OperationalError) and (
+        "locked" in text or "busy" in text or "interrupted" in text)
+
+
+def read_db_inputs(conn: sqlite3.Connection, *, raise_retryable: bool = False) -> dict:
+    """承認・配備 op・switch journal の行を読む。表ごとに失敗を状態に落とす。
+
+    ``raise_retryable`` のとき、競合・中断の失敗は状態に落とさず送出する (呼び出し元が
+    読み直しや打ち切りを決められる)。既定は落とす。"""
     result: dict = {"approvals": (), "deploy_ops": (), "journals": (),
                     "pending_status": SOURCE_OK, "journal_status": SOURCE_OK,
                     "candidates": (), "candidates_status": SOURCE_OK}
@@ -174,7 +184,9 @@ def read_db_inputs(conn: sqlite3.Connection) -> dict:
             for row in conn.execute(
                 "SELECT id,status,decided_at,created_at,payload_json FROM approval_requests "
                 "WHERE kind='plugin' ORDER BY id").fetchall())
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        if raise_retryable and _retryable(exc):
+            raise
         result["pending_status"] = SOURCE_UNAVAILABLE
     try:
         result["deploy_ops"] = tuple(
@@ -186,7 +198,9 @@ def read_db_inputs(conn: sqlite3.Connection) -> dict:
                 "SELECT op_id,op_kind,name,phase,fail_reason,subject_content_hash,"
                 "target_content_hash,target_artifact_hash,updated_at "
                 "FROM plugin_deploy_ops ORDER BY op_id").fetchall())
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        if raise_retryable and _retryable(exc):
+            raise
         result["journal_status"] = SOURCE_UNAVAILABLE
     try:
         result["journals"] = tuple(
@@ -196,7 +210,9 @@ def read_db_inputs(conn: sqlite3.Connection) -> dict:
             for row in conn.execute(
                 "SELECT op_id,kind,approval_id,name,phase,new_target,switch_required,"
                 "updated_at FROM plugin_switch_journal ORDER BY op_id").fetchall())
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        if raise_retryable and _retryable(exc):
+            raise
         result["journal_status"] = SOURCE_UNAVAILABLE
     try:
         result["candidates"] = tuple(
@@ -204,7 +220,9 @@ def read_db_inputs(conn: sqlite3.Connection) -> dict:
             for row in conn.execute(
                 "SELECT id,family_key,created_at FROM candidate_archives "
                 "ORDER BY id").fetchall())
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        if raise_retryable and _retryable(exc):
+            raise
         result["candidates_status"] = SOURCE_UNAVAILABLE
     return result
 
@@ -266,13 +284,24 @@ def _candidate_generation(conn: sqlite3.Connection, now: datetime) -> tuple | No
 
 
 def collect_inputs(plugins_root: Path, conn: sqlite3.Connection | None, *,
-                   db_status: str = SOURCE_OK) -> ReadInputs:
+                   db_status: str = SOURCE_OK, raise_retryable: bool = False) -> ReadInputs:
     """FS と DB から入力を集める。``conn`` が None のとき DB の 2 source は ``db_status``。"""
     live = scan_live(plugins_root)
     if conn is None:
         return ReadInputs(live=live, pending_status=db_status, journal_status=db_status,
                           candidates_status=db_status)
-    return assemble_inputs(live, read_db_inputs(conn))
+    return assemble_inputs(live, read_db_inputs(conn, raise_retryable=raise_retryable))
+
+
+def forward_targets_reader(plugins_root: Path):
+    """前方成績の対象を、渡された読取接続で読む関数。呼ぶたびに live の plugin を走査する。
+    競合・中断の失敗は「読めない」にせず送出する。"""
+    from agentic_fx.plugin import read_model
+
+    def read(conn: sqlite3.Connection):
+        return read_model.forward_targets(
+            collect_inputs(plugins_root, conn, raise_retryable=True))
+    return read
 
 
 def assemble_inputs(live: LiveScan, db_rows: dict) -> ReadInputs:

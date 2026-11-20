@@ -88,7 +88,7 @@ _DEPLOY_LINKED_ANTI_JOIN = (
 # `legacy_unknown` は時刻を持たない別枠)。それ以外は種別と契約版で決める。
 # 実行可能 (strategy かつ executable_v1) でない行はすべて cleanup に倒す。
 # 第 3 の分類を置かないので、claim も掃除もされず pending に残る行は無い。
-def _eligibility_case(prefix: str = "") -> str:
+def eligibility_case(prefix: str = "") -> str:
     """`prefix` は列名の前置 (JOIN で曖昧にならないよう "signals." を渡す)。"""
     status, reason = f"{prefix}status", f"{prefix}abandon_reason"
     kind, version = f"{prefix}kind", f"{prefix}contract_version"
@@ -102,7 +102,7 @@ def _eligibility_case(prefix: str = "") -> str:
         "ELSE 'ineligible_cleanup' END")
 
 
-_ELIGIBILITY_CASE = _eligibility_case()
+_ELIGIBILITY_CASE = eligibility_case()
 _ELIGIBLE_CONDITION = f"({_ELIGIBILITY_CASE})='eligible'"
 _CLEANUP_CONDITION = f"({_ELIGIBILITY_CASE})='ineligible_cleanup'"
 _LEGACY_UNKNOWN_CONDITION = f"({_ELIGIBILITY_CASE})='legacy_unknown'"
@@ -508,7 +508,7 @@ def human_signal_aggregates(conn: sqlite3.Connection, *, since: datetime,
     _require_aware(since, "since")
     _require_aware(until, "until")
     params = {"since": since.isoformat(), "until": until.isoformat()}
-    eligible = f"({_eligibility_case('signals.')})='eligible'"
+    eligible = f"({eligibility_case('signals.')})='eligible'"
     decisions = conn.execute(
         "SELECT signals.plugin, signal_decisions.decision, "
         "signal_decisions.actor, signal_decisions.reject_code, COUNT(*) AS count "

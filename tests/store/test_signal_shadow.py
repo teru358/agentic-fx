@@ -316,28 +316,3 @@ def test_unresolved_candidates_skip_terminal_complete_and_young_rows(tmp_path):
     assert young not in [r["id"] for r in got]
     assert len(ss.unresolved_candidates(
         conn, decided_before=NOW - timedelta(days=1), limit=1)) == 1
-
-
-def test_period_summary_counts_by_strategy_and_outcome(tmp_path):
-    conn = _conn(tmp_path)
-    ids = [_decided(conn, n=i, plugin="p" if i < 3 else "q").shadow_id
-           for i in range(4)]
-    outside = _decided(conn, n=9, now=NOW + timedelta(days=1)).shadow_id
-    for shadow_id, pnl in ((ids[0], 20.0), (ids[1], -10.0)):
-        row = _at(conn, shadow_id, "filled")
-        ss.transition(conn, shadow_id, expected_state="filled",
-                      expected_updated_at=row["updated_at"],
-                      outcome=ShadowOutcome.resolved(
-                          "tp" if pnl > 0 else "sl", exit_price=150.0,
-                          pnl_pips=pnl, resolved_at=EXIT_AT), now=EXIT_AT)
-    del outside
-    rows = ss.period_summary(conn, since=NOW, until=NOW + timedelta(hours=1))
-    flat = {(r["plugin"], r["state"], r["result_code"]):
-            (r["n"], r["numeric_n"], r["pnl_pips_sum"], r["win_n"])
-            for r in rows}
-    assert flat == {
-        ("p", "pending_entry", None): (1, 0, 0.0, 0),
-        ("p", "resolved", "sl"): (1, 1, -10.0, 0),
-        ("p", "resolved", "tp"): (1, 1, 20.0, 1),
-        ("q", "pending_entry", None): (1, 0, 0.0, 0),
-    }
