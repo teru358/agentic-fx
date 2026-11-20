@@ -21,7 +21,7 @@ from typing import Callable, Mapping
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.core import display_time, market_hours
 from agentic_fx.analytics import econ_reactions
-from agentic_fx.store import econ_reaction_values, ohlcv_slices, signals
+from agentic_fx.store import econ_reaction_values, ohlcv_slices, signal_forward, signals
 
 _log = logging.getLogger("agentic_fx.loops.econ_signal_report")
 
@@ -544,6 +544,74 @@ def _shown_time(value, tz: str) -> str:
     return display_time.convert_or_raw(value, tz)
 
 
+_FORWARD_NOTE = ("戦略別。機械採点は採否時点からの仮想成績で、実約定を含まないので楽観側に出ます。"
+                 "採否に至らなかった signal は含みません (穴として件数だけ数えます)。")
+
+
+def _forward_values(series: dict) -> str:
+    """N と、母数が足りるときだけ平均 R・PF。5 件未満は「–」、30 件未満は参考。"""
+    level = series["level"]
+    head = (f"N={series['n']} 勝/負/分={series['wins']}/{series['losses']}/{series['flats']}")
+    if series["r_unknown"]:
+        head += f" R不明={series['r_unknown']}"
+    if level == signal_forward.LEVEL_NONE:
+        return f"{head} 平均R=– PF=–"
+    mark = " (参考)" if level == signal_forward.LEVEL_REFERENCE else ""
+    avg = "不明" if series["avg_r"] is None else f"{series['avg_r']:.2f}"
+    if series["pf_state"] == signal_forward.PF_COMPUTED:
+        pf = f"{series['pf']:.2f}"
+    else:
+        pf = "損失なし" if series["pf_state"] == signal_forward.PF_NO_LOSSES else "不明"
+    return f"{head} 平均R={avg}{mark} PF={pf}{mark}"
+
+
+def _percent(rate) -> str:
+    return "–" if rate is None else f"{rate * 100:.0f}%"
+
+
+def _forward_rate(part: dict) -> str:
+    return f"{part['decided']}/{part['signals']} ({_percent(part['rate'])})"
+
+
+def _forward_lines(forward) -> list[str]:
+    if forward is None:
+        return ["unavailable"]
+    if not forward:
+        return [_FORWARD_NOTE, "配備中の戦略はありません"]
+    lines = [_FORWARD_NOTE]
+    for row in forward:
+        lines += ["", f"### {row['name']} ({row['content_hash'][:12]})"]
+        if row["state"] == signal_forward.STATE_FAILED:
+            lines.append("集計できませんでした")
+            continue
+        if row["state"] != signal_forward.STATE_OK:
+            lines.append(f"判定不能 ({row['reason']})")
+            continue
+        gen, win = row["generation"], row["window"]
+        dec, holes = row["decisions"], row["holes"]
+        aband = ", ".join(f"{k}={v}" for k, v in holes["abandoned"].items()) or "なし"
+        oldest = holes["oldest_unterminated_sec"]
+        comp = row["comparison"]
+        lines += [
+            f"- 世代: 開始 {gen['started_at']} / 窓 {win['start']} 〜 {win['end']} "
+            f"(最大 {win['weeks']} 週)",
+            f"- 採否: accept={dec['accept']} reject={dec['reject']} "
+            f"risk gate 通過={dec['gate_passed']} / signal 到達率={_forward_rate(row['reach'])}",
+            f"- 全採否: {_forward_values(row['series']['all'])}",
+            f"- accept: {_forward_values(row['series']['accept'])}",
+            f"- reject: {_forward_values(row['series']['reject'])}",
+            f"- 穴: abandoned: {aband} / no_fill={holes['no_fill']} / "
+            f"data_insufficient={holes['data_insufficient']} / 未終端={holes['unterminated']}"
+            f" (最古 {'–' if oldest is None else f'{oldest / 3600:.1f} 時間'}) / "
+            f"R不明={holes['r_unknown']}",
+            f"- 集中度: 採点のある取引日={row['concentration']['days']} / 日別最大="
+            f"{row['concentration']['max_day_count']} 件 "
+            f"({_percent(row['concentration']['max_day_share'])})",
+            f"- 到達率の比較 (表示のみ): 直近 4 週 {_forward_rate(comp['recent'])} / 前 4 週 "
+            f"{_forward_rate(comp['previous'])}" + ("" if comp["comparable"] else " (比較不能)")]
+    return lines
+
+
 def report_label(close_at: datetime) -> date:
     """閉じた境界の 1 分前の取引日ラベル。"""
     return market_hours.trading_date(close_at - timedelta(minutes=1))
@@ -576,15 +644,7 @@ def render_report(facts: dict, *, label: date, close_at: datetime) -> str:
     lines += (["unavailable"] if miss is None
               else [f"- {k}: {v}" for k, v in miss.items()])
     lines += ["", "## shadow"]
-    shadow = facts.get("shadow")
-    if shadow is None:
-        lines.append("unavailable")
-    else:
-        for row in shadow:
-            lines.append(
-                f"- {row['decision']}/{row['actor']}/{_fmt(row['reject_code'])} "
-                f"{row['state']}/{_fmt(row['result_code'])}: n={row['n']} "
-                f"avg_pnl_pips={_fmt(row['avg_pnl_pips'])}")
+    lines += _forward_lines(facts.get("forward"))
     if "reaction" in facts:
         lines += ["", "## reaction (pips、窓は分、床未満も数値を出す)"]
         lines += _reaction_report_lines(facts["reaction"])
@@ -633,15 +693,43 @@ def _reaction_report_lines(reaction: dict | None) -> list[str]:
     return lines
 
 
+def forward_status(conn: sqlite3.Connection, *, now: datetime,
+                   targets: Callable[[sqlite3.Connection], list[signal_forward.ForwardTarget]]
+                   | None) -> list[dict] | None:
+    """配備中の戦略ごとの機械採点。対象を読めなければ None (節ごと「不明」)、
+    1 本の集計が失敗してもほかの戦略は出す。人間の面と親専有の report だけが読む。"""
+    if targets is None:
+        return None
+    try:
+        listed = targets(conn)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("econ signal report forward targets unavailable: %s",
+                     safe_error_text(exc))
+        return None
+    out = []
+    for item in listed:
+        try:
+            out.append(signal_forward.forward_summary(conn, item, now=now))
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("econ signal report forward summary unavailable: %s",
+                         safe_error_text(exc))
+            out.append({"name": item.name, "content_hash": item.content_hash,
+                        "state": signal_forward.STATE_FAILED, "reason": "summary_failed"})
+    return out
+
+
 def collect_report_facts(conn: sqlite3.Connection, *, now: datetime,
                          capacity: CapacityReader | None,
                          worker: WorkerHealth | None,
                          admission_status: Callable[[sqlite3.Connection, datetime], dict]
                          | None = None,
-                         pair_currencies: Mapping[str, tuple[str, str]] | None = None
-                         ) -> dict:
+                         pair_currencies: Mapping[str, tuple[str, str]] | None = None,
+                         forward_targets: Callable[[sqlite3.Connection],
+                                                   list[signal_forward.ForwardTarget]]
+                         | None = None) -> dict:
     facts = econ_signal_status(conn, now=now, capacity=capacity, worker=worker,
                                pair_currencies=pair_currencies)
+    facts["forward"] = forward_status(conn, now=now, targets=forward_targets)
     if admission_status is not None:
         try:
             snap = admission_status(conn, now)
@@ -828,8 +916,10 @@ def make_daily_report_callback(*, reports_dir: Path,
                                worker: WorkerHealth | None,
                                admission_status: Callable | None = None,
                                anchor: Path | None = None,
-                               pair_currencies: Mapping[str, tuple[str, str]] | None = None
-                               ) -> Callable[[datetime], None]:
+                               pair_currencies: Mapping[str, tuple[str, str]] | None = None,
+                               forward_targets: Callable[[sqlite3.Connection],
+                                                         list[signal_forward.ForwardTarget]]
+                               | None = None) -> Callable[[datetime], None]:
     """scheduler の日次 hook (`register_daily_report`) に渡す callback。
 
     取引日 (`report_label`) で一意なので、at-least-once で呼ばれても 2 つ目は作らない。
@@ -845,7 +935,8 @@ def make_daily_report_callback(*, reports_dir: Path,
         try:
             facts = collect_report_facts(
                 conn, now=close_at - timedelta(minutes=1), capacity=capacity, worker=worker,
-                admission_status=admission_status, pair_currencies=pair_currencies)
+                admission_status=admission_status, pair_currencies=pair_currencies,
+                forward_targets=forward_targets)
         finally:
             conn.close()
         write_report_once(reports_dir, label=label, anchor=anchor,
