@@ -476,3 +476,31 @@ def test_a_future_settlement_beside_a_past_one_leaves_the_start_at_the_past_one(
     assert data["from"] == past.isoformat()
     assert data["quality"]["unplaced_closed_count"] == 1
     assert sum(r["closed_count"] for r in data["strategies"]) == 1
+
+
+def test_the_profit_factor_state_tells_no_losses_from_computed_from_unknown(ops_env):
+    conn = ops_env.conn
+    put(conn, "signal:only_wins", pnl=100.0)
+    put(conn, "signal:mixed", pnl=100.0)
+    put(conn, "signal:mixed", pnl=-50.0)
+    put(conn, "signal:none_known", pnl=None)
+    got = rows(ops_env)
+    assert (got["signal:only_wins"]["pf"], got["signal:only_wins"]["pf_state"]) == (None, "no_losses")
+    assert (got["signal:mixed"]["pf"], got["signal:mixed"]["pf_state"]) == (2.0, "computed")
+    assert (got["signal:none_known"]["pf"], got["signal:none_known"]["pf_state"]) == (None, "unknown")
+
+
+def test_a_profit_factor_that_overflows_is_unknown_and_never_a_number_or_no_losses(ops_env):
+    put(ops_env.conn, pnl=100.0)
+    put(ops_env.conn, pnl=-1e308)
+    put(ops_env.conn, pnl=-1e308)
+    row = read(ops_env)["strategies"][0]
+    json.dumps(row, allow_nan=False)
+    assert row["pf"] is None and row["pf_state"] == "unknown"
+
+
+def test_a_folded_row_takes_its_profit_factor_state_from_the_folded_counts(ops_env):
+    for index in range(40):
+        put(ops_env.conn, f"signal:s{index:02d}", pnl=10.0)
+    other = rows(ops_env)["other"]
+    assert other["pf"] is None and other["pf_state"] == "no_losses"

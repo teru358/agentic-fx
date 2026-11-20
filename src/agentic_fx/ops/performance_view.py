@@ -849,8 +849,24 @@ def _finite(value: float | None) -> float | None:
     return value if value is not None and math.isfinite(value) else None
 
 
+def _profit_factor(acc: _Acc) -> tuple[float | None, str]:
+    """PF と、その null の理由。損失が 0 件なら `no_losses`、計算できたら `computed`、
+    損益が既知でない・合計が有限でないなど読めないときは `unknown`。"""
+    if not acc.pnl_known or not math.isfinite(acc.gross_profit) \
+            or not math.isfinite(acc.gross_loss):
+        return None, "unknown"
+    if acc.losses == 0 and acc.gross_loss == 0:
+        return None, "no_losses"
+    if acc.gross_loss > 0:
+        value = _finite(acc.gross_profit / acc.gross_loss)
+        if value is not None:
+            return value, "computed"
+    return None, "unknown"
+
+
 def _row_dto(acc: _Acc, series: list[dict]) -> dict:
     known = acc.pnl_known
+    pf, pf_state = _profit_factor(acc)
     return {
         "origin": acc.origin, "origin_count": acc.count, "closed_count": acc.closed,
         "pnl_known_count": known, "r_known_count": acc.r_known,
@@ -858,8 +874,7 @@ def _row_dto(acc: _Acc, series: list[dict]) -> dict:
         "open_count": acc.holding, "close_pending_count": acc.pending,
         "wins": acc.wins, "losses": acc.losses, "flats": acc.flats,
         "win_rate": acc.wins / known if known else None,
-        "pf": _finite(acc.gross_profit / acc.gross_loss
-                      if known and acc.gross_loss > 0 else None),
+        "pf": pf, "pf_state": pf_state,
         "avg_r": _finite(acc.r_sum / acc.r_known if acc.r_known else None),
         "total_pnl": _finite(acc.total if known else None),
         "close_reasons": dict(acc.reasons), "cumulative": series}

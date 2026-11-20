@@ -404,6 +404,8 @@ REASON_LABELS = (("llm_close", "判断"), ("sl", "SL"), ("tp", "TP"), ("other", 
 SERIES_HISTORY = 120
 STRATEGY_HEADERS = ("起動理由", "件数", "勝 / 負 / 分", "勝率", "PF", "平均 R (手数料込み)",
                     "損益の合計", "決済の内訳", "保有中")
+NOTE_STRATEGIES_UNKNOWN = "戦略別の成績を読めません。数字は不明です"
+NOTE_CLOSED_UNKNOWN = "決済の件数を読めない行があります"
 NOTE_TABLE_OVER = "戦略の表は表示の上限を超えたため省きました"
 _ORIGIN = re.compile(r"signal:[a-z][a-z0-9_]{0,63}\Z")
 
@@ -462,13 +464,16 @@ def _ratio_percent(value: object) -> str:
 
 
 def _profit_factor(row: Mapping[str, object], limits: tuple[int, int] | None) -> str:
+    """PF。null の理由は daemon の `pf_state` で決め、値と状態が噛み合わないものは「不明」。"""
     known = row.get("pnl_known_count")
-    value = _number(row.get("pf"))
-    if value is None:
-        text = "損失なし" if row.get("pf") is None and type(known) is int and known > 0 \
-            and row.get("losses") == 0 else UNKNOWN
-    else:
+    state, raw = row.get("pf_state"), row.get("pf")
+    value = _number(raw)
+    if state == "no_losses" and raw is None:
+        text = "損失なし"
+    elif state == "computed" and value is not None:
         text = f"{value:.2f}" if value < BIG else f"{value:.2e}"
+    else:
+        text = UNKNOWN
     return _rated(text, known, limits)
 
 
@@ -494,17 +499,15 @@ def _holding_cell(row: Mapping[str, object]) -> str:
     text = _count(row.get("open_count"))
     pending = row.get("close_pending_count")
     if type(pending) is not int or pending != 0:
-        text += f" (決済待ち {_count(pending)})"
+        text += f" (決済未確定 {_count(pending)})"
     return _esc(text)
 
 
 def _strategy_row(row: Mapping[str, object], limits: tuple[int, int] | None) -> str:
-    closed = _count(row.get("closed_count"))
-    unknown = row.get("pnl_unknown_count")
-    if type(unknown) is not int or unknown != 0:
-        closed += f" (損益不明 {_count(unknown)})"
-    wins, losses, flats = (_count(row.get(k)) for k in ("wins", "losses", "flats"))
     known = row.get("pnl_known_count")
+    closed = (f"{_count(row.get('closed_count'))} (損益既知 {_count(known)} / "
+              f"不明 {_count(row.get('pnl_unknown_count'))})")
+    wins, losses, flats = (_count(row.get(k)) for k in ("wins", "losses", "flats"))
     total = NONE_TEXT if row.get("total_pnl") is None and known == 0 \
         else _signed_amount(row.get("total_pnl"))
     cells = [_origin_cell(row), _esc(closed), _esc(f"{wins} / {losses} / {flats}"),
@@ -521,14 +524,20 @@ def strategy_rows(data: Mapping[str, object]) -> list[dict]:
 
 def _strategy_table(data: Mapping[str, object], *, table: bool = True) -> str:
     rows = strategy_rows(data)
+    raw = data.get("strategies")
     unit = _currency(data)
     heads = list(STRATEGY_HEADERS)
     if unit:
         heads[6] += f" ({unit})"
     heading = "<section><h2>起動理由ごとの表</h2>"
+    if type(raw) is not list or (raw and not rows):
+        return heading + f"<p>{NOTE_STRATEGIES_UNKNOWN}</p></section>"
     if not rows:
         return heading + "<p>この期間に決済した取引も、保有中の取引もありません</p></section>"
-    if not any(type(r.get("closed_count")) is int and r["closed_count"] > 0 for r in rows):
+    counts = [r.get("closed_count") for r in rows]
+    if any(type(c) is not int or c < 0 for c in counts):
+        empty = f"<p>{NOTE_CLOSED_UNKNOWN}</p>"
+    elif not any(counts):
         empty = "<p>この期間に決済した取引はありません</p>"
     else:
         empty = ""
@@ -568,13 +577,32 @@ def _strategy_figure(data: Mapping[str, object], tz: str, *, draw: bool = True) 
         body += f"<p>ほか {_count(hidden)} 戦略は表のみです</p>"
     if chart.svg:
         for item in chosen:
-            closed = item.row.get("closed_count")
-            if type(closed) is int and closed > SERIES_HISTORY:
-                body += (f"<p>{_esc(item.origin)}: 古い決済 {_count(closed - SERIES_HISTORY)} 件は"
-                         "始点の 1 点にまとめています</p>")
+            body += _series_start_note(item, data, tz)
             if item.row.get("pnl_known_count") == 0 and item.row.get("closed_count"):
                 body += f"<p>{_esc(item.origin)}: 損益が不明のため、0 の線です</p>"
     return "<section><h2>累積損益の図</h2>" + body + "</section>"
+
+
+def _series_start_note(item: svg.Series, data: Mapping[str, object], tz: str) -> str:
+    """線が期間の初めから始まらない系列の、描画開始時刻と省いた古い決済の件数。"""
+    points = [p for p in svg._cumulative(item.row.get("cumulative")) if p is not None]
+    if not points:
+        return ""
+    closed = item.row.get("closed_count")
+    omitted = max(closed - SERIES_HISTORY, 0) if type(closed) is int else None
+    period_start = svg._epoch(data.get("from"))
+    late = period_start is not None and points[0][0] > period_start
+    if not late and not omitted:
+        return ""
+    start = svg._full(points[0][0], tz) or UNKNOWN
+    name = _esc(item.origin)
+    if omitted is None:
+        head = f"古い決済の件数は不明です。{_esc(start)} の始点 1 点にまとめています"
+    elif omitted:
+        head = f"古い決済 {_count(omitted)} 件は {_esc(start)} の始点 1 点にまとめています"
+    else:
+        head = f"線は {_esc(start)} から描いています"
+    return f"<p>{name}: {head} (これより前の線は描いていません)</p>"
 
 
 def _strategy_warnings(data: Mapping[str, object]) -> str:

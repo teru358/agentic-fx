@@ -412,12 +412,13 @@ MAX_SERIES_POINTS = 122
 SERIES_CSS = ("c1", "c2", "c3", "c4")
 CRON_CSS = "cr"
 CRON_ORIGIN = "cron"
-_ORIGIN = re.compile(r"cron|signal:[a-z][a-z0-9_]{0,63}\Z")
+_ORIGIN = re.compile(r"cron|signal:[a-z][a-z0-9_]{0,63}")
 LEGEND_TOP = 226
 LEGEND_ROW = 16
 NOTE_STRATEGY_OVER = "累積損益の図は表示の上限を超えたため省きました。数字は下の表を見てください"
 NOTE_NO_SERIES = "図に描ける累積損益がありません。数字は下の表を見てください"
 NO_PNL = "損益不明"
+NO_END = "終点 不明"
 
 
 class Series(NamedTuple):
@@ -439,7 +440,7 @@ def series_rows(rows: object) -> tuple[list[Series], int]:
                 or not row["cumulative"]:
             continue
         origin = row.get("origin")
-        if type(origin) is not str or not _ORIGIN.match(origin):
+        if type(origin) is not str or not _ORIGIN.fullmatch(origin):
             continue
         if origin == CRON_ORIGIN:
             chosen.append(Series(CRON_CSS, origin, row))
@@ -460,6 +461,17 @@ def _cumulative(raw: object) -> list[tuple[float, float] | None]:
         pnl = _number(item.get("pnl")) if type(item) is dict else None
         out.append(None if at is None or pnl is None else (at, pnl))
     return out
+
+
+def _end_value(points: Sequence[tuple[float, float] | None], total: object) -> float | None:
+    """線の終点。最後の点が読めない、または表の合計と食い違うときは None (終点は不明)。"""
+    last = points[-1] if points else None
+    expected = _number(total)
+    if last is None or expected is None:
+        return None
+    if abs(last[1] - expected) > 1e-6 * max(1.0, abs(expected)):
+        return None
+    return last[1]
 
 
 def _stair(scale: _Scale, points: Sequence[tuple[float, float]]) -> list[tuple[int, int]]:
@@ -516,7 +528,11 @@ def draw_strategies(data: Mapping[str, object], tz: str, amount) -> Chart:
         for chunk in _chunks(points, lambda p: p is not None):
             out.append(_line(item.css, _stair(scale, chunk)))
         known = item.row.get("pnl_known_count")
-        end = NO_PNL if type(known) is int and known == 0 else f"終点 {amount(line[-1][1])}"
+        if type(known) is int and known == 0:
+            end = NO_PNL
+        else:
+            last = _end_value(points, item.row.get("total_pnl"))
+            end = NO_END if last is None else f"終点 {amount(last)}"
         legend.append((item.css, f"{item.origin} {end}"))
     height = LEGEND_TOP + LEGEND_ROW * (len(legend) - 1) + 8
     opening = (f'<svg viewBox="0 0 {VIEW_W} {height}" role="img" '

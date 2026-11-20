@@ -17,14 +17,16 @@ SENTENCE = ("その戦略のシグナルで起きた判断の成績です。建�
 
 def row(origin="signal:rsi", *, closed=12, known=None, wins=7, losses=4, flats=1, rate=0.583,
         pf=1.4, avg_r=0.21, r_known=None, total=123.45, reasons=None, holding=1, pending=0,
-        cumulative=None, **over):
+        cumulative=None, pf_state=None, **over):
     known = closed if known is None else known
     base = {"origin": origin, "origin_count": 1, "closed_count": closed, "pnl_known_count": known,
             "r_known_count": known if r_known is None else r_known,
             "pnl_unknown_count": closed - known,
             "r_unknown_count": closed - (known if r_known is None else r_known),
             "open_count": holding, "close_pending_count": pending, "wins": wins, "losses": losses,
-            "flats": flats, "win_rate": rate, "pf": pf, "avg_r": avg_r, "total_pnl": total,
+            "flats": flats, "win_rate": rate, "pf": pf,
+            "pf_state": ("computed" if isinstance(pf, float) and pf == pf and abs(pf) != float("inf")
+                         else "unknown") if pf_state is None else pf_state, "avg_r": avg_r, "total_pnl": total,
             "close_reasons": reasons or {"llm_close": 8, "sl": 3, "tp": 1, "other": 0},
             "cumulative": [{"t": iso(0), "pnl": 0.0}, {"t": iso(2000), "pnl": 50.0},
                            {"t": iso(3000), "pnl": total}, {"t": iso(10000), "pnl": total}]
@@ -114,7 +116,7 @@ def test_the_table_has_the_nine_columns_with_the_unit_and_a_right_aligned_class(
 
 def test_a_row_with_twelve_closed_shows_the_rates_as_reference_and_the_counts():
     cells = table_cells(strategy_page(data_of(row())))[0]
-    assert cells == ["signal:rsi", "12", "7 / 4 / 1", "58.3% (参考)", "1.40 (参考)",
+    assert cells == ["signal:rsi", "12 (損益既知 12 / 不明 0)", "7 / 4 / 1", "58.3% (参考)", "1.40 (参考)",
                      "+0.21 (参考)|R 算出 12 / 決済 12 件", "+123.45", "判断 8 / SL 3 / TP 1", "1"]
 
 
@@ -134,7 +136,7 @@ def test_each_rate_uses_its_own_denominator():
     assert cells[3] == "58.3%" and cells[4] == "1.40" and cells[5].startswith("–|") \
         and "R 算出 4 / 決済 40 件" in cells[5]
     unknown = table_cells(strategy_page(data_of(row(closed=40, known=3, r_known=40))))[0]
-    assert unknown[1] == "40 (損益不明 37)" and unknown[3] == "–" and unknown[5].startswith("+0.21|")
+    assert unknown[1] == "40 (損益既知 3 / 不明 37)" and unknown[3] == "–" and unknown[5].startswith("+0.21|")
 
 
 def test_the_thresholds_come_from_the_daemon_and_unreadable_ones_make_the_rates_unknown():
@@ -150,7 +152,8 @@ def test_the_thresholds_come_from_the_daemon_and_unreadable_ones_make_the_rates_
 
 
 def test_a_profit_factor_without_losses_is_told_so_and_not_shown_as_a_number():
-    cells = table_cells(strategy_page(data_of(row(closed=40, wins=40, losses=0, flats=0, pf=None))))[0]
+    cells = table_cells(strategy_page(data_of(row(closed=40, wins=40, losses=0, flats=0, pf=None,
+                                                      pf_state="no_losses"))))[0]
     assert cells[4] == "損失なし"
     assert table_cells(strategy_page(data_of(row(closed=40, pf=None))))[0][4] == "不明"
 
@@ -179,7 +182,7 @@ def test_the_close_reasons_list_the_nonzero_ones_and_a_holding_only_row_still_ap
                holding=2, pending=1, cumulative=[])
     html = strategy_page(data_of(held))
     cells = table_cells(html)[0]
-    assert cells[1:] == ["0", "0 / 0 / 0", "–", "–", "–|R 算出 0 / 決済 0 件", "–", "–", "2 (決済待ち 1)"]
+    assert cells[1:] == ["0 (損益既知 0 / 不明 0)", "0 / 0 / 0", "–", "–", "–|R 算出 0 / 決済 0 件", "–", "–", "2 (決済未確定 1)"]
     assert "この期間に決済した取引はありません" in html and "<svg" not in html
     assert svg.NOTE_NO_SERIES in figure_part(html)
 
@@ -295,7 +298,8 @@ def test_the_series_with_more_than_the_history_says_the_old_closes_are_folded_in
     cumulative = [{"t": iso(4000), "pnl": 500.0}] + [{"t": iso(4000 + i), "pnl": 500.0 + i}
                                                       for i in range(1, 6)]
     html = strategy_page(data_of(row(closed=125, cumulative=cumulative)))
-    assert "signal:rsi: 古い決済 5 件は始点の 1 点にまとめています" in figure_part(html)
+    start = svg._full(svg._epoch(iso(4000)), "Asia/Tokyo")
+    assert f"signal:rsi: 古い決済 5 件は {start} の始点 1 点にまとめています" in figure_part(html)
     assert "古い決済" not in strategy_page(data_of(row(closed=120)))
 
 
@@ -463,3 +467,87 @@ def test_a_page_over_the_total_budget_drops_the_figure_first_then_the_table(monk
 
 def test_the_style_is_unchanged_by_the_strategy_tab_and_stays_within_the_limit():
     assert len(render.STYLE.encode("utf-8")) <= 4096
+
+
+# --- 異常な応答は正常に倒さない ---------------------------------------------------------------
+
+def test_the_profit_factor_is_told_by_the_daemons_state_and_an_unreadable_pair_is_unknown():
+    def cell(**over):
+        return table_cells(strategy_page(data_of(row(closed=40, wins=40, losses=0, flats=0,
+                                                     **over))))[0][4]
+    assert cell(pf=None, pf_state="no_losses") == "損失なし"
+    assert cell(pf=1.5, pf_state="computed") == "1.50"
+    for pf, state in ((None, "computed"), (None, "unknown"), (None, None), (None, "x"),
+                      (1.5, "unknown"), (1.5, "no_losses"), (float("nan"), "computed"),
+                      (None, True)):
+        assert cell(pf=pf, pf_state=state) == "不明"
+    missing = row(closed=40, wins=40, losses=0, flats=0, pf=None)
+    del missing["pf_state"]
+    assert table_cells(strategy_page(data_of(missing)))[0][4] == "不明"
+
+
+def test_a_row_always_states_both_the_known_and_the_unknown_pnl_counts():
+    cells = table_cells(strategy_page(data_of(row(closed=10, known=10))))[0]
+    assert cells[1] == "10 (損益既知 10 / 不明 0)"
+    for bad in ("x", None, -1, True):
+        cells = table_cells(strategy_page(data_of(row(closed=10, pnl_known_count=bad, pnl_unknown_count=bad))))[0]
+        assert cells[1] == "10 (損益既知 不明 / 不明 不明)"
+
+
+@pytest.mark.parametrize("bad", [None, "x", {}, 5, [5, "x"]])
+def test_a_strategies_list_that_cannot_be_read_is_unknown_not_an_empty_period(bad):
+    data = data_of()
+    data["strategies"] = bad
+    section = perf_pages._strategy_table(data)
+    assert "取引も、保有中の取引もありません" not in section and "決済した取引はありません" not in section
+    assert "戦略別の成績を読めません" in section
+    del data["strategies"]
+    assert "戦略別の成績を読めません" in perf_pages._strategy_table(data)
+    assert "取引も、保有中の取引もありません" in perf_pages._strategy_table(data_of())
+
+
+@pytest.mark.parametrize("bad", [None, "x", -1, True, 1.5])
+def test_an_unreadable_closed_count_never_says_nothing_was_closed(bad):
+    html = strategy_page(data_of(row(closed=0, known=0, wins=0, losses=0, flats=0, rate=None,
+                                     pf=None, avg_r=None, total=None, closed_count=bad)))
+    assert "決済した取引はありません" not in html
+    assert "決済の件数を読めない行があります" in html
+
+
+def test_a_legend_end_that_cannot_be_read_or_disagrees_with_the_table_is_unknown():
+    broken = [{"t": iso(0), "pnl": 0.0}, {"t": iso(2000), "pnl": 10.0}, {"t": iso(10000), "pnl": "x"}]
+    html = strategy_page(data_of(row(total=20.0, cumulative=broken)))
+    figure = figure_part(html)
+    assert "signal:rsi 終点 不明" in figure and "+10.00" not in "".join(parse(figure).texts)
+    short = [{"t": iso(0), "pnl": 0.0}, {"t": iso(2000), "pnl": 10.0}, {"t": iso(10000), "pnl": 10.0}]
+    html = strategy_page(data_of(row(total=20.0, cumulative=short)))
+    assert "signal:rsi 終点 不明" in figure_part(html)
+    ok = strategy_page(data_of(row(total=10.0, cumulative=short)))
+    assert "signal:rsi 終点 +10.00" in figure_part(ok)
+
+
+def test_a_series_that_starts_after_the_period_start_states_the_start_time_and_the_omitted_count():
+    folded = [{"t": iso(4000), "pnl": 500.0}, {"t": iso(5000), "pnl": 510.0},
+              {"t": iso(10000), "pnl": 510.0}]
+    html = strategy_page(data_of(row(closed=125, cumulative=folded)))
+    start = svg._full(svg._epoch(iso(4000)), "Asia/Tokyo")
+    assert start and f"古い決済 5 件は {start} の始点 1 点にまとめています" in figure_part(html)
+    assert "これより前の線は描いていません" in figure_part(html)
+    late = [{"t": iso(4000), "pnl": 0.0}, {"t": iso(10000), "pnl": 0.0}]
+    html = strategy_page(data_of(row(closed=3, cumulative=late)))
+    assert "これより前の線は描いていません" in figure_part(html)
+    assert "古い決済" not in figure_part(html)
+
+
+@pytest.mark.parametrize("origin", ["cron<script>", "cron\n", "cronx", "cron ", "signal:rsi\n"])
+def test_an_origin_that_only_starts_like_the_grammar_is_neither_drawn_nor_written(origin):
+    assert svg.series_rows([row(origin)]) == ([], 0)
+    html = strategy_page(data_of(row(origin)))
+    assert "<script" not in html and not re.findall(r"<svg[^>]*>", html)
+    assert [c[0] for c in table_cells(html)] == ["不明"]
+    assert svg.series_rows([row("cron")])[0][0].origin == "cron"
+
+
+def test_a_close_that_may_be_unsettled_is_called_unsettled_not_waiting():
+    cells = table_cells(strategy_page(data_of(row(holding=0, pending=1))))[0]
+    assert cells[8] == "0 (決済未確定 1)" and "待ち" not in "".join(cells)
