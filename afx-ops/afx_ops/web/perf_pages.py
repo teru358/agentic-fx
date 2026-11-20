@@ -158,15 +158,28 @@ def _word_card(table: Mapping[str, str], raw: object) -> tuple[str, str | None]:
     return marks.render_verdict(marks.classify_word(table, raw)), known
 
 
+def _supports_none(current: Mapping[str, object], tz: str) -> bool:
+    """「止める理由なし」と出してよいのは、kill switch が解除と読め、最新記録が新鮮で、
+    必要な 2 つの時刻が読めるときだけ。欠ける・矛盾するなら不明に倒す。"""
+    return (marks.classify_kill_switch(current.get("kill_switch")) == (marks.OK, "解除")
+            and current.get("snapshot_freshness") == "fresh"
+            and _time(current.get("snapshot_at"), tz) != UNKNOWN
+            and _time(current.get("state_fetched_at"), tz) != UNKNOWN)
+
+
 def _current(data: Mapping[str, object], tz: str) -> str:
     current = _dict(data.get("current"))
     unit = _currency(data)
     suffix = f" {unit}" if unit else ""
     kill_switch = current.get("kill_switch")
     generation = _dict(kill_switch).get("generation")
-    hold, hold_word = _word_card(marks.FILL_HOLD, current.get("fill_hold"))
+    raw_hold = current.get("fill_hold")
+    contradicted = raw_hold == "none" and not _supports_none(current, tz)
+    hold, hold_word = _word_card(marks.FILL_HOLD, None if contradicted else raw_hold)
     if hold_word is not None:
         hold += " " + _esc(FILL_HOLD_NOTE[hold_word])
+    elif contradicted:
+        hold += " " + _esc("他の値と合わず、止める理由がないとは言えません")
     fresh, _ = _word_card(marks.FRESHNESS, current.get("snapshot_freshness"))
 
     def money(value: object) -> str:

@@ -241,6 +241,68 @@ def test_current_missing_entirely_is_the_same_as_null():
     assert "○" not in block and "? 不明" in block
 
 
+def _hold_card(data):
+    return re.search(r"<strong>新規の約定</strong>(.*?)</div>", page(data), re.S).group(1)
+
+
+_KS_RELEASED = {"latched": False, "generation": 3, "latched_at": None, "reconcile_required": False}
+_MISSING = object()
+
+
+def _hold_current(kill_switch, hold, freshness="fresh", snapshot_at=_MISSING, fetched=_MISSING):
+    over = {"fill_hold": hold, "snapshot_freshness": freshness}
+    if kill_switch is _MISSING:
+        data = current(**over)
+        del data["kill_switch"]
+    else:
+        data = current(kill_switch=kill_switch, **over)
+    if snapshot_at is not _MISSING:
+        data["snapshot_at"] = snapshot_at
+    if fetched is not _MISSING:
+        data["state_fetched_at"] = fetched
+    return data
+
+
+@pytest.mark.parametrize("kill_switch,freshness,snapshot_at,fetched,shows_none", [
+    (_KS_RELEASED, "fresh", _MISSING, _MISSING, True),
+    (_MISSING, "fresh", _MISSING, _MISSING, False),
+    (None, "fresh", _MISSING, _MISSING, False),
+    ({"latched": False}, "fresh", _MISSING, _MISSING, False),
+    ({"latched": True, "generation": 4, "reconcile_required": False}, "fresh", _MISSING,
+     _MISSING, False),
+    ({"latched": False, "generation": 4, "reconcile_required": True}, "fresh", _MISSING,
+     _MISSING, False),
+    (_KS_RELEASED, "stale", _MISSING, _MISSING, False),
+    (_KS_RELEASED, "unknown", _MISSING, _MISSING, False),
+    (_KS_RELEASED, "fresh", None, _MISSING, False),
+    (_KS_RELEASED, "fresh", "garbage", _MISSING, False),
+    (_KS_RELEASED, "fresh", _MISSING, None, False),
+    (_KS_RELEASED, "fresh", _MISSING, "garbage", False),
+])
+def test_none_is_shown_as_no_reason_only_when_the_other_fields_agree(
+        kill_switch, freshness, snapshot_at, fetched, shows_none):
+    data = payload(current=_hold_current(kill_switch, "none", freshness, snapshot_at, fetched))
+    card = _hold_card(data)
+    if shows_none:
+        assert "○" in card and "止める理由は見つかっていません" in card
+    else:
+        assert "? 不明" in card and "○" not in card
+        assert "止める理由は見つかっていません" not in card
+
+
+@pytest.mark.parametrize("hold,mark", [("kill_switch", "danger"), ("drawdown", "danger"),
+                                       ("stale", "warn"), ("unknown", None)])
+@pytest.mark.parametrize("kill_switch,freshness", [
+    (_MISSING, "unknown"), (None, "stale"), (_KS_RELEASED, "fresh"),
+    ({"latched": True, "generation": 4, "reconcile_required": False}, "fresh")])
+def test_a_reason_other_than_none_is_still_shown_whatever_the_other_fields_say(
+        hold, mark, kill_switch, freshness):
+    card = _hold_card(payload(current=_hold_current(kill_switch, hold, freshness)))
+    assert hold in card
+    if mark:
+        assert f'class="st {mark}"' in card
+
+
 def test_the_account_numbers_are_formatted_and_a_stale_or_unknown_freshness_is_not_fresh():
     html = page(payload(current=current(snapshot_freshness="stale", snapshot_age_sec=700.0,
                                         fill_hold="stale")))
