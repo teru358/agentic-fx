@@ -967,11 +967,18 @@ def _strategy_section(conn, start: datetime, end: datetime, account_currency: st
 
 # --- 機械採点 (配備中の戦略ごとの前方成績) ----------------------------------------------------
 
-def _raise_if_stopped(exc: sqlite3.OperationalError, check: Callable[[], None] | None) -> None:
-    """中断要求による SQL の打ち切りは伝播し、ほかの局所的な SQL エラーは呼び元で行の不明にする。"""
+def _is_busy(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
+
+
+def _raise_if_not_local(exc: Exception, check: Callable[[], None] | None) -> None:
+    """中断要求・busy は伝播する (応答を作り直せる失敗を、行の不明にしない)。
+    ほかの局所的な SQL エラーは呼び元で行の不明にする。"""
     if check is not None:
         check()
-    if "interrupted" in str(exc):
+    if isinstance(exc, sqlite3.OperationalError) and (
+            "interrupted" in str(exc) or _is_busy(exc)):
         raise exc
 
 
@@ -980,32 +987,27 @@ def _forward_section(conn: sqlite3.Connection, plugins_root: Path | None, now: d
     """配備中の戦略ごとの機械採点。期間 (range) とは別に、現世代内・最大 12 週で集計する。
 
     対象を読めなければ節ごと `unavailable` (実取引の応答は変えない)。世代の開始時刻が
-    読めない戦略は数値を持たず `undetermined`。DB の読取は呼び出し元と同じ 1 本の transaction。"""
+    読めない戦略は数値を持たず `undetermined`。DB の読取は呼び出し元と同じ 1 本の transaction。
+    種別を読めない entry の数は `unreadable_entries` に載せる。"""
     from agentic_fx.plugin import read_model_inputs
     if plugins_root is None:
-        return {"state": "unavailable", "strategies": [], "omitted": 0}
+        return {"state": "unavailable", "strategies": [], "omitted": 0, "unreadable_entries": 0}
     try:
         targets = read_model_inputs.forward_targets_reader(plugins_root)(conn)
     except sqlite3.OperationalError as exc:
-        _raise_if_stopped(exc, check)
-        return {"state": "unavailable", "strategies": [], "omitted": 0}
+        _raise_if_not_local(exc, check)
+        return {"state": "unavailable", "strategies": [], "omitted": 0, "unreadable_entries": 0}
     except Exception:  # noqa: BLE001 - 読めない面は「不明」にし、実取引の応答は返す
-        return {"state": "unavailable", "strategies": [], "omitted": 0}
+        return {"state": "unavailable", "strategies": [], "omitted": 0, "unreadable_entries": 0}
     shown = targets[:MAX_FORWARD_ROWS]
     out = []
     for target in shown:
         if check is not None:
             check()
-        try:
-            out.append(signal_forward.forward_summary(conn, target, now=now))
-        except Exception as exc:  # noqa: BLE001 - 1 本の失敗でほかの戦略を隠さない
-            if isinstance(exc, sqlite3.OperationalError):
-                _raise_if_stopped(exc, check)
-            out.append({"name": target.name, "content_hash": target.content_hash,
-                        "state": signal_forward.STATE_FAILED, "reason": "summary_failed",
-                        "thresholds": {"min_count": signal_forward.MIN_COUNT,
-                                       "reference_count": signal_forward.REFERENCE_COUNT}})
-    return {"state": "ok", "strategies": out, "omitted": len(targets) - len(shown)}
+        out.append(signal_forward.summary_or_failed(
+            conn, target, now=now, on_error=lambda exc: _raise_if_not_local(exc, check)))
+    return {"state": "ok", "strategies": out, "omitted": len(targets) - len(shown),
+            "unreadable_entries": getattr(targets, "unreadable_entries", 0)}
 
 
 # --- 入口 -----------------------------------------------------------------------------

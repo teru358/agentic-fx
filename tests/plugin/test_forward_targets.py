@@ -133,21 +133,24 @@ def test_the_reader_scans_the_plugins_and_reads_the_journal_through_the_given_co
         ("strat", meta.content_hash, (0, op))]
 
 
-def _with_entries(world, mutate):
+def _listed_with_entries(world, mutate):
     import dataclasses
     inputs = read_model_inputs.collect_inputs(world.plugins, world.conn)
     entries = mutate(list(inputs.live.entries))
     live = dataclasses.replace(inputs.live, entries=tuple(entries))
-    return {t.name: t for t in read_model.forward_targets(
-        dataclasses.replace(inputs, live=live))}
+    return read_model.forward_targets(dataclasses.replace(inputs, live=live))
 
 
-def test_an_unreadable_live_entry_is_an_undetermined_target_not_a_missing_one(world):
+def _with_entries(world, mutate):
+    return {t.name: t for t in _listed_with_entries(world, mutate)}
+
+
+def test_an_unreadable_live_entry_of_unknown_kind_is_not_a_strategy_row_but_is_counted(world):
     put_strategy(world, "good")
-    found = _with_entries(world, lambda es: es + [read_model.LiveEntry(
+    listed = _listed_with_entries(world, lambda es: es + [read_model.LiveEntry(
         "broken", "unreadable", None, None, "invalid_manifest")])
-    assert found["broken"].reason == usage_review.REASON_STRATEGY_UNREADABLE
-    assert found["broken"].started_at is None and found["broken"].generation is None
+    found = {t.name: t for t in listed}
+    assert "broken" not in found and listed.unreadable_entries == 1
     assert found["good"].reason is None and found["good"].started_at is not None
 
 
@@ -158,7 +161,64 @@ def test_two_readable_entries_with_the_same_name_make_that_name_undetermined(wor
     assert found["dup"].started_at is None
 
 
-def test_a_single_unreadable_entry_is_not_an_empty_list(world):
-    found = _with_entries(world, lambda es: [read_model.LiveEntry(
+def test_a_single_unreadable_entry_is_not_an_empty_list_but_a_counted_unknown(world):
+    listed = _listed_with_entries(world, lambda es: [read_model.LiveEntry(
         "broken", "unreadable", None, None, "io_error")])
-    assert list(found) == ["broken"]
+    assert list(listed) == [] and listed.unreadable_entries == 1
+
+
+def test_a_readable_strategy_in_a_state_that_is_neither_link_nor_plain_is_undetermined(world):
+    import dataclasses
+    put_strategy(world, "strat")
+    found = _with_entries(world, lambda es: [
+        dataclasses.replace(es[0], state=read_model.ENTITY_UNREADABLE)])
+    assert found["strat"].reason == usage_review.REASON_STRATEGY_UNREADABLE
+    assert found["strat"].started_at is None
+
+
+def test_readable_entries_only_leave_no_unreadable_count(world):
+    put_strategy(world, "good")
+    inputs = read_model_inputs.collect_inputs(world.plugins, world.conn)
+    assert read_model.forward_targets(inputs).unreadable_entries == 0
+
+
+def test_the_generation_source_codes_have_one_home(world):
+    assert usage_review.SOURCE_JOURNAL == sf.GENERATION_SOURCE_JOURNAL
+    assert usage_review.SOURCE_DEPLOY_OP == sf.GENERATION_SOURCE_DEPLOY_OP
+    assert set(sf.GENERATION_SOURCE_NAMES) == {usage_review.SOURCE_JOURNAL,
+                                               usage_review.SOURCE_DEPLOY_OP}
+
+
+def test_the_eligibility_condition_is_a_public_function_of_the_signal_store():
+    from agentic_fx.store import signals
+    assert callable(signals.eligibility_case) and not hasattr(signals, "_eligibility_case")
+
+
+class _LockedConn:
+    def __init__(self, message):
+        self.message = message
+
+    def execute(self, *args, **kwargs):
+        import sqlite3
+        raise sqlite3.OperationalError(self.message)
+
+
+@pytest.mark.parametrize("message", ["database is locked", "database is busy", "interrupted"])
+def test_a_retryable_failure_is_raised_by_the_forward_reader_not_turned_into_unreadable(
+        world, message):
+    import sqlite3
+    put_strategy(world)
+    with pytest.raises(sqlite3.OperationalError):
+        read_model_inputs.forward_targets_reader(world.plugins)(_LockedConn(message))
+
+
+def test_the_shared_reader_still_turns_every_failure_into_a_status_by_default():
+    rows = read_model_inputs.read_db_inputs(_LockedConn("database is locked"))
+    assert rows["journal_status"] == SOURCE_UNAVAILABLE
+    assert rows["pending_status"] == SOURCE_UNAVAILABLE
+
+
+def test_a_non_retryable_failure_is_still_a_status_even_for_the_forward_reader():
+    rows = read_model_inputs.read_db_inputs(_LockedConn("no such table: x"),
+                                            raise_retryable=True)
+    assert rows["journal_status"] == SOURCE_UNAVAILABLE

@@ -29,7 +29,7 @@ from agentic_fx.plugin.resolve import (
     STATE_MATCH, STATE_UNKNOWN, AliasState, ApprovedInventory, enumerate_indicator_states,
 )
 from agentic_fx.store import plugin_deploy_ops as deploy_store
-from agentic_fx.store.signal_forward import ForwardTarget
+from agentic_fx.store.signal_forward import ForwardTarget, ForwardTargets
 from agentic_fx.tools.plugin_loader import approved_hashes_from_rows
 
 KIND_STRATEGY = "strategy"
@@ -676,29 +676,34 @@ def _usage_review(inputs: ReadInputs, rows: Sequence[PluginRow], requests: Seque
     return usage_scan, facts
 
 
-def forward_targets(inputs: ReadInputs) -> list[ForwardTarget]:
+def forward_targets(inputs: ReadInputs) -> ForwardTargets:
     """配備中の戦略ごとの前方成績の対象 (名前の順)。世代は棚卸しと同じ投影から取る。
 
-    読める 1 本の live entry を持つ戦略は数える。読めない entry がある・同名の entry が
-    複数ある名前は、時刻を持たず理由だけを持つ対象にして (正常な空の一覧と区別する)、数値を
-    出す側が「判定不能」にする。journal が読めない・遷移が合わない戦略も同じ。"""
+    読める 1 本の strategy の entry は数える。同名が複数ある・strategy なのに link でも
+    plain でもない名前は、時刻を持たず理由だけを持つ対象にして (正常な空の一覧と区別する)、
+    数値を出す側が「判定不能」にする。journal が読めない・遷移が合わない戦略も同じ。
+    種別を読めない entry は戦略かどうか決められないので行にせず、数だけ `unreadable_entries`
+    に持つ (数値を出す側が「読めない entry があります」と注記する)。"""
     by_name: dict[str, list[LiveEntry]] = {}
+    unreadable_entries = 0
     for entry in inputs.live.entries:
-        key = entry.meta.name if entry.meta is not None else entry.entry_name
-        by_name.setdefault(key, []).append(entry)
+        if entry.meta is None:
+            unreadable_entries += 1
+            continue
+        by_name.setdefault(entry.meta.name, []).append(entry)
     journal_readable = inputs.journal_status != SOURCE_UNAVAILABLE
     transitions = transitions_by_name(inputs)
     result = []
     for name in sorted(by_name):
         entries = by_name[name]
-        readable = [entry for entry in entries if entry.meta is not None]
-        if len(readable) != len(entries) or len(readable) > 1:
+        strategies = [entry for entry in entries if entry.meta.kind == KIND_STRATEGY]
+        if not strategies:
+            continue
+        if len(entries) > 1 or strategies[0].state not in (ENTITY_SYMLINK, ENTITY_PLAIN):
             result.append(ForwardTarget(name, "", None, None,
                                         usage_review.REASON_STRATEGY_UNREADABLE))
             continue
-        entry = readable[0]
-        if entry.meta.kind != KIND_STRATEGY or entry.state not in (ENTITY_SYMLINK, ENTITY_PLAIN):
-            continue
+        entry = strategies[0]
         content = entry.meta.content_hash
         if not journal_readable:
             result.append(ForwardTarget(name, content, None, None,
@@ -707,7 +712,7 @@ def forward_targets(inputs: ReadInputs) -> list[ForwardTarget]:
         started, order, reason = usage_review.generation_of(
             transitions.get(name, ()), entry.artifact_hash)
         result.append(ForwardTarget(name, content, started, order, reason))
-    return result
+    return ForwardTargets(result, unreadable_entries=unreadable_entries)
 
 
 # ---------------------------------------------------------------- DTO

@@ -455,6 +455,7 @@ def test_a_table_over_its_budget_is_replaced_whole_by_a_note_and_the_figure_stay
 
 
 def test_a_page_over_the_total_budget_drops_the_figure_first_then_the_table(monkeypatch):
+    monkeypatch.setattr(perf_pages, "_forward_section", lambda data, tz: "")
     data = data_of(row(), row("signal:b", closed=9))
     full = len(strategy_page(data).encode("utf-8"))
     monkeypatch.setattr(perf_pages, "STRATEGY_PAGE_BUDGET_BYTES", full - 1)

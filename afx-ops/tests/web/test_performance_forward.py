@@ -41,7 +41,8 @@ def forward_row(name="alpha", *, n=6, abandoned=2, pnl=1.0, hash_="a" * 64):
                      "unterminated": 0},
         "holes": {"abandoned": {"freshness_expired": abandoned} if abandoned else {},
                   "no_fill": 0, "data_insufficient": 0, "unterminated": 0,
-                  "as_of_unknown": 0, "oldest_unterminated_sec": None, "r_unknown": 0},
+                  "as_of_unknown": 0, "oldest_unterminated_sec": None, "r_unknown": 0,
+                  "time_unreadable": 0},
         "reach": {"signals": n + abandoned, "decided": n,
                   "rate": n / (n + abandoned) if n + abandoned else None},
         "concentration": {"days": n, "max_day_count": 1, "max_day_share": 1 / n if n else None},
@@ -52,7 +53,8 @@ def forward_row(name="alpha", *, n=6, abandoned=2, pnl=1.0, hash_="a" * 64):
 
 
 def with_forward(*rows, state="ok", omitted=0):
-    return data_of(forward={"state": state, "strategies": list(rows), "omitted": omitted})
+    return data_of(forward={"state": state, "strategies": list(rows), "omitted": omitted,
+                            "unreadable_entries": 0})
 
 
 def forward_part(html):
@@ -219,3 +221,69 @@ def test_the_side_rows_stay_within_the_same_budget():
     rows = [forward_row(name=f"s{i:02d}" + "x" * 40) for i in range(32)]
     section = perf_pages._forward_section(with_forward(*rows), "Asia/Tokyo")
     assert len(section.encode("utf-8")) <= perf_pages.FORWARD_TABLE_BUDGET_BYTES
+
+
+def test_a_list_without_any_readable_row_is_unknown_not_an_empty_table():
+    for bad in ([1, 2], ["x"], [None]):
+        text = forward_part(strategy_page(with_forward(*bad)))
+        assert "機械採点を読めません" in text
+        assert "<tbody></tbody>" not in text and "<table" not in text
+
+
+def test_a_count_of_unreadable_entries_is_stated_next_to_the_table():
+    data = with_forward(forward_row())
+    data["forward"]["unreadable_entries"] = 2
+    text = forward_part(strategy_page(data))
+    assert "読めない配備の entry が 2 件あります" in text and "<table" in text
+
+
+def test_an_unreadable_entry_count_alone_does_not_read_as_no_deployed_strategy():
+    data = with_forward()
+    data["forward"]["unreadable_entries"] = 1
+    text = forward_part(strategy_page(data))
+    assert "読めない配備の entry が 1 件あります" in text
+    assert "配備中の戦略はありません" not in text
+
+
+def test_a_broken_unreadable_entry_count_reads_as_unknown():
+    data = with_forward(forward_row())
+    data["forward"]["unreadable_entries"] = "x"
+    assert "読めない配備の entry が不明です" in forward_part(strategy_page(data))
+
+
+def test_the_unreadable_time_hole_is_shown_in_the_row():
+    row = forward_row()
+    row["holes"]["time_unreadable"] = 3
+    assert "時刻不明 3" in cells(strategy_page(with_forward(row)))[0][-3]
+
+
+def test_the_largest_forward_section_does_not_push_the_real_trade_chart_out(monkeypatch):
+    from tests.web.test_performance_strategy import table_cells, worst_data
+    rows = [forward_row(name=f"s{i:02d}" + "x" * 40, abandoned=9) for i in range(32)]
+    while perf_pages.NOTE_FORWARD_OVER in perf_pages._forward_section(
+            with_forward(*rows), "Asia/Tokyo"):
+        rows.pop()                       # 自分の予算に収まる最大の表
+    assert len(rows) >= 5
+    data = worst_data()
+    data["forward"] = {"state": "ok", "strategies": rows, "omitted": 0, "unreadable_entries": 0}
+    full = len(strategy_page(data).encode("utf-8"))
+    section = len(perf_pages._forward_section(data, "Asia/Tokyo").encode("utf-8"))
+    # 実取引の部分だけがちょうど収まる予算にしても、機械採点の節の分では図を落とさない
+    monkeypatch.setattr(perf_pages, "STRATEGY_PAGE_BUDGET_BYTES", full - section)
+    html = strategy_page(data)
+    assert html.count("<svg") == 1 and len(table_cells(html)) == 32
+    assert "機械採点の表は表示の上限を超えたため" not in html
+    assert len(html.encode("utf-8")) == full
+
+
+def test_every_replacement_forced_still_ends_in_a_page_without_clipping(monkeypatch):
+    from afx_ops.web import render
+    from tests.web.test_performance_strategy import worst_data
+    monkeypatch.setattr(perf_pages, "STRATEGY_PAGE_BUDGET_BYTES", 1)
+    rows = [forward_row(name=f"s{i:02d}" + "x" * 40, abandoned=9) for i in range(32)]
+    data = worst_data()
+    data["forward"] = {"state": "ok", "strategies": rows, "omitted": 0}
+    html = strategy_page(data)
+    assert "Output clipped" not in html and "<svg" not in html
+    assert len(html.encode("utf-8")) <= render.MAX_RESPONSE_BYTES
+    assert "機械採点 (配備中の戦略ごと)" in html

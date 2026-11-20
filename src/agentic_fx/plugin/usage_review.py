@@ -28,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 
 from agentic_fx.plugin.loader import _PLUGIN_NAME_RE
 from agentic_fx.plugin.logic_identity import _unescape
+from agentic_fx.store import signal_forward
 
 # 未使用と見なすまでの週数。境界は「配備から K 週以上」「候補が K 週より新しい」。
 K_WEEKS = 8
@@ -213,8 +214,8 @@ class Transition:
     order: tuple[int, int]             # (source, op_id)。同時刻の並べ替えだけに使う
 
 
-SOURCE_JOURNAL = 0
-SOURCE_DEPLOY_OP = 1
+SOURCE_JOURNAL = signal_forward.GENERATION_SOURCE_JOURNAL
+SOURCE_DEPLOY_OP = signal_forward.GENERATION_SOURCE_DEPLOY_OP
 
 
 def generation_of(transitions: Sequence[Transition], live_artifact: str | None

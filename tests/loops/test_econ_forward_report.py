@@ -197,3 +197,24 @@ def test_a_result_that_came_after_the_report_time_is_not_shown_as_a_win(conn):
                                      forward_targets=lambda c: [target()])
     text = section(report(facts))
     assert "全採否: N=1 " in text and "未終端=1" in text
+
+
+def test_an_unreadable_time_hole_is_written_in_the_holes_line(conn):
+    make = seeded(conn)
+    make.decide(at=NOW - timedelta(days=3))
+    conn.execute("UPDATE signal_decisions SET decided_at='garbage' "
+                 "WHERE id=(SELECT MAX(id) FROM signal_decisions)")
+    conn.commit()
+    facts = esr.collect_report_facts(conn, now=NOW, capacity=None, worker=None,
+                                     forward_targets=lambda c: [target(name="strat")])
+    assert "時刻不明=1" in section(report(facts))
+
+
+def test_unreadable_live_entries_are_written_even_when_no_strategy_is_listed(conn):
+    from agentic_fx.store.signal_forward import ForwardTargets
+    facts = esr.collect_report_facts(
+        conn, now=NOW, capacity=None, worker=None,
+        forward_targets=lambda c: ForwardTargets([], unreadable_entries=2))
+    text = section(report(facts))
+    assert "読めない配備の entry が 2 件あります" in text
+    assert "配備中の戦略はありません" not in text

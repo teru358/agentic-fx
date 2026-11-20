@@ -56,7 +56,8 @@ def test_the_fields_the_page_reads_exist_in_a_real_row():
                  ("reach", "signals"), ("reach", "decided"), ("reach", "rate"),
                  ("holes", "abandoned"), ("holes", "no_fill"), ("holes", "data_insufficient"),
                  ("holes", "unterminated"), ("holes", "oldest_unterminated_sec"),
-                 ("holes", "r_unknown"), ("holes", "as_of_unknown"), ("concentration", "days"),
+                 ("holes", "r_unknown"), ("holes", "as_of_unknown"),
+                 ("holes", "time_unreadable"), ("concentration", "days"),
                  ("concentration", "max_day_count"), ("concentration", "max_day_share"),
                  ("comparison", "recent"), ("comparison", "previous"),
                  ("comparison", "comparable")) + tuple(

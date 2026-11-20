@@ -573,12 +573,15 @@ def _forward_rate(part: dict) -> str:
     return f"{part['decided']}/{part['signals']} ({_percent(part['rate'])})"
 
 
-def _forward_lines(forward) -> list[str]:
+def _forward_lines(forward, unreadable_entries: int = 0) -> list[str]:
     if forward is None:
         return ["unavailable"]
+    unreadable = ([f"読めない配備の entry が {unreadable_entries} 件あります (戦略かどうか"
+                   "決められないので、この節に含まれない戦略があるかもしれません)"]
+                  if unreadable_entries else [])
     if not forward:
-        return [_FORWARD_NOTE, "配備中の戦略はありません"]
-    lines = [_FORWARD_NOTE]
+        return [_FORWARD_NOTE, *(unreadable or ["配備中の戦略はありません"])]
+    lines = [_FORWARD_NOTE, *unreadable]
     for row in forward:
         lines += ["", f"### {row['name']} ({row['content_hash'][:12]})"]
         if row["state"] == signal_forward.STATE_FAILED:
@@ -603,7 +606,8 @@ def _forward_lines(forward) -> list[str]:
             f"- 穴: abandoned: {aband} / no_fill={holes['no_fill']} / "
             f"data_insufficient={holes['data_insufficient']} / 未終端={holes['unterminated']}"
             f" (最古 {'–' if oldest is None else f'{oldest / 3600:.1f} 時間'}) / "
-            f"時点不明={holes['as_of_unknown']} / R不明={holes['r_unknown']}",
+            f"時点不明={holes['as_of_unknown']} / R不明={holes['r_unknown']} / "
+            f"時刻不明={holes.get('time_unreadable', 0)}",
             f"- 集中度: 採点のある取引日={row['concentration']['days']} / 日別最大="
             f"{row['concentration']['max_day_count']} 件 "
             f"({_percent(row['concentration']['max_day_share'])})",
@@ -644,7 +648,7 @@ def render_report(facts: dict, *, label: date, close_at: datetime) -> str:
     lines += (["unavailable"] if miss is None
               else [f"- {k}: {v}" for k, v in miss.items()])
     lines += ["", "## shadow"]
-    lines += _forward_lines(facts.get("forward"))
+    lines += _forward_lines(facts.get("forward"), facts.get("forward_unreadable_entries", 0))
     if "reaction" in facts:
         lines += ["", "## reaction (pips、窓は分、床未満も数値を出す)"]
         lines += _reaction_report_lines(facts["reaction"])
@@ -695,27 +699,20 @@ def _reaction_report_lines(reaction: dict | None) -> list[str]:
 
 def forward_status(conn: sqlite3.Connection, *, now: datetime,
                    targets: Callable[[sqlite3.Connection], list[signal_forward.ForwardTarget]]
-                   | None) -> list[dict] | None:
-    """配備中の戦略ごとの機械採点。対象を読めなければ None (節ごと「不明」)、
-    1 本の集計が失敗してもほかの戦略は出す。人間の面と親専有の report だけが読む。"""
+                   | None) -> tuple[list[dict] | None, int]:
+    """配備中の戦略ごとの機械採点と、種別を読めない配備の entry の数。対象を読めなければ
+    (None, 0) (節ごと「不明」)、1 本の集計が失敗してもほかの戦略は出す。人間の面と親専有の
+    report だけが読む。"""
     if targets is None:
-        return None
+        return None, 0
     try:
         listed = targets(conn)
     except Exception as exc:  # noqa: BLE001
         _log.warning("econ signal report forward targets unavailable: %s",
                      safe_error_text(exc))
-        return None
-    out = []
-    for item in listed:
-        try:
-            out.append(signal_forward.forward_summary(conn, item, now=now))
-        except Exception as exc:  # noqa: BLE001
-            _log.warning("econ signal report forward summary unavailable: %s",
-                         safe_error_text(exc))
-            out.append({"name": item.name, "content_hash": item.content_hash,
-                        "state": signal_forward.STATE_FAILED, "reason": "summary_failed"})
-    return out
+        return None, 0
+    rows = [signal_forward.summary_or_failed(conn, item, now=now) for item in listed]
+    return rows, getattr(listed, "unreadable_entries", 0)
 
 
 def collect_report_facts(conn: sqlite3.Connection, *, now: datetime,
@@ -729,7 +726,8 @@ def collect_report_facts(conn: sqlite3.Connection, *, now: datetime,
                          | None = None) -> dict:
     facts = econ_signal_status(conn, now=now, capacity=capacity, worker=worker,
                                pair_currencies=pair_currencies)
-    facts["forward"] = forward_status(conn, now=now, targets=forward_targets)
+    facts["forward"], facts["forward_unreadable_entries"] = forward_status(
+        conn, now=now, targets=forward_targets)
     if admission_status is not None:
         try:
             snap = admission_status(conn, now)

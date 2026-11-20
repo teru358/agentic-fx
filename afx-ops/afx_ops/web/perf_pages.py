@@ -449,6 +449,9 @@ FORWARD_SIDE_HEADING = "採否別 (採用した側と見送った側を分けた
 FORWARD_SIDES = (("accept", "accept (採用)"), ("reject", "reject (見送り)"))
 NOTE_FORWARD_UNKNOWN = "機械採点を読めません。数字は不明です"
 NOTE_FORWARD_NONE = "配備中の戦略はありません"
+NOTE_FORWARD_ENTRIES = ("読めない配備の entry が {} 件あります "
+                        "(戦略かどうか決められないので、この表に含まれない戦略があるかもしれません)")
+NOTE_FORWARD_ENTRIES_UNKNOWN = "読めない配備の entry が不明です (この表に含まれない戦略があるかもしれません)"
 NOTE_FORWARD_OVER = "機械採点の表は表示の上限を超えたため省きました"
 ABANDON_LABELS = {
     "freshness_expired": "鮮度切れ", "requeued_expired": "再投入の期限切れ",
@@ -687,7 +690,7 @@ def _forward_holes(row: Mapping[str, object]) -> str:
         parts.append(f"abandoned {label} {_count(abandoned[key])}")
     for key, label in (("no_fill", "約定なし"), ("data_insufficient", "データ不足"),
                        ("unterminated", "未終端"), ("as_of_unknown", "時点不明"),
-                       ("r_unknown", "R 不明")):
+                       ("r_unknown", "R 不明"), ("time_unreadable", "時刻不明")):
         value = holes.get(key)
         if type(value) is int and value == 0:
             continue
@@ -768,8 +771,18 @@ def _forward_section(data: Mapping[str, object], tz: str) -> str:
     if forward.get("state") != "ok" or type(raw) is not list:
         return heading + notes + f"<p>{NOTE_FORWARD_UNKNOWN}</p></section>"
     rows = [item for item in raw if type(item) is dict]
+    entries = forward.get("unreadable_entries")
+    if type(entries) is int and entries > 0:
+        entries_note = f"<p>{_esc(NOTE_FORWARD_ENTRIES.format(entries))}</p>"
+    elif "unreadable_entries" in forward and (type(entries) is not int or entries < 0):
+        entries_note = f"<p>{_esc(NOTE_FORWARD_ENTRIES_UNKNOWN)}</p>"
+    else:
+        entries_note = ""
     if not raw:
-        return heading + notes + f"<p>{NOTE_FORWARD_NONE}</p></section>"
+        return heading + notes + (entries_note or f"<p>{NOTE_FORWARD_NONE}</p>") + "</section>"
+    if not rows:
+        return heading + notes + f"<p>{NOTE_FORWARD_UNKNOWN}</p></section>"
+    notes += entries_note
     omitted = forward.get("omitted")
     tail = (f"<p>ほか {_count(omitted)} 件の戦略は表に出していません</p>"
             if type(omitted) is int and omitted > 0 else "")
@@ -865,17 +878,20 @@ def _render_strategy(data: Mapping[str, object], range_key: str) -> bytes:
             + "</ul></section>")
 
     forward = _forward_section(data, tz)
+    # 機械採点の節は自分の予算 (FORWARD_TABLE_BUDGET_BYTES) で収まっている。実取引の図と表の
+    # 予算には数えない (大きい節が実取引の図を押し出さない)。
+    allowance = len(forward.encode("utf-8"))
 
     def build(figure: str, table: str) -> bytes:
         return render._document("Performance", head + figure + table + forward + tail, tz,
                                 current=PATH, tabs=bar, refresh=False)
     figure, table = _strategy_figure(data, tz), _strategy_table(data)
     document = build(figure, table)
-    if len(document) <= STRATEGY_PAGE_BUDGET_BYTES:
+    if len(document) - allowance <= STRATEGY_PAGE_BUDGET_BYTES:
         return document
     figure = _strategy_figure(data, tz, draw=False)
     document = build(figure, table)
-    if len(document) <= STRATEGY_PAGE_BUDGET_BYTES:
+    if len(document) - allowance <= STRATEGY_PAGE_BUDGET_BYTES:
         return document
     table = _strategy_table(data, table=False)
     return render._page("Performance", head + figure + table + forward + tail, tz, current=PATH,

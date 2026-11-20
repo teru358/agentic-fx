@@ -168,3 +168,47 @@ def test_an_interrupted_query_still_refuses_the_whole_response(ops_env, monkeypa
     with pytest.raises(OpsError) as raised:
         read(ops_env, interrupt=lambda: error if calls else None)
     assert raised.value.code is ErrorCode.UNAVAILABLE
+
+
+def test_a_busy_database_while_reading_the_scores_is_not_hidden_as_unavailable(ops_env, monkeypatch):
+    import sqlite3
+    meta = deploy(ops_env)
+    decisions(ops_env, meta, 2)
+
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(pv.signal_forward, "forward_summary", locked)
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        read(ops_env)
+
+
+def test_a_busy_database_while_reading_the_targets_is_not_hidden_as_unavailable(ops_env,
+                                                                              monkeypatch):
+    import sqlite3
+    from agentic_fx.plugin import read_model_inputs
+
+    def locked_reader(_root):
+        def read_targets(_conn):
+            raise sqlite3.OperationalError("database is busy")
+        return read_targets
+
+    monkeypatch.setattr(read_model_inputs, "forward_targets_reader", locked_reader)
+    with pytest.raises(sqlite3.OperationalError, match="busy"):
+        read(ops_env)
+
+
+def test_the_count_of_unreadable_live_entries_is_carried_in_the_section(ops_env):
+    meta = deploy(ops_env)
+    decisions(ops_env, meta, 2)
+    broken = ops_env.plugins_root / "broken"
+    broken.mkdir()
+    (broken / "meta.json").write_text("{not json", encoding="utf-8")
+    data = read(ops_env)
+    assert data["forward"]["unreadable_entries"] >= 1
+    assert "alpha" in forward(data)
+
+
+def test_without_unreadable_entries_the_count_is_zero(ops_env):
+    deploy(ops_env)
+    assert read(ops_env)["forward"]["unreadable_entries"] == 0

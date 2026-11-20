@@ -8,14 +8,19 @@ R で集計する。実約定を含まず、採否に至らなかった signal �
 from __future__ import annotations
 
 import json
+import logging
 import math
 import sqlite3
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from agentic_fx._safe_error import safe_error_text
 from agentic_fx.core import market_hours
 from agentic_fx.store import signals as signal_store
+
+_log = logging.getLogger(__name__)
 
 WINDOW_WEEKS = 12
 RECENT_WEEKS = 4
@@ -26,9 +31,11 @@ STATE_OK = "ok"
 STATE_UNDETERMINED = "undetermined"
 STATE_FAILED = "failed"
 
-SOURCE_JOURNAL = "journal"
-SOURCE_DEPLOY_OP = "deploy_op"
-_SOURCES = {0: SOURCE_JOURNAL, 1: SOURCE_DEPLOY_OP}
+# 配備世代 (source, op_id) の source の番号と、応答に出す名前。番号の出所はここ 1 か所
+GENERATION_SOURCE_JOURNAL = 0
+GENERATION_SOURCE_DEPLOY_OP = 1
+GENERATION_SOURCE_NAMES = {GENERATION_SOURCE_JOURNAL: "journal",
+                           GENERATION_SOURCE_DEPLOY_OP: "deploy_op"}
 
 LEVEL_NONE = "none"
 LEVEL_REFERENCE = "reference"
@@ -53,6 +60,15 @@ class ForwardTarget:
     started_at: datetime | None
     generation: tuple[int, int] | None    # (source, op_id)
     reason: str | None = None
+
+
+class ForwardTargets(list):
+    """対象の一覧 (名前の順)。`unreadable_entries` は、種別を読めず戦略かどうか決められない
+    配備の entry の数で、あれば一覧に載らない戦略があるかもしれない。"""
+
+    def __init__(self, items=(), *, unreadable_entries: int = 0) -> None:
+        super().__init__(items)
+        self.unreadable_entries = unreadable_entries
 
 
 def r_multiple(pnl_pips: object, *, entry: object, stop_loss: object,
@@ -116,8 +132,9 @@ def _parse(value: object) -> datetime | None:
 
 
 def summarize(decided: list[dict], population: list[dict], *, target: ForwardTarget,
-              start: datetime, end: datetime) -> dict:
-    """集計の純関数。`decided` は窓内の採否 1 行ずつ、`population` は窓内に出た signal。"""
+              start: datetime, end: datetime, time_unreadable: int = 0) -> dict:
+    """集計の純関数。`decided` は窓内の採否 1 行ずつ、`population` は窓内に出た signal。
+    `time_unreadable` は時刻を読めず、窓に入るか決められなかった行の数 (穴として数える)。"""
     scored = [row for row in decided if row["result_code"] in _NUMERIC]
     abandoned = Counter(row["abandon_reason"] for row in population
                         if row["status"] == "abandoned")
@@ -136,7 +153,7 @@ def summarize(decided: list[dict], population: list[dict], *, target: ForwardTar
         "name": target.name, "content_hash": target.content_hash,
         "state": STATE_OK, "reason": None,
         "generation": {"started_at": target.started_at.isoformat(),
-                       "source": _SOURCES[target.generation[0]],
+                       "source": GENERATION_SOURCE_NAMES.get(target.generation[0], "unknown"),
                        "op_id": target.generation[1]},
         "window": {"start": start.isoformat(), "end": end.isoformat(),
                    "weeks": WINDOW_WEEKS},
@@ -161,7 +178,8 @@ def summarize(decided: list[dict], population: list[dict], *, target: ForwardTar
             "oldest_unterminated_sec": max(
                 ((end - r["decided_at"]).total_seconds() for r in unterminated),
                 default=None),
-            "r_unknown": sum(1 for r in scored if r["r"] is None)},
+            "r_unknown": sum(1 for r in scored if r["r"] is None),
+            "time_unreadable": time_unreadable},
         "reach": _rate(population),
         "concentration": {"days": len(days), "max_day_count": top,
                           "max_day_share": top / len(scored) if scored else None},
@@ -202,21 +220,27 @@ def forward_summary(conn: sqlite3.Connection, target: ForwardTarget, *,
     args = {"name": target.name, "hash": target.content_hash,
             "start": start.isoformat(), "end": end.isoformat(), "begin": begin.isoformat()}
     decided = []
+    unreadable: set[tuple[str, int]] = set()     # 時刻を読めない signal / 採否 (重複して数えない)
     for row in conn.execute(
-            "SELECT d.decision, d.decided_at, ti.gate_result, sh.result_code, "
-            "sh.entry_price, sh.pnl_pips, sh.pip_size, sh.resolved_at, sh.updated_at, "
-            "s.created_at, s.payload_json "
+            "SELECT d.id AS decision_id, s.id AS signal_id, d.decision, d.decided_at, "
+            "ti.gate_result, sh.result_code, sh.entry_price, sh.pnl_pips, sh.pip_size, "
+            "sh.resolved_at, sh.updated_at, s.created_at, s.payload_json "
             "FROM signal_decisions d JOIN signals s ON s.id = d.signal_id "
             "LEFT JOIN signal_shadow sh ON sh.decision_id = d.id "
             "LEFT JOIN trade_intents ti ON ti.id = d.trade_intent_id "
             "WHERE s.plugin = :name AND s.content_hash = :hash "
-            "AND datetime(s.created_at) >= datetime(:begin) "
-            "AND datetime(d.decided_at) >= datetime(:start) "
-            "AND datetime(d.decided_at) <= datetime(:end) "
+            "AND (datetime(s.created_at) IS NULL "
+            "OR datetime(s.created_at) >= datetime(:begin)) "
+            "AND (datetime(d.decided_at) IS NULL OR (datetime(d.decided_at) >= datetime(:start) "
+            "AND datetime(d.decided_at) <= datetime(:end))) "
             "ORDER BY d.decided_at, d.id", args):
         when = _parse(row["decided_at"])
         created = _parse(row["created_at"])
-        if when is None or created is None:
+        if created is None:
+            unreadable.add(("signal", row["signal_id"]))
+            continue
+        if when is None:
+            unreadable.add(("decision", row["decision_id"]))
             continue
         when = when.astimezone(timezone.utc)
         if not (start <= when <= end) or created.astimezone(timezone.utc) < begin:
@@ -231,16 +255,17 @@ def forward_summary(conn: sqlite3.Connection, target: ForwardTarget, *,
                              pip_size=row["pip_size"]) if result in _NUMERIC else None)})
     population = []
     for row in conn.execute(
-            "SELECT s.created_at, s.status, s.abandon_reason, s.abandoned_at, "
+            "SELECT s.id AS signal_id, s.created_at, s.status, s.abandon_reason, s.abandoned_at, "
             "d.decided_at AS decided_at "
             "FROM signals s LEFT JOIN signal_decisions d ON d.signal_id = s.id "
             "WHERE s.plugin = :name AND s.content_hash = :hash "
-            "AND datetime(s.created_at) >= datetime(:start) "
-            "AND datetime(s.created_at) <= datetime(:end) "
-            f"AND ({signal_store._eligibility_case('s.')}) IN ('eligible', 'normalization_failed') "
+            "AND (datetime(s.created_at) IS NULL OR (datetime(s.created_at) >= datetime(:start) "
+            "AND datetime(s.created_at) <= datetime(:end))) "
+            f"AND ({signal_store.eligibility_case('s.')}) IN ('eligible', 'normalization_failed') "
             "ORDER BY s.id", args):
         created = _parse(row["created_at"])
         if created is None:
+            unreadable.add(("signal", row["signal_id"]))
             continue
         created = created.astimezone(timezone.utc)
         if not (start <= created <= end):
@@ -255,7 +280,8 @@ def forward_summary(conn: sqlite3.Connection, target: ForwardTarget, *,
             "created_at": created, "status": status, "abandon_reason": reason,
             "decided": decided_at is not None
             and decided_at.astimezone(timezone.utc) <= end})
-    return summarize(decided, population, target=target, start=start, end=end)
+    return summarize(decided, population, target=target, start=start, end=end,
+                     time_unreadable=len(unreadable))
 
 
 def _result_as_of(row: sqlite3.Row, end: datetime) -> tuple[str | None, bool]:
@@ -273,6 +299,18 @@ def _result_as_of(row: sqlite3.Row, end: datetime) -> tuple[str | None, bool]:
     return (result if max(stamps) <= end else None), True
 
 
-def forward_summaries(conn: sqlite3.Connection, targets: list[ForwardTarget], *,
-                      now: datetime) -> list[dict]:
-    return [forward_summary(conn, target, now=now) for target in targets]
+def summary_or_failed(conn: sqlite3.Connection, target: ForwardTarget, *, now: datetime,
+                      on_error: Callable[[Exception], None] | None = None) -> dict:
+    """1 本の集計。失敗してもほかの戦略を隠さないよう、失敗は `failed` の行にする。
+
+    `on_error` は失敗を握りつぶす前に呼ばれ、送出すれば失敗は呼び出し元へ伝わる (中断・
+    busy など、行の不明にしてはいけないもの)。"""
+    try:
+        return forward_summary(conn, target, now=now)
+    except Exception as exc:  # noqa: BLE001 - 1 本の失敗でほかの戦略を隠さない
+        if on_error is not None:
+            on_error(exc)
+        _log.warning("forward summary unavailable: %s", safe_error_text(exc))
+        return {"name": target.name, "content_hash": target.content_hash,
+                "state": STATE_FAILED, "reason": "summary_failed",
+                "thresholds": {"min_count": MIN_COUNT, "reference_count": REFERENCE_COUNT}}

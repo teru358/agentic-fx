@@ -232,9 +232,32 @@ def test_no_decisions_give_zero_counts_and_unknown_values(conn):
 
 def test_the_summaries_are_returned_in_the_order_of_the_targets(conn, make):
     make.decide(at=NOW - timedelta(days=1))
-    out = sf.forward_summaries(conn, [target(name="strat"), target(reason="no_generation_record",
-                                                                  name="zeta")], now=NOW)
+    listed = [target(name="strat"), target(reason="no_generation_record", name="zeta")]
+    out = [sf.summary_or_failed(conn, item, now=NOW) for item in listed]
     assert [row["name"] for row in out] == ["strat", "zeta"]
+    assert not hasattr(sf, "forward_summaries")
+
+
+def test_a_failing_aggregate_becomes_a_failed_row_with_the_thresholds(conn, monkeypatch):
+    def broken(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(sf, "forward_summary", broken)
+    row = sf.summary_or_failed(conn, target(), now=NOW)
+    assert row["state"] == sf.STATE_FAILED and row["reason"] == "summary_failed"
+    assert row["name"] == "strat" and row["thresholds"]["min_count"] == sf.MIN_COUNT
+
+
+def test_the_caller_can_turn_a_failure_into_a_propagation(conn, monkeypatch):
+    def broken(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    def stop(exc):
+        raise ValueError("stop") from exc
+
+    monkeypatch.setattr(sf, "forward_summary", broken)
+    with pytest.raises(ValueError):
+        sf.summary_or_failed(conn, target(), now=NOW, on_error=stop)
 
 
 # ---------------------------------------------------------------- 旧 period_summary の検査の移行
@@ -331,3 +354,39 @@ def test_a_result_whose_time_cannot_be_read_is_unknown_not_a_win(conn, make):
     out = summary(conn)
     assert out["series"]["all"]["n"] == 0
     assert out["holes"]["as_of_unknown"] == 1 and out["holes"]["unterminated"] == 0
+
+
+# ---------------------------------------------------------------- 時刻を読めない行
+
+def test_a_decision_whose_time_cannot_be_read_is_counted_as_a_hole(conn, make):
+    make.decide(at=NOW - timedelta(days=1))
+    make.decide(at=NOW - timedelta(days=2))
+    conn.execute("UPDATE signal_decisions SET decided_at='garbage' "
+                 "WHERE id=(SELECT MAX(id) FROM signal_decisions)")
+    conn.commit()
+    out = summary(conn)
+    assert out["holes"]["time_unreadable"] == 1
+    assert out["decisions"]["total"] == 1
+
+
+def test_a_decision_time_without_a_zone_is_unreadable_not_silently_dropped(conn, make):
+    make.decide(at=NOW - timedelta(days=1))
+    conn.execute("UPDATE signal_decisions SET decided_at='2027-01-30 10:00:00'")
+    conn.commit()
+    out = summary(conn)
+    assert out["holes"]["time_unreadable"] == 1 and out["decisions"]["total"] == 0
+
+
+def test_a_signal_whose_creation_time_cannot_be_read_is_counted_once(conn, make):
+    make.decide(at=NOW - timedelta(days=1))
+    make.signal(at=NOW - timedelta(days=2))
+    conn.execute("UPDATE signals SET created_at='garbage'")
+    conn.commit()
+    out = summary(conn)
+    assert out["holes"]["time_unreadable"] == 2          # 採否のある 1 件 + 採否のない 1 件
+    assert out["decisions"]["total"] == 0 and out["reach"]["signals"] == 0
+
+
+def test_readable_data_has_no_unreadable_time_hole(conn, make):
+    make.decide(at=NOW - timedelta(days=1))
+    assert summary(conn)["holes"]["time_unreadable"] == 0
