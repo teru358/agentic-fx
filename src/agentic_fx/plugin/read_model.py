@@ -574,7 +574,7 @@ def _pending_condition(inputs: ReadInputs, requests: Sequence[_Request]
 
     戦略の依頼で依存の記録が読めないものは、どの指標を参照するか分からない。"""
     referenced: dict[str, bool] = {}
-    if inputs.pending_status != SOURCE_OK:
+    if inputs.pending_status == SOURCE_UNAVAILABLE:
         return referenced, usage_review.REASON_PENDING_SOURCE
     unreadable = False
     for request in requests:
@@ -634,9 +634,9 @@ def _usage_review(inputs: ReadInputs, rows: Sequence[PluginRow], requests: Seque
                   and row.entity.content_hash is not None]
     live_names = frozenset(row.name for row in indicators)
     records = usage_review.parse_candidates(inputs.candidates, live_names)
-    journal_readable = inputs.journal_status == SOURCE_OK
+    journal_readable = inputs.journal_status != SOURCE_UNAVAILABLE   # 無い DB は記録が無いだけ
     usage_scan = usage_review.build_scan(
-        records, candidates_readable=inputs.candidates_status == SOURCE_OK,
+        records, candidates_readable=inputs.candidates_status != SOURCE_UNAVAILABLE,
         journal_readable=journal_readable, scan_failed=scan_failed)
     referenced, pending_reason = _pending_condition(inputs, requests)
     transitions = _transitions(inputs)

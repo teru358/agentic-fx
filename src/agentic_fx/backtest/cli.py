@@ -250,8 +250,11 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     reevaluate_parser.add_argument("--yes", action="store_true", help="確認を省略する")
     versions_parser = plugin_sub.add_parser("versions", **_surface_parser_kw("plugin versions", leaf=True))
     versions_parser.add_argument("name")
-    plugin_sub.add_parser("list", **_surface_parser_kw("plugin list", leaf=True)).add_argument(
-        "--kind", choices=("indicator", "strategy"), default=None)
+    list_parser = plugin_sub.add_parser("list", **_surface_parser_kw("plugin list", leaf=True))
+    list_parser.add_argument("--kind", choices=("indicator", "strategy"), default=None)
+    list_parser.add_argument(
+        "--unused", action="store_true",
+        help="使われていない指標だけを、停止の提案にできるかと一緒に表示する")
     plugin.usage = wrapped_choices_usage(plugin.prog, list(plugin_sub.choices))
 
 
@@ -1069,7 +1072,8 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
             settings = load_settings(root / "config" / "settings.yaml")
         except (ConfigError, OSError, UnicodeError):
             settings = None
-        return plugin_deploy_cli.plugin_list(root, kind=args.kind, settings=settings)
+        return plugin_deploy_cli.plugin_list(
+            root, kind=args.kind, settings=settings, unused=args.unused)
     if not read_only_view:
         ensure_initialized(root)
     # 設定の検証は環境を変えないので、.env はこの CLI の入口で明示的に読む。
