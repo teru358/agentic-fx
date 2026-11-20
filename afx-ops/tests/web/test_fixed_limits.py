@@ -141,7 +141,7 @@ def test_security_headers_are_the_literal_fixed_set():
     response = handle_request(Request("GET", "/missing", {}), Recorder())
 
     assert response.headers["Content-Security-Policy"] == (
-        "default-src 'none'; style-src 'sha256-lYFFAn1ez362pcO/nn6Sg56uJRAD0Fk6tb3BliGylZI='; "
+        "default-src 'none'; style-src 'sha256-n+bqV6kFI2IlPGYR2OPANg7/Q+jdnovyRfR2904F680='; "
         "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     assert response.headers["X-Frame-Options"] == "DENY"

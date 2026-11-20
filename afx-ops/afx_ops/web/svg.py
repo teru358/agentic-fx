@@ -20,6 +20,9 @@ X0, X1, Y0, Y1 = 72, 952, 12, 186
 MAX_POINTS = 280
 MAX_STEPS = 320
 BIG = 1e12
+# 時刻として読む範囲 (1971〜9998 年)。外の値は表示 tz に直せないことがあるので読めない値にする
+EPOCH_MIN = datetime(1971, 1, 1, tzinfo=timezone.utc).timestamp()
+EPOCH_MAX = datetime(9998, 12, 31, tzinfo=timezone.utc).timestamp()
 # 図の部品ごとの予算 (UTF-8 byte)。超えた部品は丸ごと説明文に置き換える
 LINES_BUDGET_BYTES = 32 * 1024
 MARKS_BUDGET_BYTES = 6 * 1024
@@ -68,9 +71,10 @@ def _epoch(value: object) -> float | None:
         parsed = datetime.fromisoformat(value)
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             return None
-        return parsed.timestamp()
+        stamp = parsed.timestamp()
     except (ValueError, OverflowError, OSError):
         return None
+    return stamp if EPOCH_MIN <= stamp <= EPOCH_MAX else None
 
 
 def _integer(value: object) -> int | None:
@@ -184,8 +188,11 @@ def _axis_text(value: float, step: float) -> str:
 
 
 def _date_label(at: float, tz: str, mode: str) -> str:
-    converted = display_time.convert_time(datetime.fromtimestamp(at, tz=timezone.utc), tz,
-                                          display_time.PRECISION_MINUTE)
+    try:
+        converted = display_time.convert_time(datetime.fromtimestamp(at, tz=timezone.utc), tz,
+                                              display_time.PRECISION_MINUTE)
+    except (ValueError, OverflowError, OSError):
+        return ""
     if not converted.ok:
         return ""
     text = converted.text
@@ -290,9 +297,10 @@ def _frame(scale: _Scale, tz: str) -> str:
     return "".join(out)
 
 
-def _legend(show_kill: bool) -> str:
+def _legend(drawn: Sequence[str], kinds: Sequence[str]) -> str:
+    """描いた線 (class) と印の種別だけを載せる。"""
     out = []
-    cells = [item for item in LINE_LEGEND if item[0] != "c4" or show_kill]
+    cells = [item for item in LINE_LEGEND if item[0] in drawn]
     for index, (css, label) in enumerate(cells):
         x = X0 + LEGEND_STEP * index
         out.append(f'<line class="{css}" x1="{x}" y1="222" x2="{x + 28}" y2="222"/>'
@@ -300,7 +308,8 @@ def _legend(show_kill: bool) -> str:
     x = X0 + LEGEND_STEP * len(cells)
     out.append(f'<polygon class="bd" points="{_vertices([(x, 216), (x + 28, 216), (x + 28, 228), (x, 228)])}"/>'
                f'<text x="{x + 34}" y="226">{_esc(BAND_LEGEND)}</text>')
-    for index, (symbol, word, css) in enumerate(MARK_STYLE.values()):
+    shown = [MARK_STYLE[kind] for kind in MARK_STYLE if kind in kinds]
+    for index, (symbol, word, css) in enumerate(shown):
         out.append(f'<text class="{css}" x="{X0 + LEGEND_STEP * index}" y="246">'
                    f'{_esc(symbol + " " + word)}</text>')
     return "".join(out)
@@ -326,13 +335,8 @@ def _marks_part(scale: _Scale, marks: list[_Marks]) -> str:
     return "".join(out)
 
 
-def draw_equity(data: Mapping[str, object], tz: str, shown_marks: Sequence[object]) -> Chart:
-    """資金推移の図。描ける点が無ければ空の svg と説明文を返す。部品が予算を超えたら丸ごと省く。"""
-    parts, steps = _parts(data.get("points")), _steps(data.get("hwm_steps"))
-    if not parts:
-        return Chart("", None, (NOTE_NO_POINTS,))
-    ratio = _kill_ratio(data.get("current"))
-    marks = _marks(shown_marks, tz)
+def _scale(parts: list[_Part], steps: list[_Step], marks: list[_Marks], ratio: float | None,
+           data: Mapping[str, object]) -> _Scale:
     times = [t for p in parts for t in (p.start, p.end, p.last)] + [s.at for s in steps] \
         + [m.at for m in marks]
     times += [t for t in (_epoch(data.get("from")), _epoch(data.get("to"))) if t is not None]
@@ -346,19 +350,37 @@ def draw_equity(data: Mapping[str, object], tz: str, shown_marks: Sequence[objec
         values += [s.hwm * ratio for s in steps if s.hwm > 0]
     v_low, v_high = min(values), max(values)
     pad = (v_high - v_low) * 0.04 or max(abs(v_high) * 0.01, 1.0)
-    scale = _Scale(t_low, t_high, v_low - pad, v_high + pad)
-    span = (_full(t_low, tz), _full(t_high, tz))
-    shown_kill = ratio is not None and any(s.hwm > 0 for s in steps)
-    body = _plot(scale, parts, steps, ratio) + _frame(scale, tz) + _legend(shown_kill)
-    if len(body.encode("utf-8")) > LINES_BUDGET_BYTES:
-        return Chart("", span, (NOTE_LINES_OVER,))
+    return _Scale(t_low, t_high, v_low - pad, v_high + pad)
+
+
+def draw_equity(data: Mapping[str, object], tz: str, shown_marks: Sequence[object]) -> Chart:
+    """資金推移の図。描ける点が無ければ空の svg と説明文を返す。部品が予算を超えたら丸ごと省く。"""
+    parts, steps = _parts(data.get("points")), _steps(data.get("hwm_steps"))
+    if not parts:
+        return Chart("", None, (NOTE_NO_POINTS,))
+    ratio = _kill_ratio(data.get("current"))
+    marks = _marks(shown_marks, tz)
+    scale = _scale(parts, steps, marks, ratio, data)
     marks_part, notes = _marks_part(scale, marks), ()
     if len(marks_part.encode("utf-8")) > MARKS_BUDGET_BYTES:
-        marks_part, notes = "", (NOTE_MARKS_OVER,)
+        # 描かない印で横軸を広げない
+        marks, marks_part, notes = [], "", (NOTE_MARKS_OVER,)
+        scale = _scale(parts, steps, marks, ratio, data)
+    span = (_full(scale.t_low, tz), _full(scale.t_high, tz))
+    drawn = ["c1"] + (["c2"] if any(p.balance is not None for p in parts) else []) \
+        + (["c3"] if steps else []) \
+        + (["c4"] if ratio is not None and any(s.hwm > 0 for s in steps) else [])
+    body = _plot(scale, parts, steps, ratio) + _frame(scale, tz) \
+        + _legend(drawn, [m.kind for m in marks])
+    if len(body.encode("utf-8")) > LINES_BUDGET_BYTES:
+        return Chart("", span, (NOTE_LINES_OVER,))
     return Chart(OPENING + body + marks_part + "</svg>", span, notes)
 
 
 def _full(at: float, tz: str) -> str:
-    converted = display_time.convert_time(datetime.fromtimestamp(at, tz=timezone.utc), tz,
-                                          display_time.PRECISION_SECOND)
+    try:
+        converted = display_time.convert_time(datetime.fromtimestamp(at, tz=timezone.utc), tz,
+                                              display_time.PRECISION_SECOND)
+    except (ValueError, OverflowError, OSError):
+        return ""
     return converted.text if converted.ok else ""

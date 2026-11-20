@@ -4,7 +4,7 @@ from __future__ import annotations
 from types import MappingProxyType
 
 # render.STYLE (埋め込む唯一の CSS) の SHA-256。CSP はこの style だけを許し、script は許さない
-STYLE_HASH = "sha256-lYFFAn1ez362pcO/nn6Sg56uJRAD0Fk6tb3BliGylZI="
+STYLE_HASH = "sha256-n+bqV6kFI2IlPGYR2OPANg7/Q+jdnovyRfR2904F680="
 
 _CSP = ("default-src 'none'; style-src '" + STYLE_HASH + "'; base-uri 'none'; "
         "form-action {action}; frame-ancestors 'none'")

@@ -80,7 +80,7 @@ tbody tr:nth-child(even) { background: var(--soft); }
 .tabs a[aria-current="page"] { border-bottom-color: var(--link); }
 .scroll { max-height: 70vh; overflow: auto; }
 .scroll th { position: sticky; top: 0; }
-svg{display:block;width:100%;max-width:60rem;height:auto;}
+svg{display:block;width:100%;min-width:55rem;max-width:60rem;height:auto;}
 svg *{fill:none;stroke:var(--mut);vector-effect:non-scaling-stroke;}
 svg text{fill:var(--fg);stroke:none;font-size:11px;}
 .ax{stroke:var(--mut);}

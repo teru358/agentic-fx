@@ -362,7 +362,8 @@ RUN_WRAPPERS_MAX = len('<polygon class="bd" points=""/>') + 4 * len('<polyline c
 def static_worst_lines() -> int:
     vertices_max = 6 * 280 + 4 * (320 + 32) + 2 * 2 * 32  # 1 点だけの区間の補いを含む
     sample = svg._Scale(1.7e9, 1.7e9 + 86400 * 400, -1.2345e11, 1.2e11)
-    fixed = len((svg._frame(sample, TOKYO) + svg._legend(True)).encode("utf-8"))
+    legend = svg._legend(["c1", "c2", "c3", "c4"], list(svg.MARK_STYLE))
+    fixed = len((svg._frame(sample, TOKYO) + legend).encode("utf-8"))
     return VERTEX_MAX * vertices_max + RUN_WRAPPERS_MAX * 32 + fixed
 
 
@@ -533,3 +534,58 @@ def test_the_series_are_told_apart_by_dash_pattern_as_well_as_color():
 def test_the_style_with_the_figure_rules_stays_within_the_byte_limit():
     assert len(render.STYLE.encode("utf-8")) <= STYLE_MAX_BYTES
     assert "vector-effect" in render.STYLE and "<" not in render.STYLE
+
+
+@pytest.mark.parametrize("bad", ["0001-01-01T00:00:00+09:00", "9999-12-31T23:59:59-05:00",
+                                 "1970-06-01T00:00:00+00:00", "9998-12-31T00:00:01+00:00"])
+def test_a_time_outside_the_readable_years_is_skipped_everywhere_and_never_raises(bad):
+    assert svg._epoch(bad) is None
+    data = data_with(SIMPLE, STEPS, [mark(kind="latched", plot_at=bad)], **{"from": bad, "to": bad})
+    data["points"] = data["points"] + [{**point(4000, 4100, 9500, 9600, 9550), "last_at": bad}]
+    data["hwm_steps"] = data["hwm_steps"] + [{"t": bad, "hwm": 9800, "seg": 0}]
+    chart = draw(data)
+    assert chart.svg and chart.span is not None and all(chart.span)
+    assert [len(line) for line in polylines(chart.svg, "c1")] == [3]
+    assert page(data)
+
+
+def test_the_readable_year_range_edges_are_accepted():
+    assert svg._epoch("1971-01-01T00:00:00+00:00") is not None
+    assert svg._epoch("9998-12-30T00:00:00+00:00") is not None
+    for tz_label in ("full", "day", "time"):
+        assert svg._date_label(svg.EPOCH_MAX, TOKYO, tz_label) is not None
+    assert svg._date_label(1e18, TOKYO, "full") == "" and svg._full(1e18, TOKYO) == ""
+
+
+def test_marks_dropped_for_the_budget_do_not_stretch_the_time_axis(monkeypatch):
+    far = [mark(kind="latched", plot_at=iso(500000))]
+    data = data_with(SIMPLE, STEPS, far, **{"from": iso(1000), "to": iso(3100)})
+    with_marks = draw(data)
+    assert with_marks.svg and with_marks.span[1] != draw(data_with(SIMPLE, STEPS, **{"from": iso(1000), "to": iso(3100)})).span[1]
+    monkeypatch.setattr(svg, "MARKS_BUDGET_BYTES", 100)
+    dropped = draw(data)
+    plain = draw(data_with(SIMPLE, STEPS, [], **{"from": iso(1000), "to": iso(3100)}))
+    assert dropped.notes == (svg.NOTE_MARKS_OVER,) and dropped.span == plain.span
+    assert polylines(dropped.svg, "c1") == polylines(plain.svg, "c1")
+
+
+def test_the_legend_lists_only_the_series_and_marks_that_were_drawn(monkeypatch):
+    rows = [{**p, "balance_last": None} for p in SIMPLE]
+    bare = draw(data_with(rows, [], [mark(kind="latched", plot_at=iso(1500))])).svg
+    bare = bare[len(svg.OPENING):]
+    for absent in ("balance", "HWM", "作動の水準", "↑ 解除", "▽", "◇ 入出金", "△"):
+        assert f">{absent}" not in bare and absent not in bare.replace("HWM の付け直し", ""), absent
+    for present in (">equity<", "束内の最小〜最大", ">✕ 作動<"):
+        assert present in bare, present
+    monkeypatch.setattr(svg, "MARKS_BUDGET_BYTES", 100)
+    dropped = draw(full_data()).svg
+    assert ">✕ 作動<" not in dropped and ">equity<" in dropped and ">HWM<" in dropped
+
+
+def test_the_figure_scrolls_sideways_in_its_own_box_and_keeps_a_minimum_width_for_the_text():
+    html = page(full_data())
+    section = html.split("<h2>資金推移の図</h2>", 1)[1]
+    assert re.search(r'<div class="scroll"><svg ', section)
+    assert re.search(r"\nsvg\{[^}]*min-width:55rem", render.STYLE)
+    assert 11 / 960 * 55 * 16 >= 10
+    assert '<div class="scroll"><svg' not in page(payload(points=[]))

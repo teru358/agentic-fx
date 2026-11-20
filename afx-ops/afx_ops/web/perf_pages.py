@@ -313,7 +313,7 @@ def _figure(data: Mapping[str, object], tz: str, *, draw: bool = True) -> str:
         lines = list(chart.notes)
     else:
         lines = ["この期間の記録はありません" if empty and not chart.span else chart.notes[0]]
-    body = chart.svg + "".join(f"<p>{_esc(line)}</p>" for line in lines)
+    body = ('<div class="scroll">' + chart.svg + "</div>" if chart.svg else "") + "".join(f"<p>{_esc(line)}</p>" for line in lines)
     if chart.svg and chart.span is not None:
         unit = _currency(data)
         body += (f"<p>横軸: 表示 tz の時刻 ({_esc(chart.span[0])} 〜 {_esc(chart.span[1])})、"

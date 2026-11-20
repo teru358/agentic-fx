@@ -72,7 +72,7 @@ from afx_ops.web import headers, render  # noqa: E402
 from afx_ops.web.routes import ROUTE_TABLE  # noqa: E402
 
 # CSS を変えたらこの値も変える (CSP の hash と埋め込む CSS の取り違えを防ぐ)
-PINNED_STYLE_HASH = "sha256-lYFFAn1ez362pcO/nn6Sg56uJRAD0Fk6tb3BliGylZI="
+PINNED_STYLE_HASH = "sha256-n+bqV6kFI2IlPGYR2OPANg7/Q+jdnovyRfR2904F680="
 
 
 class ReadClient:
