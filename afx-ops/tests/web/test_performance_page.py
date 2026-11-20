@@ -582,9 +582,9 @@ def test_a_marks_table_over_its_budget_is_replaced_whole_by_a_note_and_the_rest_
 
 
 def test_a_page_over_the_total_budget_replaces_parts_and_never_clips(monkeypatch):
-    monkeypatch.setattr(perf_pages, "PAGE_BUDGET_BYTES", 6500)
+    monkeypatch.setattr(perf_pages, "PAGE_BUDGET_BYTES", 8000)
     html = page(payload(marks=[mark() for _ in range(20)]))
-    assert "Output clipped" not in html and len(html.encode()) <= 6500
+    assert "Output clipped" not in html and len(html.encode()) <= 8000
     assert "今の状態" in html and "paper の記録です" in html
 
 
@@ -644,9 +644,9 @@ def test_an_integer_too_large_for_a_float_is_unknown_in_every_numeric_cell(metho
 
 
 def test_a_page_over_the_total_budget_keeps_the_shown_and_omitted_mark_counts(monkeypatch):
-    monkeypatch.setattr(perf_pages, "PAGE_BUDGET_BYTES", 6500)
+    monkeypatch.setattr(perf_pages, "PAGE_BUDGET_BYTES", 8000)
     html = page(payload(marks=[mark() for _ in range(25)], marks_omitted=7))
-    assert "Output clipped" not in html and len(html.encode()) <= 6500
+    assert "Output clipped" not in html and len(html.encode()) <= 8000
     assert "<table><thead><tr><th>種別" not in html
     assert "ほか 12 件" in html and "<h2>印</h2>" in html
 
@@ -658,7 +658,7 @@ def test_a_stats_object_missing_the_empty_period_shape_is_unknown_not_empty(stat
     data["stats"] = stats
     html = page(data)
     assert "この期間の記録はありません" not in html
-    assert "<h2>数字で読む</h2><table>" in html
+    assert '<h2>数字で読む</h2><table class="num">' in html
     assert html.split("<h2>数字で読む</h2>", 1)[1].split("</section>", 1)[0].count("不明") >= 5
 
 

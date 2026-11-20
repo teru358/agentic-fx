@@ -34,10 +34,12 @@ REFRESH_SECONDS = 30
 STYLE = """
 :root { color-scheme: light dark; --bg: #fff; --fg: #1f2328; --mut: #57606a; --line: #d0d7de;
   --soft: #f6f8fa; --link: #0969da; --ok: #116329; --ok-bg: #dafbe1; --warn: #7d4e00;
-  --warn-bg: #fff8c5; --bad: #cf222e; --bad-bg: #ffebe9; }
+  --warn-bg: #fff8c5; --bad: #cf222e; --bad-bg: #ffebe9; --c1: #0969da; --c2: #bc4c00;
+  --c3: #1a7f37; --c4: #8250df; }
 @media (prefers-color-scheme: dark) { :root { --bg: #0d1117; --fg: #e6edf3; --mut: #9198a1;
   --line: #3d444d; --soft: #161b22; --link: #4493f8; --ok: #3fb950; --ok-bg: #12261e;
-  --warn: #d29922; --warn-bg: #2a2111; --bad: #ff7b72; --bad-bg: #2d1316; } }
+  --warn: #d29922; --warn-bg: #2a2111; --bad: #ff7b72; --bad-bg: #2d1316; --c1: #4493f8;
+  --c2: #f0883e; --c3: #3fb950; --c4: #ab7df8; } }
 body { margin: 0; padding: 0 1rem 2rem; color: var(--fg); background: var(--bg);
   font: 14px/1.45 system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
   font-variant-numeric: tabular-nums; }
@@ -78,6 +80,26 @@ tbody tr:nth-child(even) { background: var(--soft); }
 .tabs a[aria-current="page"] { border-bottom-color: var(--link); }
 .scroll { max-height: 70vh; overflow: auto; }
 .scroll th { position: sticky; top: 0; }
+svg{display:block;width:100%;max-width:60rem;height:auto;}
+svg *{fill:none;stroke:var(--mut);vector-effect:non-scaling-stroke;}
+svg text{fill:var(--fg);stroke:none;font-size:11px;}
+.ax{stroke:var(--mut);}
+.c1{stroke:var(--c1);}
+.c2{stroke:var(--c2);stroke-dasharray:6 3;}
+.c3{stroke:var(--c3);stroke-dasharray:2 3;}
+.c4{stroke:var(--c4);stroke-dasharray:8 3 2 3;}
+.bd{fill:var(--c1);stroke:none;opacity:0.15;}
+.ev{stroke:var(--bad);stroke-dasharray:3 3;}
+.rb{stroke:var(--warn);stroke-dasharray:3 3;}
+.rl{stroke:var(--mut);stroke-dasharray:2 3;}
+.cf{stroke:var(--c2);stroke-dasharray:6 3;}
+.cr{stroke:var(--mut);stroke-dasharray:10 4;}
+text.ev{fill:var(--bad);stroke:none;}
+text.rb{fill:var(--warn);stroke:none;}
+text.rl{fill:var(--mut);stroke:none;}
+text.cf{fill:var(--c2);stroke:none;}
+text.cr{fill:var(--mut);stroke:none;}
+.num td:not(:first-child),.num th:not(:first-child){text-align:right;}
 form { margin: 0.5rem 0; }
 form + form { margin-top: 1.5rem; }
 button, input { font: inherit; padding: 0.25rem 0.6rem; }

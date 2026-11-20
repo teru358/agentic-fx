@@ -1,4 +1,4 @@
-"""資金推移の画面 (/performance)。今の資金保護の状態・数字・印の表だけを出し、図は出さない。
+"""資金推移の画面 (/performance)。今の資金保護の状態・資金推移の図・数字・印の表を出す。
 
 daemon の応答のうち、ここで名指しした field だけを表示する。上位の型は request の
 `_check_reply_shape` が見ており、個々の値の異常はここで「不明」にする (正常には倒さない)。
@@ -12,7 +12,7 @@ from collections.abc import Mapping
 
 from afx_ops import display_time
 from afx_ops.display_zone import zone_of
-from afx_ops.web import marks, render, tabs
+from afx_ops.web import marks, render, svg, tabs
 
 PATH = "/performance"
 RANGES = ("7d", "30d", "90d", "all")
@@ -237,7 +237,7 @@ def _stats(data: Mapping[str, object], tz: str) -> str:
         cells = [_amount(stats.get(f"{name}_{key}")) for key in ("first", "last", "min", "max")]
         rows.append(f"<tr><td>{label}</td>" + "".join(f"<td>{_esc(c)}</td>" for c in cells)
                     + "</tr>")
-    table = ("<table><thead><tr><th>項目</th><th>期間の初め</th><th>期間の終わり</th>"
+    table = ('<table class="num"><thead><tr><th>項目</th><th>期間の初め</th><th>期間の終わり</th>'
              "<th>最小</th><th>最大</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
     span = (f"<p>記録の範囲: {_time(stats.get('first_at'), tz)} 〜 {_time(stats.get('last_at'), tz)}"
             + (f" (単位: {_esc(unit)})" if unit else "") + "</p>")
@@ -271,9 +271,13 @@ def _mark_row(item: Mapping[str, object], tz: str) -> str:
     return "<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>"
 
 
-def _marks_section(data: Mapping[str, object], tz: str, *, table: bool = True) -> str:
+def _mark_items(data: Mapping[str, object]) -> list[dict]:
     raw = data.get("marks")
-    items = [item for item in raw if type(item) is dict] if type(raw) is list else []
+    return [item for item in raw if type(item) is dict] if type(raw) is list else []
+
+
+def _marks_section(data: Mapping[str, object], tz: str, *, table: bool = True) -> str:
+    items = _mark_items(data)
     shown = items[:MAX_MARKS]
     omitted = len(items) - len(shown)
     daemon_omitted = data.get("marks_omitted")
@@ -294,6 +298,39 @@ def _marks_section(data: Mapping[str, object], tz: str, *, table: bool = True) -
     return heading + omitted_note + more + "</section>"
 
 
+# --- 図 ------------------------------------------------------------------------------------
+
+def _figure(data: Mapping[str, object], tz: str, *, draw: bool = True) -> str:
+    """資金推移の図の枠。描けない・予算を超えた図は説明文にし、固定文と注記は必ず残す。"""
+    stats = _dict(data.get("stats"))
+    empty = "first_at" in stats and "last_at" in stats and stats["first_at"] is None \
+        and stats["last_at"] is None
+    if draw:
+        chart = svg.draw_equity(data, tz, _mark_items(data)[:MAX_MARKS])
+    else:
+        chart = svg.Chart("", None, (svg.NOTE_LINES_OVER,))
+    if chart.svg:
+        lines = list(chart.notes)
+    else:
+        lines = ["この期間の記録はありません" if empty and not chart.span else chart.notes[0]]
+    body = chart.svg + "".join(f"<p>{_esc(line)}</p>" for line in lines)
+    if chart.svg and chart.span is not None:
+        unit = _currency(data)
+        body += (f"<p>横軸: 表示 tz の時刻 ({_esc(chart.span[0])} 〜 {_esc(chart.span[1])})、"
+                 "縦軸: 口座通貨の金額" + (f" ({_esc(unit)})" if unit else "") + "</p>")
+    omissions = _dict(data.get("omissions"))
+    omitted = [(label, omissions.get(key)) for label, key in (("代表点", "equity_points"),
+                                                              ("階段の段", "hwm_steps"))]
+    shown = [f"{label} {_count(value)}" for label, value in omitted
+             if type(value) is int and value > 0]
+    if shown:
+        body += ("<p>図から省いたもの: " + _esc("、".join(shown))
+                 + " (下の数字は省く前の全期間の集計です)</p>")
+    body += ("<p>線は時間で束ねた表示で、判定の根拠ではありません。"
+             "kill switch の印は記録がある分だけです。</p>")
+    return "<section><h2>資金推移の図</h2>" + body + "</section>"
+
+
 # --- 注記 ----------------------------------------------------------------------------------
 
 def _notes(data: Mapping[str, object], tz: str) -> str:
@@ -307,6 +344,7 @@ def _notes(data: Mapping[str, object], tz: str) -> str:
         "線を割っただけでは印は付きません",
         history,
         "期間内にも履歴の欠けがあり得ます",
+        "束内の equity と作動の水準の厳密な交差は再現していません",
         "event だけから分かる印は、作動 / 解除を記録した時刻です。通知の時刻を状態が変わった時刻とは"
         "断定しません",
     ]
@@ -317,18 +355,25 @@ def _notes(data: Mapping[str, object], tz: str) -> str:
 
 def render_performance(data: Mapping[str, object], tab: str = "equity",
                        range_key: str = DEFAULT_RANGE) -> bytes:
-    """資金推移の画面。合計の予算を超えるときは、印の表を説明文に置き換える 1 段だけ行う。"""
+    """資金推移の画面。合計の予算を超えるときは、印の表、次に図を説明文に置き換える (各 1 段)。"""
     tz = zone_of(data)
     bar = tabs.bar(PATH, tab, carry={"range": range_key} if range_key != DEFAULT_RANGE else None,
                    omit_default=True)
     head = "<p>paper の記録です</p>" + _warnings(data) + _range_links(tab, range_key)
-    fixed = _current(data, tz) + _stats(data, tz)
+    current = _current(data, tz)
+    stats = _stats(data, tz)
     tail = _notes(data, tz)
-    marks_part = _marks_section(data, tz)
-    document = render._document("Performance", head + fixed + marks_part + tail, tz,
-                                current=PATH, tabs=bar, refresh=False)
+
+    def build(figure: str, marks_part: str) -> bytes:
+        return render._document("Performance", head + current + figure + stats + marks_part + tail,
+                                tz, current=PATH, tabs=bar, refresh=False)
+    figure = _figure(data, tz)
+    document = build(figure, _marks_section(data, tz))
     if len(document) <= PAGE_BUDGET_BYTES:
         return document
     replaced = _marks_section(data, tz, table=False)
-    return render._page("Performance", head + fixed + replaced + tail, tz, current=PATH, tabs=bar,
-                        refresh=False)
+    document = build(figure, replaced)
+    if len(document) <= PAGE_BUDGET_BYTES:
+        return document
+    return render._page("Performance", head + current + _figure(data, tz, draw=False) + stats
+                        + replaced + tail, tz, current=PATH, tabs=bar, refresh=False)

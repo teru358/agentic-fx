@@ -425,7 +425,7 @@ def test_a_page_whose_claims_shrink_marks_each_cut_claim_and_a_dropped_claim():
     claims = tab_text(built, "claims", detail)
     assert re.findall(r"<pre>(あ+)…</pre>", claims) and "…(省略)" not in claims
     assert "…(" in tab_text(built, "change", detail) and "申告: あり" in built.block
-    built, detail = _shrink_case(claim="あ" * 2000, parent_items=20)
+    built, detail = _shrink_case(claim="あ" * 2000, parent_items=18)
     claims = tab_text(built, "claims", detail)
     assert "<p>…(省略)</p>" in claims and "<pre>" not in claims
     assert "申告: あり" in built.block and "<dt>parent_facts</dt>" in tab_text(built, "overview", detail)
