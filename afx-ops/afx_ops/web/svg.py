@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import html
 import math
+import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import NamedTuple
@@ -402,3 +403,125 @@ def _full(at: float, tz: str) -> str:
     except (ValueError, OverflowError, OSError):
         return ""
     return converted.text if converted.ok else ""
+
+
+# --- 戦略別の累積損益 ----------------------------------------------------------------------
+
+STRATEGY_BUDGET_BYTES = 14 * 1024
+MAX_SERIES_POINTS = 122
+SERIES_CSS = ("c1", "c2", "c3", "c4")
+CRON_CSS = "cr"
+CRON_ORIGIN = "cron"
+_ORIGIN = re.compile(r"cron|signal:[a-z][a-z0-9_]{0,63}\Z")
+LEGEND_TOP = 226
+LEGEND_ROW = 16
+NOTE_STRATEGY_OVER = "累積損益の図は表示の上限を超えたため省きました。数字は下の表を見てください"
+NOTE_NO_SERIES = "図に描ける累積損益がありません。数字は下の表を見てください"
+NO_PNL = "損益不明"
+
+
+class Series(NamedTuple):
+    css: str
+    origin: str
+    row: Mapping[str, object]
+
+
+def series_rows(rows: object) -> tuple[list[Series], int]:
+    """図に描く系列と、色が足りず描かなかった系列の数。
+
+    起動理由が文法に合い、累積の点を持つ行だけ。定期の判断は中立色の長破線、ほかは件数の多い順
+    (行の並び順) に 4 色を割り当てる。"""
+    chosen: list[Series] = []
+    skipped = 0
+    colors = iter(SERIES_CSS)
+    for row in rows if type(rows) is list else []:
+        if type(row) is not dict or type(row.get("cumulative")) is not list \
+                or not row["cumulative"]:
+            continue
+        origin = row.get("origin")
+        if type(origin) is not str or not _ORIGIN.match(origin):
+            continue
+        if origin == CRON_ORIGIN:
+            chosen.append(Series(CRON_CSS, origin, row))
+            continue
+        css = next(colors, None)
+        if css is None:
+            skipped += 1
+        else:
+            chosen.append(Series(css, origin, row))
+    return chosen, skipped
+
+
+def _cumulative(raw: object) -> list[tuple[float, float] | None]:
+    """読めない点は None のまま残し、線を切る位置にする。"""
+    out: list[tuple[float, float] | None] = []
+    for item in (raw if type(raw) is list else [])[-MAX_SERIES_POINTS:]:
+        at = _epoch(item.get("t")) if type(item) is dict else None
+        pnl = _number(item.get("pnl")) if type(item) is dict else None
+        out.append(None if at is None or pnl is None else (at, pnl))
+    return out
+
+
+def _stair(scale: _Scale, points: Sequence[tuple[float, float]]) -> list[tuple[int, int]]:
+    """決済の時刻で垂直に動く階段 (水平 → 垂直)。"""
+    pairs = [(scale.x(points[0][0]), scale.y(points[0][1]))]
+    for (_, before), (at, after) in zip(points, points[1:]):
+        pairs.append((scale.x(at), scale.y(before)))
+        pairs.append((scale.x(at), scale.y(after)))
+    return pairs
+
+
+def _strategy_scale(data: Mapping[str, object],
+                    lines: Sequence[Sequence[tuple[float, float]]]) -> _Scale:
+    times = [t for line in lines for t, _ in line]
+    times += [t for t in (_epoch(data.get("from")), _epoch(data.get("to"))) if t is not None]
+    t_low, t_high = min(times), max(times)
+    if t_high <= t_low:
+        t_high = t_low + 1
+    values = [v for line in lines for _, v in line] + [0.0]
+    v_low, v_high = min(values), max(values)
+    pad = (v_high - v_low) * 0.04 or 1.0
+    low, high = v_low - pad, v_high + pad
+    if not (high - low) / 4 >= MIN_TICK_STEP:
+        low, high = v_low - 1.0, v_high + 1.0
+    return _Scale(t_low, t_high, low, high)
+
+
+def _strategy_legend(items: Sequence[tuple[str, str]]) -> str:
+    out = []
+    for index, (css, label) in enumerate(items):
+        y = LEGEND_TOP + LEGEND_ROW * index
+        out.append(f'<line class="{css}" x1="{X0}" y1="{y - 4}" x2="{X0 + 28}" y2="{y - 4}"/>'
+                   f'<text x="{X0 + 34}" y="{y}">{_esc(label)}</text>')
+    return "".join(out)
+
+
+def draw_strategies(data: Mapping[str, object], tz: str, amount) -> Chart:
+    """起動理由ごとの累積損益の階段線。期間の初めを 0 とする daemon の点をそのまま描く。
+
+    `amount` は金額の書式 (表と同じ関数)。凡例は描いた系列だけで、終点の値を添える。
+    予算を超えたら図を丸ごと説明文に置き換える。"""
+    chosen, _ = series_rows(data.get("strategies"))
+    drawn = [(item, _cumulative(item.row.get("cumulative"))) for item in chosen]
+    drawn = [(item, points) for item, points in drawn if any(p is not None for p in points)]
+    if not drawn:
+        return Chart("", None, (NOTE_NO_SERIES,))
+    readable = [[p for p in points if p is not None] for _, points in drawn]
+    scale = _strategy_scale(data, readable)
+    span = (_full(scale.t_low, tz), _full(scale.t_high, tz))
+    zero = scale.y(0.0)
+    out = [f'<line class="ax" x1="{X0}" y1="{zero}" x2="{X1}" y2="{zero}"/>']
+    legend = []
+    for (item, points), line in zip(drawn, readable):
+        for chunk in _chunks(points, lambda p: p is not None):
+            out.append(_line(item.css, _stair(scale, chunk)))
+        known = item.row.get("pnl_known_count")
+        end = NO_PNL if type(known) is int and known == 0 else f"終点 {amount(line[-1][1])}"
+        legend.append((item.css, f"{item.origin} {end}"))
+    height = LEGEND_TOP + LEGEND_ROW * (len(legend) - 1) + 8
+    opening = (f'<svg viewBox="0 0 {VIEW_W} {height}" role="img" '
+               'aria-label="戦略別の累積損益の図 (起動理由ごとの階段線)">')
+    body = "".join(out) + _frame(scale, tz) + _strategy_legend(legend)
+    if len((opening + body + "</svg>").encode("utf-8")) > STRATEGY_BUDGET_BYTES:
+        return Chart("", span, (NOTE_STRATEGY_OVER,))
+    return Chart(opening + body + "</svg>", span, ())

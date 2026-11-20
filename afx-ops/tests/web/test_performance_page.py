@@ -87,10 +87,10 @@ def body_text(html: str) -> str:
 
 # --- route・query ----------------------------------------------------------------
 
-def test_the_route_is_the_performance_read_and_its_tab_table_has_one_equity_tab():
+def test_the_route_is_the_performance_read_and_its_tab_table_has_the_equity_and_strategy_tabs():
     from afx_ops.web.routes import resolve_route
     assert resolve_route("/performance").route.client_method == "performance"
-    assert tabs.tab_names("/performance") == ("equity",)
+    assert tabs.tab_names("/performance") == ("equity", "strategy")
     assert tabs.default_tab("/performance") == "equity"
 
 
@@ -110,7 +110,7 @@ def test_the_default_range_is_30_days():
 
 @pytest.mark.parametrize("query", [
     {"range": "1d"}, {"range": "30D"}, {"range": ""}, {"range": "30d "}, {"range": "all,7d"},
-    {"tab": "strategy"}, {"tab": "Equity"}, {"tab": ""}, {"x": "1"}, {"range": "7d", "n": "5"},
+    {"tab": "strategies"}, {"tab": "Strategy"}, {"tab": "Equity"}, {"tab": ""}, {"x": "1"}, {"range": "7d", "n": "5"},
     {"range": "7d", "limit": "5"}])
 @pytest.mark.parametrize("method", ["GET", "HEAD"])
 def test_an_unknown_key_or_value_is_400_without_calling_the_daemon(query, method):
@@ -129,7 +129,8 @@ def test_the_range_links_swap_range_and_keep_the_tab_and_the_tab_bar_keeps_the_r
     assert hrefs["30 日"] == "/performance"
     assert hrefs["全期間"] == "/performance?range=all"
     bar = re.search(r'<nav class="tabs">(.*?)</nav>', html, re.S).group(1)
-    assert re.findall(r'<a href="([^"]*)"', bar) == ["/performance?range=7d"]
+    assert re.findall(r'<a href="([^"]*)"', bar) \
+        == ["/performance?range=7d", "/performance?tab=strategy&amp;range=7d"]
     assert "range=" not in re.search(r'<nav class="tabs">(.*?)</nav>', page(), re.S).group(1)
 
 

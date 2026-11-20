@@ -23,6 +23,9 @@ MAX_MARKS = 20
 # 資金推移の画面の合計と、印の表の部品の予算 (UTF-8 byte)
 PAGE_BUDGET_BYTES = 60 * 1024
 MARKS_BUDGET_BYTES = 7 * 1024
+# 戦略別の画面の合計と、戦略の表の部品の予算 (UTF-8 byte)
+STRATEGY_PAGE_BUDGET_BYTES = 48 * 1024
+STRATEGY_TABLE_BUDGET_BYTES = 22 * 1024
 
 UNKNOWN = "不明"
 NONE_TEXT = "–"
@@ -355,7 +358,14 @@ def _notes(data: Mapping[str, object], tz: str) -> str:
 
 def render_performance(data: Mapping[str, object], tab: str = "equity",
                        range_key: str = DEFAULT_RANGE) -> bytes:
+    if tab == "strategy":
+        return _render_strategy(data, range_key)
+    return _render_equity(data, range_key)
+
+
+def _render_equity(data: Mapping[str, object], range_key: str) -> bytes:
     """資金推移の画面。合計の予算を超えるときは、印の表、次に図を説明文に置き換える (各 1 段)。"""
+    tab = "equity"
     tz = zone_of(data)
     bar = tabs.bar(PATH, tab, carry={"range": range_key} if range_key != DEFAULT_RANGE else None,
                    omit_default=True)
@@ -377,3 +387,230 @@ def render_performance(data: Mapping[str, object], tab: str = "equity",
         return document
     return render._page("Performance", head + current + _figure(data, tz, draw=False) + stats
                         + replaced + tail, tz, current=PATH, tabs=bar, refresh=False)
+
+
+# --- 戦略別 ------------------------------------------------------------------------------------
+
+STRATEGY_INTRO = ("その戦略のシグナルで起きた判断の成績です。建てる・決済する判断は LLM が行うので、"
+                  "戦略そのものの成績 (backtest) とは違います")
+STRATEGY_NOTES = (
+    "累積損益の合計は equity の変化と一致しません (含み損益、期間の外で決済した取引、"
+    "スワップを含まないため)",
+    "同じ名前の plugin の版が変わっても、同じ行に数えます",
+)
+CRON_LABEL = "定期の判断 (cron、戦略に属さない)"
+UNKNOWN_LABEL = "帰属不明"
+REASON_LABELS = (("llm_close", "判断"), ("sl", "SL"), ("tp", "TP"), ("other", "その他"))
+SERIES_HISTORY = 120
+STRATEGY_HEADERS = ("起動理由", "件数", "勝 / 負 / 分", "勝率", "PF", "平均 R (手数料込み)",
+                    "損益の合計", "決済の内訳", "保有中")
+NOTE_TABLE_OVER = "戦略の表は表示の上限を超えたため省きました"
+_ORIGIN = re.compile(r"signal:[a-z][a-z0-9_]{0,63}\Z")
+
+
+def _signed_amount(value: object) -> str:
+    text = _amount(value)
+    number = _number(value)
+    return "+" + text if number is not None and text != UNKNOWN and not text.startswith("-") \
+        and number > 0 else text
+
+
+def _signed_r(value: object) -> str:
+    number = _number(value)
+    if number is None:
+        return UNKNOWN
+    if abs(number) >= BIG:
+        return f"{number:+.2e}"
+    text = f"{number:+.2f}"
+    return "0.00" if not any(c in "123456789" for c in text) else text
+
+
+def _thresholds(data: Mapping[str, object]) -> tuple[int, int] | None:
+    """daemon が返す、率を出す最小の件数と「(参考)」が外れる件数。読めなければ None (率は不明)。"""
+    raw = _dict(data.get("thresholds"))
+    low, high = raw.get("min_count"), raw.get("reference_count")
+    if type(low) is int and type(high) is int and 0 < low <= high:
+        return low, high
+    return None
+
+
+def _rated(value: str, count: object, limits: tuple[int, int] | None) -> str:
+    """母数が少ない率は「–」、基準に満たなければ「(参考)」を添える。"""
+    if limits is None or type(count) is not int or count < 0:
+        return UNKNOWN
+    if count < limits[0]:
+        return NONE_TEXT
+    return value if count >= limits[1] else value + " (参考)"
+
+
+def _origin_cell(row: Mapping[str, object]) -> str:
+    origin = row.get("origin")
+    if origin == "cron":
+        return _esc(CRON_LABEL)
+    if origin == "unknown":
+        return _esc(UNKNOWN_LABEL)
+    if origin == "other":
+        return _esc(f"ほか {_count(row.get('origin_count'))} 件")
+    if type(origin) is str and _ORIGIN.match(origin):
+        return _esc(origin)
+    return UNKNOWN
+
+
+def _ratio_percent(value: object) -> str:
+    number = _number(value)
+    return UNKNOWN if number is None or not 0 <= number <= 1 else _percent(number * 100)
+
+
+def _profit_factor(row: Mapping[str, object], limits: tuple[int, int] | None) -> str:
+    known = row.get("pnl_known_count")
+    value = _number(row.get("pf"))
+    if value is None:
+        text = "損失なし" if row.get("pf") is None and type(known) is int and known > 0 \
+            and row.get("losses") == 0 else UNKNOWN
+    else:
+        text = f"{value:.2f}" if value < BIG else f"{value:.2e}"
+    return _rated(text, known, limits)
+
+
+def _average_r(row: Mapping[str, object], limits: tuple[int, int] | None) -> str:
+    known = row.get("r_known_count")
+    value = "–" if row.get("avg_r") is None and known == 0 else _signed_r(row.get("avg_r"))
+    cell = _rated(value, known, limits)
+    return _esc(cell) + f"<br>R 算出 {_count(known)} / 決済 {_count(row.get('closed_count'))} 件"
+
+
+def _reasons_cell(row: Mapping[str, object]) -> str:
+    reasons = _dict(row.get("close_reasons"))
+    shown = []
+    for key, label in REASON_LABELS:
+        value = reasons.get(key)
+        if type(value) is int and value == 0:
+            continue
+        shown.append(f"{label} {_count(value)}")
+    return _esc(" / ".join(shown)) if shown else NONE_TEXT
+
+
+def _holding_cell(row: Mapping[str, object]) -> str:
+    text = _count(row.get("open_count"))
+    pending = row.get("close_pending_count")
+    if type(pending) is not int or pending != 0:
+        text += f" (決済待ち {_count(pending)})"
+    return _esc(text)
+
+
+def _strategy_row(row: Mapping[str, object], limits: tuple[int, int] | None) -> str:
+    closed = _count(row.get("closed_count"))
+    unknown = row.get("pnl_unknown_count")
+    if type(unknown) is not int or unknown != 0:
+        closed += f" (損益不明 {_count(unknown)})"
+    wins, losses, flats = (_count(row.get(k)) for k in ("wins", "losses", "flats"))
+    known = row.get("pnl_known_count")
+    total = NONE_TEXT if row.get("total_pnl") is None and known == 0 \
+        else _signed_amount(row.get("total_pnl"))
+    cells = [_origin_cell(row), _esc(closed), _esc(f"{wins} / {losses} / {flats}"),
+             _esc(_rated(_ratio_percent(row.get("win_rate")), known, limits)),
+             _esc(_profit_factor(row, limits)), _average_r(row, limits), _esc(total),
+             _reasons_cell(row), _holding_cell(row)]
+    return "<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>"
+
+
+def strategy_rows(data: Mapping[str, object]) -> list[dict]:
+    raw = data.get("strategies")
+    return [item for item in raw if type(item) is dict] if type(raw) is list else []
+
+
+def _strategy_table(data: Mapping[str, object], *, table: bool = True) -> str:
+    rows = strategy_rows(data)
+    unit = _currency(data)
+    heads = list(STRATEGY_HEADERS)
+    if unit:
+        heads[6] += f" ({unit})"
+    heading = "<section><h2>起動理由ごとの表</h2>"
+    if not rows:
+        return heading + "<p>この期間に決済した取引も、保有中の取引もありません</p></section>"
+    if not any(type(r.get("closed_count")) is int and r["closed_count"] > 0 for r in rows):
+        empty = "<p>この期間に決済した取引はありません</p>"
+    else:
+        empty = ""
+    omitted = _dict(data.get("omissions")).get("strategy_rows")
+    merged = (f"<p>行数が多いため、{_count(omitted)} 件の起動理由を「ほか」の行にまとめました</p>"
+              if type(omitted) is int and omitted > 0 else "")
+    if table:
+        limits = _thresholds(data)
+        body = ('<div class="scroll"><table class="num"><thead><tr>'
+                + "".join(f"<th>{_esc(name)}</th>" for name in heads)
+                + "</tr></thead><tbody>" + "".join(_strategy_row(r, limits) for r in rows)
+                + "</tbody></table></div>")
+        text = heading + empty + body + merged + "</section>"
+        if len(text.encode("utf-8")) <= STRATEGY_TABLE_BUDGET_BYTES:
+            return text
+    return heading + empty + f"<p>{NOTE_TABLE_OVER}</p>" + merged + "</section>"
+
+
+def _strategy_figure(data: Mapping[str, object], tz: str, *, draw: bool = True) -> str:
+    chosen, skipped = svg.series_rows(data.get("strategies"))
+    if draw:
+        chart = svg.draw_strategies(data, tz, _signed_amount)
+    else:
+        chart = svg.Chart("", None, (svg.NOTE_STRATEGY_OVER,))
+    body = '<div class="scroll">' + chart.svg + "</div>" if chart.svg else ""
+    body += "".join(f"<p>{_esc(line)}</p>" for line in chart.notes)
+    if chart.svg and chart.span is not None:
+        unit = _currency(data)
+        body += (f"<p>横軸: 表示 tz の時刻 ({_esc(chart.span[0])} 〜 {_esc(chart.span[1])})、"
+                 "縦軸: 期間の初めを 0 とした累積損益" + (f" ({_esc(unit)})" if unit else "")
+                 + "</p>")
+    hidden = skipped
+    series_hidden = _dict(data.get("omissions")).get("strategy_series")
+    if type(series_hidden) is int and series_hidden > 0:
+        hidden += series_hidden
+    if hidden:
+        body += f"<p>ほか {_count(hidden)} 戦略は表のみです</p>"
+    if chart.svg:
+        for item in chosen:
+            closed = item.row.get("closed_count")
+            if type(closed) is int and closed > SERIES_HISTORY:
+                body += (f"<p>{_esc(item.origin)}: 古い決済 {_count(closed - SERIES_HISTORY)} 件は"
+                         "始点の 1 点にまとめています</p>")
+            if item.row.get("pnl_known_count") == 0 and item.row.get("closed_count"):
+                body += f"<p>{_esc(item.origin)}: 損益が不明のため、0 の線です</p>"
+    return "<section><h2>累積損益の図</h2>" + body + "</section>"
+
+
+def _strategy_warnings(data: Mapping[str, object]) -> str:
+    quality = _dict(data.get("quality"))
+    lines = []
+    if quality.get("partial") is True:
+        lines.append("一部の記録を読めていません。集計は読めた分だけです")
+    for key, text in (("invalid_orders", "読めない注文があります。その指標は不明にしました"),
+                      ("unplaced_closed_count", "決済の時刻を読めない取引があり、期間に数えていません")):
+        value = quality.get(key)
+        if type(value) is int and value > 0:
+            lines.append(f"{text} ({_count(value)} 件)")
+    return "".join(f'<p><span class="st warn">△ 注意</span> {_esc(line)}</p>' for line in lines)
+
+
+def _render_strategy(data: Mapping[str, object], range_key: str) -> bytes:
+    """戦略別の画面。合計の予算を超えるときは、図、次に表を説明文に置き換える (各 1 段)。"""
+    tz = zone_of(data)
+    bar = tabs.bar(PATH, "strategy", carry={"range": range_key} if range_key != DEFAULT_RANGE
+                   else None, omit_default=True)
+    head = ("<p>paper の記録です</p>" + _strategy_warnings(data) + _range_links("strategy", range_key)
+            + "<section><h2>戦略別の成績</h2><p>" + _esc(STRATEGY_INTRO) + "</p></section>")
+    tail = ("<section><h2>注記</h2><ul>" + "".join(f"<li>{_esc(line)}</li>" for line in STRATEGY_NOTES)
+            + "</ul></section>")
+
+    def build(figure: str, table: str) -> bytes:
+        return render._document("Performance", head + figure + table + tail, tz, current=PATH,
+                                tabs=bar, refresh=False)
+    figure, table = _strategy_figure(data, tz), _strategy_table(data)
+    document = build(figure, table)
+    if len(document) <= STRATEGY_PAGE_BUDGET_BYTES:
+        return document
+    figure = _strategy_figure(data, tz, draw=False)
+    document = build(figure, table)
+    if len(document) <= STRATEGY_PAGE_BUDGET_BYTES:
+        return document
+    table = _strategy_table(data, table=False)
+    return render._page("Performance", head + figure + table + tail, tz, current=PATH, tabs=bar,
+                        refresh=False)

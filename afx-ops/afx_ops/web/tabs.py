@@ -73,7 +73,10 @@ TABS: dict[str, tuple[Tab, ...]] = {
         Tab("change", "変更", Link(TAB, "change")),
         Tab("claims", "申告", Link(TAB, "claims")),
     ),
-    "/performance": (Tab("equity", "資金推移", Link(TAB, "equity")),),
+    "/performance": (
+        Tab("equity", "資金推移", Link(TAB, "equity")),
+        Tab("strategy", "戦略別", Link(TAB, "strategy")),
+    ),
     "/activity": (Tab(ALL, "全件", Link(CATEGORY, None)),)
     + tuple(Tab(name, name, Link(CATEGORY, name)) for name in ACTIVITY_CATEGORIES),
 }
