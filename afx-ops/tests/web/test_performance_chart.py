@@ -537,7 +537,7 @@ def test_the_style_with_the_figure_rules_stays_within_the_byte_limit():
 
 
 @pytest.mark.parametrize("bad", ["0001-01-01T00:00:00+09:00", "9999-12-31T23:59:59-05:00",
-                                 "1970-06-01T00:00:00+00:00", "9998-12-31T00:00:01+00:00"])
+                                 "1970-06-01T00:00:00+00:00", "9999-01-01T00:00:00+00:00"])
 def test_a_time_outside_the_readable_years_is_skipped_everywhere_and_never_raises(bad):
     assert svg._epoch(bad) is None
     data = data_with(SIMPLE, STEPS, [mark(kind="latched", plot_at=bad)], **{"from": bad, "to": bad})
@@ -552,9 +552,71 @@ def test_a_time_outside_the_readable_years_is_skipped_everywhere_and_never_raise
 def test_the_readable_year_range_edges_are_accepted():
     assert svg._epoch("1971-01-01T00:00:00+00:00") is not None
     assert svg._epoch("9998-12-30T00:00:00+00:00") is not None
+    assert svg._epoch("9998-12-31T12:00:00+00:00") is not None
+    assert svg._epoch("9998-12-31T23:59:59+00:00") is not None
+    assert svg._epoch("9999-01-01T00:00:00+00:00") is None
+    assert svg._epoch("9999-01-01T08:59:59+09:00") is not None
     for tz_label in ("full", "day", "time"):
-        assert svg._date_label(svg.EPOCH_MAX, TOKYO, tz_label) is not None
+        assert svg._date_label(svg.EPOCH_MAX_EXCLUSIVE - 1, TOKYO, tz_label) is not None
     assert svg._date_label(1e18, TOKYO, "full") == "" and svg._full(1e18, TOKYO) == ""
+
+
+def test_a_point_on_the_last_day_of_the_last_readable_year_is_drawn():
+    late = [{**point(0, 1, 9000, 9100, 9050), "start_at": "9998-12-31T12:00:00+00:00",
+             "end_at": "9998-12-31T13:00:00+00:00", "last_at": "9998-12-31T13:00:00+00:00"}]
+    chart = draw(data_with(late, **{"from": "9998-12-31T12:00:00+00:00",
+                                    "to": "9998-12-31T13:00:00+00:00"}))
+    assert chart.svg and len(polylines(chart.svg, "c1")[0]) == 2
+
+
+@pytest.mark.parametrize("low,high", [(0.0, 5e-324), (0.0, 1e-323), (5e-324, 5e-324), (0.0, 0.0),
+                                      (1e10, 1e10 + 1e-5), (0.0, 1e-300)])
+def test_a_value_range_too_narrow_to_tick_still_draws_with_a_widened_axis(low, high):
+    rows = [point(1000, 1100, low, high, low), point(2000, 2100, low, high, high)]
+    chart = draw(data_with(rows, []))
+    assert chart.svg and polylines(chart.svg, "c1")
+    ticks = re.findall(r'<text x="\d+" y="\d+" text-anchor="end">([0-9.-]+)</text>', chart.svg)
+    assert ticks and all(t == t for t in ticks)
+
+
+def test_the_tick_step_is_always_positive_and_finite():
+    for low, high in [(0.0, 5e-324), (0.0, 0.0), (1.0, 1.0), (0.0, 1e-300), (-1e12, 1e12)]:
+        ticks, step = svg._nice_ticks(low, high)
+        assert step > 0 and step == step and step != float("inf") and ticks
+
+
+def test_marks_at_neighbouring_positions_do_not_overlap_their_symbols():
+    # 作動と解除が隣り合う x (1 目盛りだけ違う) に落ちても、同じ高さに文字が重ならない
+    span = 10000 / 880
+    marks = [mark(kind="latched", plot_at=iso(1500)), mark(kind="released", plot_at=iso(1500 + span)),
+             mark(kind="cashflow", plot_at=iso(1500 + 2 * span))]
+    texts = re.findall(r'<text class="\w+" x="(\d+)" y="(\d+)" text-anchor="middle">',
+                       draw(data_with(SIMPLE, STEPS, marks)).svg)
+    assert len(texts) == 3
+    for i, (xa, ya) in enumerate(texts):
+        for xb, yb in texts[i + 1:]:
+            assert ya != yb or abs(int(xa) - int(xb)) >= svg.MARK_WIDTH, texts
+
+
+def test_far_apart_marks_share_a_row_and_a_neighbouring_counted_group_keeps_clear():
+    far = [mark(kind="latched", plot_at=iso(1000)), mark(kind="released", plot_at=iso(5000))]
+    ys = re.findall(r'<text class="\w+" x="\d+" y="(\d+)" text-anchor="middle">',
+                    draw(data_with(SIMPLE, STEPS, far)).svg)
+    assert len(set(ys)) == 1
+    many = [mark(kind="latched", plot_at=iso(1500)) for _ in range(4)] \
+        + [mark(kind="released", plot_at=iso(1500 + 10000 / 880 * 3))]
+    texts = re.findall(r'<text class="\w+" x="(\d+)" y="(\d+)" text-anchor="middle">'
+                       r'<title>[^<]*</title>([^<]*)</text>', draw(data_with(SIMPLE, STEPS, many)).svg)
+    (xa, ya, la), (xb, yb, lb) = texts
+    assert ya != yb or abs(int(xa) - int(xb)) * 2 >= svg.MARK_WIDTH * (len(la) + len(lb))
+
+
+def test_the_crowded_marks_stay_inside_the_figure_and_the_part_budget():
+    marks = [mark(kind=k, plot_at=iso(3000 + 5 * j)) for j, k in enumerate(
+        ["latched", "released", "rebase", "cashflow", "unknown_hwm_drop"] * 4)]
+    chart = draw(data_with(SIMPLE, STEPS, marks))
+    ys = [int(y) for y in re.findall(r'<text class="\w+" x="\d+" y="(\d+)" text-anchor="middle">', chart.svg)]
+    assert len(ys) == 20 and max(ys) < svg.Y1
 
 
 def test_marks_dropped_for_the_budget_do_not_stretch_the_time_axis(monkeypatch):

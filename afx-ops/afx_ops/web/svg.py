@@ -20,9 +20,11 @@ X0, X1, Y0, Y1 = 72, 952, 12, 186
 MAX_POINTS = 280
 MAX_STEPS = 320
 BIG = 1e12
-# 時刻として読む範囲 (1971〜9998 年)。外の値は表示 tz に直せないことがあるので読めない値にする
+# 目盛り間隔の下限。これより細かい値幅は広げて描く
+MIN_TICK_STEP = 1e-9
+# 時刻として読む範囲 (1971〜9998 年。9999-01-01T00:00:00 UTC は含めない)。外の値は表示 tz に直せないことがあるので読めない値にする
 EPOCH_MIN = datetime(1971, 1, 1, tzinfo=timezone.utc).timestamp()
-EPOCH_MAX = datetime(9998, 12, 31, tzinfo=timezone.utc).timestamp()
+EPOCH_MAX_EXCLUSIVE = datetime(9999, 1, 1, tzinfo=timezone.utc).timestamp()
 # 図の部品ごとの予算 (UTF-8 byte)。超えた部品は丸ごと説明文に置き換える
 LINES_BUDGET_BYTES = 32 * 1024
 MARKS_BUDGET_BYTES = 6 * 1024
@@ -37,6 +39,9 @@ MARK_STYLE = {"latched": ("✕", "作動", "ev"), "released": ("↑", "解除", 
 LINE_LEGEND = (("c1", "equity"), ("c2", "balance"), ("c3", "HWM"), ("c4", "作動の水準 (今の閾値)"))
 BAND_LEGEND = "帯: 束内の最小〜最大"
 LEGEND_STEP = 176
+# 印の記号 1 つぶんの文字幅 (図の単位)。段の数は図の高さに収まる範囲
+MARK_WIDTH = 12
+MARK_ROWS = (Y1 - Y0 - 10) // 12
 _TITLE_MAX_BYTES = 160
 
 NOTE_LINES_OVER = "図は表示の上限を超えたため省きました。数字は下の表を見てください"
@@ -74,7 +79,7 @@ def _epoch(value: object) -> float | None:
         stamp = parsed.timestamp()
     except (ValueError, OverflowError, OSError):
         return None
-    return stamp if EPOCH_MIN <= stamp <= EPOCH_MAX else None
+    return stamp if EPOCH_MIN <= stamp < EPOCH_MAX_EXCLUSIVE else None
 
 
 def _integer(value: object) -> int | None:
@@ -168,6 +173,9 @@ def _marks(raw: Sequence[object], tz: str) -> list[_Marks]:
 
 def _nice_ticks(low: float, high: float) -> tuple[list[float], float]:
     raw = (high - low) / 4
+    if not (math.isfinite(raw) and raw >= MIN_TICK_STEP):
+        raw = 1.0
+        high = low + 4.0
     magnitude = 10 ** math.floor(math.log10(raw))
     step = next(m * magnitude for m in (1, 2, 5, 10) if m * magnitude >= raw)
     first = math.ceil(low / step)
@@ -316,21 +324,28 @@ def _legend(drawn: Sequence[str], kinds: Sequence[str]) -> str:
 
 
 def _marks_part(scale: _Scale, marks: list[_Marks]) -> str:
-    """同じ x 位置・同じ種別の印は 1 つの記号にまとめて件数を添える。位置ごとに種別を縦にずらす。"""
+    """同じ x 位置・同じ種別の印は 1 つの記号にまとめて件数を添える。文字が重なり合う印 (近い位置・別種別) は
+    縦に段をずらす。"""
     groups: dict[tuple[int, str], list[_Marks]] = {}
-    rows: dict[int, int] = {}
     for mark in marks:
         groups.setdefault((scale.x(mark.at), mark.kind), []).append(mark)
+    order = list(MARK_STYLE)
+    placed: list[list[tuple[int, int]]] = []  # 段ごとの (中心 x, 文字幅)
     out = []
-    for (x, kind), members in groups.items():
-        row = rows[x] = rows.get(x, -1) + 1
-        symbol, _, css = MARK_STYLE[kind]
+    for (x, kind), members in sorted(groups.items(), key=lambda g: (g[0][0], order.index(g[0][1]))):
         count = len(members)
+        symbol, _, css = MARK_STYLE[kind]
+        shown = f"{symbol}×{count}" if count > 1 else symbol
+        width = MARK_WIDTH * len(shown)
+        row = next((i for i, taken in enumerate(placed)
+                    if all(abs(x - cx) * 2 >= width + w for cx, w in taken)), len(placed))
+        if row == len(placed):
+            placed.append([])
+        placed[row].append((x, width))
         base = members[0].title.encode("utf-8")[:_TITLE_MAX_BYTES - 16].decode("utf-8", "ignore")
         title = _esc(base + (f" ほか {count - 1} 件" if count > 1 else ""))
-        shown = f"{symbol}×{count}" if count > 1 else symbol
         out.append(f'<line class="{css}" x1="{x}" y1="{Y0}" x2="{x}" y2="{Y1}"/>'
-                   f'<text class="{css}" x="{x}" y="{Y0 + 10 + 12 * row}" '
+                   f'<text class="{css}" x="{x}" y="{Y0 + 10 + 12 * min(row, MARK_ROWS - 1)}" '
                    f'text-anchor="middle"><title>{title}</title>{shown}</text>')
     return "".join(out)
 
@@ -350,7 +365,10 @@ def _scale(parts: list[_Part], steps: list[_Step], marks: list[_Marks], ratio: f
         values += [s.hwm * ratio for s in steps if s.hwm > 0]
     v_low, v_high = min(values), max(values)
     pad = (v_high - v_low) * 0.04 or max(abs(v_high) * 0.01, 1.0)
-    return _Scale(t_low, t_high, v_low - pad, v_high + pad)
+    low, high = v_low - pad, v_high + pad
+    if not (high - low) / 4 >= MIN_TICK_STEP:
+        low, high = v_low - 1.0, v_high + 1.0
+    return _Scale(t_low, t_high, low, high)
 
 
 def draw_equity(data: Mapping[str, object], tz: str, shown_marks: Sequence[object]) -> Chart:
