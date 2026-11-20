@@ -160,11 +160,22 @@ def _word_card(table: Mapping[str, str], raw: object) -> tuple[str, str | None]:
 
 def _supports_none(current: Mapping[str, object], tz: str) -> bool:
     """「止める理由なし」と出してよいのは、kill switch が解除と読め、最新記録が新鮮で、
-    必要な 2 つの時刻が読めるときだけ。欠ける・矛盾するなら不明に倒す。"""
-    return (marks.classify_kill_switch(current.get("kill_switch")) == (marks.OK, "解除")
+    必要な 2 つの時刻が読め、応答の中の経過秒数・DD・equity が停止条件に反しないときだけ。
+    欠ける・矛盾するなら不明に倒す。判定の作り直しはここまでで、以上は daemon を正とする。"""
+    if not (marks.classify_kill_switch(current.get("kill_switch")) == (marks.OK, "解除")
             and current.get("snapshot_freshness") == "fresh"
             and _time(current.get("snapshot_at"), tz) != UNKNOWN
-            and _time(current.get("state_fetched_at"), tz) != UNKNOWN)
+            and _time(current.get("state_fetched_at"), tz) != UNKNOWN):
+        return False
+    age = _number(current.get("snapshot_age_sec"))
+    limit = _number(current.get("snapshot_max_age_min"))
+    dd = _number(current.get("dd_pct"))
+    threshold = _number(current.get("kill_pct"))
+    level = _number(current.get("kill_level"))
+    headroom = _number(current.get("headroom"))
+    if None in (age, limit, dd, threshold, level, headroom):
+        return False
+    return age <= limit * 60 and dd < threshold and level + headroom > 0
 
 
 def _current(data: Mapping[str, object], tz: str) -> str:

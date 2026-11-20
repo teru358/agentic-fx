@@ -133,7 +133,7 @@ web (afx-ops) ──GET /v1/performance?range=30d──▶ daemon (ops API、sta
 
 同時刻の順序は daemon が id で決める。pnl_unknown_count = closed_count − pnl_known_count、r_unknown_count = closed_count − r_known_count、wins + losses + flats = pnl_known_count。
 不正行の検証は daemon が担当する。snapshot は除外して区間を切り、印は除外、注文は件数を残して該当指標を不明にし quality へ数える。非有限値・bool、不正 JSON・SL 欠落は指標不明、closed_at 欠落・不正、および to より未来の closed_at は期間へ割り当てず unplaced_closed_count へ。`range=all` の始点は to 以下の候補だけから選ぶ (from <= to)。
-web は既存の `_check_reply_shape` (`A/web/request.py:206-234`) と同じ上位の型・形だけを検査し、違えば 502。個々の表示値の異常は「不明」。再集約・合算・行検証は繰り返さず、集計値を図から再計算しない。marks_since が null なら「event の記録はありません」。
+web は既存の `_check_reply_shape` (`A/web/request.py:206-234`) と同じ上位の型・形だけを検査し、違えば 502。個々の表示値の異常は「不明」。再集約・合算・行検証は繰り返さず、集計値を図から再計算しない。marks_since が null なら「event の記録はありません」。例外として `fill_hold` の `none` だけは、応答の中の鮮度・経過秒数と上限・DD と閾値・equity (kill_level + headroom) が停止条件に反しないと確かめられたときに限って正常に出し、欠ける・矛盾するなら「不明」に倒す。web が daemon の判定を作り直すのはここまでで、それ以上の不整合は daemon を正とする。
 
 ### 2.3 資金推移の間引き
 

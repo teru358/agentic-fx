@@ -21,7 +21,7 @@ def current(**over):
             "state_fetched_at": NOW, "snapshot_at": "2026-11-19T02:59:30+00:00",
             "snapshot_fetched_at": NOW, "snapshot_age_sec": 30.0, "snapshot_freshness": "fresh",
             "dd_pct": 2.5, "kill_level": 9000.0, "headroom": 500.0, "kill_pct": 10.0,
-            "fill_hold": "none"}
+            "fill_hold": "none", "snapshot_max_age_min": 10.0}
     base.update(over)
     return base
 
@@ -288,6 +288,36 @@ def test_none_is_shown_as_no_reason_only_when_the_other_fields_agree(
     else:
         assert "? 不明" in card and "○" not in card
         assert "止める理由は見つかっていません" not in card
+
+
+_NUM_MISSING = object()
+
+
+@pytest.mark.parametrize("field,value,shows_none", [
+    ("snapshot_age_sec", 600.0, True), ("snapshot_age_sec", 600.5, False),
+    ("snapshot_age_sec", _NUM_MISSING, False), ("snapshot_age_sec", None, False),
+    ("snapshot_age_sec", "30", False), ("snapshot_age_sec", True, False),
+    ("snapshot_max_age_min", 0.5, True), ("snapshot_max_age_min", 0.4, False),
+    ("snapshot_max_age_min", _NUM_MISSING, False), ("snapshot_max_age_min", None, False),
+    ("dd_pct", 9.99, True), ("dd_pct", 10.0, False), ("dd_pct", 30.0, False),
+    ("dd_pct", _NUM_MISSING, False), ("dd_pct", None, False),
+    ("kill_pct", 2.5, False), ("kill_pct", 2.6, True),
+    ("kill_pct", _NUM_MISSING, False), ("kill_pct", None, False),
+    ("kill_level", _NUM_MISSING, False), ("headroom", _NUM_MISSING, False),
+    ("headroom", -9000.0, False), ("headroom", -9001.0, False),
+    ("headroom", -8999.0, True),
+])
+def test_none_must_agree_with_the_age_and_drawdown_in_the_same_reply(field, value, shows_none):
+    data = current()
+    if value is _NUM_MISSING:
+        del data[field]
+    else:
+        data[field] = value
+    card = _hold_card(payload(current=data))
+    if shows_none:
+        assert "○" in card and "止める理由は見つかっていません" in card
+    else:
+        assert "? 不明" in card and "○" not in card
 
 
 @pytest.mark.parametrize("hold,mark", [("kill_switch", "danger"), ("drawdown", "danger"),
@@ -696,7 +726,7 @@ def test_without_a_usable_threshold_the_note_writes_no_number(bad):
 
 def test_a_missing_threshold_key_writes_no_number():
     data = payload()
-    assert "snapshot_max_age_min" not in data["current"]
+    del data["current"]["snapshot_max_age_min"]
     assert "分を超えた" not in page(data)
 
 
