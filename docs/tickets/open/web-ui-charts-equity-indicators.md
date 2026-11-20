@@ -26,3 +26,4 @@ related: []
 - 2026-10-11: 起票。
 - 2026-11-17: 状態: 設計待ち — 利用者の追加要望 (2026-11-17): 資金推移のページに戦略ごとの成績を表示したい。取引は判断 mission の起動理由 (missions.trigger) で戦略に結び付く: signal:<plugin> はその戦略のシグナルで起きた判断、cron は定期の判断で戦略に属さない。建てる判断は LLM が行うので、表示は「その戦略のシグナルで起きた判断の成績」と明記する。候補: 資金推移の線 (equity / balance / HWM、kill switch の発動と HWM の付け直しの印)、戦略 (起動理由) ごとの累積損益の線と表 (件数・勝率・PF・平均 R・決済理由の内訳)、判断による決済とそのまま SL/TP まで持った場合の R の比較。daemon の読取 API (戦略別集計と時系列) → web のページ → チャートの JS の順。web の順序は配置 → CSS → チャートの裁定 (2026-11-15) のうちチャートの段にあたる
 - 2026-11-19: 状態: 実装中 — 設計 docs/superpowers/specs/2026-11-19-web-charts-equity-strategy-design.md C1 を利用者承認 (§6 は 6 件とも推奨どおり)。範囲は資金推移と戦略別の成績。比較と重ね表示は web-decision-close-vs-hold-r-compare・web-price-chart-overlays へ
+- 2026-11-20: 状態: 実装中 — T1〜T4 実装・レビュー済み (branch webcharts)。残りは T5 の実ブラウザの受入
