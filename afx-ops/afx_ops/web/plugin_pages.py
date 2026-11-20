@@ -12,10 +12,12 @@ from afx_ops.web import marks, render, tabs
 from afx_ops.web.common import approval_link, display_time, pick, plugin_link
 
 # server DTO の新 field を表示面へ自動的に広げないための allowlist (入れ子の object ごと)。
-LISTING_FIELDS = frozenset({"sources", "plugins", "invalid_pending", "unknown_submissions"})
+LISTING_FIELDS = frozenset({"sources", "plugins", "invalid_pending", "unknown_submissions",
+                            "usage_inventory"})
 ROW_FIELDS = frozenset({"name", "kind", "entity", "admission", "pending_count", "pending",
                         "open_ops", "issues", "dependencies", "dependencies_set_state",
-                        "dependents", "usefulness", "history", "history_total", "versions"})
+                        "dependents", "usefulness", "history", "history_total", "versions",
+                        "usage_review"})
 ENTITY_FIELDS = frozenset({"state", "artifact_hash", "content_hash", "reason"})
 ADMISSION_FIELDS = frozenset({"state", "reason", "alias", "detail"})
 PENDING_FIELDS = frozenset({"id", "content_hash", "kind"})

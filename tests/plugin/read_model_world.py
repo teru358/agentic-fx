@@ -119,18 +119,40 @@ class World:
         return approval_id
 
     def journal(self, name: str, approval_id: int, *, phase: str = "decided",
-                kind: str = "approve", new_target: str | None = None) -> int:
+                kind: str = "approve", new_target: str | None = None,
+                at: datetime | str | None = None, switch_required: int = 1) -> int:
         target = new_target or f".versions/{name}/{'c' * 64}"
+        stamp = at if at is not None else self.now()
         cur = self.conn.execute(
             "INSERT INTO plugin_switch_journal (kind,approval_id,name,old_kind,old_target,"
             "temp_path,new_target,switch_required,phase,actor,updated_at) "
-            "VALUES (?,?,?,'absent',NULL,'t',?,1,?,'test',?)",
-            (kind, approval_id, name, target, phase, self.now().isoformat()))
+            "VALUES (?,?,?,'absent',NULL,'t',?,?,?,'test',?)",
+            (kind, approval_id, name, target, switch_required, phase,
+             stamp if isinstance(stamp, str) else stamp.isoformat()))
         self.conn.commit()
         return cur.lastrowid
 
+    def candidate(self, family_key: str | None, created_at: datetime | str | None = None, *,
+                  mission_id: int = 1, name: str = "cand") -> int:
+        """実際の ``candidate_archives.insert`` で作り、作成時刻だけ後から合わせる。"""
+        from agentic_fx.store import candidate_archives
+        self.tick += 1
+        digest = f"{self.tick:064x}"
+        row_id = candidate_archives.insert(
+            self.conn, mission_id=mission_id, name=name, content_hash=digest,
+            artifact_hash=digest, archive_path=None, pair=None, metrics={},
+            now=self.now(), family_key=family_key, commit=True)
+        if created_at is not None:
+            self.conn.execute(
+                "UPDATE candidate_archives SET created_at=? WHERE id=?",
+                (created_at if isinstance(created_at, str) else created_at.isoformat(),
+                 row_id))
+            self.conn.commit()
+        return row_id
+
     def deploy_op(self, name: str, *, op_kind: str = "disable_symlink", phase: str = "done",
-                  fail_reason: str | None = None, target: str | None = None) -> int:
+                  fail_reason: str | None = None, target: str | None = None,
+                  at: datetime | str | None = None) -> int:
         """実際の ``insert_intent`` で作り、phase だけ後から進める。"""
         from agentic_fx.store import plugin_deploy_ops as deploy_store
         digest = "a" * 64
@@ -152,6 +174,10 @@ class World:
         if phase != "intent":
             self.conn.execute("UPDATE plugin_deploy_ops SET phase=?, fail_reason=? "
                               "WHERE op_id=?", (phase, fail_reason, op_id))
+            self.conn.commit()
+        if at is not None:
+            self.conn.execute("UPDATE plugin_deploy_ops SET updated_at=? WHERE op_id=?",
+                              (at if isinstance(at, str) else at.isoformat(), op_id))
             self.conn.commit()
         return op_id
 

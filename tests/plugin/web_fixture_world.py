@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 from agentic_fx.plugin import read_model, read_model_inputs
@@ -17,6 +18,8 @@ from tests.plugin.read_model_world import World
 
 FIXTURE_DIR = Path(__file__).resolve().parents[2] / "afx-ops" / "tests" / "fixtures"
 ZONE = "Asia/Tokyo"
+# 棚卸しの判定は読む時刻で変わるので、見本は固定の時刻で作る
+READ_AT = datetime(2026, 12, 31, 12, 0, tzinfo=timezone.utc)
 NAMES = ("rsi", "mom", "brk", "bol", "junk", "ghost")
 
 
@@ -58,9 +61,9 @@ def build_dtos(root: Path) -> dict[str, dict]:
     try:
         inputs = read_model_inputs.collect_inputs(world.plugins, world.conn)
         model = read_model.build_read_model(inputs, settings=SETTINGS)
-        out = {"plugins_list": read_model.model_to_dto(model)}
+        out = {"plugins_list": read_model.model_to_dto(model, now=READ_AT)}
         for name in NAMES:
-            out[f"plugin_{name}"] = read_model.detail_to_dto(model, name)
+            out[f"plugin_{name}"] = read_model.detail_to_dto(model, name, now=READ_AT)
     finally:
         world.conn.close()
     return {key: {**value, "display_timezone": ZONE} for key, value in out.items()}
