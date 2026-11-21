@@ -151,10 +151,11 @@ def shadow_deadline(kind: object, decided_at: datetime, entry_at: datetime | Non
 
 def summarize(decided: list[dict], population: list[dict], *, target: ForwardTarget,
               start: datetime, end: datetime, time_unreadable: int = 0,
-              evaluated_at: datetime | None = None) -> dict:
+              evaluated_at: datetime | None = None, judgement_inputs: bool = False) -> dict:
     """集計の純関数。`decided` は窓内の採否 1 行ずつ、`population` は窓内に出た signal。
     `time_unreadable` は時刻を読めず、窓に入るか決められなかった行の数 (穴として数える)。
-    `evaluated_at` は shadow の終端を数える時刻で、窓の終端以後。省略すると窓の終端。"""
+    `evaluated_at` は shadow の終端を数える時刻で、窓の終端以後。省略すると窓の終端。
+    `judgement_inputs` は、週次の判定が使う項目 (最初の採否・直近の採否・短期表示) も返す。"""
     evaluated = end if evaluated_at is None else evaluated_at
     scored = [row for row in decided if row["result_code"] in _NUMERIC]
     abandoned = Counter(row["abandon_reason"] for row in population
@@ -172,14 +173,8 @@ def summarize(decided: list[dict], population: list[dict], *, target: ForwardTar
                       if previous_from <= row["created_at"] < recent_from])
     accepts = [row for row in decided if row["decision"] == "accept"]
     two_weeks = end - RECENT_DECISION_WEEKS * _WEEK
-    return {
+    out = {
         "name": target.name, "content_hash": target.content_hash,
-        "first_decided_at": (min(r["decided_at"] for r in decided).isoformat()
-                             if decided else None),
-        "recent_decisions": sum(1 for r in decided if r["decided_at"] > two_weeks),
-        "short_term": {"weeks": RECENT_WEEKS,
-                      **{key: _series([r for r in decided if r["decided_at"] > recent_from])[key]
-                         for key in ("n", "wins", "losses", "avg_r")}},
         "state": STATE_OK, "reason": None,
         "generation": {"started_at": target.started_at.isoformat(),
                        "source": GENERATION_SOURCE_NAMES.get(target.generation[0], "unknown"),
@@ -219,6 +214,14 @@ def summarize(decided: list[dict], population: list[dict], *, target: ForwardTar
                        "comparable": recent["rate"] is not None
                        and previous["rate"] is not None},
     }
+    if judgement_inputs:
+        out["first_decided_at"] = (min(r["decided_at"] for r in decided).isoformat()
+                                   if decided else None)
+        out["recent_decisions"] = sum(1 for r in decided if r["decided_at"] > two_weeks)
+        short = _series([r for r in decided if r["decided_at"] > recent_from])
+        out["short_term"] = {"weeks": RECENT_WEEKS,
+                             **{key: short[key] for key in ("n", "wins", "losses", "avg_r")}}
+    return out
 
 
 def _undetermined(target: ForwardTarget) -> dict:
@@ -236,7 +239,8 @@ def _payload_stop(payload_json: object) -> object:
 
 
 def forward_summary(conn: sqlite3.Connection, target: ForwardTarget, *,
-                    now: datetime, evaluated_at: datetime | None = None) -> dict:
+                    now: datetime, evaluated_at: datetime | None = None,
+                    judgement_inputs: bool = False) -> dict:
     """配備中の戦略 1 本の、現世代内・最大 12 週の機械採点。
 
     `now` は評価時刻で、窓の終端であり、採否・abandon・shadow の終端のうち、これより
@@ -314,7 +318,8 @@ def forward_summary(conn: sqlite3.Connection, target: ForwardTarget, *,
             "decided": decided_at is not None
             and decided_at.astimezone(timezone.utc) <= end})
     return summarize(decided, population, target=target, start=start, end=end,
-                     time_unreadable=len(unreadable), evaluated_at=evaluated)
+                     time_unreadable=len(unreadable), evaluated_at=evaluated,
+                     judgement_inputs=judgement_inputs)
 
 
 def _deadline(row: sqlite3.Row, decided: datetime) -> datetime | None:
@@ -353,13 +358,19 @@ def _result_as_of(row: sqlite3.Row, end: datetime) -> tuple[str | None, bool]:
 
 def summary_or_failed(conn: sqlite3.Connection, target: ForwardTarget, *, now: datetime,
                       on_error: Callable[[Exception], None] | None = None,
-                      evaluated_at: datetime | None = None) -> dict:
+                      evaluated_at: datetime | None = None,
+                      judgement_inputs: bool = False) -> dict:
     """1 本の集計。失敗してもほかの戦略を隠さないよう、失敗は `failed` の行にする。
 
     `on_error` は失敗を握りつぶす前に呼ばれ、送出すれば失敗は呼び出し元へ伝わる (中断・
     busy など、行の不明にしてはいけないもの)。"""
     try:
-        return forward_summary(conn, target, now=now, evaluated_at=evaluated_at)
+        extra: dict = {}
+        if evaluated_at is not None:
+            extra["evaluated_at"] = evaluated_at
+        if judgement_inputs:
+            extra["judgement_inputs"] = True
+        return forward_summary(conn, target, now=now, **extra)
     except Exception as exc:  # noqa: BLE001 - 1 本の失敗でほかの戦略を隠さない
         if on_error is not None:
             on_error(exc)

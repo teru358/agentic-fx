@@ -65,7 +65,8 @@ from agentic_fx.ops.api_server import ApiLimits, ApiServer, ApiStartError
 from agentic_fx.ops.rebase_service import RebaseWiring
 from agentic_fx.ops.service import OpsLimits, OpsService, plan_kill_switch_notice
 from agentic_fx.ops.trade_event_sink import BUSY_RETRY_SEC, TradeEventEmitter, TradeEventSink
-from agentic_fx.loops import econ_signal_report, reflection_cycle, weekly_review, weekly_review_report
+from agentic_fx import weekly_review, weekly_review_report
+from agentic_fx.loops import econ_signal_report, reflection_cycle
 from agentic_fx.loops.mission_watch import MissionWatch
 from agentic_fx.loops.reflection_cycle import ReflectionCycle
 from agentic_fx.loops.summary import ANSWER_SCHEMA, trade_intent_schema

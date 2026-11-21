@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from agentic_fx.loops import weekly_review_report as rep
+from agentic_fx import weekly_review_report as rep
 from agentic_fx.store import weekly_review as store
 from agentic_fx.store.db import connect, init_db
 

@@ -23,6 +23,7 @@ EXPECTED = {
     "improve_run_summaries", "signal_decisions", "signal_shadow", "ohlcv_slice_sets", "ohlcv_slices",
     "ohlcv_slice_generations", "econ_reaction_keys", "econ_reaction_values",
     "kill_switch_hwm_rebases",
+    "review_weeks", "strategy_review_weekly", "plugin_inventory_weekly",
 }
 
 

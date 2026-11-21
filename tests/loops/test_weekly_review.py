@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from agentic_fx.loops import weekly_review as wk
+from agentic_fx import weekly_review as wk
 from agentic_fx.plugin import read_model_inputs
 from agentic_fx.plugin.read_model import (
     SOURCE_UNAVAILABLE, ApprovalRow, DeployOpRow, JournalRow, LiveScan, ReadInputs)

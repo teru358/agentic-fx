@@ -2,7 +2,7 @@
 
 週の記録と 2 つの集計表は 1 transaction で書き、後から変えない (UPDATE / DELETE は
 trigger が拒む)。同じ週は 1 度しか確定できず、2 度目は何も書かずに `EXISTS` を返す。
-評価の中身 (集計・判定・棚卸し) は `agentic_fx.loops.weekly_review` が作り、ここは保存だけを担う。
+評価の中身 (集計・判定・棚卸し) は `agentic_fx.weekly_review` が作り、ここは保存だけを担う。
 金額は持たない。"""
 from __future__ import annotations
 

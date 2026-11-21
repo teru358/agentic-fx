@@ -23,7 +23,7 @@ def make(conn):
 
 def summary(conn, *, now=NOW, evaluated_at=None, **kw):
     return sf.forward_summary(conn, target(kw.pop("started", None), **kw), now=now,
-                              evaluated_at=evaluated_at)
+                              evaluated_at=evaluated_at, judgement_inputs=True)
 
 
 def test_the_first_decision_time_of_the_window_is_reported(conn, make):
@@ -118,3 +118,9 @@ def test_the_short_term_view_counts_only_the_last_four_weeks(conn, make):
 def test_an_empty_short_term_has_no_average(conn):
     short = summary(conn)["short_term"]
     assert short["n"] == 0 and short["avg_r"] is None
+
+
+def test_the_judgement_inputs_are_left_out_unless_asked_for(conn, make):
+    make.decide(at=NOW - WEEK)
+    plain = sf.forward_summary(conn, target(), now=NOW)
+    assert not {"first_decided_at", "recent_decisions", "short_term"} & set(plain)

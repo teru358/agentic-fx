@@ -13,11 +13,9 @@ import logging
 import sqlite3
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Callable
 
-from agentic_fx._safe_error import safe_error_text
-from agentic_fx.core import review_weeks
 from agentic_fx.plugin import read_model, usage_review
 from agentic_fx.plugin.read_model import ReadInputs
 from agentic_fx.store import signal_forward
@@ -316,7 +314,7 @@ def evaluate_week(conn: sqlite3.Connection, label: date, close_at: datetime, *,
     stopped = restored.stopped
     for target in restored.targets:
         summary = signal_forward.summary_or_failed(
-            conn, target, now=close_at, evaluated_at=evaluated_at,
+            conn, target, now=close_at, evaluated_at=evaluated_at, judgement_inputs=True,
             on_error=_propagate_retryable)
         judgement = judge(summary, end=close_at)
         if summary["state"] == signal_forward.STATE_UNDETERMINED:
