@@ -469,3 +469,94 @@ def test_a_replacement_during_an_acceptance_rolls_the_acceptance_back(tmp_path):
     assert _tick(conn, machine, WED + timedelta(minutes=3)) == "ready"
     assert machine.status()["resume_last_result"] == "accepted"
     assert not conn.in_transaction
+
+
+# ---- 記録の取りこぼし ----------------------------------------------------
+
+class _BrokenActivity:
+    def write(self, *args, **kwargs):
+        raise OSError("activity unavailable")
+
+
+def test_a_failing_activity_write_does_not_skip_the_notice_record(tmp_path):
+    conn, machine = _rig(tmp_path, activity=_BrokenActivity())
+    _set(conn, machine, state="ready", epoch=4)
+    for minute in range(2):
+        with pytest.raises(OSError):
+            _tick(conn, machine, WED + timedelta(minutes=minute), failed=True)
+    assert machine.status()["confirmed"] == 1
+    assert _notices(conn) == [(5, "stopped", "")]
+
+
+def test_a_failing_activity_write_does_not_skip_the_result_record_of_a_request(tmp_path):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="ready", epoch=4)
+    _degrade(conn, machine, WED)
+    machine.request_resume(WED + timedelta(minutes=1), acknowledge=False)
+    key = machine.status()["resume_requested_at"]
+    machine.activity = _BrokenActivity()
+    with pytest.raises(OSError):
+        _tick(conn, machine, WED + timedelta(minutes=2))
+    assert _notices(conn) == [(5, "resume_accepted", key), (5, "resumed", "")]
+
+
+def test_a_failed_notice_write_is_retried_on_the_next_tick(tmp_path):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="ready", epoch=4)
+    _tick(conn, machine, WED, failed=True)
+    conn.execute("DROP TABLE datafeed_outage_notices")
+    conn.commit()
+    _tick(conn, machine, WED + timedelta(minutes=1), failed=True)   # confirmed。記録は失敗する
+    assert machine.status()["confirmed"] == 1
+    init_db(conn)                                                      # 表が戻る
+    _tick(conn, machine, WED + timedelta(minutes=2), failed=True)
+    rows = conn.execute("SELECT epoch, notice_state, occurred_at FROM datafeed_outage_notices").fetchall()
+    assert [(r["epoch"], r["notice_state"], r["occurred_at"]) for r in rows] == [
+        (5, "stopped", (WED + timedelta(minutes=1)).isoformat())]
+
+
+def test_pending_notices_are_bounded_and_the_oldest_are_dropped(tmp_path, caplog):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="ready", epoch=4)
+    conn.execute("DROP TABLE datafeed_outage_notices")
+    conn.commit()
+    with caplog.at_level(logging.WARNING):
+        for epoch in range(100, 170):
+            machine._record_notices(epoch, WED, [("stopped", "")])
+    assert sum(len(entries) for _e, _t, entries in machine._pending_notices) == 64
+    assert machine._pending_notices[0][0] == 106
+    assert "datafeed_notice_dropped" in caplog.text
+
+
+def test_a_lock_failure_of_the_first_write_is_retried(tmp_path):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="ready", epoch=4)
+    conn.execute("PRAGMA busy_timeout=0")
+    other = connect(tmp_path / "notices.db")
+    other.execute("BEGIN IMMEDIATE")
+    machine._record_notices(7, WED, [("stopped", "")])
+    other.rollback()
+    assert _notices(conn) == []
+    _tick(conn, machine, WED + timedelta(minutes=1))
+    assert _notices(conn) == [(7, "stopped", "")]
+
+
+def test_an_unexpected_error_reading_used_request_keys_propagates(tmp_path):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="degraded", epoch=7)
+    conn.execute("DROP TABLE datafeed_outage_notices")
+    conn.execute("CREATE VIEW datafeed_outage_notices AS SELECT abs(-9223372036854775808) AS request_key")
+    conn.commit()
+    with pytest.raises(sqlite3.OperationalError):
+        machine.request_resume(WED, acknowledge=False)
+    assert machine.status()["resume_requested_at"] is None
+
+
+def test_a_rolled_back_consumption_keeps_the_unprocessed_memo(tmp_path):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="ready", epoch=4)
+    _degrade(conn, machine, WED)
+    machine.request_resume(WED + timedelta(minutes=1), acknowledge=False)
+    _replace_during_consumption(machine, tmp_path)
+    _tick(conn, machine, WED + timedelta(minutes=2))
+    assert machine._last_unprocessed_by_pair is not None

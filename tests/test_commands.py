@@ -1958,3 +1958,10 @@ def test_data_resume_distinguishes_new_inquiry_and_acknowledge_replacement(tmp_p
     assert cancelled.startswith("resume 要求は既に記録済みです。")
     assert "--acknowledge 指定あり" in cancelled
     assert outage.status()["resume_acknowledge"] == 1
+
+
+def test_data_resume_acknowledge_mark_is_separated_from_the_unprocessed_sentence(tmp_path):
+    _, _, _, cmds, outage = _commands_with_outage(tmp_path)
+    assert _degrade(outage, NOW) == "degraded"
+    out = cmds.dispatch("data resume --acknowledge")
+    assert "(--acknowledge 指定あり) 未処理の足がある建玉" in out

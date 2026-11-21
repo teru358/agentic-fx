@@ -33,6 +33,8 @@ RESUME_RESULTS = ("accepted", "rejected_unprocessed", "rejected_watermark", "alr
 
 log = logging.getLogger(__name__)
 
+_PENDING_NOTICE_LIMIT = 64
+
 
 class _RequestChanged(Exception):
     """読んだ後に要求が置き換えられた。判定は捨て、次の tick が新しい要求を判定する。"""
@@ -164,6 +166,9 @@ class OutageStateMachine:
         # non-ready になるのを避けるため、この印があるときだけ入口で片付け直す
         # (呼び出し元の transaction には印が立たず、従来どおり拒否する)。
         self._own_transaction_left_open = False
+        # 記録に失敗した通知の保留 (epoch, 発生時刻, entries)。次の tick の冒頭で再試行する。
+        # プロセスが落ちれば消える (state commit 後の crash と同じ限界)
+        self._pending_notices: list[tuple[int, datetime, list[tuple[str, str]]]] = []
 
     # ---- public -------------------------------------------------------
 
@@ -244,6 +249,7 @@ class OutageStateMachine:
         立てない。
         """
         now = as_utc(now)
+        self._retry_pending_notices()
         try:
             outcome = self._commit_observation(now, report)
         except Exception:
@@ -257,9 +263,10 @@ class OutageStateMachine:
         self._last_attempt_ok = outcome.attempt_ok
         self._problem_streak = outcome.problem_streak
         state, epoch = outcome.state, outcome.epoch
+        # 通知の記録は activity の書込みより先に。activity の例外で記録を飛ばさない
+        self._record_notices(epoch, now, outcome.notices)
         for event, summary in outcome.activities:
             self._write_activity(event, summary)
-        self._record_notices(epoch, now, outcome.notices)
         if state == "degraded":
             by_pair = self._unprocessed_positions_by_pair(now, epoch)
             if by_pair != self._last_unprocessed_by_pair:
@@ -357,6 +364,8 @@ class OutageStateMachine:
         activities: list[tuple[str, str]] = []
         notices: list[tuple[str, str]] = []
         request_pending = row.get("resume_requested_at") is not None
+        # この epoch で停止または待ちを知らせる対象になったか (復帰の通知の条件)
+        noticed = bool(confirmed) or recovered_notified_epoch == epoch
         opened = False
 
         def degrade() -> None:
@@ -416,7 +425,8 @@ class OutageStateMachine:
                         restricted_since = None
                         deadline = None
                         activities.append(recovered_activity())
-                        notices.append(("resumed_if_noticed", ""))
+                        if noticed:
+                            notices.append(("resumed", ""))
                     else:
                         # 復帰はしないが健全に戻っている — 人の resume 待ちとして
                         # 同じ tick で知らせる。
@@ -438,7 +448,8 @@ class OutageStateMachine:
                     restricted_since = None
                     deadline = None
                     activities.append(recovered_activity())
-                    notices.append(("resumed_if_noticed", ""))
+                    if noticed:
+                        notices.append(("resumed", ""))
             else:
                 ready_streak = 0
                 # 自動 ready の条件 (flat・自動復帰有効・pending なし) が揃わないまま
@@ -454,7 +465,8 @@ class OutageStateMachine:
             if state == "degraded" and not confirmed and problem_streak >= 2:
                 confirmed = 1
                 activities.append(("data_outage_degraded", f"epoch={epoch} unprocessed_positions={self._unprocessed_position_count(now, epoch)}"))
-                notices.append(("stopped_if_unawaited", ""))
+                if recovered_notified_epoch != epoch:
+                    notices.append(("stopped", ""))
         else:
             problem_streak = 0
 
@@ -528,8 +540,10 @@ class OutageStateMachine:
         try:
             used.update(key for (key,) in c.execute(
                 "SELECT request_key FROM datafeed_outage_notices WHERE request_key<>''"))
-        except sqlite3.OperationalError:
-            pass  # 通知の表が無い DB でも要求の記録は止めない
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc):
+                raise
+            # 通知の表が無い DB でも要求の記録は止めない
         stamp = now
         while _iso(stamp) in used:
             stamp += timedelta(microseconds=1)
@@ -689,7 +703,6 @@ class OutageStateMachine:
         detail = format_unprocessed_positions(unprocessed_by_pair)
         if watermark_healthy and (unprocessed == 0 or acknowledge):
             state = "ready"
-            self._last_unprocessed_by_pair = None
             # state の更新と要求の消去・結果の記録は 1 つの transaction。途中で落ちたら
             # どちらも元のまま残り、次 tick が同じ要求を判定し直す。
             with self.conn:
@@ -702,13 +715,14 @@ class OutageStateMachine:
                                  ready_streak=0,
                                  updated_at=_iso(now))
                 self._finish_resume_request(now, requested_at, acknowledge, "accepted")
+            self._last_unprocessed_by_pair = None
+            self._record_notices(epoch, now, [("resume_accepted", requested_at),
+                                              ("resumed", "")])
             self._write_activity(
                 "data_resume_accepted",
                 f"epoch={epoch} unprocessed_positions={unprocessed}"
                 + (f" ({detail})" if detail else "")
                 + f" acknowledge={acknowledge}")
-            self._record_notices(epoch, now, [("resume_accepted", requested_at),
-                                              ("resumed", "")])
         else:
             reason = []
             if not watermark_healthy:
@@ -725,9 +739,9 @@ class OutageStateMachine:
             result = "rejected_watermark" if not watermark_healthy else "rejected_unprocessed"
             with self.conn:
                 self._finish_resume_request(now, requested_at, acknowledge, result)
+            self._record_notices(epoch, now, [("resume_rejected", requested_at)])
             self._write_activity(
                 "data_resume_rejected", f"epoch={epoch} reason={','.join(reason)}")
-            self._record_notices(epoch, now, [("resume_rejected", requested_at)])
         return state
 
     def _finish_resume_request(self, now: datetime, requested_at: str,
@@ -760,27 +774,25 @@ class OutageStateMachine:
         """通知の記録を state/gap と要求消費の transaction の外で書く。
 
         失敗しても状態更新や保護処理を止めない (例外は握って固定語をログに残す)。
+        失敗した分はメモリに保留し、次の tick の冒頭で同じ書込みを再試行する。
         書くのは固定語・整数・要求時刻だけ。同じ鍵は `ON CONFLICT DO NOTHING` で重複させない。
         """
-        if not entries:
-            return
+        if entries and not self._write_notices(epoch, now, entries):
+            self._pending_notices.append((epoch, now, list(entries)))
+            self._trim_pending_notices()
+
+    def _write_notices(self, epoch: int, now: datetime,
+                       entries: list[tuple[str, str]]) -> bool:
         try:
             with self.conn:
                 for notice_state, request_key in entries:
-                    if notice_state == "stopped_if_unawaited":
-                        if self._awaited(epoch):
-                            continue
-                        notice_state = "stopped"
-                    elif notice_state == "resumed_if_noticed":
-                        if not self._noticed(epoch):
-                            continue
-                        notice_state = "resumed"
                     self.conn.execute(
                         "INSERT INTO datafeed_outage_notices "
                         "(epoch, notice_state, request_key, occurred_at, event_id) "
                         "VALUES (?, ?, ?, ?, NULL) "
                         "ON CONFLICT (epoch, notice_state, request_key) DO NOTHING",
                         (epoch, notice_state, request_key, _iso(now)))
+            return True
         except Exception:  # noqa: BLE001 - 通知の記録の失敗で状態更新を止めない
             log.warning("datafeed_notice_deferred")
             try:
@@ -788,21 +800,22 @@ class OutageStateMachine:
                     self.conn.rollback()
             except Exception:  # noqa: BLE001
                 log.warning("datafeed_notice_deferred")
+            return False
 
-    def _awaited(self, epoch: int) -> bool:
-        """同 epoch で待ちの印が立っている、または待ちを記録済み。"""
-        row = self.conn.execute(
-            "SELECT recovered_notified_epoch FROM datafeed_outage_state WHERE id=1").fetchone()
-        if row is not None and row["recovered_notified_epoch"] == epoch:
-            return True
-        return self.conn.execute(
-            "SELECT 1 FROM datafeed_outage_notices WHERE epoch=? "
-            "AND notice_state='awaiting_resume'", (epoch,)).fetchone() is not None
+    def _retry_pending_notices(self) -> None:
+        pending, self._pending_notices = self._pending_notices, []
+        for item in pending:
+            if not self._write_notices(*item):
+                self._pending_notices.append(item)
+        self._trim_pending_notices()
 
-    def _noticed(self, epoch: int) -> bool:
-        return self.conn.execute(
-            "SELECT 1 FROM datafeed_outage_notices WHERE epoch=? "
-            "AND notice_state IN ('stopped', 'awaiting_resume')", (epoch,)).fetchone() is not None
+    def _trim_pending_notices(self) -> None:
+        """保留は件数の上限つき。超えたら古い順に捨てる。"""
+        total = sum(len(entries) for _e, _t, entries in self._pending_notices)
+        while total > _PENDING_NOTICE_LIMIT and self._pending_notices:
+            total -= len(self._pending_notices[0][2])
+            del self._pending_notices[0]
+            log.warning("datafeed_notice_dropped")
 
     # ---- internal: activity --------------------------------------------
 

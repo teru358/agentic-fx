@@ -15,7 +15,7 @@ def resume_reply(outcome: str, acknowledge: bool) -> str:
 
     ``acknowledge`` は要求が持つ有効な ack。照会では既存の要求と ack を保ったことを示す。
     """
-    mark = " (--acknowledge 指定あり)" if acknowledge else ""
+    mark = " (--acknowledge 指定あり) " if acknowledge else ""
     if outcome == "existing":
         kept = "--acknowledge 指定ありを維持" if acknowledge else "--acknowledge 指定なしを維持"
         return "resume 要求は既に記録済みです。要求時刻はそのままで、" + kept + "しています。" + _WAIT
