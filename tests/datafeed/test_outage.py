@@ -1072,7 +1072,7 @@ def test_auto_resume_can_be_disabled_or_blocked_by_human_confirmation(tmp_path):
         for minute in (2, 3, 4):
             assert machine.observe(datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy) == "degraded"
         awaiting = [line for line in log.tail(50) if "datafeed_recovered_awaiting_resume" in line]
-        assert len(awaiting) == (1 if kwargs else 0)
+        assert len(awaiting) == 1
 
 
 def test_disabled_auto_resume_keeps_ready_streak_zero(tmp_path):

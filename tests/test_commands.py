@@ -1933,3 +1933,28 @@ def test_status_survives_an_econ_source_that_fails(tmp_path):
 
     cmds.use_econ_status_source(broken)
     assert "econ signal" not in cmds.dispatch("status")
+
+
+def test_data_resume_distinguishes_new_inquiry_and_acknowledge_replacement(tmp_path):
+    _, _, _, cmds, outage = _commands_with_outage(tmp_path)
+    assert _degrade(outage, NOW) == "degraded"
+    first = cmds.dispatch("data resume")
+    assert first.startswith("resume 要求を記録しました。")
+    assert "次の開場中の tick の判定待ち" in first
+    requested = outage.status()["resume_requested_at"]
+
+    again = cmds.dispatch("data resume")
+    assert again.startswith("resume 要求は既に記録済みです。")
+    assert "次の開場中の tick の判定待ち" in again
+    assert "--acknowledge 指定あり" not in again
+    assert outage.status()["resume_requested_at"] == requested
+
+    replaced = cmds.dispatch("data resume --acknowledge")
+    assert replaced.startswith("先の要求を --acknowledge 付き要求に置き換えました。")
+    assert "次の開場中の tick の判定待ち" in replaced
+    assert outage.status()["resume_acknowledge"] == 1
+
+    cancelled = cmds.dispatch("data resume")
+    assert cancelled.startswith("resume 要求は既に記録済みです。")
+    assert "--acknowledge 指定あり" in cancelled
+    assert outage.status()["resume_acknowledge"] == 1

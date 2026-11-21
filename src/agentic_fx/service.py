@@ -2250,11 +2250,13 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
         lane = holder[0].lane_connection
         now = clock.now()
         info = outage.gap_summary(now, conn=lane)
-        outage.request_resume(now, acknowledge=acknowledge, conn=lane)
+        recorded = outage.request_resume(now, acknowledge=acknowledge, conn=lane)
         gaps = [{"pair": pair, "interval": interval,
                  "since": since.isoformat() if hasattr(since, "isoformat") else str(since)}
                 for (pair, interval), since in sorted(info["gap_starts"].items())]
-        return {"requested": True, "acknowledge": acknowledge, "state": info["state"],
+        return {"requested": True, "acknowledge": recorded["acknowledge"],
+                "request_outcome": recorded["outcome"], "epoch": recorded["epoch"],
+                "state": info["state"],
                 "unprocessed_positions": info["unprocessed_positions"], "gaps": gaps}
 
     service = OpsService(

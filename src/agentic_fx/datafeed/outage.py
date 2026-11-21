@@ -10,7 +10,9 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+import sqlite3
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from agentic_fx.activity import Category
@@ -22,6 +24,14 @@ from agentic_fx.store import ohlcv, orders
 
 # 永続状態機械の取りうる state。web の状態の印の割当表 (afx-ops) はこの語彙を写して持ち、test が突き合わせる
 DATA_STATES = ("ready", "restricted", "degraded")
+
+# 通知の記録の状態語彙。Discord の本文は afx-ops 側が固定語で描く
+NOTICE_STATES = ("stopped", "awaiting_resume", "resume_accepted",
+                 "resume_rejected", "resume_already_ready", "resumed")
+# 要求の終端結果。consume 時に state と同じ transaction で残す
+RESUME_RESULTS = ("accepted", "rejected_unprocessed", "rejected_watermark", "already_ready")
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +85,7 @@ class _Outcome:
     attempt_ok: dict
     problem_streak: int
     unconfirmed: frozenset
+    notices: list = field(default_factory=list)
 
 
 def _iso(dt: datetime) -> str:
@@ -208,6 +219,8 @@ class OutageStateMachine:
             "pending_human_confirmation": row.get("pending_human_confirmation", 0),
             "resume_requested_at": row.get("resume_requested_at"),
             "resume_acknowledge": row.get("resume_acknowledge", 0),
+            "resume_last_result": row.get("resume_last_result"),
+            "resume_last_result_at": row.get("resume_last_result_at"),
             "unprocessed_positions": self._unprocessed_position_count(now, epoch, conn=conn),
             "unprocessed_by_pair": self._unprocessed_positions_by_pair(now, epoch, conn=conn),
             "gap_starts": gaps,
@@ -242,6 +255,7 @@ class OutageStateMachine:
         state, epoch = outcome.state, outcome.epoch
         for event, summary in outcome.activities:
             self._write_activity(event, summary)
+        self._record_notices(epoch, now, outcome.notices)
         if state == "degraded":
             by_pair = self._unprocessed_positions_by_pair(now, epoch)
             if by_pair != self._last_unprocessed_by_pair:
@@ -337,6 +351,8 @@ class OutageStateMachine:
         pending = row.get("pending_human_confirmation", 0)
         recovered_notified_epoch = row.get("recovered_notified_epoch")
         activities: list[tuple[str, str]] = []
+        notices: list[tuple[str, str]] = []
+        request_pending = row.get("resume_requested_at") is not None
         opened = False
 
         def degrade() -> None:
@@ -396,14 +412,16 @@ class OutageStateMachine:
                         restricted_since = None
                         deadline = None
                         activities.append(recovered_activity())
+                        notices.append(("resumed_if_noticed", ""))
                     else:
                         # 復帰はしないが健全に戻っている — 人の resume 待ちとして
                         # 同じ tick で知らせる。
                         degrade()
                         activities.append(degraded_activity())
-                        if recovered_notified_epoch != epoch:
+                        if recovered_notified_epoch != epoch and not request_pending:
                             recovered_notified_epoch = epoch
                             activities.append(("datafeed_recovered_awaiting_resume", f"epoch={epoch}"))
+                            notices.append(("awaiting_resume", ""))
             else:
                 ready_streak = 0
         elif state == "degraded":
@@ -416,22 +434,31 @@ class OutageStateMachine:
                     restricted_since = None
                     deadline = None
                     activities.append(recovered_activity())
+                    notices.append(("resumed_if_noticed", ""))
             else:
                 ready_streak = 0
-                if healthy and (not flat or not self.auto_resume_when_flat) and recovered_notified_epoch != epoch:
+                # 自動 ready の条件 (flat・自動復帰有効・pending なし) が揃わないまま
+                # 健全に戻ったら、人の再開待ちとして一度だけ知らせる。要求中は促さない
+                if (healthy and not request_pending and recovered_notified_epoch != epoch
+                        and (not flat or not self.auto_resume_when_flat or pending)):
                     recovered_notified_epoch = epoch
                     activities.append(("datafeed_recovered_awaiting_resume", f"epoch={epoch}"))
+                    notices.append(("awaiting_resume", ""))
 
         if immediate or stalled:
             problem_streak += 1
             if state == "degraded" and not confirmed and problem_streak >= 2:
                 confirmed = 1
                 activities.append(("data_outage_degraded", f"epoch={epoch} unprocessed_positions={self._unprocessed_position_count(now, epoch)}"))
+                notices.append(("stopped_if_unawaited", ""))
         else:
             problem_streak = 0
 
         if opened:
             self._open_gaps(epoch, now, watermarks)
+            self.conn.execute(
+                "UPDATE datafeed_outage_state SET resume_last_result=NULL, "
+                "resume_last_result_at=NULL, resume_last_request_at=NULL WHERE id=1")
         self._save_state(state=state, epoch=epoch, confirmed=confirmed,
                          entered_degraded_at=entered,
                          restricted_since=restricted_since,
@@ -441,16 +468,26 @@ class OutageStateMachine:
                          ready_streak=ready_streak, updated_at=_iso(now))
         return _Outcome(state=state, epoch=epoch, activities=activities,
                         attempt_ok=attempt_ok, problem_streak=problem_streak,
-                        unconfirmed=unconfirmed)
+                        unconfirmed=unconfirmed, notices=notices)
 
     def request_resume(self, now: datetime, *, acknowledge: bool = False,
-                       conn=None) -> None:
+                       conn=None) -> dict:
         """手動復旧コマンドから呼ばれる。state は直接書き換えず、要求を
         永続化するだけ — 呼び出し元は core の書込みロックを取らない別スレッド
         (人間向けシェル) を想定する。実際の判定・遷移は次 tick の
         `observe()` (単一のロック区間) の中で行う。これにより、シェル実行と
         scheduler tick の間に競合があっても、判定は常に commit 直後の
         report/watermark を使って行われる。
+
+        未消費の要求の有無を read→判定→更新の 1 つの書込み transaction で決め、
+        結果を返す。``outcome`` は次のいずれか。
+
+        - ``new``: 未消費の要求が無く、新しい要求時刻で記録した。
+        - ``existing``: 未消費の要求があり、同じ ack、または ack ありの要求に対する
+          ack なし。要求時刻と ack は変えない (ack を取り消さない)。
+        - ``replaced``: ack なしの要求を ack ありの新しい要求へ置き換えた。
+
+        ``epoch`` は記録時の epoch、``acknowledge`` は要求が持つ有効な ack。
 
         `conn` を渡すと `self.conn` (scheduler tick 側の接続) の代わりに
         その接続で書く — `Commands` は自身の接続 (`conn_shell`) を渡し、
@@ -460,11 +497,39 @@ class OutageStateMachine:
         now = as_utc(now)
         c = conn if conn is not None else self.conn
         with c:
-            self._ensure_row(now, conn=c)
+            if not c.in_transaction:
+                c.execute("BEGIN IMMEDIATE")
+            self._insert_row_if_missing(c, now)
+            row = dict(c.execute(
+                "SELECT * FROM datafeed_outage_state WHERE id=1").fetchone())
+            current = row.get("resume_requested_at")
+            current_ack = bool(row.get("resume_acknowledge"))
+            epoch = row["epoch"]
+            if current is not None and (current_ack or not acknowledge):
+                return {"outcome": "existing", "epoch": epoch,
+                        "acknowledge": current_ack}
+            stamp = self._unused_request_key(c, now, epoch, row, current)
             c.execute(
                 "UPDATE datafeed_outage_state SET resume_requested_at=?, "
                 "resume_acknowledge=? WHERE id=1",
-                (_iso(now), 1 if acknowledge else 0))
+                (stamp, 1 if acknowledge else 0))
+            return {"outcome": "new" if current is None else "replaced",
+                    "epoch": epoch, "acknowledge": bool(acknowledge)}
+
+    @staticmethod
+    def _unused_request_key(c, now: datetime, epoch: int, row: dict,
+                            current: str | None) -> str:
+        """要求時刻は終端結果の対応キーにもなるので、既に使った値と衝突させない。"""
+        used = {current, row.get("resume_last_request_at")}
+        try:
+            used.update(key for (key,) in c.execute(
+                "SELECT request_key FROM datafeed_outage_notices WHERE request_key<>''"))
+        except sqlite3.OperationalError:
+            pass  # 通知の表が無い DB でも要求の記録は止めない
+        stamp = now
+        while _iso(stamp) in used:
+            stamp += timedelta(microseconds=1)
+        return _iso(stamp)
 
     # ---- internal: persistence ----------------------------------------
 
@@ -602,9 +667,10 @@ class OutageStateMachine:
             return state
         acknowledge = bool(row.get("resume_acknowledge"))
         if state == "ready":
-            # 既に ready — 要求は無意味なので消費して終える。
+            # 既に ready — 要求は無意味なので消費して終える。結果は残す。
             with self.conn:
-                self._clear_resume_request()
+                self._finish_resume_request(now, requested_at, "already_ready")
+            self._record_notices(epoch, now, [("resume_already_ready", requested_at)])
             return state
         watermark_healthy = not unconfirmed_keys
         unprocessed_by_pair = self._unprocessed_positions_by_pair(now, epoch)
@@ -613,7 +679,7 @@ class OutageStateMachine:
         if watermark_healthy and (unprocessed == 0 or acknowledge):
             state = "ready"
             self._last_unprocessed_by_pair = None
-            # state の更新と要求の消去は 1 つの transaction。途中で落ちたら
+            # state の更新と要求の消去・結果の記録は 1 つの transaction。途中で落ちたら
             # どちらも元のまま残り、次 tick が同じ要求を判定し直す。
             with self.conn:
                 self._save_state(state=state, epoch=epoch, confirmed=0,
@@ -624,12 +690,14 @@ class OutageStateMachine:
                                  recovered_notified_epoch=row.get("recovered_notified_epoch"),
                                  ready_streak=0,
                                  updated_at=_iso(now))
-                self._clear_resume_request()
+                self._finish_resume_request(now, requested_at, "accepted")
             self._write_activity(
                 "data_resume_accepted",
                 f"epoch={epoch} unprocessed_positions={unprocessed}"
                 + (f" ({detail})" if detail else "")
                 + f" acknowledge={acknowledge}")
+            self._record_notices(epoch, now, [("resume_accepted", requested_at),
+                                              ("resumed", "")])
         else:
             reason = []
             if not watermark_healthy:
@@ -642,17 +710,80 @@ class OutageStateMachine:
                 reason.append(
                     f"unprocessed_positions={unprocessed}"
                     + (f" ({detail})" if detail else ""))
+            # 両方に該当するときは watermark の拒否を優先する
+            result = "rejected_watermark" if not watermark_healthy else "rejected_unprocessed"
             with self.conn:
-                self._clear_resume_request()
+                self._finish_resume_request(now, requested_at, result)
             self._write_activity(
                 "data_resume_rejected", f"epoch={epoch} reason={','.join(reason)}")
+            self._record_notices(epoch, now, [("resume_rejected", requested_at)])
         return state
+
+    def _finish_resume_request(self, now: datetime, requested_at: str, result: str) -> None:
+        """呼び出し側の `with self.conn:` の中で使う (自前では commit しない)。
+        要求を消費し、その終端結果・判定時刻・対象の要求時刻を残す。"""
+        self._clear_resume_request()
+        self.conn.execute(
+            "UPDATE datafeed_outage_state SET resume_last_result=?, "
+            "resume_last_result_at=?, resume_last_request_at=? WHERE id=1",
+            (result, _iso(now), requested_at))
 
     def _clear_resume_request(self) -> None:
         """呼び出し側の `with self.conn:` の中で使う (自前では commit しない)。"""
         self.conn.execute(
             "UPDATE datafeed_outage_state SET resume_requested_at=NULL, "
             "resume_acknowledge=0 WHERE id=1")
+
+    # ---- internal: notice records --------------------------------------
+
+    def _record_notices(self, epoch: int, now: datetime,
+                        entries: list[tuple[str, str]]) -> None:
+        """通知の記録を state/gap と要求消費の transaction の外で書く。
+
+        失敗しても状態更新や保護処理を止めない (例外は握って固定語をログに残す)。
+        書くのは固定語・整数・要求時刻だけ。同じ鍵は `ON CONFLICT DO NOTHING` で重複させない。
+        """
+        if not entries:
+            return
+        try:
+            with self.conn:
+                for notice_state, request_key in entries:
+                    if notice_state == "stopped_if_unawaited":
+                        if self._awaited(epoch):
+                            continue
+                        notice_state = "stopped"
+                    elif notice_state == "resumed_if_noticed":
+                        if not self._noticed(epoch):
+                            continue
+                        notice_state = "resumed"
+                    self.conn.execute(
+                        "INSERT INTO datafeed_outage_notices "
+                        "(epoch, notice_state, request_key, occurred_at, event_id) "
+                        "VALUES (?, ?, ?, ?, NULL) "
+                        "ON CONFLICT (epoch, notice_state, request_key) DO NOTHING",
+                        (epoch, notice_state, request_key, _iso(now)))
+        except Exception:  # noqa: BLE001 - 通知の記録の失敗で状態更新を止めない
+            log.warning("datafeed_notice_deferred")
+            try:
+                if self.conn.in_transaction:
+                    self.conn.rollback()
+            except Exception:  # noqa: BLE001
+                log.warning("datafeed_notice_deferred")
+
+    def _awaited(self, epoch: int) -> bool:
+        """同 epoch で待ちの印が立っている、または待ちを記録済み。"""
+        row = self.conn.execute(
+            "SELECT recovered_notified_epoch FROM datafeed_outage_state WHERE id=1").fetchone()
+        if row is not None and row["recovered_notified_epoch"] == epoch:
+            return True
+        return self.conn.execute(
+            "SELECT 1 FROM datafeed_outage_notices WHERE epoch=? "
+            "AND notice_state='awaiting_resume'", (epoch,)).fetchone() is not None
+
+    def _noticed(self, epoch: int) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM datafeed_outage_notices WHERE epoch=? "
+            "AND notice_state IN ('stopped', 'awaiting_resume')", (epoch,)).fetchone() is not None
 
     # ---- internal: activity --------------------------------------------
 

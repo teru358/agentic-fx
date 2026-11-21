@@ -1761,7 +1761,9 @@ class OpsService:
             if self._data_resume is None:
                 raise OpsError(ErrorCode.INVALID_STATE)
             response = self._data_resume(acknowledge)
-            self._guard_event("data_feed", "resume_requested", None)
+            # 受付は新規に記録したときだけ残す。照会・ack の置換は応答と操作監査だけ
+            if response.get("request_outcome", "new") == "new":
+                self._guard_event("data_feed", "resume_requested", None)
             return response
 
         return self._mutate(principal, ENDPOINTS["data_resume"],
