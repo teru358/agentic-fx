@@ -17,8 +17,8 @@ def resume_reply(outcome: str, acknowledge: bool) -> str:
     """
     mark = " (--acknowledge 指定あり)" if acknowledge else ""
     if outcome == "existing":
-        return ("resume 要求は既に記録済みです。要求時刻と --acknowledge の指定は保ったままです"
-                + mark + "。" + _WAIT)
+        kept = "--acknowledge 指定ありを維持" if acknowledge else "--acknowledge 指定なしを維持"
+        return "resume 要求は既に記録済みです。要求時刻はそのままで、" + kept + "しています。" + _WAIT
     if outcome == "replaced":
         return "先の要求を --acknowledge 付き要求に置き換えました。" + _WAIT
     return "resume 要求を記録しました。" + _WAIT + mark
