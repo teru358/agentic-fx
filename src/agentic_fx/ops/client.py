@@ -33,6 +33,7 @@ import httpcore
 import httpx
 
 from agentic_fx.core import improve_repeat as ir
+from agentic_fx.datafeed import guidance_text
 from agentic_fx.datafeed.resume_reply import OUTCOMES, resume_reply
 from agentic_fx.core.kill_switch_words import KILL_SWITCH_RESET_WARNING
 from agentic_fx.core.display_time import (
@@ -780,6 +781,7 @@ def format_status(data: dict) -> str:
     feed = data.get("data") if isinstance(data.get("data"), dict) else None
     if feed is not None:
         lines.append(f"data: {display_text(feed.get('state'))}")
+        lines.extend(guidance_text.guidance_lines(feed) or ())
     references = _references_line(data.get("references"))
     if references is not None:
         lines.append(references)
