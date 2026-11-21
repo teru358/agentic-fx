@@ -16,9 +16,10 @@ from pathlib import Path
 from agentic_fx.core import accounting
 from agentic_fx.datafeed.price_provider import _SPECS
 from agentic_fx.store import signal_forward, snapshots
-from agentic_fx.store.db import connect_readonly
+from agentic_fx.store.db import (HWM_REBASE_SOURCE, SNAPSHOT_SOURCES, connect_readonly,
+                                 read_hwm_rebase_ledger)
 
-from . import events as ops_events
+from . import events
 from .contracts import ErrorCode, OpsError
 from . import trade_events
 
@@ -47,8 +48,8 @@ MIN_SQLITE = (3, 42, 0)
 CHECK_EVERY = 256  # Python 側の行ごとの処理で、期限・停止を確かめる間隔 (行数)
 PROGRESS_OPS = 20000      # 打ち切りの確認の間隔 (SQLite の VM 命令数)
 
-_SOURCES = ("paper", "manual_ks_rebase")
-_REBASE_SOURCE = "manual_ks_rebase"
+_SOURCES = SNAPSHOT_SOURCES
+_REBASE_SOURCE = HWM_REBASE_SOURCE
 _MAX_PLAIN = 1e300
 
 _KIND_RANK = {"latched": 0, "released": 1, "rebase": 2, "cashflow": 3, "unknown_hwm_drop": 4}
@@ -119,7 +120,8 @@ def _bad_values(alias: str) -> str:
 
 _DD_SQL = ("(CASE WHEN hwm<=0 THEN 0.0 "
            "ELSE MAX(0.0,(hwm-equity)/hwm*100.0) END)")
-_VALID_SQL = ("(NOT " + _bad_values("") + " AND source IN ('paper','manual_ks_rebase'))")
+_VALID_SQL = ("(NOT " + _bad_values("") + " AND source IN ("
+              + ",".join(f"'{name}'" for name in _SOURCES) + "))")
 
 
 def _special_sql(prev: str, cur: str) -> str:
@@ -627,10 +629,7 @@ def _point_dto(part: _Part) -> dict:
 # --- 印 -------------------------------------------------------------------------------
 
 def _ledger(conn, quality: _Quality) -> tuple[list[dict], frozenset[int]]:
-    rows = conn.execute(
-        "SELECT l.id,l.applied_at,l.generation,l.latched_at,l.rebase_snapshot_id,"
-        "l.source_snapshot_id,s.ts AS source_ts FROM kill_switch_hwm_rebases l "
-        "LEFT JOIN account_snapshots s ON s.id=l.source_snapshot_id ORDER BY l.id").fetchall()
+    rows = read_hwm_rebase_ledger(conn)
     ids = frozenset(row["rebase_snapshot_id"] for row in rows)
     return [dict(row) for row in rows], ids
 
@@ -1083,7 +1082,7 @@ def build(conn: sqlite3.Connection, *, range_key: str, now: datetime, kill_pct: 
 
     ledger, ledger_ids = _ledger(conn, quality)
     poll()
-    history, marks_since, clipped = ops_events.kill_switch_event_history(
+    history, marks_since, clipped = events.kill_switch_event_history(
         conn, limit=EVENT_LIMIT)
     if clipped:
         quality.partial = True

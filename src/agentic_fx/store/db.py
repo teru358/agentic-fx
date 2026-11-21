@@ -944,6 +944,18 @@ TABLE_NAMES = frozenset({
 })
 
 
+HWM_REBASE_SOURCE = "manual_ks_rebase"
+SNAPSHOT_SOURCES = ("paper", HWM_REBASE_SOURCE)
+
+
+def read_hwm_rebase_ledger(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """HWM 付け替え台帳の読取り専用の写し (source snapshot の時刻つき)。"""
+    return conn.execute(
+        "SELECT l.id,l.applied_at,l.generation,l.latched_at,l.rebase_snapshot_id,"
+        "l.source_snapshot_id,s.ts AS source_ts FROM kill_switch_hwm_rebases l "
+        "LEFT JOIN account_snapshots s ON s.id=l.source_snapshot_id ORDER BY l.id").fetchall()
+
+
 def connect(db_path: Path, *, check_same_thread: bool = False) -> sqlite3.Connection:
     # プラン 8 B 束: signals.py の claim_oldest/requeue/reclaim_expired は
     # RETURNING 句に依存する (SQLite 3.35.0 = 2021-03-12 以降)。古い
