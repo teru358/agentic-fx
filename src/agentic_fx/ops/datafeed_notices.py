@@ -50,16 +50,20 @@ def _skip_schema(key: tuple) -> None:
     _log.warning("datafeed_notice_skipped reason=schema")
 
 
+def _enabled_at(conn, now: datetime) -> tuple[datetime, bool]:
+    stored = _parse_utc(alert_state.get(conn, PRODUCER_KEY))
+    if stored is not None:
+        return stored, False
+    now = now.astimezone(timezone.utc)
+    alert_state.set(conn, PRODUCER_KEY, now.isoformat(), now=now)
+    return now, True
+
+
 def producer_enabled_at(conn, now: datetime) -> datetime:
     """通知生成を有効にした daemon を初めて起動した時刻。無い (または読めない) ときだけ今を置く。
 
     置いた値は再起動・再導入でも更新しない。"""
-    stored = _parse_utc(alert_state.get(conn, PRODUCER_KEY))
-    if stored is not None:
-        return stored
-    now = now.astimezone(timezone.utc)
-    alert_state.set(conn, PRODUCER_KEY, now.isoformat(), now=now)
-    return now
+    return _enabled_at(conn, now)[0]
 
 
 def sweep(conn, events: EventStore, now: datetime) -> int:
@@ -122,10 +126,13 @@ def supplement(conn, now: datetime) -> int:
     それ以外 (ready・restricted・条件未到達) = 補完しない。補った記録の発生時刻は導入時刻。
     導入前の同じキーの未 event 化の記録は、その一件だけ導入時刻へ移す。導入後の記録・
     event 化済みの記録は動かさないので、再実行しても増えず時刻も動かない。"""
-    floor = producer_enabled_at(conn, now)
+    floor, first_time = _enabled_at(conn, now)
+    # 補った記録の発生時刻: 初回の導入時は導入時刻、後の再起動では実際に補った時刻
+    # (条件が後から成立した停止を導入時刻へ遡らせない)
+    made_at = floor if first_time else now.astimezone(timezone.utc)
     row = conn.execute(
         "SELECT state, epoch, confirmed, entered_degraded_at, resume_requested_at, "
-        "recovered_notified_epoch FROM datafeed_outage_state WHERE id=1").fetchone()
+        "resume_last_result_at, recovered_notified_epoch FROM datafeed_outage_state WHERE id=1").fetchone()
     if row is None or row["state"] != "degraded" or row["resume_requested_at"] is not None:
         return 0
     epoch = row["epoch"]
@@ -134,7 +141,8 @@ def supplement(conn, now: datetime) -> int:
     if row["recovered_notified_epoch"] == epoch:
         target = "awaiting_resume"
     elif row["confirmed"] or notice_rules.stop_after_open_minutes(
-            row["entered_degraded_at"], now.astimezone(timezone.utc)):
+            notice_rules.timer_start(row["entered_degraded_at"], row["resume_last_result_at"]),
+            now.astimezone(timezone.utc)):
         target = "stopped"
         if conn.execute(
                 "SELECT 1 FROM datafeed_outage_notices WHERE epoch=? "
@@ -151,7 +159,7 @@ def supplement(conn, now: datetime) -> int:
                 "INSERT INTO datafeed_outage_notices "
                 "(epoch, notice_state, request_key, occurred_at, event_id) "
                 "VALUES (?, ?, '', ?, NULL) ON CONFLICT (epoch, notice_state, request_key) "
-                "DO NOTHING", (epoch, target, floor.isoformat()))
+                "DO NOTHING", (epoch, target, made_at.isoformat()))
         else:
             occurred = _parse_utc(found["occurred_at"])
             if found["event_id"] is not None or (occurred is not None and occurred >= floor):

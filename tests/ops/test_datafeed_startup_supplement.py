@@ -188,3 +188,21 @@ def test_a_daemon_without_the_producer_flag_supplements_nothing(ops_env):
     ops_env.service().emit_pending_notices(improve_enabled=False)
     assert _records(ops_env.conn) == []
     assert alert_state.get(ops_env.conn, datafeed_notices.PRODUCER_KEY) is None
+
+
+def test_a_later_restart_supplements_with_the_time_it_was_made_not_the_enabled_time(rig):
+    _state(rig.conn, entered_degraded_at=(FLOOR - timedelta(minutes=2)).isoformat())
+    _start(rig)                                   # 導入: 停止条件は未到達で 0 件
+    assert _records(rig.conn) == []
+    other = FLOOR + timedelta(minutes=5)          # 間に別の記録がある
+    rig.conn.execute("INSERT INTO datafeed_outage_notices VALUES (66,'resume_rejected','k',?,NULL)",
+                     (other.isoformat(),))
+    rig.conn.commit()
+    later = FLOOR + timedelta(minutes=12)
+    rig.env.wall.now = later
+    rig.env.service(datafeed_notices=True).emit_pending_notices(improve_enabled=False)
+    stopped = [r for r in _records(rig.conn) if r[1] == "stopped"]
+    assert len(stopped) == 1 and stopped[0][3] == later.isoformat()
+    order = [(json.loads(r["fields_json"])["state"]) for r in
+             rig.conn.execute("SELECT fields_json FROM ops_events ORDER BY id")]
+    assert order == ["resume_rejected", "stopped"]

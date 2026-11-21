@@ -900,22 +900,23 @@ class OutageStateMachine:
     def _record_timed_stop(self, epoch: int, now: datetime) -> None:
         """連続の問題観測 (confirmed) に届かない停止を、開場時間の経過で一度だけ記録する。
 
-        同じ epoch に待ちの印・停止か待ちの記録があれば何もしない。再開の要求中、または
-        要求への結果が既にある epoch は、人が状況を知って操作しているので知らせない。
-        開場中の観測 tick の commit 後だけで呼ぶ。停止の判定・遷移は変えず、失敗しても例外を出さない。"""
+        同じ epoch に待ちの印・停止か待ちの記録があれば何もしない。再開の要求が未消費の間は、
+        人が操作中なので知らせない。要求への結果が出ていれば、その判定時刻から開場時間を
+        数え直す。開場中の観測 tick の commit 後だけで呼ぶ。停止の判定・遷移は変えず、失敗しても例外を出さない。"""
         try:
             row = self._load_row()
             if row.get("state") != "degraded" or row.get("recovered_notified_epoch") == epoch:
                 return
-            if (row.get("resume_requested_at") is not None
-                    or row.get("resume_last_result") is not None):
+            if row.get("resume_requested_at") is not None:
                 return
             if self.conn.execute(
                     "SELECT 1 FROM datafeed_outage_notices WHERE epoch=? "
                     "AND notice_state IN ('stopped', 'awaiting_resume')",
                     (epoch,)).fetchone() is not None:
                 return
-            if not notice_rules.stop_after_open_minutes(row.get("entered_degraded_at"), now):
+            start = notice_rules.timer_start(row.get("entered_degraded_at"),
+                                             row.get("resume_last_result_at"))
+            if not notice_rules.stop_after_open_minutes(start, now):
                 return
         except Exception:  # noqa: BLE001 - 通知の判断が読めなくても観測は続ける
             log.warning("datafeed_notice_deferred")

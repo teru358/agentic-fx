@@ -146,12 +146,29 @@ def test_no_stop_is_recorded_when_a_resume_request_is_waiting_at_the_tenth_minut
     assert _states(conn) == ["resume_rejected"]
 
 
-def test_no_stop_is_recorded_once_a_request_has_already_got_its_result(tmp_path):
+def test_the_open_time_restarts_from_the_result_of_a_request_and_the_stop_is_then_recorded(tmp_path):
     conn, machine = _rig(tmp_path)
     _set(conn, machine, state="degraded", epoch=3, entered_degraded_at=WED.isoformat())
     machine.request_resume(WED, acknowledge=False)
     _tick(conn, machine, WED + timedelta(minutes=1), failed=True)   # 取得不健全のため拒否
     assert machine.status()["resume_last_result"] == "rejected_watermark"
+    seen = []
     for index in range(2, 14):
         _tick(conn, machine, WED + timedelta(minutes=index), failed=index % 2 == 1)
-    assert "stopped" not in _states(conn)
+        seen.append(_states(conn))
+    # 判定 (+1 分) から開場時間 10 分の tick (+11 分) まで停止は無く、そこで一度だけ記録する
+    assert seen[:9] == [["resume_rejected"]] * 9
+    assert seen[9:] == [["resume_rejected", "stopped"]] * 3
+    row = conn.execute("SELECT occurred_at FROM datafeed_outage_notices "
+                       "WHERE notice_state='stopped'").fetchone()
+    assert row["occurred_at"] == (WED + timedelta(minutes=11)).isoformat()
+
+
+def test_a_confirmed_stop_after_a_request_is_recorded_as_usual(tmp_path):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="degraded", epoch=3, entered_degraded_at=WED.isoformat())
+    machine.request_resume(WED, acknowledge=False)
+    _tick(conn, machine, WED + timedelta(minutes=1), failed=True)   # 拒否
+    _tick(conn, machine, WED + timedelta(minutes=2), failed=True)   # 2 連続: confirmed
+    assert machine.status()["confirmed"] == 1
+    assert _states(conn) == ["resume_rejected", "stopped"]

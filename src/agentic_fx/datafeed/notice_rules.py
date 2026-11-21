@@ -23,3 +23,18 @@ def stop_after_open_minutes(entered_degraded_at: str | None, now: datetime) -> b
     if entered.tzinfo is None:
         return False
     return market_hours.open_time_between(entered, now) >= timedelta(minutes=STOP_OPEN_MINUTES)
+
+
+def timer_start(entered_degraded_at: str | None, last_result_at: str | None) -> str | None:
+    """時間条件を数え始める時刻。要求への結果が出ていれば、その判定時刻から数え直す
+    (判定は人が状況を見た時点で、その後も続く停止を改めて知らせるため)。結果の時刻が
+    読めなければ degraded に入った時刻を使う。"""
+    if last_result_at:
+        try:
+            result = datetime.fromisoformat(last_result_at)
+            entered = datetime.fromisoformat(entered_degraded_at) if entered_degraded_at else None
+        except (TypeError, ValueError):
+            return entered_degraded_at
+        if result.tzinfo is not None and (entered is None or result > entered):
+            return last_result_at
+    return entered_degraded_at
