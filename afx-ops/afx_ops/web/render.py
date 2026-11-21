@@ -6,7 +6,8 @@ import re
 import unicodedata
 from collections.abc import Mapping, Sequence
 
-from afx_ops import base_text, display_time, history_text, plugin_text, reevaluation_text
+from afx_ops import (base_text, display_time, guidance_text, history_text, plugin_text,
+                     reevaluation_text)
 from afx_ops.display_zone import zone_of
 from afx_ops.metric_words import metric_items
 from afx_ops.web import marks
@@ -267,9 +268,28 @@ def _status_cards(data: Mapping[str, object]) -> tuple[str, set[str]]:
     return marks.cards(items), covered
 
 
+_DATA_OPERATION_NOTE = "操作は SSH の端末から行ってください。この画面からは実行できません。"
+
+
+def _data_guidance(data: Mapping[str, object]) -> str:
+    """data カードの直下の固定案内 (停止理由と次の操作)。常時出す。
+
+    旧 daemon の応答 (案内の key が無い) では何も足さず、既存の state の印だけにする。
+    実行のボタンは持たない。"""
+    feed = data.get("data")
+    lines = guidance_text.guidance_lines(feed)
+    if lines is None:
+        return ""
+    verdict = marks.classify_data_phase({"phase": guidance_text.checked_pair(feed)[0]})
+    return ("<section><h2>データの案内</h2>"
+            + "<p>" + marks.render_verdict(verdict) + "</p>"
+            + "".join("<p>" + html.escape(line, quote=True) + "</p>" for line in lines)
+            + "<p>" + _DATA_OPERATION_NOTE + "</p></section>")
+
+
 def _status_overview(data: Mapping[str, object], tz: str) -> str:
     cards, covered = _status_cards(data)
-    parts = [cards]
+    parts = [cards, _data_guidance(data)]
     for title, keys in STATUS_GROUPS:
         rows = _pairs(data, STATUS_FIELDS, nested_allowed=NESTED_FIELDS, emphasis=_EMPHASIS,
                       tz=tz, order=[key for key in keys if key not in covered])
