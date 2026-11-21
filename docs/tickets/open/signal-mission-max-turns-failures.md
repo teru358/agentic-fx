@@ -20,7 +20,11 @@ related: [weekly-improve-rebacktests-deployed-strategies, strategy-attribution-a
 
 ## 原因
 
-未調査。調べること: signal mission の prompt と使うツール (get_signals ほか) の往復の数、max_turns で終わった transcript のツール呼出しの並び、cron との差。
+max_turns の 44 本は全件、16 ターンとも `search_news` を呼び続け、最終 JSON を一度も出していない (最終回答の試行・修復・ツールエラーは 0)。30 本は同じ query の繰り返し、14 本は言い換えの連続 (為替介入が「実施されたか」の確認や日付の語に寄る)。意味検索の上位 5 件はほぼ同じ記事が返る。同じ signal の再実行で結果が分かれる (max_turns の 26 本中 17 本が requeue 後に completed) ので、モデルのばらつきが主因。決定論的な欠けとして:
+- runner は毎ターン `tool_choice: "auto"` で、残り手数を伝えず、最終ターンでもツールを使える。同じ呼出しの繰り返しも抑えない (`src/agentic_fx/runners/local_runner.py:167-179`)。cron の max_turns 49 本も最終回答の試行 0 (`get_positions` の連打)。
+- signal の prompt (`src/agentic_fx/loops/prompts/signal_decision_mission.md`) に検索回数の目安・打ち切りの条件が無い。
+- `search_news` の結果に記事の時刻が無い (`src/agentic_fx/tools/news_tools.py:12-14`、`added_at` は `src/agentic_fx/store/rag.py:119-124` にある)。
+ツール結果の大きさ・prompt の長さ・timeout は原因ではない (失敗の中央値 74 秒、timeout 300 秒)。
 
 ## 処置案・裁定
 
@@ -30,4 +34,5 @@ related: [weekly-improve-rebacktests-deployed-strategies, strategy-attribution-a
 
 ## 経緯
 
-- 2026-11-21: 起票。日次上限の使い切りと鮮度切れの関係を DB で確認 (signal% mission は 10 日中 8 日で 12 本ちょうど、鮮度切れ 98 件は全部が上限到達後、consumed 58 件は全部が到達前)。
+- 2026-11-21: 起票。
+- 2026-11-21: transcript 102 本を集計し原因を記録。日次上限の使い切りと鮮度切れの関係を DB で確認 (signal% mission は 10 日中 8 日で 12 本ちょうど、鮮度切れ 98 件は全部が上限到達後、consumed 58 件は全部が到達前)。
