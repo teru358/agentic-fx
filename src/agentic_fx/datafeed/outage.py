@@ -34,6 +34,10 @@ RESUME_RESULTS = ("accepted", "rejected_unprocessed", "rejected_watermark", "alr
 log = logging.getLogger(__name__)
 
 
+class _RequestChanged(Exception):
+    """読んだ後に要求が置き換えられた。判定は捨て、次の tick が新しい要求を判定する。"""
+
+
 @dataclass(frozen=True, slots=True)
 class IngestTickReport:
     """`Ingest.prepare()` が 1 tick ごとに使い捨てる、真に immutable な報告。
@@ -661,6 +665,13 @@ class OutageStateMachine:
 
     def _consume_resume_request(self, now: datetime, state: str, epoch: int,
                                 unconfirmed_keys: frozenset) -> str:
+        try:
+            return self._consume_read_request(now, state, epoch, unconfirmed_keys)
+        except _RequestChanged:
+            return state
+
+    def _consume_read_request(self, now: datetime, state: str, epoch: int,
+                              unconfirmed_keys: frozenset) -> str:
         row = self._load_row()
         requested_at = row.get("resume_requested_at")
         if requested_at is None:
@@ -669,7 +680,7 @@ class OutageStateMachine:
         if state == "ready":
             # 既に ready — 要求は無意味なので消費して終える。結果は残す。
             with self.conn:
-                self._finish_resume_request(now, requested_at, "already_ready")
+                self._finish_resume_request(now, requested_at, acknowledge, "already_ready")
             self._record_notices(epoch, now, [("resume_already_ready", requested_at)])
             return state
         watermark_healthy = not unconfirmed_keys
@@ -690,7 +701,7 @@ class OutageStateMachine:
                                  recovered_notified_epoch=row.get("recovered_notified_epoch"),
                                  ready_streak=0,
                                  updated_at=_iso(now))
-                self._finish_resume_request(now, requested_at, "accepted")
+                self._finish_resume_request(now, requested_at, acknowledge, "accepted")
             self._write_activity(
                 "data_resume_accepted",
                 f"epoch={epoch} unprocessed_positions={unprocessed}"
@@ -713,20 +724,28 @@ class OutageStateMachine:
             # 両方に該当するときは watermark の拒否を優先する
             result = "rejected_watermark" if not watermark_healthy else "rejected_unprocessed"
             with self.conn:
-                self._finish_resume_request(now, requested_at, result)
+                self._finish_resume_request(now, requested_at, acknowledge, result)
             self._write_activity(
                 "data_resume_rejected", f"epoch={epoch} reason={','.join(reason)}")
             self._record_notices(epoch, now, [("resume_rejected", requested_at)])
         return state
 
-    def _finish_resume_request(self, now: datetime, requested_at: str, result: str) -> None:
+    def _finish_resume_request(self, now: datetime, requested_at: str,
+                               acknowledge: bool, result: str) -> None:
         """呼び出し側の `with self.conn:` の中で使う (自前では commit しない)。
-        要求を消費し、その終端結果・判定時刻・対象の要求時刻を残す。"""
-        self._clear_resume_request()
-        self.conn.execute(
+        要求を消費し、その終端結果・判定時刻・対象の要求時刻を残す。
+
+        判定の根拠にした要求が今も同じ値のときだけ消費する。読んだ後に置き換えられて
+        いたら例外で transaction ごと戻し (state の保存も結果の記録も残さない)、
+        次の tick が置換後の要求を判定する。"""
+        cur = self.conn.execute(
             "UPDATE datafeed_outage_state SET resume_last_result=?, "
-            "resume_last_result_at=?, resume_last_request_at=? WHERE id=1",
-            (result, _iso(now), requested_at))
+            "resume_last_result_at=?, resume_last_request_at=? "
+            "WHERE id=1 AND resume_requested_at=? AND resume_acknowledge=?",
+            (result, _iso(now), requested_at, requested_at, 1 if acknowledge else 0))
+        if cur.rowcount != 1:
+            raise _RequestChanged()
+        self._clear_resume_request()
 
     def _clear_resume_request(self) -> None:
         """呼び出し側の `with self.conn:` の中で使う (自前では commit しない)。"""

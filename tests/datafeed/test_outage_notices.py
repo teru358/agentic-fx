@@ -408,3 +408,64 @@ def test_epoch_66_rejection_on_reopen_is_notified_and_a_re_request_is_accepted(t
     assert _tick(conn, machine, sunday + timedelta(minutes=2)) == "ready"
     assert _notices(conn) == [(66, "awaiting_resume", ""), (66, "resume_rejected", first),
                               (66, "resume_accepted", second), (66, "resumed", "")]
+
+
+# ---- 置換と消費の競合 --------------------------------------------------
+
+def _replace_during_consumption(machine, tmp_path):
+    """消費側が要求を読んだ後に、別接続が ack 付きの要求へ置換する。"""
+    other = connect(tmp_path / "notices.db")
+    original = machine._unprocessed_positions_by_pair
+    fired = []
+    calls = []
+
+    def hook(*args, **kwargs):
+        result = original(*args, **kwargs)
+        calls.append(1)
+        # 1 回目は観測の未処理内訳の記録、2 回目が要求の消費での読取り
+        if len(calls) == 2 and not fired:
+            fired.append(machine.request_resume(WED + timedelta(minutes=30), acknowledge=True,
+                                                conn=other))
+        return result
+
+    machine._unprocessed_positions_by_pair = hook
+    return fired
+
+
+def test_a_replacement_during_a_rejection_leaves_no_result_for_the_old_request(tmp_path):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="ready", epoch=4)
+    _degrade(conn, machine, WED, with_position=True)
+    _bar(conn, WED + timedelta(minutes=4))
+    machine.request_resume(WED + timedelta(minutes=5), acknowledge=False)
+    fired = _replace_during_consumption(machine, tmp_path)
+    notices_before = _states(conn)
+    assert _tick(conn, machine, WED + timedelta(minutes=6)) == "degraded"
+    assert fired[0]["outcome"] == "replaced"
+    row = machine.status()
+    assert row["resume_requested_at"] == (WED + timedelta(minutes=30)).isoformat()
+    assert row["resume_acknowledge"] == 1
+    assert row["resume_last_result"] is None
+    assert _states(conn) == notices_before
+    new_key = row["resume_requested_at"]
+    assert _tick(conn, machine, WED + timedelta(minutes=7)) == "ready"
+    assert machine.status()["resume_last_request_at"] == new_key
+    assert _notices(conn)[-2:] == [(5, "resume_accepted", new_key), (5, "resumed", "")]
+
+
+def test_a_replacement_during_an_acceptance_rolls_the_acceptance_back(tmp_path):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="ready", epoch=4)
+    _degrade(conn, machine, WED)
+    machine.request_resume(WED + timedelta(minutes=1), acknowledge=False)
+    fired = _replace_during_consumption(machine, tmp_path)
+    assert _tick(conn, machine, WED + timedelta(minutes=2)) == "degraded"
+    assert fired[0]["outcome"] == "replaced"
+    row = machine.status()
+    assert row["state"] == "degraded"
+    assert row["resume_requested_at"] == (WED + timedelta(minutes=30)).isoformat()
+    assert row["resume_acknowledge"] == 1 and row["resume_last_result"] is None
+    assert "resume_accepted" not in _states(conn)
+    assert _tick(conn, machine, WED + timedelta(minutes=3)) == "ready"
+    assert machine.status()["resume_last_result"] == "accepted"
+    assert not conn.in_transaction
