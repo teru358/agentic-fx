@@ -44,7 +44,7 @@ def test_every_pair_shows_both_lines_just_below_the_data_card(phase, action):
 def test_the_guidance_is_always_shown_even_when_nothing_is_wrong():
     page = _page(_feed(state="ready", phase="ready", next_action="none"))
     assert "次の操作: 不要です" in page
-    assert "操作は SSH の端末から行ってください" in page
+    assert "操作は SSH の端末から行ってください" not in page
 
 
 def test_the_page_has_no_button_or_form_for_the_operation():
@@ -126,3 +126,24 @@ def test_a_rejection_after_the_awaiting_mark_still_asks_to_recheck_the_feed():
     page = _page(_feed(phase="resume_rejected", next_action="resume_with_ack",
                        resume_last_result="rejected_unprocessed", unprocessed_positions=2))
     assert "取得状態を再確認してください" in page
+
+
+@pytest.mark.parametrize(("phase", "action", "shown"), [
+    ("ready", "none", False), ("unknown", "check_status", False),
+    ("resume_requested", "wait_tick", False), ("restricted", "wait_tick", False),
+    ("stopped", "restore_source", False),
+    ("awaiting_resume", "resume", True), ("awaiting_resume", "resume_with_ack", True),
+    ("resume_rejected", "resume", True), ("resume_rejected", "resume_with_ack", True)])
+def test_the_ssh_note_is_shown_only_when_the_next_action_is_a_command(phase, action, shown):
+    page = _page(_feed(phase=phase, next_action=action, unprocessed_positions=0,
+                       resume_last_result="rejected_unprocessed"))
+    assert ("操作は SSH の端末から行ってください" in page) is shown
+
+
+def test_the_guidance_section_follows_the_section_that_holds_the_data_row():
+    page = _page(_feed())
+    assert page.index("<dt>data</dt>") < page.index("データの案内")
+    assert "</dl></section><section><h2>データの案内</h2>" in page
+    before = page[:page.index("<h2>データの案内</h2>")]
+    assert before.rstrip().endswith("</dl></section>")
+    assert before.rfind("<h2>稼働</h2>") > before.rfind("<h2>資金</h2>")

@@ -37,6 +37,13 @@ log = logging.getLogger(__name__)
 _PENDING_NOTICE_LIMIT = 64
 
 
+def unknown_guidance() -> dict:
+    """案内を読めないときの値 (state は含めない)。件数はゼロにせず unknown。"""
+    return {"phase": "unknown", "next_action": "check_status",
+            "unprocessed_positions": UNKNOWN_COUNT, "resume_last_result": None,
+            "resume_last_result_at": None, "auto_resume_possible": False}
+
+
 def resume_guidance(*, observe_failed: bool, state: str | None, request_pending: bool,
                     last_result: str | None, awaiting_mark: bool,
                     unprocessed: int | None) -> tuple[str, str]:
@@ -275,36 +282,53 @@ class OutageStateMachine:
     def guidance_snapshot(self, now: datetime, *, conn=None) -> dict:
         """API の status `data` に足す案内の値。読み取り専用 (行を作らない)。
 
-        state・phase・次の操作は 1 回読んだ同じ行から作る (読取りの間の遷移で食い違わない)。
-        state は `state_from` と同じ値 (観測の保存に失敗中は degraded)。行が読めない
-        ときは state を含めない (呼び出し側が自分の読みに戻す)。
-
-        行が読めなければ unknown (ready に倒さない)。件数は読めなければ "unknown" を返し、
-        ゼロとはみなさない。`conn` は `status()` と同じ意味で、API thread は自分の読取り接続を渡す。
+        state・phase・次の操作は 1 回読んだ同じ行から作る。未処理建玉数は別の表への
+        別の読取りで、行の読取りとの間に tick が遷移すれば 1 回の表示でずれ得る
+        (ack の要否は人が建玉を確認してから決める前提)。state は `state_from` と同じ値
+        (観測の保存に失敗中は degraded)。行が読めないときは state を含めない
+        (呼び出し側が自分の読みに戻す)。件数は ready の行では数えず、読めなければ
+        "unknown" を返し、どちらもゼロとはみなさない。`conn` は `status()` と同じ意味で、
+        API thread は自分の読取り接続を渡す。
         """
         now = as_utc(now)
         try:
             row = self._load_row(conn=conn)
         except Exception:  # noqa: BLE001 — 読めないものは不明として返す
-            return {"phase": "unknown", "next_action": "check_status",
-                    "unprocessed_positions": UNKNOWN_COUNT, "resume_last_result": None,
-                    "resume_last_result_at": None}
+            return unknown_guidance()
         epoch = row.get("epoch", 0)
-        try:
-            unprocessed: int | None = self._unprocessed_position_count(now, epoch, conn=conn)
-        except Exception:  # noqa: BLE001 — 読めない件数をゼロにしない
-            unprocessed = None
         result = row.get("resume_last_result")
+        state = row.get("state", "ready")
+        unprocessed: int | None = None
+        if state in ("restricted", "degraded") or result in ("rejected_watermark",
+                                                            "rejected_unprocessed"):
+            try:
+                unprocessed = self._unprocessed_position_count(now, epoch, conn=conn)
+            except Exception:  # noqa: BLE001 — 読めない件数をゼロにしない
+                unprocessed = None
         marked = row.get("recovered_notified_epoch") == epoch
         phase, action = resume_guidance(
-            observe_failed=self._observe_failed, state=row.get("state", "ready"),
+            observe_failed=self._observe_failed, state=state,
             request_pending=row.get("resume_requested_at") is not None,
             last_result=result, awaiting_mark=marked, unprocessed=unprocessed)
         return {"state": "degraded" if self._observe_failed else row.get("state", "ready"),
                 "phase": phase, "next_action": action,
                 "unprocessed_positions": UNKNOWN_COUNT if unprocessed is None else unprocessed,
                 "resume_last_result": result,
-                "resume_last_result_at": row.get("resume_last_result_at")}
+                "resume_last_result_at": row.get("resume_last_result_at"),
+                "auto_resume_possible": self._may_resume_unattended(row, conn)}
+
+    def _may_resume_unattended(self, row: dict, conn) -> bool:
+        """停止中の epoch が、建玉が無く pending も無く自動復帰が有効で、人の操作なしに
+        戻り得るか。読めなければ False (戻ると言わない)。"""
+        if row.get("state") != "degraded" or not self.auto_resume_when_flat:
+            return False
+        if row.get("pending_human_confirmation", 0):
+            return False
+        try:
+            c = conn if conn is not None else self.conn
+            return not orders.list_by_status(c, *_EXPOSURE)
+        except Exception:  # noqa: BLE001 — 読めないものは戻るとは言わない
+            return False
 
     def observe(self, now: datetime, report: IngestTickReport) -> str:
         """1 tick 分の観測を反映し、遷移後の `state` を返す。

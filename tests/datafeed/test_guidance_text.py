@@ -25,7 +25,9 @@ def test_every_published_pair_renders_two_lines(phase, action):
 
 def test_the_vocabulary_is_exactly_the_pairs():
     assert {p for p, _ in gt.PAIRS} == set(gt.PHASES)
-    assert {a for _, a in gt.PAIRS} == set(gt.NEXT_ACTIONS)
+    assert {a for _, a in gt.PAIRS} == set(gt._ACTION)
+    assert set(gt._REASON) | {"resume_rejected"} == set(gt.PHASES)
+    assert not hasattr(gt, "NEXT_ACTIONS") and not hasattr(gt, "REJECTED_RESULTS")
 
 
 @pytest.mark.parametrize("phase", ["resume_requested", "restricted"])
@@ -160,3 +162,36 @@ def test_no_count_or_internal_names_leak_into_stopped_or_ready_text():
     for pair in (("stopped", "restore_source"), ("ready", "none"), ("restricted", "wait_tick")):
         text = "".join(gt.guidance_lines(_feed(*pair, unprocessed_positions=9)))
         assert "9" not in text
+
+
+def test_a_stopped_row_that_may_recover_by_itself_says_so():
+    _, step = gt.guidance_lines(_feed("stopped", "restore_source", auto_resume_possible=True))
+    assert "建玉が無ければ自動で戻ることがあります" in step
+    for value in (False, None, "true", 1, [True]):
+        _, step = gt.guidance_lines(_feed("stopped", "restore_source", auto_resume_possible=value))
+        assert "自動で戻ることがあります" not in step, value
+    _, step = gt.guidance_lines(_feed("stopped", "restore_source"))
+    assert "自動で戻ることがあります" not in step
+
+
+@pytest.mark.parametrize(("phase", "action"), sorted(gt.PAIRS - {("stopped", "restore_source")}))
+def test_the_unattended_recovery_note_is_only_for_the_stopped_row(phase, action):
+    _, step = gt.guidance_lines(_feed(phase, action, auto_resume_possible=True,
+                                      unprocessed_positions=1))
+    assert "自動で戻ることがあります" not in step
+
+
+@pytest.mark.parametrize("result", ["rejected_watermark", "rejected_unprocessed", "other", None])
+def test_a_rejection_reason_says_it_is_about_the_previous_request(result):
+    action = "restore_source" if result == "rejected_watermark" else "resume_with_ack"
+    reason, _ = gt.guidance_lines(_feed("resume_rejected", action, resume_last_result=result,
+                                        unprocessed_positions=2))
+    assert reason.startswith("停止理由: 前回の要求は")
+    assert "拒否されました" in reason
+
+
+def test_the_condition_for_an_old_response_is_exactly_both_keys_missing():
+    assert gt.guidance_lines({"state": "ready", "unprocessed_positions": 1}) is None
+    assert gt.guidance_lines({"phase": "ready", "next_action": "none"}) is not None
+    assert gt.guidance_lines({"phase": "ready"}) is not None
+    assert gt.guidance_lines({"next_action": "none"}) is not None

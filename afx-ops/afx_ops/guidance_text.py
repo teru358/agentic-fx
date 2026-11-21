@@ -9,8 +9,6 @@ from __future__ import annotations
 
 PHASES = ("unknown", "resume_requested", "ready", "resume_rejected", "awaiting_resume",
           "stopped", "restricted")
-NEXT_ACTIONS = ("check_status", "wait_tick", "none", "restore_source", "resume_with_ack",
-                "resume")
 # daemon が返す (phase, next_action) の組。これ以外は不明として扱う
 PAIRS = frozenset({
     ("unknown", "check_status"),
@@ -24,7 +22,6 @@ PAIRS = frozenset({
     ("stopped", "restore_source"),
     ("restricted", "wait_tick"),
 })
-REJECTED_RESULTS = ("rejected_watermark", "rejected_unprocessed")
 UNKNOWN_COUNT = "unknown"
 
 RESUME = "`afx ctl --as approver data resume`"
@@ -39,11 +36,12 @@ _REASON = {
     "restricted": "データの欠落を検知し、制限状態で自動復帰を判定しています",
 }
 _REJECTED_REASON = {
-    "rejected_watermark": "直近の再開要求は、取得状態が確認できず拒否されました",
-    "rejected_unprocessed": ("直近の再開要求は、未処理の足がある建玉の確認 "
+    "rejected_watermark": "前回の要求は、取得状態が確認できず拒否されました",
+    "rejected_unprocessed": ("前回の要求は、未処理の足がある建玉の確認 "
                              "(--acknowledge) が無く拒否されました"),
 }
-_REJECTED_FALLBACK = "直近の再開要求は拒否されました"
+_REJECTED_FALLBACK = "前回の要求は拒否されました"
+_AUTO_RESUME = "。建玉が無ければ自動で戻ることがあります"
 
 _WAIT = "次の開場中の tick の判定待ちです。人の操作は要りません"
 _RECHECK = "待ちの記録は発生時点のものです。取得状態を再確認してください"
@@ -88,7 +86,9 @@ def count_of(feed: dict) -> int | None:
 
 def guidance_lines(feed: object) -> tuple[str, str] | None:
     """(停止理由の行, 次の操作の行)。旧 API の応答 (案内の key が無い) では None。"""
-    if type(feed) is not dict or "phase" not in feed and "next_action" not in feed:
+    # 旧 daemon の応答は phase と next_action のどちらの key も持たない。
+    # 片方だけある応答は新しい daemon の不完全な応答なので、None にせず不明の案内にする
+    if type(feed) is not dict or ("phase" not in feed and "next_action" not in feed):
         return None
     phase, action = checked_pair(feed)
     result = feed.get("resume_last_result")
@@ -106,4 +106,6 @@ def guidance_lines(feed: object) -> tuple[str, str] | None:
         text = _ACTION[action]
     if phase in ("awaiting_resume", "resume_rejected"):
         text += "。" + _RECHECK
+    if phase == "stopped" and feed.get("auto_resume_possible") is True:
+        text += _AUTO_RESUME
     return "停止理由: " + reason, "次の操作: " + text

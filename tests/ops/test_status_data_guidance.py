@@ -31,7 +31,7 @@ def test_status_data_keeps_the_state_and_adds_the_guidance_keys(tmp_path):
         assert data["state"] == "ready"
         assert NEW_KEYS <= set(data)
         assert (data["phase"], data["next_action"]) == ("ready", "none")
-        assert data["unprocessed_positions"] == 0
+        assert data["unprocessed_positions"] == "unknown"  # ready は数えない
         assert data["resume_last_result"] is None and data["resume_last_result_at"] is None
     finally:
         app.close()
@@ -94,6 +94,8 @@ def test_a_guidance_read_failure_is_unknown_and_keeps_the_state_read_once(tmp_pa
         assert data["state"] == "ready"
         assert (data["phase"], data["next_action"]) == ("unknown", "check_status")
         assert data["unprocessed_positions"] == "unknown"
+        from agentic_fx.datafeed.outage import unknown_guidance
+        assert {k: v for k, v in data.items() if k != "state"} == unknown_guidance()
     finally:
         app.close()
 

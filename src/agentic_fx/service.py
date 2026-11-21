@@ -49,7 +49,7 @@ from agentic_fx.core.supervisor import MissionSupervisor, SubmitResult
 from agentic_fx.core.writer_admission import WriterAdmission
 from agentic_fx.datafeed import bridge_observe, cache_window, sources
 from agentic_fx.datafeed.ingest import Ingest
-from agentic_fx.datafeed.outage import IngestTickReport, OutageStateMachine
+from agentic_fx.datafeed.outage import IngestTickReport, OutageStateMachine, unknown_guidance
 from agentic_fx.datafeed.planner import RequirementPlanner, startup_disposition
 from agentic_fx.datafeed.reference_status import reference_rows
 from agentic_fx.datafeed.requirements import build_registry
@@ -2160,9 +2160,7 @@ def _data_guidance(outage, conn, now) -> dict:
         return dict(outage.guidance_snapshot(now, conn=conn))
     except Exception as exc:  # noqa: BLE001 — 補助表示は status を止めない
         _log.warning("data guidance unavailable: %s", type(exc).__name__)
-        return {"phase": "unknown", "next_action": "check_status",
-                "unprocessed_positions": "unknown", "resume_last_result": None,
-                "resume_last_result_at": None}
+        return unknown_guidance()
 
 
 def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity,

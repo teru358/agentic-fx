@@ -8,7 +8,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from agentic_fx.datafeed import guidance_text
-from agentic_fx.datafeed.outage import IngestTickReport, OutageStateMachine, resume_guidance
+from agentic_fx.datafeed.outage import (IngestTickReport, OutageStateMachine, resume_guidance,
+                                        unknown_guidance)
 from agentic_fx.core.contracts import Bar
 from agentic_fx.store import orders
 from agentic_fx.store.db import connect, init_db
@@ -142,10 +143,10 @@ def test_the_snapshot_of_a_machine_that_never_observed_is_ready(tmp_path):
     conn, machine = _rig(tmp_path)
     snap = machine.guidance_snapshot(WED, conn=conn)
     assert snap["phase"] == "ready" and snap["next_action"] == "none"
-    assert snap["unprocessed_positions"] == 0
+    assert snap["unprocessed_positions"] == "unknown"
     assert snap["resume_last_result"] is None and snap["resume_last_result_at"] is None
     assert set(snap) == {"state", "phase", "next_action", "unprocessed_positions",
-                         "resume_last_result", "resume_last_result_at"}
+                         "resume_last_result", "resume_last_result_at", "auto_resume_possible"}
 
 
 def test_a_recorded_request_shows_wait_tick_and_keeps_the_last_result(tmp_path):
@@ -275,7 +276,9 @@ def test_pending_confirmed_and_the_market_hours_do_not_change_the_guidance(
         _open_position(conn, WED - timedelta(minutes=20))
     snap = machine.guidance_snapshot(now, conn=conn)
     assert (snap["phase"], snap["next_action"]) == expected
-    assert snap["unprocessed_positions"] == (1 if positions else 0)
+    # ready の行は件数を数えない
+    expected_count = "unknown" if cols["state"] == "ready" else (1 if positions else 0)
+    assert snap["unprocessed_positions"] == expected_count
     # API の data をそのまま ctl に通すと、同じ組の固定文が出る
     feed = {"state": cols["state"], **snap}
     lines = client.format_status({"data": feed}).splitlines()
@@ -312,3 +315,91 @@ def test_the_snapshot_state_reads_degraded_while_an_observe_failure_marker_is_up
     _set(conn, machine, state="ready", epoch=1)
     machine._observe_failed = True
     assert machine.guidance_snapshot(WED, conn=conn)["state"] == "degraded"
+
+
+# ---- 件数を数える条件 ----------------------------------------------------
+
+def _forbid_count(machine, monkeypatch):
+    def boom(*_a, **_k):
+        raise AssertionError("count must not be read")
+
+    monkeypatch.setattr(machine, "_unprocessed_position_count", boom)
+
+
+def test_a_ready_row_does_not_count_positions(tmp_path, monkeypatch):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="ready", epoch=3)
+    _forbid_count(machine, monkeypatch)
+    snap = machine.guidance_snapshot(WED, conn=conn)
+    assert (snap["phase"], snap["next_action"]) == ("ready", "none")
+    assert snap["unprocessed_positions"] == "unknown"
+
+
+@pytest.mark.parametrize("state", ["degraded", "restricted"])
+def test_a_stopped_or_restricted_row_counts_positions(tmp_path, state):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state=state, epoch=3)
+    assert machine.guidance_snapshot(WED, conn=conn)["unprocessed_positions"] == 0
+
+
+def test_a_ready_row_with_a_rejected_last_result_still_counts(tmp_path):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="ready", epoch=3, resume_last_result="rejected_unprocessed",
+         resume_last_result_at=WED.isoformat())
+    assert machine.guidance_snapshot(WED, conn=conn)["unprocessed_positions"] == 0
+
+
+# ---- 自動で戻ることがある停止 ----------------------------------------------
+
+def test_a_flat_degraded_epoch_with_auto_resume_and_no_pending_may_recover_unattended(tmp_path):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="degraded", epoch=3, pending_human_confirmation=0)
+    snap = machine.guidance_snapshot(WED, conn=conn)
+    assert (snap["phase"], snap["auto_resume_possible"]) == ("stopped", True)
+
+
+def test_an_exposure_pending_or_a_disabled_auto_resume_rules_that_out(tmp_path):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="degraded", epoch=3, pending_human_confirmation=1)
+    assert machine.guidance_snapshot(WED, conn=conn)["auto_resume_possible"] is False
+    _set(conn, machine, pending_human_confirmation=0)
+    _open_position(conn, WED - timedelta(minutes=5))
+    assert machine.guidance_snapshot(WED, conn=conn)["auto_resume_possible"] is False
+    conn.execute("UPDATE orders SET status='closed'")
+    conn.commit()
+    assert machine.guidance_snapshot(WED, conn=conn)["auto_resume_possible"] is True
+    (tmp_path / "off").mkdir()
+    off_conn, off = _rig(tmp_path / "off", auto_resume_when_flat=False)
+    _set(off_conn, off, state="degraded", epoch=3, pending_human_confirmation=0)
+    assert off.guidance_snapshot(WED, conn=off_conn)["auto_resume_possible"] is False
+
+
+@pytest.mark.parametrize("cols", [dict(state="ready"), dict(state="restricted")])
+def test_only_a_degraded_row_can_report_an_unattended_recovery(tmp_path, cols):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, epoch=3, **cols)
+    assert machine.guidance_snapshot(WED, conn=conn)["auto_resume_possible"] is False
+
+
+def test_an_unreadable_flat_check_does_not_claim_an_unattended_recovery(tmp_path, monkeypatch):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="degraded", epoch=3)
+    monkeypatch.setattr("agentic_fx.datafeed.outage.orders.list_by_status",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("unreadable")))
+    snap = machine.guidance_snapshot(WED, conn=conn)
+    assert snap["auto_resume_possible"] is False
+
+
+def test_the_unknown_payload_has_one_definition_and_no_state():
+    payload = unknown_guidance()
+    assert payload == {"phase": "unknown", "next_action": "check_status",
+                       "unprocessed_positions": "unknown", "resume_last_result": None,
+                       "resume_last_result_at": None, "auto_resume_possible": False}
+    assert unknown_guidance() is not payload
+
+
+def test_an_unreadable_row_returns_the_shared_unknown_payload(tmp_path, monkeypatch):
+    conn, machine = _rig(tmp_path)
+    monkeypatch.setattr(machine, "_load_row",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert machine.guidance_snapshot(WED, conn=conn) == unknown_guidance()

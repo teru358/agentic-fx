@@ -216,7 +216,7 @@ def test_the_web_phase_table_and_the_guidance_text_copy_match_the_daemon_vocabul
         "from afx_ops import guidance_text\n"
         "from afx_ops.web import marks\n"
         "print(json.dumps({'table': sorted(marks.DATA_PHASES), 'text': sorted(marks.DATA_PHASE_TEXT),"
-        " 'phases': list(guidance_text.PHASES), 'actions': list(guidance_text.NEXT_ACTIONS),"
+        " 'phases': list(guidance_text.PHASES),"
         " 'pairs': sorted(map(list, guidance_text.PAIRS))}))\n")
     done = subprocess.run([sys.executable, "-I", "-c", child, str(AFX_OPS)], capture_output=True,
                           text=True, check=True, timeout=60)
@@ -224,7 +224,6 @@ def test_the_web_phase_table_and_the_guidance_text_copy_match_the_daemon_vocabul
     assert set(seen["table"]) == set(guidance_text.PHASES)
     assert set(seen["text"]) == set(guidance_text.PHASES)
     assert seen["phases"] == list(guidance_text.PHASES)
-    assert seen["actions"] == list(guidance_text.NEXT_ACTIONS)
     assert seen["pairs"] == sorted(map(list, guidance_text.PAIRS))
 
 
