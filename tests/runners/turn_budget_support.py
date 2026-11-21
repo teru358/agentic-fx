@@ -115,3 +115,41 @@ class StubTools:
 
     def count(self, name: str) -> int:
         return sum(1 for n, _ in self.calls if n == name)
+
+
+def call_message(*calls: tuple[str, str, object], content: str = "") -> dict:
+    """構造化の tool_calls を持つ assistant 応答。calls = (id, name, arguments)。
+    arguments が str ならそのまま、それ以外は json.dumps した文字列にする。"""
+    return {"role": "assistant", "content": content, "tool_calls": [
+        {"id": cid, "type": "function",
+         "function": {"name": name,
+                      "arguments": args if isinstance(args, str)
+                      else json.dumps(args)}}
+        for cid, name, args in calls]}
+
+
+def text_message(content: str) -> dict:
+    return {"role": "assistant", "content": content}
+
+
+def search_call(n: int, query: str | None = None) -> dict:
+    return call_message((f"id{n:030d}", "search_news",
+                         {"query": query or f"q{n}"}))
+
+
+ACCEPT = text_message('{"decision": "accept", "reject_code": null}')
+REJECT = text_message('{"decision": "reject", "reject_code": "news_shock"}')
+HOLD = text_message('{"action": "hold"}')
+CRON_SCHEMA = {"type": "object", "properties": {"action": {"type": "string"}},
+               "required": ["action"]}
+
+
+def tool_contents(messages: list[dict]) -> list[dict]:
+    """tool 応答の content (JSON 文字列) を dict にして並べる。"""
+    return [json.loads(m["content"]) for m in messages if m["role"] == "tool"]
+
+
+def assert_no_consecutive_user_rows(body: dict) -> None:
+    roles = [m["role"] for m in body["messages"]]
+    for a, b in zip(roles, roles[1:]):
+        assert not (a == "user" and b == "user"), roles

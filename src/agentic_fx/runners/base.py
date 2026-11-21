@@ -33,6 +33,12 @@ class Mission:
     output_schema: dict[str, Any]
     max_turns: int
     timeout_sec: float
+    # 取引判断の手数制御 ("signal" / "cron")。既定 None は従来動作。local runner だけが解釈する。
+    turn_policy: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.turn_policy is not None and self.turn_policy not in ("signal", "cron"):
+            raise ValueError(f"unknown turn_policy: {self.turn_policy!r}")
 
 
 #: ツール予算 abort の reason prefix (runner が構築し、worker / improve_loop が判定)。
@@ -78,6 +84,8 @@ class MissionResult:
     # 失敗の固定分類 (`resource_exhausted` / `runner_fault` / なし)。`stderr_fatal` の
     # 自由文とは別に、検知したパターンの表から直接決める。
     failure_class: str | None = None
+    # 取引判断の手数制御の終端要約 (本文を含まない集計)。policy 無効では None。
+    turn_summary: dict[str, Any] | None = None
 
 
 class AgentRunner(ABC):
