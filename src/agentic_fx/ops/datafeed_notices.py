@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from agentic_fx.datafeed import notice_rules
 from agentic_fx.store import alert_state
@@ -27,9 +27,10 @@ _RANK = {"stopped": 0, "awaiting_resume": 1, "resume_accepted": 2, "resume_rejec
 _TERMINAL = frozenset({"resume_accepted", "resume_rejected", "resume_already_ready"})
 _SKIP_LOG_LIMIT = 256
 _skip_logged: set[tuple] = set()
-# 保存に失敗した記録ごとの回数 (メモリだけ。次の tick で再試行する)
-_failed_records: dict[tuple, int] = {}
-_FAILURE_STREAK_LIMIT = 3
+# 1 回の回収で許す失敗の件数 (DB 全体の障害で同じ回に無駄打ちしない)
+_FAILURES_PER_PASS = 3
+_RETRY_BASE_SEC = 60
+_RETRY_MAX_SEC = 3600
 
 
 def _parse_utc(text: object) -> datetime | None:
@@ -69,6 +70,28 @@ def ensure_enabled(conn, now: datetime) -> bool:
     return _enabled_at(conn, now)[1]
 
 
+class Retries:
+    """保存に失敗した記録ごとの再試行時刻 (メモリだけ)。1 回目は次の回収で試し、2 回目以降は
+    指数で間隔を伸ばして上限で止める。その時刻までは飛ばして後続を通す。"""
+
+    def __init__(self) -> None:
+        self._failures: dict[tuple, tuple[int, datetime]] = {}
+
+    def due(self, key: tuple, now: datetime) -> bool:
+        item = self._failures.get(key)
+        return item is None or now >= item[1]
+
+    def failed(self, key: tuple, now: datetime) -> None:
+        count = (self._failures[key][0] if key in self._failures else 0) + 1
+        delay = 0 if count == 1 else min(_RETRY_BASE_SEC * 2 ** (count - 2), _RETRY_MAX_SEC)
+        if len(self._failures) >= _SKIP_LOG_LIMIT * 4 and key not in self._failures:
+            self._failures.clear()
+        self._failures[key] = (count, now + timedelta(seconds=delay))
+
+    def succeeded(self, key: tuple) -> None:
+        self._failures.pop(key, None)
+
+
 def producer_enabled_at(conn, now: datetime) -> datetime:
     """通知生成を有効にした daemon を初めて起動した時刻。無い (または読めない) ときだけ今を置く。
 
@@ -76,11 +99,15 @@ def producer_enabled_at(conn, now: datetime) -> datetime:
     return _enabled_at(conn, now)[0]
 
 
-def sweep(conn, events: EventStore, now: datetime) -> int:
+def sweep(conn, events: EventStore, now: datetime, *, retries: Retries | None = None,
+          enabled_hint: datetime | None = None) -> int:
     """下限以後の未 event 化の記録を、有限 batch で順に event にする。出した (または対応を付けた) 件数。
 
-    失敗した記録は残して次の tick に回し、最初の失敗でこの回の回収を止める。"""
-    floor = producer_enabled_at(conn, now)
+    失敗した記録は残し、記録ごとの再試行時刻まで飛ばして後続を通す。1 回の回収の失敗は
+    ``_FAILURES_PER_PASS`` 件まで。`enabled_hint` は構築時刻で、下限が保存できていないときの
+    置く値 (回収時刻で置き換えない)。"""
+    retries = retries if retries is not None else Retries()
+    floor = producer_enabled_at(conn, enabled_hint or now)
     due = []
     for row in conn.execute(
             "SELECT epoch, notice_state, request_key, occurred_at FROM datafeed_outage_notices "
@@ -94,10 +121,12 @@ def sweep(conn, events: EventStore, now: datetime) -> int:
         if occurred >= floor:
             due.append((occurred, epoch, _RANK[state], key, state))
     due.sort()
-    done = streak = 0
+    done = failures = 0
     for occurred, epoch, _rank, key, state in due:
         if done >= BATCH_LIMIT:
             break
+        if not retries.due((epoch, state, key), now):
+            continue
         try:
             event_id = None if state in _TERMINAL else data_feed_guard_event_id(
                 conn, generation=epoch, state=state)
@@ -116,17 +145,13 @@ def sweep(conn, events: EventStore, now: datetime) -> int:
             continue
         except Exception:  # noqa: BLE001 -- 通知の失敗で状態更新・保護処理を止めない
             _rollback(conn)
-            _failed_records[(epoch, state, key)] = _failed_records.get((epoch, state, key), 0) + 1
-            if len(_failed_records) > _SKIP_LOG_LIMIT:
-                _failed_records.clear()
+            retries.failed((epoch, state, key), now)
             _log.warning("datafeed_notice_deferred")
-            # 1 件の失敗は飛ばして後続を続ける。続けて失敗するなら DB 全体の障害とみなして止める
-            streak += 1
-            if streak >= _FAILURE_STREAK_LIMIT:
+            failures += 1
+            if failures >= _FAILURES_PER_PASS:
                 return done
             continue
-        _failed_records.pop((epoch, state, key), None)
-        streak = 0
+        retries.succeeded((epoch, state, key))
         done += 1
     return done
 
@@ -138,38 +163,45 @@ def _rollback(conn) -> None:
         pass
 
 
-def supplement(conn, now: datetime, *, introduced: bool = False) -> int:
-    """導入時点で停止中の episode から、通常キーの記録を 0〜1 件だけ補う。
-
-    優先順: 要求あり = 補完しない / 待ちの印あり = 待ち / confirmed または開場時間の停止条件 = 停止 /
-    それ以外 (ready・restricted・条件未到達) = 補完しない。補った記録の発生時刻は導入時刻。
-    `introduced` は daemon の構築時に有効化の時刻を初めて置いたことを表す。
-    導入前の同じキーの未 event 化の記録は、その一件だけ導入時刻へ移す。導入後の記録・
-    event 化済みの記録は動かさないので、再実行しても増えず時刻も動かない。"""
-    floor = producer_enabled_at(conn, now)
-    # 補った記録の発生時刻: 初回の導入時 (`introduced`) は導入時刻、後の再起動では実際に補った時刻
-    # (条件が後から成立した停止を導入時刻へ遡らせない)
-    made_at = floor if introduced else now.astimezone(timezone.utc)
+def snapshot_target(conn, now: datetime) -> tuple[int, str] | None:
+    """いま補完の対象になる記録 (epoch, 状態)。優先順: 要求あり = なし / 待ちの印あり = 待ち /
+    confirmed または開場時間の停止条件 = 停止 / それ以外 (ready・restricted・条件未到達) = なし。
+    読むだけ。"""
     row = conn.execute(
         "SELECT state, epoch, confirmed, entered_degraded_at, resume_requested_at, "
         "resume_last_result_at, recovered_notified_epoch FROM datafeed_outage_state WHERE id=1").fetchone()
     if row is None or row["state"] != "degraded" or row["resume_requested_at"] is not None:
-        return 0
+        return None
     epoch = row["epoch"]
     if type(epoch) is not int or epoch < 0:
-        return 0
+        return None
     if row["recovered_notified_epoch"] == epoch:
-        target = "awaiting_resume"
-    elif row["confirmed"] or notice_rules.stop_after_open_minutes(
+        return epoch, "awaiting_resume"
+    if row["confirmed"] or notice_rules.stop_after_open_minutes(
             notice_rules.timer_start(row["entered_degraded_at"], row["resume_last_result_at"]),
             now.astimezone(timezone.utc)):
-        target = "stopped"
         if conn.execute(
                 "SELECT 1 FROM datafeed_outage_notices WHERE epoch=? "
                 "AND notice_state='awaiting_resume'", (epoch,)).fetchone() is not None:
-            return 0
-    else:
+            return None
+        return epoch, "stopped"
+    return None
+
+
+def supplement(conn, now: datetime, *, snapshot: tuple[int, str] | None = None,
+               enabled_hint: datetime | None = None) -> int:
+    """導入時点で停止中の episode から、通常キーの記録を 0〜1 件だけ補う (対象は `snapshot_target`)。
+
+    補った記録の発生時刻は、有効化の snapshot の時点で既に成り立っていた対象 (`snapshot` と
+    同じ epoch・状態) だけ導入時刻、それ以外 (snapshot の後に成り立った停止、後の再起動の補完) は
+    実際に補った時刻。導入前の同じキーの未 event 化の記録は、その一件だけ導入時刻へ移す。
+    導入後の記録・event 化済みの記録は動かさないので、再実行しても増えず時刻も動かない。"""
+    floor = producer_enabled_at(conn, enabled_hint or now)
+    found_target = snapshot_target(conn, now)
+    if found_target is None:
         return 0
+    epoch, target = found_target
+    made_at = floor if snapshot == found_target else now.astimezone(timezone.utc)
     found = conn.execute(
         "SELECT occurred_at, event_id FROM datafeed_outage_notices "
         "WHERE epoch=? AND notice_state=? AND request_key=''", (epoch, target)).fetchone()

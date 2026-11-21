@@ -4,7 +4,9 @@ state の行は SQL で直接置く。時刻は固定の例 (水曜の開場中)
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -206,3 +208,58 @@ def test_a_later_restart_supplements_with_the_time_it_was_made_not_the_enabled_t
     order = [(json.loads(r["fields_json"])["state"]) for r in
              rig.conn.execute("SELECT fields_json FROM ops_events ORDER BY id")]
     assert order == ["resume_rejected", "stopped"]
+
+
+def _fast_service(env):
+    from agentic_fx.ops.service import OpsLimits
+    return env.service(datafeed_notices=True, limits=OpsLimits(
+        request_deadline_seconds=0.1, ops_lock_wait_seconds=0.05))
+
+
+@contextlib.contextmanager
+def _lane_held(service):
+    held, release = threading.Event(), threading.Event()
+
+    def holder():
+        with service._ops_lock:
+            held.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=holder, daemon=True)
+    thread.start()
+    assert held.wait(5)
+    try:
+        yield
+    finally:
+        release.set()
+        thread.join(5)
+
+
+def test_a_stop_that_became_true_after_the_snapshot_is_dated_when_it_was_made(ops_env):
+    """導入時は条件未到達で、最初の補完が lane の混雑で遅れる間に停止が成り立つ。"""
+    ops_env.wall.now = FLOOR
+    _state(ops_env.conn, entered_degraded_at=(FLOOR - timedelta(minutes=2)).isoformat())
+    service = _fast_service(ops_env)
+    with _lane_held(service):
+        service.emit_pending_notices(improve_enabled=False)
+    ops_env.conn.execute("INSERT INTO datafeed_outage_notices VALUES (66,'resume_rejected','k',?,NULL)",
+                         ((FLOOR + timedelta(minutes=5)).isoformat(),))
+    ops_env.conn.commit()
+    later = FLOOR + timedelta(minutes=12)
+    ops_env.wall.now = later
+    service.emit_pending_notices(improve_enabled=False)
+    stopped = [r for r in _records(ops_env.conn) if r[1] == "stopped"]
+    assert [r[3] for r in stopped] == [later.isoformat()]
+    assert _events(ops_env.conn) == [("resume_rejected", 66), ("stopped", 66)]
+
+
+def test_a_stop_that_was_true_at_the_snapshot_keeps_the_enabled_time_when_the_lane_was_busy(ops_env):
+    ops_env.wall.now = FLOOR
+    _state(ops_env.conn, confirmed=1)
+    service = _fast_service(ops_env)
+    with _lane_held(service):
+        service.emit_pending_notices(improve_enabled=False)
+    ops_env.wall.now = FLOOR + timedelta(minutes=30)
+    service.emit_pending_notices(improve_enabled=False)
+    assert [r[3] for r in _records(ops_env.conn)] == [FLOOR.isoformat()]
+    assert _events(ops_env.conn) == [("stopped", 66)]

@@ -774,13 +774,19 @@ class OpsService:
         # 再開要求の受付は記録時の epoch を generation に持つ。偽なら従来の受付 (generation なし) だけ
         self._datafeed_notices = datafeed_notices is True
         self._datafeed_supplemented = False
-        self._datafeed_introduced = False
+        self._datafeed_snapshot: tuple[int, str] | None = None
+        self._datafeed_built_at: datetime | None = None
+        self._datafeed_retries = notice_sweep.Retries()
         if self._datafeed_notices:
-            # 有効化の時刻は構築時に置く。ops lane が塞がっていても、その後の記録が下限より前にならない
+            # 有効化の時刻は構築時に置く。ops lane が塞がっていても、その後の記録が下限より前にならない。
+            # 保存に失敗したら構築時刻を持ち続け、保存できるまで同じ値で再試行する
+            self._datafeed_built_at = _aware(wall_clock()).astimezone(timezone.utc)
             try:
-                self._datafeed_introduced = notice_sweep.ensure_enabled(
-                    conn, _aware(wall_clock()).astimezone(timezone.utc))
-            except Exception:  # noqa: BLE001 -- 置けなければ最初の回収で置く
+                if notice_sweep.ensure_enabled(conn, self._datafeed_built_at):
+                    # 有効化の時点で成り立っていた補完の対象 (発生時刻を導入時刻にしてよい分)
+                    self._datafeed_snapshot = notice_sweep.snapshot_target(
+                        conn, self._datafeed_built_at)
+            except Exception:  # noqa: BLE001 -- 置けなければ最初の回収で再試行する
                 _log.warning("datafeed_notice_deferred")
         self._ask_submitter = ask_submitter
         self._improve_supervisor = improve_supervisor
@@ -2109,14 +2115,17 @@ class OpsService:
         now = _aware(self._wall_clock()).astimezone(timezone.utc)
         if not self._datafeed_supplemented:
             try:
-                notice_sweep.supplement(self._conn, now, introduced=self._datafeed_introduced)
+                notice_sweep.supplement(
+                    self._conn, now, snapshot=self._datafeed_snapshot,
+                    enabled_hint=self._datafeed_built_at)
                 self._datafeed_supplemented = True
             except Exception:  # noqa: BLE001
                 _log.warning("datafeed_notice_deferred")
                 with contextlib.suppress(Exception):
                     self._conn.rollback()
         try:
-            notice_sweep.sweep(self._conn, self.events, now)
+            notice_sweep.sweep(self._conn, self.events, now, retries=self._datafeed_retries,
+                               enabled_hint=self._datafeed_built_at)
         except Exception:  # noqa: BLE001
             _log.warning("datafeed_notice_deferred")
             with contextlib.suppress(Exception):

@@ -4,14 +4,17 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
 from agentic_fx.ops import datafeed_notices
+from agentic_fx.ops.service import OpsLimits
 from agentic_fx.ops.events import MAX_POLL_LIMIT
 from agentic_fx.store import alert_state
 
@@ -293,7 +296,7 @@ def test_a_failure_between_the_event_and_the_link_rolls_both_back(rig, caplog):
     assert _link(rig.conn, 66, "stopped") is not None
 
 
-def test_a_failed_event_insert_keeps_the_record_and_stops_the_batch_for_this_time(rig, caplog):
+def test_a_failure_of_every_record_keeps_them_and_retries_them_once_the_insert_recovers(rig, caplog):
     _first_sweep(rig)
     _notice(rig.conn, 66, "stopped", at=FLOOR + timedelta(minutes=1))
     _notice(rig.conn, 67, "stopped", at=FLOOR + timedelta(minutes=2))
@@ -383,11 +386,52 @@ def test_the_enabled_time_is_stored_when_the_service_is_built_even_if_the_lane_i
     assert alert_state.get(ops_env.conn, datafeed_notices.PRODUCER_KEY) == FLOOR.isoformat()
 
 
+@contextlib.contextmanager
+def hold_lane(service):
+    """別 thread が ops lane の lock を持つ間、lane は実際に塞がる。"""
+    held, release = threading.Event(), threading.Event()
+
+    def holder():
+        with service._ops_lock:
+            held.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=holder, daemon=True)
+    thread.start()
+    assert held.wait(5)
+    try:
+        yield
+    finally:
+        release.set()
+        thread.join(5)
+
+
+FAST = OpsLimits(request_deadline_seconds=0.1, ops_lock_wait_seconds=0.05)
+
+
 def test_a_record_made_while_the_lane_was_busy_at_startup_is_sent_later(ops_env):
-    service = ops_env.service(datafeed_notices=True)
+    service = ops_env.service(datafeed_notices=True, limits=FAST)
+    with hold_lane(service):
+        service.emit_pending_notices(improve_enabled=False)         # 起動の回収は lane を取れない
+    assert _events(ops_env.conn) == []
     _notice(ops_env.conn, 66, "resume_rejected", key="k", at=FLOOR + timedelta(minutes=2))
     ops_env.wall.advance(hours=1)
     service.emit_pending_notices(improve_enabled=False)
+    assert _events(ops_env.conn) == [("resume_rejected", 66)]
+
+
+def test_the_enabled_time_survives_a_failed_save_at_build_and_is_not_replaced_later(ops_env):
+    ops_env.conn.execute("CREATE TRIGGER block_alert BEFORE INSERT ON alert_state "
+                         "BEGIN SELECT RAISE(ABORT,'blocked'); END")
+    ops_env.conn.commit()
+    service = ops_env.service(datafeed_notices=True)         # 構築時の保存は失敗する
+    assert alert_state.get(ops_env.conn, datafeed_notices.PRODUCER_KEY) is None
+    _notice(ops_env.conn, 66, "resume_rejected", key="k", at=FLOOR + timedelta(minutes=2))
+    ops_env.conn.execute("DROP TRIGGER block_alert")
+    ops_env.conn.commit()
+    ops_env.wall.advance(hours=1)                             # DB が戻ったのは構築の 1 時間後
+    service.emit_pending_notices(improve_enabled=False)
+    assert alert_state.get(ops_env.conn, datafeed_notices.PRODUCER_KEY) == FLOOR.isoformat()
     assert _events(ops_env.conn) == [("resume_rejected", 66)]
 
 
@@ -407,6 +451,7 @@ def test_a_record_that_keeps_failing_is_skipped_and_the_later_ones_still_go(rig)
     assert _link(rig.conn, 66, "stopped") is None
     rig.conn.execute("DROP TRIGGER block_one")
     rig.conn.commit()
+    rig.env.wall.advance(hours=2)    # 失敗した記録の再試行時刻が来てから
     _sweep(rig)
     assert _events(rig.conn) == [("stopped", 67), ("stopped", 68), ("stopped", 66)]
 
@@ -424,3 +469,21 @@ def test_a_failure_of_every_record_stops_the_pass_after_a_few_attempts(rig, monk
     monkeypatch.setattr(rig.service.events, "insert_data_feed_guard", fail)
     _sweep(rig)
     assert 1 <= len(calls) <= 3
+
+
+def test_permanently_failing_records_at_the_head_never_block_the_later_ones_across_ticks(rig):
+    _first_sweep(rig)
+    for epoch in (1, 2, 3, 4):
+        _notice(rig.conn, epoch, "stopped", at=FLOOR + timedelta(minutes=epoch))
+    rig.conn.execute(
+        "CREATE TRIGGER block_head BEFORE UPDATE ON datafeed_outage_notices "
+        "WHEN OLD.epoch<=3 BEGIN SELECT RAISE(ABORT,'blocked'); END")
+    rig.conn.commit()
+    for _ in range(4):
+        _sweep(rig)
+    assert _events(rig.conn) == [("stopped", 4)]
+    rig.conn.execute("DROP TRIGGER block_head")
+    rig.conn.commit()
+    rig.env.wall.advance(hours=2)                        # 再試行の時刻が来ればまた試す
+    _sweep(rig)
+    assert sorted(_events(rig.conn)) == [("stopped", g) for g in (1, 2, 3, 4)]
