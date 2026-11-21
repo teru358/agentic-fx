@@ -165,6 +165,23 @@ def test_a_transition_time_that_cannot_be_read_is_an_undetermined_row_and_a_degr
     assert store.get_week(world.conn, "2027-01-29")["degraded"] == {"strategy_undetermined": 1}
 
 
+def test_a_live_strategy_with_no_deployment_record_does_not_make_a_normal_empty_week(world):
+    world.deploy("plain_only", "strategy")
+    finalize(world)
+    [row] = rows(world)
+    assert row["name"] == "plain_only" and row["state"] == "undetermined"
+    week = store.get_week(world.conn, "2027-01-29")
+    assert week["evaluation"] == "degraded"
+    assert week["degraded"] == {"strategy_undetermined": 1}
+
+
+def test_a_strategy_deployed_only_after_the_window_end_does_not_degrade_the_week(world):
+    put(world, "later", "strategy", at=END + timedelta(hours=3))
+    finalize(world)
+    week = store.get_week(world.conn, "2027-01-29")
+    assert rows(world) == [] and week["evaluation"] == "normal"
+
+
 def test_an_unreadable_deployment_record_degrades_the_week_without_strategy_rows(world):
     put(world, "strat", "strategy", at=END - 10 * WEEK)
     finalize(world, journal_status=SOURCE_UNAVAILABLE)

@@ -91,6 +91,14 @@ def test_a_review_reason_turns_an_above_floor_strategy_into_a_check_request(conn
     assert "機械採点上は床超え" not in text
 
 
+def test_an_unreadable_deadline_is_shown_as_a_check_reason_and_in_the_holes(conn):
+    holes = {**strategy().holes, "deadline_unknown": 2}
+    store.commit_week(conn, week(), [strategy(reasons=["deadline_unknown"], holes=holes)], [])
+    text = rep.render_report(conn, "2027-01-29")
+    assert "要確認" in text and "期限を読めない未終端がある" in text
+    assert "期限不明 2" in text and "機械採点上は床超え" not in text
+
+
 def test_a_stop_candidate_keeps_its_label_with_its_reasons(conn):
     store.commit_week(conn, week(), [strategy(sign="stop_candidate",
                                               reasons=["overdue_unterminated"])], [])

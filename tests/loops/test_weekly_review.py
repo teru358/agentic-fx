@@ -3,14 +3,16 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
 from agentic_fx import weekly_review as wk
 from agentic_fx.plugin import read_model_inputs
+from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.plugin.read_model import (
-    SOURCE_UNAVAILABLE, ApprovalRow, DeployOpRow, JournalRow, LiveScan, ReadInputs)
+    SOURCE_UNAVAILABLE, ApprovalRow, DeployOpRow, JournalRow, LiveEntry, LiveScan, ReadInputs)
 from agentic_fx.store import signal_forward as sf
 from agentic_fx.store import weekly_review as store
 from tests.backtest.factories import SETTINGS
@@ -28,7 +30,8 @@ ART = "c" * 64
 
 # ---------------------------------------------------------------- 判定 (純関数)
 
-def summary(*, n=40, avg=0.2, first_days=60, recent=5, overdue=0, gen_weeks=20, state="ok"):
+def summary(*, n=40, avg=0.2, first_days=60, recent=5, overdue=0, gen_weeks=20, state="ok",
+            unknown=0):
     if state != "ok":
         return {"state": state}
     return {"state": "ok",
@@ -36,7 +39,7 @@ def summary(*, n=40, avg=0.2, first_days=60, recent=5, overdue=0, gen_weeks=20, 
             "recent_decisions": recent,
             "generation": {"started_at": (END - gen_weeks * WEEK).isoformat()},
             "series": {"all": {"n": n, "avg_r": avg}},
-            "holes": {"overdue_unterminated": overdue}}
+            "holes": {"overdue_unterminated": overdue, "deadline_unknown": unknown}}
 
 
 @pytest.mark.parametrize("kw,sign", [
@@ -67,6 +70,15 @@ def test_no_decision_in_the_last_two_weeks_is_a_reason():
 
 def test_an_overdue_unterminated_row_is_a_reason():
     assert wk.judge(summary(overdue=2), end=END).reasons == ["overdue_unterminated"]
+
+
+def test_an_unterminated_row_with_an_unreadable_deadline_is_a_reason():
+    assert wk.judge(summary(unknown=1), end=END).reasons == ["deadline_unknown"]
+
+
+def test_an_above_floor_strategy_with_an_unreadable_deadline_is_not_clean():
+    j = wk.judge(summary(unknown=1), end=END)
+    assert j.sign == "above_floor" and j.display == "needs_review" and j.needs_review
 
 
 def test_a_generation_of_twelve_weeks_with_fewer_than_thirty_is_a_reason():
@@ -238,6 +250,49 @@ def test_a_deployment_whose_approval_cannot_be_read_is_undetermined_not_dropped(
                            END)
     [t] = got.targets
     assert t.name == "s" and t.reason is not None
+
+
+def live_entry(name, kind="strategy", *, state="symlink"):
+    meta = PluginMeta(name=name, kind=kind, path=Path("/x") / name, params={}, timeframe=None,
+                      pairs=(), max_bars=1, content_hash=H, artifact_hash=ART)
+    return LiveEntry(name, state, ART, meta)
+
+
+def test_a_live_strategy_with_no_deployment_record_is_undetermined_not_dropped():
+    got = wk.targets_as_of(inputs(live=LiveScan(entries=(live_entry("plain_only"),))), END)
+    [t] = got.targets
+    assert t.name == "plain_only" and t.reason == "no_generation_record"
+    assert t.started_at is None and t.generation is None
+
+
+def test_a_live_indicator_with_no_deployment_record_is_not_a_forward_target():
+    got = wk.targets_as_of(inputs(live=LiveScan(entries=(live_entry("ind", "indicator"),))), END)
+    assert got.targets == []
+
+
+def test_a_live_strategy_whose_only_record_is_after_the_window_end_stays_out():
+    got = wk.targets_as_of(inputs(
+        live=LiveScan(entries=(live_entry("s"),)),
+        approvals=(approval(1, "s"),),
+        journals=(journal(5, "s", 1, END + timedelta(hours=1)),)), END)
+    assert got.targets == [] and got.stopped == []
+
+
+def test_a_live_strategy_with_a_record_is_not_added_twice():
+    got = wk.targets_as_of(inputs(
+        live=LiveScan(entries=(live_entry("s"),)),
+        approvals=(approval(1, "s"),),
+        journals=(journal(5, "s", 1, END - WEEK),)), END)
+    [t] = got.targets
+    assert t.reason is None and t.generation == (0, 5)
+
+
+def test_targets_with_and_without_records_stay_in_name_order():
+    got = wk.targets_as_of(inputs(
+        live=LiveScan(entries=(live_entry("a"), live_entry("c"))),
+        approvals=(approval(1, "b"),),
+        journals=(journal(5, "b", 1, END - WEEK),)), END)
+    assert [t.name for t in got.targets] == ["a", "b", "c"]
 
 
 def test_unreadable_journals_make_the_restoration_unavailable():

@@ -1,7 +1,7 @@
 """週次の確定が使う、前方成績の追加の面: 評価時刻と窓終端の分離・最初の採否・期限超え・直近の採否。"""
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -104,6 +104,47 @@ def test_a_filled_limit_row_uses_the_deadline_of_its_fill(conn, make):
                '"stop_loss":149.0,"take_profit":152.0}')
     make.decide(at=at, result="filled", payload=payload)
     assert summary(conn)["holes"]["overdue_unterminated"] == 1
+
+
+LIMIT = ('{"action":"open","direction":"long","entry_type":"limit","limit_price":149.5,'
+         '"stop_loss":149.0,"take_profit":152.0}')
+
+
+def test_an_unterminated_row_whose_deadline_cannot_be_read_is_counted_as_unknown(conn, make):
+    make.decide(at=NOW - 10 * WEEK, result=None, payload="not json")
+    holes = summary(conn)["holes"]
+    assert holes["unterminated"] == 1
+    assert holes["deadline_unknown"] == 1 and holes["overdue_unterminated"] == 0
+
+
+def test_an_unterminated_row_with_a_readable_deadline_is_not_unknown(conn, make):
+    make.decide(at=NOW - 10 * WEEK, result=None)
+    make.decide(at=NOW - 9 * WEEK, result="filled")
+    holes = summary(conn)["holes"]
+    assert holes["unterminated"] == 2 and holes["deadline_unknown"] == 0
+
+
+def test_a_terminated_row_with_a_broken_payload_is_not_a_deadline_unknown(conn, make):
+    make.decide(at=NOW - 10 * WEEK, result="tp", payload="not json")
+    assert summary(conn)["holes"]["deadline_unknown"] == 0
+
+
+def test_a_limit_row_filled_late_is_not_overdue_before_the_day_close(
+        conn, make):
+    decided = datetime(2027, 1, 12, 10, tzinfo=timezone.utc)
+    make.decide(at=decided, result=None, payload=LIMIT)
+    end = decided + timedelta(hours=1)
+    # 有効時間 (4 時間) と猶予は過ぎたが、約定後の day close (21:55) の猶予内
+    between = decided + timedelta(days=1, hours=8)
+    assert summary(conn, now=end, evaluated_at=between)["holes"]["overdue_unterminated"] == 0
+
+
+def test_a_limit_row_without_a_fill_is_overdue_after_the_day_close_plus_grace(conn, make):
+    decided = datetime(2027, 1, 12, 10, tzinfo=timezone.utc)
+    make.decide(at=decided, result=None, payload=LIMIT)
+    end = decided + timedelta(hours=1)
+    late = decided + timedelta(days=1, hours=12)
+    assert summary(conn, now=end, evaluated_at=late)["holes"]["overdue_unterminated"] == 1
 
 
 def test_the_short_term_view_counts_only_the_last_four_weeks(conn, make):

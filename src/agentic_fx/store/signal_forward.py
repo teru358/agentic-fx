@@ -140,11 +140,14 @@ def _parse(value: object) -> datetime | None:
 
 def shadow_deadline(kind: object, decided_at: datetime, entry_at: datetime | None) -> datetime:
     """終端していない shadow の、確定猶予を足した期限。成行は採否後の day close、指値は
-    約定済みなら約定の足の day close、未約定なら指値の有効時間の終わり。"""
+    約定済みなら約定の足の day close。約定の時刻が未保存の指値は、有効時間のうちに約定して
+    その後の day close を待つ場合があるので、有効時間の終わりを含む足の day close を上限に
+    する (正常な待ちを期限超過にしない)。"""
     t0 = signal_shadow.observation_start(decided_at)
     if kind == "limit":
         if entry_at is None:
-            return t0 + _LIMIT_WINDOW + FINALIZE_GRACE
+            first_end = t0 + _LIMIT_WINDOW
+            return max(day_close_deadline(first_end), first_end) + FINALIZE_GRACE
         return max(day_close_deadline(entry_at), entry_at + timedelta(minutes=1)) + FINALIZE_GRACE
     return day_close_deadline(t0) + FINALIZE_GRACE
 
@@ -205,6 +208,7 @@ def summarize(decided: list[dict], population: list[dict], *, target: ForwardTar
             "overdue_unterminated": sum(
                 1 for r in unterminated
                 if r["deadline"] is not None and evaluated > r["deadline"]),
+            "deadline_unknown": sum(1 for r in unterminated if r["deadline"] is None),
             "r_unknown": sum(1 for r in scored if r["r"] is None),
             "time_unreadable": time_unreadable},
         "reach": _rate(population),

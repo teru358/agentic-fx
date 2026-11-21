@@ -25,6 +25,7 @@ _SIGN = {"indeterminate": "判定不能", "insufficient": "標本不足", "stop_
 _REASON = {
     "no_recent_decisions": "直近 2 週に採否のある signal がない",
     "overdue_unterminated": "評価時刻が期限を超えた未終端がある",
+    "deadline_unknown": "期限を読めない未終端がある",
     "generation_aged_insufficient": "現世代が 12 週に達しても N が 30 に届かない"}
 _DEGRADED = {
     "strategy_undetermined": "判定不能の戦略", "strategy_failed": "集計に失敗した戦略",
@@ -74,7 +75,8 @@ def _strategy_lines(row: dict) -> list[str]:
         f"data_insufficient={holes.get('data_insufficient', 0)} / "
         f"未終端={holes.get('unterminated', 0)}"
         f" (最古 {'–' if oldest is None else f'{oldest / 3600:.1f} 時間'}、"
-        f"期限超え {holes.get('overdue_unterminated', 0)}) / "
+        f"期限超え {holes.get('overdue_unterminated', 0)}、"
+        f"期限不明 {holes.get('deadline_unknown', 0)}) / "
         f"時点不明={holes.get('as_of_unknown', 0)} / R不明={holes.get('r_unknown', 0)} / "
         f"時刻不明={holes.get('time_unreadable', 0)}",
         f"- 採否: accept={dec.get('accept', 0)} reject={dec.get('reject', 0)} "

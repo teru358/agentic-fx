@@ -34,6 +34,7 @@ DISPLAY_NEEDS_REVIEW = "needs_review"
 
 REASON_NO_RECENT_DECISIONS = "no_recent_decisions"
 REASON_OVERDUE = "overdue_unterminated"
+REASON_DEADLINE_UNKNOWN = "deadline_unknown"
 REASON_AGED_INSUFFICIENT = "generation_aged_insufficient"
 
 # 劣化の理由 (固定語)
@@ -98,6 +99,8 @@ def judge(summary: dict, *, end: datetime) -> Judgement:
         reasons.append(REASON_NO_RECENT_DECISIONS)
     if summary["holes"].get("overdue_unterminated", 0) > 0:
         reasons.append(REASON_OVERDUE)
+    if summary["holes"].get("deadline_unknown", 0) > 0:
+        reasons.append(REASON_DEADLINE_UNKNOWN)
     if n < MIN_SAMPLE and started is not None and end - started >= GENERATION_LIMIT:
         reasons.append(REASON_AGED_INSUFFICIENT)
     return Judgement(sign, reasons)
@@ -228,6 +231,20 @@ def targets_as_of(inputs: ReadInputs, end: datetime) -> TargetsAsOf:
         metrics = _metrics(body)
         if metrics is not None:
             out.approval_metrics[(name, content)] = metrics
+    known = {target.name for target in out.targets}
+    for entry in inputs.live.entries:
+        meta = entry.meta
+        name = meta.name if meta is not None else entry.entry_name
+        kind = meta.kind if meta is not None else kinds.get(name, read_model.KIND_STRATEGY)
+        if name in events or name in known or kind != read_model.KIND_STRATEGY:
+            continue
+        # 配備中なのに配備の記録が 1 件も無い (記録を残さない配置)。いつから現世代かを
+        # 決められないので、数値を出さず判定不能の対象にする。
+        known.add(name)
+        out.targets.append(ForwardTarget(
+            name, meta.content_hash if meta is not None else "", None, None,
+            usage_review.REASON_NO_GENERATION))
+    out.targets.sort(key=lambda target: target.name)
     return out
 
 
