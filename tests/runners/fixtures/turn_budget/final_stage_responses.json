@@ -1,0 +1,100 @@
+{
+ "measured": {
+  "signal_switch_answer": {
+   "role": "assistant",
+   "content": "{\"decision\": \"accept\", \"reject_code\": null}"
+  },
+  "cron_switch_answer": {
+   "role": "assistant",
+   "content": "{\"action\":\"hold\",\"pair\":\"USDJPY\",\"confidence\":0.2,\"reasoning\":\"調査結果は全て synthetic/zero の placeholder で、価格・指標・ニュース・ポジションのいずれにも実質的なシグナルが得られていない。確信が持てないため hold を選ぶ。\"}"
+  },
+  "signal_final_after_structured_stop": {
+   "role": "assistant",
+   "content": "{\"decision\": \"accept\", \"reject_code\": null}"
+  },
+  "signal_final_after_text_stop": {
+   "role": "assistant",
+   "content": "{\"decision\": \"accept\", \"reject_code\": null}"
+  },
+  "signal_final_after_invalid_json": {
+   "role": "assistant",
+   "content": "{\"decision\": \"accept\", \"reject_code\": null}"
+  },
+  "cron_final_after_structured_stop": {
+   "role": "assistant",
+   "content": "{\"action\":\"hold\",\"pair\":\"USDJPY\",\"reasoning\":\"調査結果は全て synthetic のダミー値(価格・指標が0、ニュースも意味なし)であり、方向性やエントリー水準を裏付ける有効な情報がない。ポジションの状況も不明確で確信を持てないため、新規openやclose/cancelはリスクが高い。確信が持てない場合はholdが適切。\"}"
+  },
+  "cron_final_after_text_stop": {
+   "role": "assistant",
+   "content": "{\"action\":\"hold\",\"pair\":\"USDJPY\",\"reasoning\":\"市場データの値が全て0で、ニュースも合成データのみ。テクニカル指標・価格・経済指標から方向性や確信度を判断できず、ポジション管理に必要な信頼できる情報がないため新規エントリーは避ける。\"}"
+  }
+ },
+ "synthetic": {
+  "structured_tool_call_response": {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+     "type": "function",
+     "function": {
+      "name": "search_news",
+      "arguments": "{\"query\": \"synthetic query last\"}"
+     }
+    }
+   ]
+  },
+  "structured_two_calls_response": {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "b1b2c3d4e5f60718293a4b5c6d7e8f91",
+     "type": "function",
+     "function": {
+      "name": "search_news",
+      "arguments": "{\"query\": \"synthetic query last\"}"
+     }
+    },
+    {
+     "id": "b2b2c3d4e5f60718293a4b5c6d7e8f92",
+     "type": "function",
+     "function": {
+      "name": "get_positions",
+      "arguments": "{}"
+     }
+    }
+   ]
+  },
+  "structured_invalid_arguments_response": {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "c1b2c3d4e5f60718293a4b5c6d7e8f93",
+     "type": "function",
+     "function": {
+      "name": "search_news",
+      "arguments": "{\"query\": "
+     }
+    }
+   ]
+  },
+  "text_tool_call_json_response": {
+   "role": "assistant",
+   "content": "<tool_call>\n{\"name\": \"search_news\", \"arguments\": {\"query\": \"synthetic query last\"}}\n</tool_call>"
+  },
+  "text_tool_call_with_decision_inside": {
+   "role": "assistant",
+   "content": "<tool_call>\n{\"decision\": \"accept\", \"reject_code\": null}\n</tool_call>"
+  },
+  "text_tool_call_function_form_response": {
+   "role": "assistant",
+   "content": "<tool_call>\n<function=search_news>\n<parameter=query>\nsynthetic query last\n</parameter>\n</function>\n</tool_call>"
+  },
+  "prose_without_json_response": {
+   "role": "assistant",
+   "content": "判断材料は揃った。accept とする。"
+  }
+ }
+}
