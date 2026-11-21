@@ -144,6 +144,6 @@ def test_the_guidance_section_follows_the_section_that_holds_the_data_row():
     page = _page(_feed())
     assert page.index("<dt>data</dt>") < page.index("データの案内")
     assert "</dl></section><section><h2>データの案内</h2>" in page
-    before = page[:page.index("<h2>データの案内</h2>")]
+    before = page[:page.index("<section><h2>データの案内</h2>")]
     assert before.rstrip().endswith("</dl></section>")
     assert before.rfind("<h2>稼働</h2>") > before.rfind("<h2>資金</h2>")
