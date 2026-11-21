@@ -1,0 +1,326 @@
+{
+ "kind": "signal",
+ "messages": [
+  {
+   "role": "user",
+   "content": "(anonymized initial prompt)"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "26716848eae5d62a6d138d98e47bb32b",
+     "type": "function",
+     "function": {
+      "name": "search_news",
+      "arguments": "{\"query\": \"synthetic query 1\"}"
+     }
+    },
+    {
+     "id": "d231b6b7d211e1b882d71756fd173095",
+     "type": "function",
+     "function": {
+      "name": "get_positions",
+      "arguments": "{}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "26716848eae5d62a6d138d98e47bb32b",
+   "content": "[{\"title\": \"synthetic title 1\", \"body\": \"synthetic body 1\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 2\", \"body\": \"synthetic body 2\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 3\", \"body\": \"synthetic body 3\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 4\", \"body\": \"synthetic body 4\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 5\", \"body\": \"synthetic body 5\", \"source_name\": \"synthetic source\"}]"
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "d231b6b7d211e1b882d71756fd173095",
+   "content": "[]"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "e0d5653475429b027b5d61b96d791bcd",
+     "type": "function",
+     "function": {
+      "name": "search_news",
+      "arguments": "{\"query\": \"synthetic query 2\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e0d5653475429b027b5d61b96d791bcd",
+   "content": "[{\"title\": \"synthetic title 1\", \"body\": \"synthetic body 1\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 2\", \"body\": \"synthetic body 2\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 3\", \"body\": \"synthetic body 3\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 4\", \"body\": \"synthetic body 4\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 5\", \"body\": \"synthetic body 5\", \"source_name\": \"synthetic source\"}]"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "2cc0af0db5f6d732127742d17cb13b68",
+     "type": "function",
+     "function": {
+      "name": "search_news",
+      "arguments": "{\"query\": \"synthetic query 3\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "2cc0af0db5f6d732127742d17cb13b68",
+   "content": "[{\"title\": \"synthetic title 1\", \"body\": \"synthetic body 1\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 2\", \"body\": \"synthetic body 2\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 3\", \"body\": \"synthetic body 3\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 4\", \"body\": \"synthetic body 4\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 5\", \"body\": \"synthetic body 5\", \"source_name\": \"synthetic source\"}]"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "ec97fc03b3afbca610c50af50923aa88",
+     "type": "function",
+     "function": {
+      "name": "search_news",
+      "arguments": "{\"query\": \"synthetic query 4\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "ec97fc03b3afbca610c50af50923aa88",
+   "content": "[{\"title\": \"synthetic title 1\", \"body\": \"synthetic body 1\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 2\", \"body\": \"synthetic body 2\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 3\", \"body\": \"synthetic body 3\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 4\", \"body\": \"synthetic body 4\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 5\", \"body\": \"synthetic body 5\", \"source_name\": \"synthetic source\"}]"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "2011f33e9f041e93202fb49c316c1bf5",
+     "type": "function",
+     "function": {
+      "name": "search_news",
+      "arguments": "{\"query\": \"synthetic query 5\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "2011f33e9f041e93202fb49c316c1bf5",
+   "content": "[{\"title\": \"synthetic title 1\", \"body\": \"synthetic body 1\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 2\", \"body\": \"synthetic body 2\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 3\", \"body\": \"synthetic body 3\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 4\", \"body\": \"synthetic body 4\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 5\", \"body\": \"synthetic body 5\", \"source_name\": \"synthetic source\"}]"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "d1098a4e5aaaedc2ef312ee4333bc41b",
+     "type": "function",
+     "function": {
+      "name": "search_news",
+      "arguments": "{\"query\": \"synthetic query 6\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "d1098a4e5aaaedc2ef312ee4333bc41b",
+   "content": "[{\"title\": \"synthetic title 1\", \"body\": \"synthetic body 1\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 2\", \"body\": \"synthetic body 2\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 3\", \"body\": \"synthetic body 3\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 4\", \"body\": \"synthetic body 4\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 5\", \"body\": \"synthetic body 5\", \"source_name\": \"synthetic source\"}]"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "bb0563c295eb858946b9acfeea507d82",
+     "type": "function",
+     "function": {
+      "name": "search_news",
+      "arguments": "{\"query\": \"synthetic query 7\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "bb0563c295eb858946b9acfeea507d82",
+   "content": "[{\"title\": \"synthetic title 1\", \"body\": \"synthetic body 1\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 2\", \"body\": \"synthetic body 2\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 3\", \"body\": \"synthetic body 3\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 4\", \"body\": \"synthetic body 4\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 5\", \"body\": \"synthetic body 5\", \"source_name\": \"synthetic source\"}]"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "d717cb951f591689a5d9d2395850d678",
+     "type": "function",
+     "function": {
+      "name": "search_news",
+      "arguments": "{\"query\": \"synthetic query 8\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "d717cb951f591689a5d9d2395850d678",
+   "content": "[{\"title\": \"synthetic title 1\", \"body\": \"synthetic body 1\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 2\", \"body\": \"synthetic body 2\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 3\", \"body\": \"synthetic body 3\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 4\", \"body\": \"synthetic body 4\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 5\", \"body\": \"synthetic body 5\", \"source_name\": \"synthetic source\"}]"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "73a3d864f1773368fb70a3b5e60638a2",
+     "type": "function",
+     "function": {
+      "name": "search_news",
+      "arguments": "{\"query\": \"synthetic query 9\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "73a3d864f1773368fb70a3b5e60638a2",
+   "content": "[{\"title\": \"synthetic title 1\", \"body\": \"synthetic body 1\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 2\", \"body\": \"synthetic body 2\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 3\", \"body\": \"synthetic body 3\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 4\", \"body\": \"synthetic body 4\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 5\", \"body\": \"synthetic body 5\", \"source_name\": \"synthetic source\"}]"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "661678b2a984cae3be07fdc8c2a17d61",
+     "type": "function",
+     "function": {
+      "name": "search_news",
+      "arguments": "{\"query\": \"synthetic query 10\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "661678b2a984cae3be07fdc8c2a17d61",
+   "content": "[{\"title\": \"synthetic title 1\", \"body\": \"synthetic body 1\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 2\", \"body\": \"synthetic body 2\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 3\", \"body\": \"synthetic body 3\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 4\", \"body\": \"synthetic body 4\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 5\", \"body\": \"synthetic body 5\", \"source_name\": \"synthetic source\"}]"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "54c85005cebd01647322df91a7c20520",
+     "type": "function",
+     "function": {
+      "name": "search_news",
+      "arguments": "{\"query\": \"synthetic query 11\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "54c85005cebd01647322df91a7c20520",
+   "content": "[{\"title\": \"synthetic title 1\", \"body\": \"synthetic body 1\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 2\", \"body\": \"synthetic body 2\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 3\", \"body\": \"synthetic body 3\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 4\", \"body\": \"synthetic body 4\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 5\", \"body\": \"synthetic body 5\", \"source_name\": \"synthetic source\"}]"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "33da87cfa45b1b046f827a839ae6ff15",
+     "type": "function",
+     "function": {
+      "name": "search_news",
+      "arguments": "{\"query\": \"synthetic query 12\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "33da87cfa45b1b046f827a839ae6ff15",
+   "content": "[{\"title\": \"synthetic title 1\", \"body\": \"synthetic body 1\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 2\", \"body\": \"synthetic body 2\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 3\", \"body\": \"synthetic body 3\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 4\", \"body\": \"synthetic body 4\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 5\", \"body\": \"synthetic body 5\", \"source_name\": \"synthetic source\"}]"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "46d097c3727c061a7807a69beb477b5a",
+     "type": "function",
+     "function": {
+      "name": "search_news",
+      "arguments": "{\"query\": \"synthetic query 13\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "46d097c3727c061a7807a69beb477b5a",
+   "content": "[{\"title\": \"synthetic title 1\", \"body\": \"synthetic body 1\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 2\", \"body\": \"synthetic body 2\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 3\", \"body\": \"synthetic body 3\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 4\", \"body\": \"synthetic body 4\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 5\", \"body\": \"synthetic body 5\", \"source_name\": \"synthetic source\"}]"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "efb91aae6eb3f9ea9555f0c731e99bca",
+     "type": "function",
+     "function": {
+      "name": "search_news",
+      "arguments": "{\"query\": \"synthetic query 14\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "efb91aae6eb3f9ea9555f0c731e99bca",
+   "content": "[{\"title\": \"synthetic title 1\", \"body\": \"synthetic body 1\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 2\", \"body\": \"synthetic body 2\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 3\", \"body\": \"synthetic body 3\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 4\", \"body\": \"synthetic body 4\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 5\", \"body\": \"synthetic body 5\", \"source_name\": \"synthetic source\"}]"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "fd96784dd1c5ac7d25bf9302c6b73f47",
+     "type": "function",
+     "function": {
+      "name": "search_news",
+      "arguments": "{\"query\": \"synthetic query 15\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "fd96784dd1c5ac7d25bf9302c6b73f47",
+   "content": "[{\"title\": \"synthetic title 1\", \"body\": \"synthetic body 1\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 2\", \"body\": \"synthetic body 2\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 3\", \"body\": \"synthetic body 3\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 4\", \"body\": \"synthetic body 4\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 5\", \"body\": \"synthetic body 5\", \"source_name\": \"synthetic source\"}]"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "e0af7392958396eedfd935336bb713d6",
+     "type": "function",
+     "function": {
+      "name": "search_news",
+      "arguments": "{\"query\": \"synthetic query 16\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "e0af7392958396eedfd935336bb713d6",
+   "content": "[{\"title\": \"synthetic title 1\", \"body\": \"synthetic body 1\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 2\", \"body\": \"synthetic body 2\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 3\", \"body\": \"synthetic body 3\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 4\", \"body\": \"synthetic body 4\", \"source_name\": \"synthetic source\"}, {\"title\": \"synthetic title 5\", \"body\": \"synthetic body 5\", \"source_name\": \"synthetic source\"}]"
+  }
+ ]
+}
