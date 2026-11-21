@@ -168,14 +168,15 @@ def compute_fingerprint(*, landlock_abi: int) -> RuntimeFingerprint:
     )
 
 
-# 2026-10-03 に正常 workload を完走した 1 組 (2026-10-29 にカーネルを 7.0.0-42 へ更新し、本番の自己試験合格を受けて差し替え)
+# 2026-10-03 に正常 workload を完走した 1 組 (カーネル・glibc の更新のたびに、本番の自己試験合格を受けて差し替える。
+# 2026-10-29 に 7.0.0-42、2026-11-21 に 7.0.0-44 と glibc 2ubuntu2.7)
 _SUPPORTED = (
     RuntimeFingerprint(
-        kernel_release="7.0.0-42-generic",
+        kernel_release="7.0.0-44-generic",
         machine="x86_64",
         landlock_abi=8,
         glibc_version="2.43",
-        glibc_build="Ubuntu GLIBC 2.43-2ubuntu2.4",
+        glibc_build="Ubuntu GLIBC 2.43-2ubuntu2.7",
         python_version="3.13.14",
         python_build=("main", "Jun 11 2026 04:03:13"),
         python_executable="",
