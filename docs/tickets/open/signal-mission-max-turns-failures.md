@@ -1,7 +1,7 @@
 ---
 id: signal-mission-max-turns-failures
 title: signal で起動する取引判断の 4 割が手数の上限で判断を出せずに終わる
-status: 調査待ち
+status: 実装中
 priority: 高
 kind: 不具合
 opened: 2026-11-21
@@ -10,7 +10,7 @@ related: [weekly-improve-rebacktests-deployed-strategies, strategy-attribution-a
 ---
 # [signal-mission-max-turns-failures] signal で起動する取引判断の 4 割が手数の上限で判断を出せずに終わる
 
-**状態**: 調査待ち / **優先**: 高 / **種別**: 不具合
+**状態**: 実装中 / **優先**: 高 / **種別**: 不具合
 
 ## 現象
 
@@ -36,4 +36,5 @@ max_turns の 44 本は全件、16 ターンとも `search_news` を呼び続け
 ## 経緯
 
 - 2026-11-21: 起票。
-- 2026-11-21: transcript 102 本を集計し原因を記録。日次上限の使い切りと鮮度切れの関係を DB で確認 (signal% mission は 10 日中 8 日で 12 本ちょうど、鮮度切れ 98 件は全部が上限到達後、consumed 58 件は全部が到達前)。
+- 2026-11-21: transcript 102 本を集計し原因を記録。
+- 2026-11-21: 設計 docs/superpowers/specs/2026-11-21-trade-mission-turn-budget-design.md C1 を利用者が承認 (問い 1 は推奨どおり)。日次上限の使い切りと鮮度切れの関係を DB で確認 (signal% mission は 10 日中 8 日で 12 本ちょうど、鮮度切れ 98 件は全部が上限到達後、consumed 58 件は全部が到達前)。
