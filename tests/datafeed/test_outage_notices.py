@@ -560,3 +560,55 @@ def test_a_rolled_back_consumption_keeps_the_unprocessed_memo(tmp_path):
     _replace_during_consumption(machine, tmp_path)
     _tick(conn, machine, WED + timedelta(minutes=2))
     assert machine._last_unprocessed_by_pair is not None
+
+
+# ---- 保留の再試行の位置と量 ----------------------------------------------
+
+@pytest.mark.parametrize("table_present", [True, False])
+def test_a_pending_retry_never_commits_or_rolls_back_the_callers_transaction(tmp_path, table_present):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="ready", epoch=4)
+    conn.execute("DROP TABLE datafeed_outage_notices")
+    conn.commit()
+    machine._record_notices(9, WED, [("stopped", "")])
+    assert len(machine._pending_notices) == 1
+    if table_present:
+        init_db(conn)
+    conn.execute("UPDATE datafeed_outage_state SET updated_at='caller-marker' WHERE id=1")
+    with pytest.raises(RuntimeError):
+        machine.observe(WED, _report())
+    assert conn.in_transaction
+    assert conn.execute("SELECT updated_at FROM datafeed_outage_state").fetchone()[0] == "caller-marker"
+    other = connect(tmp_path / "notices.db")
+    assert other.execute("SELECT updated_at FROM datafeed_outage_state").fetchone()[0] != "caller-marker"
+    assert len(machine._pending_notices) == 1
+    conn.rollback()
+
+
+def test_a_pending_retry_stops_at_the_first_failure(tmp_path):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="ready", epoch=4)
+    machine._pending_notices = [(100 + n, WED, [("stopped", "")]) for n in range(64)]
+    calls = []
+
+    def failing(epoch, now, entries):
+        calls.append(epoch)
+        return False
+
+    machine._write_notices = failing
+    _tick(conn, machine, WED)
+    assert calls == [100]
+    assert len(machine._pending_notices) == 64
+    assert [item[0] for item in machine._pending_notices] == list(range(100, 164))
+
+
+def test_a_pending_retry_runs_after_the_closed_market_path_too(tmp_path):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="ready", epoch=4)
+    conn.execute("DROP TABLE datafeed_outage_notices")
+    conn.commit()
+    machine._record_notices(9, WED, [("stopped", "")])
+    init_db(conn)
+    saturday = datetime(2026, 10, 3, 12, 0, tzinfo=UTC)
+    machine.observe(saturday, _report())
+    assert _notices(conn) == [(9, "stopped", "")]

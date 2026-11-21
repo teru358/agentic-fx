@@ -249,13 +249,15 @@ class OutageStateMachine:
         立てない。
         """
         now = as_utc(now)
-        self._retry_pending_notices()
         try:
             outcome = self._commit_observation(now, report)
         except Exception:
             self._observe_failed = True
             raise
         self._observe_failed = False
+        # 入口の検査と自分の transaction の commit を通った後。呼び出し元の
+        # transaction には触らず、観測の遷移も遅らせない
+        self._retry_pending_notices()
         if isinstance(outcome, str):
             return outcome
         # commit 済み。プロセス内の記録は commit が成功した後にだけ進める
@@ -803,10 +805,13 @@ class OutageStateMachine:
             return False
 
     def _retry_pending_notices(self) -> None:
+        """保留を古い順に書き直す。最初の失敗で止め、残りは保留に残す
+        (lock 待ちを tick あたり保留分の 1 回に抑える)。"""
         pending, self._pending_notices = self._pending_notices, []
-        for item in pending:
+        for index, item in enumerate(pending):
             if not self._write_notices(*item):
-                self._pending_notices.append(item)
+                self._pending_notices = pending[index:] + self._pending_notices
+                break
         self._trim_pending_notices()
 
     def _trim_pending_notices(self) -> None:
