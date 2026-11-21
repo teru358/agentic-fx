@@ -30,7 +30,7 @@ from agentic_fx.store import weekly_review as store
 _log = logging.getLogger(__name__)
 
 MAX_ATTEMPTS_PER_DAY = 3
-ABORT_AFTER = timedelta(days=14)
+ABORT_AFTER = review_weeks.ABORT_AFTER
 POLL_INTERVAL = timedelta(minutes=15)
 
 RUNNING = "running"
@@ -46,17 +46,30 @@ def _day(now: datetime) -> str:
     return now.astimezone(timezone.utc).date().isoformat()
 
 
+_STATES = frozenset({RUNNING, DONE, FAILED, INTERRUPTED})
+CANCEL = "cancel"
+
+
 def _parse_record(raw: object) -> dict | None:
+    """試行記録。回数は 0 以上・上限以下で履歴の件数と一致し、ID は一意、状態は既知の
+    ものだけ。外れる記録は None (呼び出し側はその日を上限到達として扱う)。"""
     try:
         record = json.loads(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return None
-    if (isinstance(record, dict) and type(record.get("count")) is int
-            and isinstance(record.get("attempts"), list)
-            and all(isinstance(a, dict) and isinstance(a.get("id"), str)
-                    and isinstance(a.get("state"), str) for a in record["attempts"])):
-        return record
-    return None
+    if not (isinstance(record, dict) and type(record.get("count")) is int
+            and isinstance(record.get("attempts"), list)):
+        return None
+    attempts = record["attempts"]
+    if not 0 <= record["count"] <= MAX_ATTEMPTS_PER_DAY or len(attempts) != record["count"]:
+        return None
+    if not all(isinstance(a, dict) and isinstance(a.get("id"), str)
+               and isinstance(a.get("state"), str) and a["state"] in _STATES
+               for a in attempts):
+        return None
+    if len({a["id"] for a in attempts}) != len(attempts):
+        return None
+    return record
 
 
 class WeeklyReviewTick:
@@ -74,6 +87,9 @@ class WeeklyReviewTick:
         self._thread: threading.Thread | None = None
         self._last_poll: datetime | None = None
         self._recovered = False
+        # この process の試行 ID と、書込みを譲られて保留した記録の更新 (key, 試行 ID, 更新)
+        self._own: set[str] = set()
+        self._pending: list[tuple[str, str, str]] = []
 
     # ---- scheduler tick から -------------------------------------------------
 
@@ -124,9 +140,11 @@ class WeeklyReviewTick:
         """中断の回収 → 運用開始週 → 未確定の週の列挙と処理 → 古い key の掃除 → report。"""
         conn = self._open_conn()
         try:
+            self._flush_pending(conn, now)
             if not self._recovered:
                 self._recover(conn, now)
                 self._recovered = True
+            self._recover_own(conn, now)
             start = self._start_week(conn, now)
             recorded = store.recorded_weeks(conn)
             for label, close in review_weeks.due_weeks(now, first=start):
@@ -189,12 +207,42 @@ class WeeklyReviewTick:
         with self._scope():
             alert_state.set(conn, key, json.dumps(record, sort_keys=True), now=now)
 
+    def _update(self, conn: sqlite3.Connection, key: str, attempt: str, change: str,
+                now: datetime) -> None:
+        """試行 1 件の記録を更新する。`CANCEL` は記録から外して回数を戻す。"""
+        current = self._load(conn, key)
+        if current is None:
+            return
+        if change == CANCEL:
+            current["attempts"] = [a for a in current["attempts"] if a["id"] != attempt]
+            current["count"] = max(0, current["count"] - 1)
+        else:
+            for item in current["attempts"]:
+                if item["id"] == attempt:
+                    item["state"] = change
+        self._save(conn, key, current, now)
+
+    def _settle(self, conn: sqlite3.Connection, key: str, attempt: str, change: str,
+                now: datetime) -> None:
+        """更新が譲られたら保留に持ち、次の実行の冒頭で再適用する。"""
+        try:
+            self._update(conn, key, attempt, change, now)
+        except WriteDeferred:
+            self._pending.append((key, attempt, change))
+            raise
+
+    def _flush_pending(self, conn: sqlite3.Connection, now: datetime) -> None:
+        while self._pending:
+            key, attempt, change = self._pending[0]
+            self._update(conn, key, attempt, change, now)
+            self._pending.pop(0)
+
     def _attempt(self, conn: sqlite3.Connection, label: date, close: datetime,
                  now: datetime) -> None:
         key = alert_state.weekly_review_attempt_key(label.isoformat(), _day(now))
         record = self._load(conn, key)
         if record is None:
-            # 壊れた記録で上限を 0 に戻さない。その週 × UTC 日は上限到達とみなす。
+            # 壊れた記録で上限を 0 に戻さない。その週 x UTC 日は上限到達とみなす。
             _log.warning("weekly review attempt record unreadable; skipping this day")
             return
         if record["count"] >= MAX_ATTEMPTS_PER_DAY:
@@ -202,6 +250,7 @@ class WeeklyReviewTick:
         attempt = secrets.token_hex(8)
         record["count"] += 1
         record["attempts"].append({"id": attempt, "state": RUNNING})
+        self._own.add(attempt)
         self._save(conn, key, record, now)
         state = DONE
         try:
@@ -210,24 +259,14 @@ class WeeklyReviewTick:
             # 書込みを始められなかっただけで、試行には数えない。
             if conn.in_transaction:
                 conn.rollback()
-            current = self._load(conn, key)
-            if current is not None:
-                current["attempts"] = [a for a in current["attempts"] if a["id"] != attempt]
-                current["count"] = max(0, current["count"] - 1)
-                self._save(conn, key, current, now)
+            self._settle(conn, key, attempt, CANCEL, now)
             raise
         except Exception as exc:  # noqa: BLE001 - 失敗は記録して次へ
             state = FAILED
             _log.warning("weekly review %s failed: %s", label, safe_error_text(exc))
             if conn.in_transaction:
                 conn.rollback()
-        current = self._load(conn, key)
-        if current is None:
-            return
-        for item in current["attempts"]:
-            if item["id"] == attempt:
-                item["state"] = state
-        self._save(conn, key, current, now)
+        self._settle(conn, key, attempt, state, now)
 
     def _recover(self, conn: sqlite3.Connection, now: datetime) -> None:
         for key in alert_state.keys_with_prefix(conn, alert_state.WEEKLY_REVIEW_ATTEMPT_PREFIX):
@@ -237,6 +276,23 @@ class WeeklyReviewTick:
             changed = False
             for item in record["attempts"]:
                 if item["state"] == RUNNING:
+                    item["state"] = INTERRUPTED
+                    changed = True
+            if changed:
+                self._save(conn, key, record, now)
+
+    def _recover_own(self, conn: sqlite3.Connection, now: datetime) -> None:
+        """この process の試行で、更新できずに `running` のまま残ったものを回収する。
+        実行の冒頭 (thread は 1 本だけなので、実行中の試行は無い)。"""
+        if not self._own:
+            return
+        for key in alert_state.keys_with_prefix(conn, alert_state.WEEKLY_REVIEW_ATTEMPT_PREFIX):
+            record = _parse_record(alert_state.get(conn, key))
+            if record is None:
+                continue
+            changed = False
+            for item in record["attempts"]:
+                if item["state"] == RUNNING and item["id"] in self._own:
                     item["state"] = INTERRUPTED
                     changed = True
             if changed:

@@ -264,3 +264,30 @@ def test_the_write_scope_wraps_only_the_commit(world, make, monkeypatch):
     wk.finalize_week(world.conn, world.conn, LABEL, END, now=NOW, read_inputs=reader(world),
                      settings=SETTINGS, write_scope=Scope)
     assert events == ["read", "enter", "exit"]
+
+
+def test_the_saving_time_is_read_again_just_before_the_commit(world):
+    saved = END + timedelta(days=3)
+    finalize_with = lambda clock: wk.finalize_week(      # noqa: E731
+        world.conn, world.conn, LABEL, END, now=NOW, read_inputs=reader(world),
+        settings=SETTINGS, clock=clock)
+    assert finalize_with(lambda: saved) == store.COMMITTED
+    week = store.get_week(world.conn, "2027-01-29")
+    assert week["status"] == "completed"
+    assert week["finalized_at"] == saved.isoformat() and week["evaluated_at"] == NOW.isoformat()
+
+
+def test_a_week_whose_period_ran_out_during_the_evaluation_is_aborted(world):
+    late = END + timedelta(days=14, seconds=1)
+    wk.finalize_week(world.conn, world.conn, LABEL, END, now=END + timedelta(days=14),
+                     read_inputs=reader(world), settings=SETTINGS, clock=lambda: late)
+    week = store.get_week(world.conn, "2027-01-29")
+    assert week["status"] == "aborted" and week["evaluation"] == "unevaluated"
+    assert week["finalized_at"] == late.isoformat() and rows(world) == []
+
+
+def test_a_week_saved_exactly_at_the_period_end_is_still_completed(world):
+    edge = END + timedelta(days=14)
+    wk.finalize_week(world.conn, world.conn, LABEL, END, now=edge,
+                     read_inputs=reader(world), settings=SETTINGS, clock=lambda: edge)
+    assert store.get_week(world.conn, "2027-01-29")["status"] == "completed"

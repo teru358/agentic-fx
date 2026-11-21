@@ -11,11 +11,13 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import dataclasses
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Callable
 
+from agentic_fx.core import review_weeks
 from agentic_fx.plugin import read_model, usage_review
 from agentic_fx.plugin.read_model import ReadInputs
 from agentic_fx.store import signal_forward
@@ -355,15 +357,22 @@ def evaluate_week(conn: sqlite3.Connection, label: date, close_at: datetime, *,
 def finalize_week(read_conn: sqlite3.Connection, write_conn: sqlite3.Connection,
                   label: date, close_at: datetime, *, now: datetime,
                   read_inputs: Callable[[sqlite3.Connection], ReadInputs],
-                  settings, write_scope: Callable | None = None) -> str:
+                  settings, write_scope: Callable | None = None,
+                  clock: Callable[[], datetime] | None = None) -> str:
     """週を評価して確定する。確定済みなら何もせず `EXISTS`。評価の例外は送出し、何も書かない。
-    `write_scope` は、DB へ書く範囲 (確定の transaction) だけを包む。評価の読取は包まない。"""
+    `write_scope` は、DB へ書く範囲 (確定の transaction) だけを包む。評価の読取は包まない。
+    `clock` があれば、保存の直前に読み直す。確定の時刻はその時刻で、窓の終端から打切りの
+    期間を過ぎていれば、評価を捨てて打切りで確定する。"""
     if store.week_exists(read_conn, label.isoformat()):
         return store.EXISTS
     evaluation = evaluate_week(read_conn, label, close_at, evaluated_at=now,
                                inputs=read_inputs(read_conn), settings=settings)
     with write_scope() if write_scope is not None else nullcontext():
-        return store.commit_week(write_conn, evaluation.record, evaluation.strategies,
+        saved_at = clock() if clock is not None else now
+        if clock is not None and saved_at > close_at + review_weeks.ABORT_AFTER:
+            return abort_week(write_conn, label, close_at, now=saved_at)
+        record = dataclasses.replace(evaluation.record, finalized_at=saved_at)
+        return store.commit_week(write_conn, record, evaluation.strategies,
                                  evaluation.inventory)
 
 

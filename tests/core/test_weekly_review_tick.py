@@ -526,3 +526,93 @@ def test_a_deferred_week_commit_does_not_use_an_attempt(rig):
     tick.run_once(AFTER_W2 + timedelta(minutes=20))
     assert set(rig.recorded()) == {W2.isoformat()}
     assert rig.state(W2, AFTER_W2)["count"] == 1
+
+
+class Gate:
+    """`allow` 回までは入れ、その後は `open` が真になるまで WriteDeferred を送出する書込み範囲。"""
+    def __init__(self, allow=0):
+        self.allow = allow
+        self.open = False
+        self.entered = 0
+
+    @contextmanager
+    def scope(self):
+        self.entered += 1
+        if not self.open and self.entered > self.allow:
+            raise WriteDeferred()
+        yield
+
+
+def gated_tick(rig, gate):
+    def finalize(conn, label, close_at, now):
+        with gate.scope():
+            return rig.finalize(conn, label, close_at, now)
+    return WeeklyReviewTick(open_conn=rig.conn, finalize=finalize, report=rig.report,
+                            write_scope=gate.scope)
+
+
+def test_a_flag_that_stays_up_never_uses_up_the_daily_limit(rig):
+    rig.set_start(W2)
+    gate = Gate(allow=1)                 # 実行中の保存だけ通り、あとは譲る
+    tick = gated_tick(rig, gate)
+    for i in range(5):
+        tick.run_once(AFTER_W2 + timedelta(minutes=20 * i))
+    assert rig.calls == []
+    gate.open = True
+    tick.run_once(AFTER_W2 + timedelta(minutes=120))
+    state = rig.state(W2, AFTER_W2)
+    assert state["count"] == 1 and [a["state"] for a in state["attempts"]] == ["done"]
+    assert len(rig.calls) == 1
+
+
+def test_no_running_attempt_is_left_once_the_flag_comes_down(rig):
+    rig.set_start(W2)
+    gate = Gate(allow=1)
+    tick = gated_tick(rig, gate)
+    tick.run_once(AFTER_W2)
+    assert rig.state(W2, AFTER_W2)["attempts"][0]["state"] == "running"
+    gate.open = True
+    tick.run_once(AFTER_W2 + timedelta(minutes=20))
+    assert all(a["state"] != "running" for a in rig.state(W2, AFTER_W2)["attempts"])
+
+
+def test_a_completion_that_was_deferred_is_applied_by_the_next_run(rig):
+    rig.set_start(W2)
+    gate = Gate(allow=2)                 # 実行中の保存と週の確定は通り、完了の更新を譲る
+    tick = gated_tick(rig, gate)
+    tick.run_once(AFTER_W2)
+    assert set(rig.recorded()) == {W2.isoformat()}
+    assert rig.state(W2, AFTER_W2)["attempts"][0]["state"] == "running"
+    gate.open = True
+    tick.run_once(AFTER_W2 + timedelta(minutes=20))
+    state = rig.state(W2, AFTER_W2)
+    assert state["count"] == 1 and state["attempts"][0]["state"] == "done"
+    assert len(rig.calls) == 1
+
+
+def test_a_running_attempt_of_this_process_is_collected_even_if_the_pending_update_is_lost(rig):
+    rig.set_start(W2)
+    gate = Gate(allow=1)
+    tick = gated_tick(rig, gate)
+    tick.run_once(AFTER_W2)
+    tick._pending.clear()
+    gate.open = True
+    tick.run_once(AFTER_W2 + timedelta(minutes=20))
+    states = [a["state"] for a in rig.state(W2, AFTER_W2)["attempts"]]
+    assert states == ["interrupted", "done"]
+
+
+@pytest.mark.parametrize("record", [
+    {"count": -100, "attempts": []},
+    {"count": 1, "attempts": []},
+    {"count": 0, "attempts": [{"id": "a", "state": "failed"}]},
+    {"count": 2, "attempts": [{"id": "a", "state": "failed"}, {"id": "a", "state": "failed"}]},
+    {"count": 1, "attempts": [{"id": "a", "state": "weird"}]},
+    {"count": 4, "attempts": [{"id": str(i), "state": "failed"} for i in range(4)]},
+    {"count": True, "attempts": [{"id": "a", "state": "failed"}]},
+])
+def test_an_attempt_record_that_does_not_add_up_counts_as_the_limit(rig, record):
+    rig.set_start(W2)
+    rig.put_attempt(W2, AFTER_W2.date().isoformat(), record)
+    rig.tick().run_once(AFTER_W2)
+    assert rig.calls == []

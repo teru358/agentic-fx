@@ -14,6 +14,8 @@ from agentic_fx.store.ohlcv_slices import FINALIZE_GRACE
 
 _ONE_MINUTE = timedelta(minutes=1)
 _WEEKDAYS = 5
+# 窓の終端からこの期間を過ぎても確定していない週は、打切りにする
+ABORT_AFTER = timedelta(days=14)
 # 列挙の上限 (壊れた開始週で無限に回らないための安全弁)
 MAX_WEEKS = 1040
 
