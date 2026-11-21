@@ -889,9 +889,9 @@ class OutageStateMachine:
         if entries and not self._write_notices(epoch, now, entries):
             # 保留に同じ (epoch, 状態, 要求キー) があれば重ねない。書込みが続けて失敗する間に
             # 同じ記録が積まれて、保留の上限で別の結果の記録を押し出さないため
-            queued = {(e, state, key) for e, _t, items in self._pending_notices
-                      for state, key in items}
-            fresh = [(state, key) for state, key in entries if (epoch, state, key) not in queued]
+            queued = {(e, kind, key) for e, _t, items in self._pending_notices
+                      for kind, key in items}
+            fresh = [(kind, key) for kind, key in entries if (epoch, kind, key) not in queued]
             if fresh:
                 self._pending_notices.append((epoch, now, fresh))
                 self._trim_pending_notices()
