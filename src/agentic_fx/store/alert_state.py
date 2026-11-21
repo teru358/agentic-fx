@@ -14,10 +14,12 @@ WAIT_BUDGET_NOTIFIED_PREFIX = "signal_wait_budget.notified."
 WAIT_BUDGET_SNAPSHOT_KEY = "signal_wait_budget.snapshot"
 # 最後に通知した calendar の鮮度 (stale / fresh)
 CALENDAR_FRESHNESS_KEY = "econ_calendar.notified_freshness"
+# データの停止・再開待ちの通知を作る daemon を初めて起動した UTC 時刻 (ISO 8601)。動かさない
+DATAFEED_NOTICE_PRODUCER_KEY = "datafeed_notice.producer_enabled_at"
 
 _KNOWN_KEYS = frozenset({
     GATE_REJECT_STREAK_KEY, DAILY_REPORT_KEY, WAIT_BUDGET_NOTIFIED_KEY,
-    WAIT_BUDGET_SNAPSHOT_KEY, CALENDAR_FRESHNESS_KEY})
+    WAIT_BUDGET_SNAPSHOT_KEY, CALENDAR_FRESHNESS_KEY, DATAFEED_NOTICE_PRODUCER_KEY})
 _KNOWN_PREFIXES = (LIMIT_SUPPRESS_PREFIX, WAIT_BUDGET_NOTIFIED_PREFIX)
 
 

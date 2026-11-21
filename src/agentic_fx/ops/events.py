@@ -147,17 +147,33 @@ class EventStore:
             now = now.replace(tzinfo=timezone.utc)
         return max(now.astimezone(timezone.utc), not_before.astimezone(timezone.utc)).isoformat()
 
-    def emit(self, code: str, ref: str, fields: dict, *,
-             not_before: datetime | None = None) -> int:
-        """1 件を永続化する。schema 違反は呼び出し側の誤りなので例外にする。"""
+    def insert(self, code: str, ref: str, fields: dict, *,
+               not_before: datetime | None = None) -> int:
+        """1 件を INSERT するだけで commit しない。呼び出し側が transaction を所有する。
+
+        schema と時刻の検査は ``emit`` と同じ。検査に落ちたら何も書かない。"""
         validate_fields(code, fields, ref)
         ts = self._stamp(not_before)
         cur = self._conn.execute(
             "INSERT INTO ops_events(ts,code,ref,fields_json) VALUES (?,?,?,?)",
             (ts, code, ref,
              json.dumps(fields, sort_keys=True, separators=(",", ":"))))
-        self._conn.commit()
         return int(cur.lastrowid)
+
+    def insert_data_feed_guard(self, state: str, generation: int, *,
+                               not_before: datetime) -> int:
+        """data_feed の guard event を commit せずに INSERT する (呼び出し側が transaction を所有)。"""
+        return self.insert(
+            "guard_state_changed", "instance",
+            {"guard_kind": "data_feed", "state": state, "generation": generation},
+            not_before=not_before)
+
+    def emit(self, code: str, ref: str, fields: dict, *,
+             not_before: datetime | None = None) -> int:
+        """1 件を永続化する。schema 違反は呼び出し側の誤りなので例外にする。"""
+        event_id = self.insert(code, ref, fields, not_before=not_before)
+        self._conn.commit()
+        return event_id
 
     def emit_best_effort(self, code: str, ref: str, fields: dict, *,
                          not_before: datetime | None = None) -> int | None:
@@ -271,6 +287,18 @@ def kill_switch_event_states(conn: sqlite3.Connection, generation: int) -> list[
         "AND json_extract(fields_json,'$.generation')=?", (generation,)).fetchall()
     return [(row[0], row[1]) for row in rows]
 
+
+
+def data_feed_guard_event_id(conn: sqlite3.Connection, *, generation: int, state: str) -> int | None:
+    """data_feed の ``guard_state_changed`` のうち、指定した世代と state の最小の event id。
+
+    guard_kind で絞るので kill switch の event とは一致しない。読むだけ。"""
+    row = conn.execute(
+        "SELECT MIN(id) FROM ops_events WHERE code='guard_state_changed' AND ref='instance' "
+        "AND json_extract(fields_json,'$.guard_kind')='data_feed' "
+        "AND json_extract(fields_json,'$.generation')=? "
+        "AND json_extract(fields_json,'$.state')=?", (generation, state)).fetchone()
+    return row[0]
 
 
 _KILL_SWITCH_WHERE = ("code='guard_state_changed' AND ref='instance' "

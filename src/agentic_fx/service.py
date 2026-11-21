@@ -2276,7 +2276,7 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
         policy_path=directives_path(root), state_store=state,
         status_provider=status_provider, log_path=root / "logs" / "agentic.log",
         activity_path=root / "logs" / "activity.log", data_resume=data_resume,
-        ask_submitter=ask_submitter, improve_supervisor=improve_supervisor,
+        datafeed_notices=True, ask_submitter=ask_submitter, improve_supervisor=improve_supervisor,
         plugins_root=plugins_dir, settings=settings, activity_log=activity,
         improve_reports_dir=root / "data" / "improve_reports",
         # HWM の付け直しだけが使う依存。core_lock か broker が無ければ付け直しだけ使えない。
