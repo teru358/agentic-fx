@@ -48,14 +48,58 @@ def test_an_acknowledge_is_requested_only_for_a_confirmed_check_of_the_positions
     assert gt.RESUME in plain and "--acknowledge`" not in plain
 
 
-def test_the_awaiting_phase_always_adds_a_reminder_to_recheck_the_feed():
-    for action in ("resume", "resume_with_ack"):
-        _, step = gt.guidance_lines(_feed("awaiting_resume", action, unprocessed_positions=1))
-        assert "取得状態を再確認してください" in step
-    for phase, action in sorted(gt.PAIRS - {("awaiting_resume", "resume"),
-                                            ("awaiting_resume", "resume_with_ack")}):
+RECHECK = "取得状態を再確認してください"
+REMINDED = {("awaiting_resume", "resume"), ("awaiting_resume", "resume_with_ack"),
+            ("resume_rejected", "restore_source"), ("resume_rejected", "resume"),
+            ("resume_rejected", "resume_with_ack")}
+
+
+def test_the_awaiting_and_rejected_phases_always_add_a_reminder_to_recheck_the_feed():
+    for phase, action in sorted(REMINDED):
+        for count in (0, 1):
+            _, step = gt.guidance_lines(_feed(phase, action, unprocessed_positions=count,
+                                              resume_last_result="rejected_unprocessed"))
+            assert RECHECK in step, (phase, action, count)
+    for phase, action in sorted(gt.PAIRS - REMINDED):
         _, step = gt.guidance_lines(_feed(phase, action, unprocessed_positions=1))
-        assert "取得状態を再確認してください" not in step, (phase, action)
+        assert RECHECK not in step, (phase, action)
+
+
+@pytest.mark.parametrize("result", ["rejected_watermark", "rejected_unprocessed"])
+def test_a_rejection_after_the_awaiting_mark_still_asks_to_recheck_the_feed(result):
+    action = "restore_source" if result == "rejected_watermark" else "resume_with_ack"
+    _, step = gt.guidance_lines(_feed("resume_rejected", action, resume_last_result=result,
+                                      unprocessed_positions=2, awaiting_mark=True))
+    assert RECHECK in step
+
+
+@pytest.mark.parametrize("count", [None, -1, True, 1.5, "3", "unknown", [], {}])
+@pytest.mark.parametrize("phase", ["resume_rejected", "awaiting_resume"])
+def test_the_no_acknowledge_text_needs_a_count_that_is_the_integer_zero(phase, count):
+    for action in ("resume", "resume_with_ack"):
+        feed = _feed(phase, action, resume_last_result="rejected_unprocessed")
+        if count is not None:
+            feed["unprocessed_positions"] = count
+        reason, step = gt.guidance_lines(feed)
+        assert reason == "停止理由: 状態を確認できません", (phase, action, count)
+        assert "なしで再要求" not in step and "不要です" not in step
+        assert "再実行" in step
+
+
+@pytest.mark.parametrize("phase", ["resume_rejected", "awaiting_resume"])
+def test_a_positive_count_always_gets_the_acknowledge_guidance(phase):
+    for action in ("resume", "resume_with_ack"):
+        _, step = gt.guidance_lines(_feed(phase, action, unprocessed_positions=3,
+                                          resume_last_result="rejected_unprocessed"))
+        assert gt.RESUME_ACK in step and "なしで再要求" not in step
+
+
+@pytest.mark.parametrize("phase", ["resume_rejected", "awaiting_resume"])
+def test_the_integer_zero_gets_the_plain_resume_guidance(phase):
+    for action in ("resume", "resume_with_ack"):
+        _, step = gt.guidance_lines(_feed(phase, action, unprocessed_positions=0,
+                                          resume_last_result="rejected_unprocessed"))
+        assert gt.RESUME in step and gt.RESUME_ACK not in step
 
 
 def test_restore_source_does_not_assert_the_cause_of_the_outage():
@@ -85,10 +129,10 @@ def test_an_unprocessed_rejection_with_no_positions_now_says_ack_is_not_needed()
     assert gt.RESUME_ACK in step and "なしで" not in step
 
 
-@pytest.mark.parametrize("count", [None, -1, True, 1.5, "3", "unknown", [], {}])
-def test_a_count_that_is_not_a_non_negative_integer_is_shown_as_unknown(count):
-    reason, _ = gt.guidance_lines(_feed("awaiting_resume", "resume_with_ack",
-                                        unprocessed_positions=count))
+def test_an_unreadable_count_is_shown_as_unknown_on_rows_that_do_not_need_it():
+    reason, _ = gt.guidance_lines(_feed("resume_rejected", "restore_source",
+                                        resume_last_result="rejected_watermark",
+                                        unprocessed_positions="unknown"))
     assert reason.endswith("(未処理の足がある建玉 不明 件)")
 
 

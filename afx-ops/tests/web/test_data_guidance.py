@@ -96,8 +96,33 @@ def test_the_phase_assignment_table_covers_the_vocabulary_exactly():
     assert set(marks.DATA_PHASE_TEXT) == set(guidance_text.PHASES)
 
 
-def test_the_count_is_shown_in_the_reason_and_unknown_when_unreadable():
+def test_the_count_is_shown_in_the_reason_and_an_unreadable_one_is_unknown_guidance():
     assert "未処理の足がある建玉 2 件" in _page(_feed(
         phase="awaiting_resume", next_action="resume_with_ack", unprocessed_positions=2))
-    assert "未処理の足がある建玉 不明 件" in _page(_feed(
-        phase="awaiting_resume", next_action="resume_with_ack", unprocessed_positions="unknown"))
+    page = _page(_feed(phase="awaiting_resume", next_action="resume_with_ack",
+                       unprocessed_positions="unknown"))
+    assert "停止理由: 状態を確認できません" in page and "不要です" not in page
+
+
+@pytest.mark.parametrize("count", [None, "unknown", -1, True, "0"])
+def test_the_no_acknowledge_text_is_never_shown_for_a_count_that_is_not_the_integer_zero(count):
+    feed = _feed(phase="resume_rejected", next_action="resume",
+                 resume_last_result="rejected_unprocessed")
+    if count is None:
+        del feed["unprocessed_positions"]
+    else:
+        feed["unprocessed_positions"] = count
+    page = _page(feed)
+    assert "なしで再要求" not in page and "停止理由: 状態を確認できません" in page
+    ok = _page(_feed(phase="resume_rejected", next_action="resume",
+                     resume_last_result="rejected_unprocessed", unprocessed_positions=0))
+    assert "なしで再要求" in ok
+    positive = _page(_feed(phase="resume_rejected", next_action="resume",
+                           resume_last_result="rejected_unprocessed", unprocessed_positions=4))
+    assert "なしで再要求" not in positive and "--acknowledge" in positive
+
+
+def test_a_rejection_after_the_awaiting_mark_still_asks_to_recheck_the_feed():
+    page = _page(_feed(phase="resume_rejected", next_action="resume_with_ack",
+                       resume_last_result="rejected_unprocessed", unprocessed_positions=2))
+    assert "取得状態を再確認してください" in page

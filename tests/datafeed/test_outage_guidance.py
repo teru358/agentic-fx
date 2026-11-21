@@ -144,8 +144,8 @@ def test_the_snapshot_of_a_machine_that_never_observed_is_ready(tmp_path):
     assert snap["phase"] == "ready" and snap["next_action"] == "none"
     assert snap["unprocessed_positions"] == 0
     assert snap["resume_last_result"] is None and snap["resume_last_result_at"] is None
-    assert set(snap) == {"phase", "next_action", "unprocessed_positions", "resume_last_result",
-                         "resume_last_result_at"}
+    assert set(snap) == {"state", "phase", "next_action", "unprocessed_positions",
+                         "resume_last_result", "resume_last_result_at"}
 
 
 def test_a_recorded_request_shows_wait_tick_and_keeps_the_last_result(tmp_path):
@@ -281,3 +281,34 @@ def test_pending_confirmed_and_the_market_hours_do_not_change_the_guidance(
     lines = client.format_status({"data": feed}).splitlines()
     assert lines[lines.index(f"data: {cols['state']}") + 1:][:2] == list(
         guidance_text.guidance_lines(feed))
+
+
+def test_the_snapshot_builds_state_phase_and_count_from_one_read_of_the_row(tmp_path):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="ready", epoch=3)
+    real = machine._load_row
+    reads = []
+
+    def read_then_transition(*a, **k):
+        row = real(*a, **k)
+        reads.append(row.get("state"))
+        # 読んだ直後に別の接続が停止へ遷移させる
+        conn.execute("UPDATE datafeed_outage_state SET state='degraded' WHERE id=1")
+        conn.commit()
+        return row
+
+    machine._load_row = read_then_transition
+    snap = machine.guidance_snapshot(WED, conn=conn)
+    assert reads == ["ready"]
+    assert snap["state"] == "ready"
+    assert (snap["phase"], snap["next_action"]) == ("ready", "none")
+    machine._load_row = real
+    snap = machine.guidance_snapshot(WED, conn=conn)
+    assert snap["state"] == "degraded" and snap["phase"] != "ready"
+
+
+def test_the_snapshot_state_reads_degraded_while_an_observe_failure_marker_is_up(tmp_path):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="ready", epoch=1)
+    machine._observe_failed = True
+    assert machine.guidance_snapshot(WED, conn=conn)["state"] == "degraded"

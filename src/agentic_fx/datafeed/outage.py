@@ -275,6 +275,10 @@ class OutageStateMachine:
     def guidance_snapshot(self, now: datetime, *, conn=None) -> dict:
         """API の status `data` に足す案内の値。読み取り専用 (行を作らない)。
 
+        state・phase・次の操作は 1 回読んだ同じ行から作る (読取りの間の遷移で食い違わない)。
+        state は `state_from` と同じ値 (観測の保存に失敗中は degraded)。行が読めない
+        ときは state を含めない (呼び出し側が自分の読みに戻す)。
+
         行が読めなければ unknown (ready に倒さない)。件数は読めなければ "unknown" を返し、
         ゼロとはみなさない。`conn` は `status()` と同じ意味で、API thread は自分の読取り接続を渡す。
         """
@@ -296,7 +300,8 @@ class OutageStateMachine:
             observe_failed=self._observe_failed, state=row.get("state", "ready"),
             request_pending=row.get("resume_requested_at") is not None,
             last_result=result, awaiting_mark=marked, unprocessed=unprocessed)
-        return {"phase": phase, "next_action": action,
+        shown = "degraded" if self._observe_failed else row.get("state", "ready")
+        return {"state": shown, "phase": phase, "next_action": action,
                 "unprocessed_positions": UNKNOWN_COUNT if unprocessed is None else unprocessed,
                 "resume_last_result": result,
                 "resume_last_result_at": row.get("resume_last_result_at")}

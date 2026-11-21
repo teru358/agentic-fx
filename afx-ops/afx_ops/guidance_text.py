@@ -62,11 +62,20 @@ _RESUME_NO_ACK_NEEDED = ("未処理の足がある建玉は現在ありません
 
 
 def checked_pair(feed: dict) -> tuple[str, str]:
-    """phase と next_action。published の組でなければ不明 (ready や操作不要に倒さない)。"""
+    """phase と next_action。published の組でなければ不明 (ready や操作不要に倒さない)。
+
+    ack の要否を決める行 (再開待ち・拒否後の再要求) は、現在の件数が非負の整数のときだけ
+    その件数から決め直す。件数が読めなければ不明、正の数は ack つき、整数 0 だけ ack なし。
+    """
     phase, action = feed.get("phase"), feed.get("next_action")
-    if type(phase) is str and type(action) is str and (phase, action) in PAIRS:
-        return phase, action
-    return "unknown", "check_status"
+    if not (type(phase) is str and type(action) is str and (phase, action) in PAIRS):
+        return "unknown", "check_status"
+    if phase in ("awaiting_resume", "resume_rejected") and action in ("resume", "resume_with_ack"):
+        count = count_of(feed)
+        if count is None:
+            return "unknown", "check_status"
+        return phase, "resume_with_ack" if count else "resume"
+    return phase, action
 
 
 def count_of(feed: dict) -> int | None:
@@ -95,6 +104,6 @@ def guidance_lines(feed: object) -> tuple[str, str] | None:
         text = _RESUME_NO_ACK_NEEDED
     else:
         text = _ACTION[action]
-    if phase == "awaiting_resume":
+    if phase in ("awaiting_resume", "resume_rejected"):
         text += "。" + _RECHECK
     return "停止理由: " + reason, "次の操作: " + text

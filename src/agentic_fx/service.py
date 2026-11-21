@@ -2198,6 +2198,8 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
                 recent = missions.recent(conn, 1)
                 data_state = str(outage.state_from(conn))
                 data_guidance = _data_guidance(outage, conn, clock.now())
+                # カードの state も案内と同じ 1 回の読取りから作る。読めなければ自分の読みに戻す
+                card_state = str(data_guidance.pop("state", data_state))
                 references = (
                     _reference_status_rows(conn, ingest, clock.now(), settings)
                     if ingest is not None else None)
@@ -2234,7 +2236,7 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
                   "orders": {"active": len(active)}, "mission": mission,
                   "health": {"latched": health_latch.is_latched(),
                              "failures": len(health_latch.summary())},
-                  "data": {"state": data_state, **data_guidance}, "setup": setup}
+                  "data": {**data_guidance, "state": card_state}, "setup": setup}
         if references:
             status["references"] = references
         if guard_notice is not None:

@@ -57,6 +57,20 @@ def test_a_degraded_row_with_the_awaiting_mark_asks_for_a_resume(tmp_path):
         app.close()
 
 
+def test_the_card_state_and_the_guidance_come_from_the_same_read(tmp_path):
+    _init(tmp_path)
+    app = _app(tmp_path)
+    try:
+        _seed(app, state="degraded", epoch=5)
+        # 別の読み取りが ready を返しても、data の state は案内と同じ行から作る
+        app.outage.state_from = lambda conn: "ready"
+        data = _data(app)
+        assert data["state"] == "degraded"
+        assert (data["phase"], data["next_action"]) == ("stopped", "restore_source")
+    finally:
+        app.close()
+
+
 def test_a_guidance_read_failure_is_unknown_and_keeps_the_state_read_once(tmp_path):
     _init(tmp_path)
     app = _app(tmp_path)
