@@ -67,12 +67,12 @@
   {
    "role": "tool",
    "tool_call_id": "d231b6b7d211e1b882d71756fd173095",
-   "content": "{\"sma_20\": 0, \"sma_50\": 0, \"ema_12\": 0, \"ema_26\": 0, \"macd\": 0, \"macd_signal\": 0, \"rsi_14\": 0, \"atr_14\": 0, \"bb_upper\": 0, \"bb_lower\": 0, \"interval\": \"v2\", \"role\": \"v5\", \"plugin:synthetic_k10\": {\"abs_return_autocorrelation\": 0}, \"plugin:synthetic_k11\": {\"abs_return_dispersion\": 0}, \"plugin:synthetic_k12\": {\"abs_return_mean_median_ratio\": 0}, \"plugin:synthetic_k13\": {\"adx\": 0, \"plus_di\": 0, \"minus_di\": 0}, \"plugin:synthetic_k14\": {\"atr\": 0}, \"plugin:synthetic_k15\": {\"atr_percentile\": 0}, \"plugin:synthetic_k16\": {\"regime\": 0}, \"plugin:synthetic_k17\": {\"body_pressure_autocorrelation\": 0}, \"plugin:synthetic_k18\": {\"body_pressure_variance\": 0}, \"plugin:synthetic_k19\": {\"upper\": 0, \"middle\": 0, \"lower\": 0}, \"plugin:synthetic_k20\": {\"candle_pressure\": 0}, \"plugin:synthetic_k21\": {\"choppiness_index\": 0}, \"plugin:synthetic_k22\": {\"close_location_autocorrelation\": 0}, \"plugin:synthetic_k23\": {\"close_log_return\": 0}, \"plugin:synthetic_k24\": {\"close_occupancy_entropy\": 0}, \"plugin:synthetic_k25\": {\"directional_hit_rate_imbalance\": 0}, \"plugin:synthetic_k26\": {\"downside_realized_variance_share\": 0}, \"plugin:synthetic_k27\": {\"downside_upside_ratio\": 0}, \"plugin:synthetic_k28\": {\"value\": 0}, \"plugin:synthetic_k29\": {}, \"plugin:synthetic_k30\": {\"gap_range_share\": 0}, \"plugin:synthetic_k31\": {\"garman_klass_volatility\": 0}, \"plugin:synthetic_k32\": {\"hourly_range_cv\": 0}, \"plugin:synthetic_k33\": {}, \"plugin:synthetic_k34\": {}, \"plugin:synthetic_k35\": {\"hourly_volume_seasonality\": 0}, \"plugin:synthetic_k36\": {\"hurst_rs\": 0}, \"plugin:synthetic_k37\": {\"tenkan\": 0, \"kijun\": 0, \"senkou_a\": 0, \"senkou_b\": 0, \"chikou\": 0}, \"plugin:synthetic_k38\": {\"jump_variance_share\": 0}, \"plugin:synthetic_k39\": {\"lagged_sign_range_asymmetry\": 0}, \"plugin:synthetic_k40\": {\"low_range_run\": 0}, \"plugin:synthetic_k41\": {\"macd\": 0, \"signal\": 0, \"hist\": 0}, \"plugin:synthetic_k42\": {\"alignment\": 0}, \"plugin:synthetic_k43\": {\"opening_gap_percentile\": 0}, \"plugin:synthetic_k44\": {\"ou_reversion_half_life\": 0}, \"plugin:synthetic_k45\": {\"parkinson_volatility\": 0}, \"plugin:synthetic_k46\": {\"perm_abs_return_entropy\": 0}, \"plugin:synthetic_k47\": {\"correlation\": 0}, \"plugin:synthetic_k48\": {\"range_autocorrelation\": 0}, \"plugin:synthetic_k49\": {\"range_breakout_reentry_rate\": 0}, \"plugin:synthetic_k50\": {\"range_close_variance_ratio\": 0}, \"plugin:synthetic_k51\": {\"range_containment_persistence\": 0}, \"plugin:synthetic_k52\": {\"range_deviation_autocorrelation\": 0}, \"plugin:synthetic_k53\": {\"range_edge_traversal_rate\": 0}, \"plugin:synthetic_k54\": {\"range_midpoint_cross_rate\": 0}, \"plugin:synthetic_k55\": {\"range_midpoint_occupancy\": 0}, \"plugin:synthetic_k56\": {\"range_overlap_persistence\": 0}, \"plugin:synthetic_k57\": {\"range_percentile\": 0}, \"plugin:synthetic_k58\": {\"upper_rejection_rate\": 0, \"lower_rejection_rate\": 0}, \"plugin:synthetic_k59\": {\"realized_quarticity_ratio\": 0}, \"plugin:synthetic_k60\": {\"open\": 0, \"high\": 0, \"low\": 0, \"close\": 0, \"volume\": 0}, \"plugin:synthetic_k61\": {\"autocorrelation\": 0}, \"plugin:synthetic_k62\": {\"downside_deviation\": 0}, \"plugin:synthetic_k63\": {\"return_future_vol_correlation\": 0}, \"plugin:synthetic_k64\": {\"kurtosis\": 0}, \"plugin:synthetic_k65\": {\"return_magnitude_percentile\": 0}, \"plugin:synthetic_k66\": {\"skewness\": 0}, \"plugin:synthetic_k67\": {\"upside_deviation\": 0}, \"plugin:synthetic_k68\": {\"reversal_capture_ratio\": 0}, \"plugin:synthetic_k69\": {\"rogers_satchell_volatility\": 0}, \"plugin:synthetic_k70\": {\"rolling_body_range_efficiency\": 0}, \"plugin:synthetic_k71\": {\"rolling_close_drawdown\": 0}, \"plugin:synthetic_k72\": {\"close_location_value\": 0}, \"plugin:synthetic_k73\": {\"high_age\": 0, \"low_age\": 0}, \"plugin:synthetic_k74\": {\"rolling_inside_bar_rate\": 0}, \"plugin:synthetic_k75\": {\"sign_switch_rate\": 0}, \"plugin:synthetic_k76\": {\"rolling_wick_asymmetry\": 0}, \"plugin:synthetic_k77\": {\"rs_parkinson_ratio\": 0}, \"plugin:synthetic_k78\": {\"rsi\": 0}, \"plugin:synthetic_k79\": {\"rsi_14\": 0}, \"plugin:synthetic_k80\": {\"rsi_14\": 0}, \"plugin:synthetic_k81\": {\"run_length_entropy\": 0}, \"plugin:synthetic_k82\": {\"run_length_imbalance\": 0}, \"plugin:synthetic_k83\": {\"session_range_surprise\": 0}, \"plugin:synthetic_k84\": {\"newyork_high\": 0, \"newyork_low\": 0}, \"plugin:synthetic_k85\": {\"shock_asymmetry\": 0}, \"plugin:synthetic_k86\": {\"value\": 0}, \"plugin:synthetic_k87\": {\"squared_return_autocorrelation\": 0}, \"plugin:synthetic_k88\": {\"k\": 0, \"d\": 0}, \"plugin:synthetic_k89\": {\"tick_volume_adjusted_move\": 0}, \"plugin:synthetic_k90\": {\"trend_efficiency\": 0}, \"plugin:synthetic_k91\": {\"true_range_dispersion\": 0}, \"plugin:synthetic_k92\": {\"hourly_drift\": 0}, \"plugin:synthetic_k93\": {}, \"plugin:synthetic_k94\": {\"utc_day_open_return\": 0}, \"plugin:synthetic_k95\": {\"utc_hour_return_variance_ratio\": 0}, \"plugin:synthetic_k96\": {\"variance_ratio\": 0}, \"plugin:synthetic_k97\": {\"volatility_expansion_ratio\": 0}, \"plugin:synthetic_k98\": {\"volume_abs_return_correlation\": 0}, \"plugin:synthetic_k99\": {\"volume_surprise_ratio\": 0}, \"plugin:synthetic_k100\": {\"weekday_range_surprise\": 0}, \"plugin:synthetic_k101\": {\"hourly_volatility_surprise\": 0}, \"plugin:synthetic_k102\": {}, \"plugin:synthetic_k103\": {\"yang_zhang_volatility\": 0}}"
+   "content": "{\"sma_20\": 0, \"sma_50\": 0, \"ema_12\": 0, \"ema_26\": 0, \"macd\": 0, \"macd_signal\": 0, \"rsi_14\": 0, \"atr_14\": 0, \"bb_upper\": 0, \"bb_lower\": 0, \"interval\": \"v2\", \"role\": \"v5\", \"indicator_i10\": {\"indicator_i11\": 0}, \"indicator_i12\": {\"indicator_i13\": 0}, \"indicator_i14\": {\"indicator_i15\": 0}, \"indicator_i16\": {\"indicator_i17\": 0, \"indicator_i18\": 0, \"indicator_i19\": 0}, \"indicator_i20\": {\"indicator_i21\": 0}, \"indicator_i22\": {\"indicator_i23\": 0}, \"indicator_i24\": {\"indicator_i25\": 0}, \"indicator_i26\": {\"indicator_i27\": 0}, \"indicator_i28\": {\"indicator_i29\": 0}, \"indicator_i30\": {\"indicator_i31\": 0, \"indicator_i32\": 0, \"indicator_i33\": 0}, \"indicator_i34\": {\"indicator_i35\": 0}, \"indicator_i36\": {\"indicator_i37\": 0}, \"indicator_i38\": {\"indicator_i39\": 0}, \"indicator_i40\": {\"indicator_i41\": 0}, \"indicator_i42\": {\"indicator_i43\": 0}, \"indicator_i44\": {\"indicator_i45\": 0}, \"indicator_i46\": {\"indicator_i47\": 0}, \"indicator_i48\": {\"indicator_i49\": 0}, \"indicator_i50\": {\"indicator_i51\": 0}, \"indicator_i52\": {}, \"indicator_i53\": {\"indicator_i54\": 0}, \"indicator_i55\": {\"indicator_i56\": 0}, \"indicator_i57\": {\"indicator_i58\": 0}, \"indicator_i59\": {}, \"indicator_i60\": {}, \"indicator_i61\": {\"indicator_i62\": 0}, \"indicator_i63\": {\"indicator_i64\": 0}, \"indicator_i65\": {\"indicator_i66\": 0, \"indicator_i67\": 0, \"indicator_i68\": 0, \"indicator_i69\": 0, \"indicator_i70\": 0}, \"indicator_i71\": {\"indicator_i72\": 0}, \"indicator_i73\": {\"indicator_i74\": 0}, \"indicator_i75\": {\"indicator_i76\": 0}, \"indicator_i77\": {\"macd\": 0, \"indicator_i78\": 0, \"indicator_i79\": 0}, \"indicator_i80\": {\"indicator_i81\": 0}, \"indicator_i82\": {\"indicator_i83\": 0}, \"indicator_i84\": {\"indicator_i85\": 0}, \"indicator_i86\": {\"indicator_i87\": 0}, \"indicator_i88\": {\"indicator_i89\": 0}, \"indicator_i90\": {\"indicator_i91\": 0}, \"indicator_i92\": {\"indicator_i93\": 0}, \"indicator_i94\": {\"indicator_i95\": 0}, \"indicator_i96\": {\"indicator_i97\": 0}, \"indicator_i98\": {\"indicator_i99\": 0}, \"indicator_i100\": {\"indicator_i101\": 0}, \"indicator_i102\": {\"indicator_i103\": 0}, \"indicator_i104\": {\"indicator_i105\": 0}, \"indicator_i106\": {\"indicator_i107\": 0}, \"indicator_i108\": {\"indicator_i109\": 0}, \"indicator_i110\": {\"indicator_i111\": 0}, \"indicator_i112\": {\"indicator_i113\": 0, \"indicator_i114\": 0}, \"indicator_i115\": {\"indicator_i116\": 0}, \"indicator_i117\": {\"indicator_i118\": 0, \"indicator_i119\": 0, \"indicator_i120\": 0, \"indicator_i121\": 0, \"indicator_i122\": 0}, \"indicator_i123\": {\"indicator_i124\": 0}, \"indicator_i125\": {\"indicator_i126\": 0}, \"indicator_i127\": {\"indicator_i128\": 0}, \"indicator_i129\": {\"indicator_i130\": 0}, \"indicator_i131\": {\"indicator_i132\": 0}, \"indicator_i133\": {\"indicator_i134\": 0}, \"indicator_i135\": {\"indicator_i136\": 0}, \"indicator_i137\": {\"indicator_i138\": 0}, \"indicator_i139\": {\"indicator_i140\": 0}, \"indicator_i141\": {\"indicator_i142\": 0}, \"indicator_i143\": {\"indicator_i144\": 0}, \"indicator_i145\": {\"indicator_i146\": 0}, \"indicator_i147\": {\"indicator_i148\": 0, \"indicator_i149\": 0}, \"indicator_i150\": {\"indicator_i151\": 0}, \"indicator_i152\": {\"indicator_i153\": 0}, \"indicator_i154\": {\"indicator_i155\": 0}, \"indicator_i156\": {\"indicator_i157\": 0}, \"indicator_i158\": {\"indicator_i159\": 0}, \"indicator_i160\": {\"rsi_14\": 0}, \"indicator_i161\": {\"rsi_14\": 0}, \"indicator_i162\": {\"indicator_i163\": 0}, \"indicator_i164\": {\"indicator_i165\": 0}, \"indicator_i166\": {\"indicator_i167\": 0}, \"indicator_i168\": {\"indicator_i169\": 0, \"indicator_i170\": 0}, \"indicator_i171\": {\"indicator_i172\": 0}, \"indicator_i173\": {\"indicator_i51\": 0}, \"indicator_i174\": {\"indicator_i175\": 0}, \"indicator_i176\": {\"indicator_i177\": 0, \"indicator_i178\": 0}, \"indicator_i179\": {\"indicator_i180\": 0}, \"indicator_i181\": {\"indicator_i182\": 0}, \"indicator_i183\": {\"indicator_i184\": 0}, \"indicator_i185\": {\"indicator_i186\": 0}, \"indicator_i187\": {}, \"indicator_i188\": {\"indicator_i189\": 0}, \"indicator_i190\": {\"indicator_i191\": 0}, \"indicator_i192\": {\"indicator_i193\": 0}, \"indicator_i194\": {\"indicator_i195\": 0}, \"indicator_i196\": {\"indicator_i197\": 0}, \"indicator_i198\": {\"indicator_i199\": 0}, \"indicator_i200\": {\"indicator_i201\": 0}, \"indicator_i202\": {\"indicator_i203\": 0}, \"indicator_i204\": {}, \"indicator_i205\": {\"indicator_i206\": 0}}"
   },
   {
    "role": "tool",
    "tool_call_id": "e0d5653475429b027b5d61b96d791bcd",
-   "content": "{\"sma_20\": 0, \"sma_50\": 0, \"ema_12\": 0, \"ema_26\": 0, \"macd\": 0, \"macd_signal\": 0, \"rsi_14\": 0, \"atr_14\": 0, \"bb_upper\": 0, \"bb_lower\": 0, \"interval\": \"v3\", \"role\": \"v104\", \"plugin:synthetic_k10\": {\"abs_return_autocorrelation\": 0}, \"plugin:synthetic_k11\": {\"abs_return_dispersion\": 0}, \"plugin:synthetic_k12\": {\"abs_return_mean_median_ratio\": 0}, \"plugin:synthetic_k13\": {\"adx\": 0, \"plus_di\": 0, \"minus_di\": 0}, \"plugin:synthetic_k14\": {\"atr\": 0}, \"plugin:synthetic_k15\": {\"atr_percentile\": 0}, \"plugin:synthetic_k16\": {\"regime\": 0}, \"plugin:synthetic_k17\": {\"body_pressure_autocorrelation\": 0}, \"plugin:synthetic_k18\": {\"body_pressure_variance\": 0}, \"plugin:synthetic_k19\": {\"upper\": 0, \"middle\": 0, \"lower\": 0}, \"plugin:synthetic_k20\": {\"candle_pressure\": 0}, \"plugin:synthetic_k21\": {\"choppiness_index\": 0}, \"plugin:synthetic_k22\": {\"close_location_autocorrelation\": 0}, \"plugin:synthetic_k23\": {\"close_log_return\": 0}, \"plugin:synthetic_k24\": {\"close_occupancy_entropy\": 0}, \"plugin:synthetic_k25\": {\"directional_hit_rate_imbalance\": 0}, \"plugin:synthetic_k26\": {\"downside_realized_variance_share\": 0}, \"plugin:synthetic_k27\": {\"downside_upside_ratio\": 0}, \"plugin:synthetic_k28\": {\"value\": 0}, \"plugin:synthetic_k29\": {}, \"plugin:synthetic_k30\": {\"gap_range_share\": 0}, \"plugin:synthetic_k31\": {\"garman_klass_volatility\": 0}, \"plugin:synthetic_k32\": {\"hourly_range_cv\": 0}, \"plugin:synthetic_k33\": {}, \"plugin:synthetic_k34\": {}, \"plugin:synthetic_k35\": {\"hourly_volume_seasonality\": 0}, \"plugin:synthetic_k36\": {\"hurst_rs\": 0}, \"plugin:synthetic_k37\": {\"tenkan\": 0, \"kijun\": 0, \"senkou_a\": 0, \"senkou_b\": 0, \"chikou\": 0}, \"plugin:synthetic_k38\": {\"jump_variance_share\": 0}, \"plugin:synthetic_k39\": {\"lagged_sign_range_asymmetry\": 0}, \"plugin:synthetic_k40\": {\"low_range_run\": 0}, \"plugin:synthetic_k41\": {\"macd\": 0, \"signal\": 0, \"hist\": 0}, \"plugin:synthetic_k42\": {\"alignment\": 0}, \"plugin:synthetic_k43\": {\"opening_gap_percentile\": 0}, \"plugin:synthetic_k44\": {\"ou_reversion_half_life\": 0}, \"plugin:synthetic_k45\": {\"parkinson_volatility\": 0}, \"plugin:synthetic_k46\": {\"perm_abs_return_entropy\": 0}, \"plugin:synthetic_k47\": {\"correlation\": 0}, \"plugin:synthetic_k48\": {\"range_autocorrelation\": 0}, \"plugin:synthetic_k49\": {\"range_breakout_reentry_rate\": 0}, \"plugin:synthetic_k50\": {\"range_close_variance_ratio\": 0}, \"plugin:synthetic_k51\": {\"range_containment_persistence\": 0}, \"plugin:synthetic_k52\": {\"range_deviation_autocorrelation\": 0}, \"plugin:synthetic_k53\": {\"range_edge_traversal_rate\": 0}, \"plugin:synthetic_k54\": {\"range_midpoint_cross_rate\": 0}, \"plugin:synthetic_k55\": {\"range_midpoint_occupancy\": 0}, \"plugin:synthetic_k56\": {\"range_overlap_persistence\": 0}, \"plugin:synthetic_k57\": {\"range_percentile\": 0}, \"plugin:synthetic_k58\": {\"upper_rejection_rate\": 0, \"lower_rejection_rate\": 0}, \"plugin:synthetic_k59\": {\"realized_quarticity_ratio\": 0}, \"plugin:synthetic_k60\": {\"open\": 0, \"high\": 0, \"low\": 0, \"close\": 0, \"volume\": 0}, \"plugin:synthetic_k61\": {\"autocorrelation\": 0}, \"plugin:synthetic_k62\": {\"downside_deviation\": 0}, \"plugin:synthetic_k63\": {\"return_future_vol_correlation\": 0}, \"plugin:synthetic_k64\": {\"kurtosis\": 0}, \"plugin:synthetic_k65\": {\"return_magnitude_percentile\": 0}, \"plugin:synthetic_k66\": {\"skewness\": 0}, \"plugin:synthetic_k67\": {\"upside_deviation\": 0}, \"plugin:synthetic_k68\": {\"reversal_capture_ratio\": 0}, \"plugin:synthetic_k69\": {\"rogers_satchell_volatility\": 0}, \"plugin:synthetic_k70\": {\"rolling_body_range_efficiency\": 0}, \"plugin:synthetic_k71\": {\"rolling_close_drawdown\": 0}, \"plugin:synthetic_k72\": {\"close_location_value\": 0}, \"plugin:synthetic_k73\": {\"high_age\": 0, \"low_age\": 0}, \"plugin:synthetic_k74\": {\"rolling_inside_bar_rate\": 0}, \"plugin:synthetic_k75\": {\"sign_switch_rate\": 0}, \"plugin:synthetic_k76\": {\"rolling_wick_asymmetry\": 0}, \"plugin:synthetic_k77\": {\"rs_parkinson_ratio\": 0}, \"plugin:synthetic_k78\": {\"rsi\": 0}, \"plugin:synthetic_k79\": {\"rsi_14\": 0}, \"plugin:synthetic_k80\": {\"rsi_14\": 0}, \"plugin:synthetic_k81\": {\"run_length_entropy\": 0}, \"plugin:synthetic_k82\": {\"run_length_imbalance\": 0}, \"plugin:synthetic_k83\": {\"session_range_surprise\": 0}, \"plugin:synthetic_k84\": {\"newyork_high\": 0, \"newyork_low\": 0}, \"plugin:synthetic_k85\": {\"shock_asymmetry\": 0}, \"plugin:synthetic_k86\": {\"value\": 0}, \"plugin:synthetic_k87\": {\"squared_return_autocorrelation\": 0}, \"plugin:synthetic_k88\": {\"k\": 0, \"d\": 0}, \"plugin:synthetic_k89\": {\"tick_volume_adjusted_move\": 0}, \"plugin:synthetic_k90\": {\"trend_efficiency\": 0}, \"plugin:synthetic_k91\": {\"true_range_dispersion\": 0}, \"plugin:synthetic_k92\": {\"hourly_drift\": 0}, \"plugin:synthetic_k93\": {}, \"plugin:synthetic_k94\": {\"utc_day_open_return\": 0}, \"plugin:synthetic_k95\": {\"utc_hour_return_variance_ratio\": 0}, \"plugin:synthetic_k96\": {\"variance_ratio\": 0}, \"plugin:synthetic_k97\": {\"volatility_expansion_ratio\": 0}, \"plugin:synthetic_k98\": {\"volume_abs_return_correlation\": 0}, \"plugin:synthetic_k99\": {\"volume_surprise_ratio\": 0}, \"plugin:synthetic_k100\": {\"weekday_range_surprise\": 0}, \"plugin:synthetic_k101\": {\"hourly_volatility_surprise\": 0}, \"plugin:synthetic_k102\": {}, \"plugin:synthetic_k103\": {\"yang_zhang_volatility\": 0}}"
+   "content": "{\"sma_20\": 0, \"sma_50\": 0, \"ema_12\": 0, \"ema_26\": 0, \"macd\": 0, \"macd_signal\": 0, \"rsi_14\": 0, \"atr_14\": 0, \"bb_upper\": 0, \"bb_lower\": 0, \"interval\": \"v3\", \"role\": \"v207\", \"indicator_i10\": {\"indicator_i11\": 0}, \"indicator_i12\": {\"indicator_i13\": 0}, \"indicator_i14\": {\"indicator_i15\": 0}, \"indicator_i16\": {\"indicator_i17\": 0, \"indicator_i18\": 0, \"indicator_i19\": 0}, \"indicator_i20\": {\"indicator_i21\": 0}, \"indicator_i22\": {\"indicator_i23\": 0}, \"indicator_i24\": {\"indicator_i25\": 0}, \"indicator_i26\": {\"indicator_i27\": 0}, \"indicator_i28\": {\"indicator_i29\": 0}, \"indicator_i30\": {\"indicator_i31\": 0, \"indicator_i32\": 0, \"indicator_i33\": 0}, \"indicator_i34\": {\"indicator_i35\": 0}, \"indicator_i36\": {\"indicator_i37\": 0}, \"indicator_i38\": {\"indicator_i39\": 0}, \"indicator_i40\": {\"indicator_i41\": 0}, \"indicator_i42\": {\"indicator_i43\": 0}, \"indicator_i44\": {\"indicator_i45\": 0}, \"indicator_i46\": {\"indicator_i47\": 0}, \"indicator_i48\": {\"indicator_i49\": 0}, \"indicator_i50\": {\"indicator_i51\": 0}, \"indicator_i52\": {}, \"indicator_i53\": {\"indicator_i54\": 0}, \"indicator_i55\": {\"indicator_i56\": 0}, \"indicator_i57\": {\"indicator_i58\": 0}, \"indicator_i59\": {}, \"indicator_i60\": {}, \"indicator_i61\": {\"indicator_i62\": 0}, \"indicator_i63\": {\"indicator_i64\": 0}, \"indicator_i65\": {\"indicator_i66\": 0, \"indicator_i67\": 0, \"indicator_i68\": 0, \"indicator_i69\": 0, \"indicator_i70\": 0}, \"indicator_i71\": {\"indicator_i72\": 0}, \"indicator_i73\": {\"indicator_i74\": 0}, \"indicator_i75\": {\"indicator_i76\": 0}, \"indicator_i77\": {\"macd\": 0, \"indicator_i78\": 0, \"indicator_i79\": 0}, \"indicator_i80\": {\"indicator_i81\": 0}, \"indicator_i82\": {\"indicator_i83\": 0}, \"indicator_i84\": {\"indicator_i85\": 0}, \"indicator_i86\": {\"indicator_i87\": 0}, \"indicator_i88\": {\"indicator_i89\": 0}, \"indicator_i90\": {\"indicator_i91\": 0}, \"indicator_i92\": {\"indicator_i93\": 0}, \"indicator_i94\": {\"indicator_i95\": 0}, \"indicator_i96\": {\"indicator_i97\": 0}, \"indicator_i98\": {\"indicator_i99\": 0}, \"indicator_i100\": {\"indicator_i101\": 0}, \"indicator_i102\": {\"indicator_i103\": 0}, \"indicator_i104\": {\"indicator_i105\": 0}, \"indicator_i106\": {\"indicator_i107\": 0}, \"indicator_i108\": {\"indicator_i109\": 0}, \"indicator_i110\": {\"indicator_i111\": 0}, \"indicator_i112\": {\"indicator_i113\": 0, \"indicator_i114\": 0}, \"indicator_i115\": {\"indicator_i116\": 0}, \"indicator_i117\": {\"indicator_i118\": 0, \"indicator_i119\": 0, \"indicator_i120\": 0, \"indicator_i121\": 0, \"indicator_i122\": 0}, \"indicator_i123\": {\"indicator_i124\": 0}, \"indicator_i125\": {\"indicator_i126\": 0}, \"indicator_i127\": {\"indicator_i128\": 0}, \"indicator_i129\": {\"indicator_i130\": 0}, \"indicator_i131\": {\"indicator_i132\": 0}, \"indicator_i133\": {\"indicator_i134\": 0}, \"indicator_i135\": {\"indicator_i136\": 0}, \"indicator_i137\": {\"indicator_i138\": 0}, \"indicator_i139\": {\"indicator_i140\": 0}, \"indicator_i141\": {\"indicator_i142\": 0}, \"indicator_i143\": {\"indicator_i144\": 0}, \"indicator_i145\": {\"indicator_i146\": 0}, \"indicator_i147\": {\"indicator_i148\": 0, \"indicator_i149\": 0}, \"indicator_i150\": {\"indicator_i151\": 0}, \"indicator_i152\": {\"indicator_i153\": 0}, \"indicator_i154\": {\"indicator_i155\": 0}, \"indicator_i156\": {\"indicator_i157\": 0}, \"indicator_i158\": {\"indicator_i159\": 0}, \"indicator_i160\": {\"rsi_14\": 0}, \"indicator_i161\": {\"rsi_14\": 0}, \"indicator_i162\": {\"indicator_i163\": 0}, \"indicator_i164\": {\"indicator_i165\": 0}, \"indicator_i166\": {\"indicator_i167\": 0}, \"indicator_i168\": {\"indicator_i169\": 0, \"indicator_i170\": 0}, \"indicator_i171\": {\"indicator_i172\": 0}, \"indicator_i173\": {\"indicator_i51\": 0}, \"indicator_i174\": {\"indicator_i175\": 0}, \"indicator_i176\": {\"indicator_i177\": 0, \"indicator_i178\": 0}, \"indicator_i179\": {\"indicator_i180\": 0}, \"indicator_i181\": {\"indicator_i182\": 0}, \"indicator_i183\": {\"indicator_i184\": 0}, \"indicator_i185\": {\"indicator_i186\": 0}, \"indicator_i187\": {}, \"indicator_i188\": {\"indicator_i189\": 0}, \"indicator_i190\": {\"indicator_i191\": 0}, \"indicator_i192\": {\"indicator_i193\": 0}, \"indicator_i194\": {\"indicator_i195\": 0}, \"indicator_i196\": {\"indicator_i197\": 0}, \"indicator_i198\": {\"indicator_i199\": 0}, \"indicator_i200\": {\"indicator_i201\": 0}, \"indicator_i202\": {\"indicator_i203\": 0}, \"indicator_i204\": {}, \"indicator_i205\": {\"indicator_i206\": 0}}"
   },
   {
    "role": "tool",
@@ -82,12 +82,12 @@
   {
    "role": "tool",
    "tool_call_id": "ec97fc03b3afbca610c50af50923aa88",
-   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v105\", \"status\": \"v106\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v107\"}]"
+   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v208\", \"status\": \"v209\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v210\"}]"
   },
   {
    "role": "tool",
    "tool_call_id": "2011f33e9f041e93202fb49c316c1bf5",
-   "content": "[{\"order_id\": 0, \"content\": \"v108\", \"created_at\": \"v109\"}, {\"order_id\": 0, \"content\": \"v110\", \"created_at\": \"v111\"}, {\"order_id\": 0, \"content\": \"v112\", \"created_at\": \"v113\"}, {\"order_id\": 0, \"content\": \"v114\", \"created_at\": \"v115\"}, {\"order_id\": 0, \"content\": \"v116\", \"created_at\": \"v117\"}]"
+   "content": "[{\"order_id\": 0, \"content\": \"v211\", \"created_at\": \"v212\"}, {\"order_id\": 0, \"content\": \"v213\", \"created_at\": \"v214\"}, {\"order_id\": 0, \"content\": \"v215\", \"created_at\": \"v216\"}, {\"order_id\": 0, \"content\": \"v217\", \"created_at\": \"v218\"}, {\"order_id\": 0, \"content\": \"v219\", \"created_at\": \"v220\"}]"
   },
   {
    "role": "assistant",
@@ -98,7 +98,7 @@
      "type": "function",
      "function": {
       "name": "search_reflections",
-      "arguments": "{\"query\": \"v118\"}"
+      "arguments": "{\"query\": \"v221\"}"
      }
     }
    ]
@@ -106,7 +106,7 @@
   {
    "role": "tool",
    "tool_call_id": "d1098a4e5aaaedc2ef312ee4333bc41b",
-   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"content\": \"v119\"}, {\"order_id\": 0, \"pair\": \"v1\", \"content\": \"v120\"}, {\"order_id\": 0, \"pair\": \"v1\", \"content\": \"v121\"}, {\"order_id\": 0, \"pair\": \"v1\", \"content\": \"v122\"}, {\"order_id\": 0, \"pair\": \"v1\", \"content\": \"v123\"}]"
+   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"content\": \"v222\"}, {\"order_id\": 0, \"pair\": \"v1\", \"content\": \"v223\"}, {\"order_id\": 0, \"pair\": \"v1\", \"content\": \"v224\"}, {\"order_id\": 0, \"pair\": \"v1\", \"content\": \"v225\"}, {\"order_id\": 0, \"pair\": \"v1\", \"content\": \"v226\"}]"
   },
   {
    "role": "assistant",
@@ -125,7 +125,7 @@
   {
    "role": "tool",
    "tool_call_id": "bb0563c295eb858946b9acfeea507d82",
-   "content": "[{\"id\": 0, \"ts\": \"v124\", \"country\": \"v125\", \"name\": \"v126\", \"importance\": 0, \"actual\": null, \"forecast\": null, \"previous\": null}, {\"id\": 0, \"ts\": \"v127\", \"country\": \"v128\", \"name\": \"v129\", \"importance\": 0, \"actual\": null, \"forecast\": \"v130\", \"previous\": \"v131\"}, {\"id\": 0, \"ts\": \"v127\", \"country\": \"v125\", \"name\": \"v132\", \"importance\": 0, \"actual\": null, \"forecast\": null, \"previous\": null}, {\"id\": 0, \"ts\": \"v133\", \"country\": \"v134\", \"name\": \"v135\", \"importance\": 0, \"actual\": null, \"forecast\": \"v136\", \"previous\": \"v137\"}, {\"id\": 0, \"ts\": \"v138\", \"country\": \"v139\", \"name\": \"v140\", \"importance\": 0, \"actual\": null, \"forecast\": \"v141\", \"previous\": \"v141\"}]"
+   "content": "[{\"id\": 0, \"ts\": \"v227\", \"country\": \"v228\", \"name\": \"v229\", \"importance\": 0, \"actual\": null, \"forecast\": null, \"previous\": null}, {\"id\": 0, \"ts\": \"v230\", \"country\": \"v231\", \"name\": \"v232\", \"importance\": 0, \"actual\": null, \"forecast\": \"v233\", \"previous\": \"v234\"}, {\"id\": 0, \"ts\": \"v230\", \"country\": \"v228\", \"name\": \"v235\", \"importance\": 0, \"actual\": null, \"forecast\": null, \"previous\": null}, {\"id\": 0, \"ts\": \"v236\", \"country\": \"v237\", \"name\": \"v238\", \"importance\": 0, \"actual\": null, \"forecast\": \"v239\", \"previous\": \"v240\"}, {\"id\": 0, \"ts\": \"v241\", \"country\": \"v242\", \"name\": \"v243\", \"importance\": 0, \"actual\": null, \"forecast\": \"v244\", \"previous\": \"v244\"}]"
   },
   {
    "role": "assistant",
@@ -144,7 +144,7 @@
   {
    "role": "tool",
    "tool_call_id": "d717cb951f591689a5d9d2395850d678",
-   "content": "[{\"currency\": \"v128\", \"kind\": \"v142\", \"key\": \"v143\", \"window_min\": 0, \"status\": \"v144\"}, {\"currency\": \"v128\", \"kind\": \"v142\", \"key\": \"v143\", \"window_min\": 0, \"status\": \"v144\"}, {\"currency\": \"v128\", \"kind\": \"v142\", \"key\": \"v143\", \"window_min\": 0, \"status\": \"v144\"}, {\"currency\": \"v128\", \"kind\": \"v145\", \"key\": \"v146\", \"window_min\": 0, \"status\": \"v144\"}, {\"currency\": \"v128\", \"kind\": \"v145\", \"key\": \"v146\", \"window_min\": 0, \"status\": \"v144\"}]"
+   "content": "[{\"currency\": \"v231\", \"kind\": \"v245\", \"key\": \"v246\", \"window_min\": 0, \"status\": \"v247\"}, {\"currency\": \"v231\", \"kind\": \"v245\", \"key\": \"v246\", \"window_min\": 0, \"status\": \"v247\"}, {\"currency\": \"v231\", \"kind\": \"v245\", \"key\": \"v246\", \"window_min\": 0, \"status\": \"v247\"}, {\"currency\": \"v231\", \"kind\": \"v248\", \"key\": \"v249\", \"window_min\": 0, \"status\": \"v247\"}, {\"currency\": \"v231\", \"kind\": \"v248\", \"key\": \"v249\", \"window_min\": 0, \"status\": \"v247\"}]"
   },
   {
    "role": "assistant",
@@ -163,7 +163,7 @@
   {
    "role": "tool",
    "tool_call_id": "73a3d864f1773368fb70a3b5e60638a2",
-   "content": "[{\"order_id\": 0, \"content\": \"v108\", \"created_at\": \"v109\"}, {\"order_id\": 0, \"content\": \"v110\", \"created_at\": \"v111\"}, {\"order_id\": 0, \"content\": \"v112\", \"created_at\": \"v113\"}]"
+   "content": "[{\"order_id\": 0, \"content\": \"v211\", \"created_at\": \"v212\"}, {\"order_id\": 0, \"content\": \"v213\", \"created_at\": \"v214\"}, {\"order_id\": 0, \"content\": \"v215\", \"created_at\": \"v216\"}]"
   },
   {
    "role": "assistant",
@@ -182,7 +182,7 @@
   {
    "role": "tool",
    "tool_call_id": "661678b2a984cae3be07fdc8c2a17d61",
-   "content": "[{\"currency\": \"v128\", \"kind\": \"v142\", \"key\": \"v143\", \"window_min\": 0, \"status\": \"v144\"}, {\"currency\": \"v128\", \"kind\": \"v142\", \"key\": \"v143\", \"window_min\": 0, \"status\": \"v144\"}, {\"currency\": \"v128\", \"kind\": \"v142\", \"key\": \"v143\", \"window_min\": 0, \"status\": \"v144\"}, {\"currency\": \"v128\", \"kind\": \"v145\", \"key\": \"v146\", \"window_min\": 0, \"status\": \"v144\"}, {\"currency\": \"v128\", \"kind\": \"v145\", \"key\": \"v146\", \"window_min\": 0, \"status\": \"v144\"}]"
+   "content": "[{\"currency\": \"v231\", \"kind\": \"v245\", \"key\": \"v246\", \"window_min\": 0, \"status\": \"v247\"}, {\"currency\": \"v231\", \"kind\": \"v245\", \"key\": \"v246\", \"window_min\": 0, \"status\": \"v247\"}, {\"currency\": \"v231\", \"kind\": \"v245\", \"key\": \"v246\", \"window_min\": 0, \"status\": \"v247\"}, {\"currency\": \"v231\", \"kind\": \"v248\", \"key\": \"v249\", \"window_min\": 0, \"status\": \"v247\"}, {\"currency\": \"v231\", \"kind\": \"v248\", \"key\": \"v249\", \"window_min\": 0, \"status\": \"v247\"}]"
   },
   {
    "role": "assistant",
@@ -201,7 +201,7 @@
   {
    "role": "tool",
    "tool_call_id": "54c85005cebd01647322df91a7c20520",
-   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v105\", \"status\": \"v106\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v107\"}]"
+   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v208\", \"status\": \"v209\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v210\"}]"
   },
   {
    "role": "assistant",
@@ -220,7 +220,7 @@
   {
    "role": "tool",
    "tool_call_id": "33da87cfa45b1b046f827a839ae6ff15",
-   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v105\", \"status\": \"v106\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v107\"}]"
+   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v208\", \"status\": \"v209\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v210\"}]"
   },
   {
    "role": "assistant",
@@ -239,7 +239,7 @@
   {
    "role": "tool",
    "tool_call_id": "46d097c3727c061a7807a69beb477b5a",
-   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v105\", \"status\": \"v106\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v107\"}]"
+   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v208\", \"status\": \"v209\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v210\"}]"
   },
   {
    "role": "assistant",
@@ -258,7 +258,7 @@
   {
    "role": "tool",
    "tool_call_id": "efb91aae6eb3f9ea9555f0c731e99bca",
-   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v105\", \"status\": \"v106\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v107\"}]"
+   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v208\", \"status\": \"v209\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v210\"}]"
   },
   {
    "role": "assistant",
@@ -277,7 +277,7 @@
   {
    "role": "tool",
    "tool_call_id": "fd96784dd1c5ac7d25bf9302c6b73f47",
-   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v105\", \"status\": \"v106\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v107\"}]"
+   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v208\", \"status\": \"v209\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v210\"}]"
   },
   {
    "role": "assistant",
@@ -296,7 +296,7 @@
   {
    "role": "tool",
    "tool_call_id": "e0af7392958396eedfd935336bb713d6",
-   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v105\", \"status\": \"v106\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v107\"}]"
+   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v208\", \"status\": \"v209\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v210\"}]"
   },
   {
    "role": "assistant",
@@ -315,7 +315,7 @@
   {
    "role": "tool",
    "tool_call_id": "21046b6d0b36802cee540e685ff9ec43",
-   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v105\", \"status\": \"v106\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v107\"}]"
+   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v208\", \"status\": \"v209\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v210\"}]"
   },
   {
    "role": "assistant",
@@ -334,7 +334,7 @@
   {
    "role": "tool",
    "tool_call_id": "9c3314f67ae08c696c0f37ce24de077c",
-   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v105\", \"status\": \"v106\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v107\"}]"
+   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v208\", \"status\": \"v209\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v210\"}]"
   },
   {
    "role": "assistant",
@@ -353,7 +353,7 @@
   {
    "role": "tool",
    "tool_call_id": "d0010c3aaeb379750781b6bc837c9382",
-   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v105\", \"status\": \"v106\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v107\"}]"
+   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v208\", \"status\": \"v209\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v210\"}]"
   },
   {
    "role": "assistant",
@@ -372,7 +372,7 @@
   {
    "role": "tool",
    "tool_call_id": "d982972b6832d5a2482a1839a4ef8a3c",
-   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v105\", \"status\": \"v106\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v107\"}]"
+   "content": "[{\"order_id\": 0, \"pair\": \"v1\", \"direction\": \"v208\", \"status\": \"v209\", \"quantity\": 0, \"entry\": 0, \"stop_loss\": 0, \"take_profit\": 0, \"horizon\": \"v210\"}]"
   }
  ]
 }

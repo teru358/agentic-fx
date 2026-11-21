@@ -1194,6 +1194,61 @@ def test_worker_runner_rag_rpc_dispatches_to_rag_and_responds(
     assert result.status == "completed"
 
 
+def test_worker_runner_rag_rpc_passes_added_at_through_to_the_child(
+        tmp_path, monkeypatch):
+    """親の RAG 応答は検索結果の key を落とさない (added_at が子の tool の
+    ingested_at の元になる)。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+    seen: list[dict] = []
+    hit = {"title": "news1", "added_at": "2026-08-04T12:00:00+00:00"}
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        json.loads(child_in.readline())  # handshake
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "tool_rpc", "seq": 2, "rpc_id": "1",
+                                "name": "search_news",
+                                "args": {"query": "q", "n": 5}})
+        seen.append(json.loads(child_in.readline()))
+        write_frame(child_out, {"type": "result", "seq": 3,
+                                "status": "completed", "output": {}})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    fake_proc = FakeProc()
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    root = _root(tmp_path)
+    rag = _rag(tmp_path)
+    rag.search_news = lambda query, n=5: [dict(hit)]
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=clock, rag=rag)
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "completed"
+    assert seen[0]["result"] == [hit]
+
+
 def test_worker_runner_empty_rpc_handlers_dict_fails_closed_not_rag_fallback(
         tmp_path, monkeypatch):
     """F-1 是正 (プラン10 Task13 検収): `rpc_handlers={}` (空 dict、`None` では

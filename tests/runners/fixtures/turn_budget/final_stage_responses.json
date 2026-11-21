@@ -95,6 +95,10 @@
   "prose_without_json_response": {
    "role": "assistant",
    "content": "判断材料は揃った。accept とする。"
+  },
+  "text_tool_call_function_form_after_prose_response": {
+   "role": "assistant",
+   "content": "追加で確認する。\n\n<tool_call>\n<function=search_news>\n<parameter=query>\nsynthetic query last\n</parameter>\n</function>\n</tool_call>"
   }
  }
 }

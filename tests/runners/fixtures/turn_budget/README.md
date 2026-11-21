@@ -19,7 +19,10 @@ query は「出現順の番号つきの合成語」に置換し、同一 query �
 初期 user message は `(anonymized initial prompt)` に置換した。実 prompt が要る試験は自前で組み立てる。
 
 `synthetic` の根拠: 構造化の呼出しは OpenAI 互換の `tool_calls` の形 (runner が組み立てる形と同じ)。
-文字列の呼出しは Qwen 系の template が出す `<tool_call>` 包みの一般形で、稼働モデルの実 template は確認していない。
+文字列の呼出しのうち `text_tool_call_function_form_response` と `..._after_prose_response` は、稼働モデルの chat template が
+指示する形 (`<tool_call>` の中に `<function=名前>` と `<parameter=名前>` を入れ、template は「呼出しの前に自然文を置いてよい」と述べる)
+をその template の文面から写した。モデルが実際にこの形を出した観測は無い (最終段階の要求は tools を省略するため)。
+`text_tool_call_json_response` は JSON を包む別形 (他の Qwen 系 template に見られる一般形) の合成。
 `text_tool_call_with_decision_inside` は呼出し包みの中に判断 JSON が入る形を作ったもの。
 
 ## 切替要求の互換性確認
