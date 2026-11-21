@@ -23,12 +23,13 @@ related: [weekly-improve-rebacktests-deployed-strategies, strategy-attribution-a
 max_turns の 44 本は全件、16 ターンとも `search_news` を呼び続け、最終 JSON を一度も出していない (最終回答の試行・修復・ツールエラーは 0)。30 本は同じ query の繰り返し、14 本は言い換えの連続 (為替介入が「実施されたか」の確認や日付の語に寄る)。意味検索の上位 5 件はほぼ同じ記事が返る。同じ signal の再実行で結果が分かれる (max_turns の 26 本中 17 本が requeue 後に completed) ので、モデルのばらつきが主因。決定論的な欠けとして:
 - runner は毎ターン `tool_choice: "auto"` で、残り手数を伝えず、最終ターンでもツールを使える。同じ呼出しの繰り返しも抑えない (`src/agentic_fx/runners/local_runner.py:167-179`)。cron の max_turns 49 本も最終回答の試行 0 (`get_positions` の連打)。
 - signal の prompt (`src/agentic_fx/loops/prompts/signal_decision_mission.md`) に検索回数の目安・打ち切りの条件が無い。
-- `search_news` の結果に記事の時刻が無い (`src/agentic_fx/tools/news_tools.py:12-14`、`added_at` は `src/agentic_fx/store/rag.py:119-124` にある)。
+- `search_news` の結果に記事の時刻が無い (`src/agentic_fx/tools/news_tools.py:12-14`、`added_at` は `src/agentic_fx/store/rag.py:155-159` で書き込まれる)。
 ツール結果の大きさ・prompt の長さ・timeout は原因ではない (失敗の中央値 74 秒、timeout 300 秒)。
 
 ## 処置案・裁定
 
 - 2026-11-21 利用者裁定: 当面 `signal_daily_max` を 36 に上げる (個人設定、次の再起動で反映)。失敗の原因は本チケットで調べる。成績の悪い戦略 (close_pressure_followthrough・volume_close_pressure) は止めず、判断に回る件数が増えて採点が進んでから改善の対象にする。
+- 2026-11-21 利用者承認の方針 (設計 docs/superpowers/specs/2026-11-21-trade-mission-turn-budget-design.md の元): (a) 最後の 1〜2 ターンはツールを渡さず JSON だけを出させる (b) 同じツール・同じ引数の呼出しは実行せず既出と返す (c) signal の判断の `search_news` に回数の予算を置き、予算切れは固定の返答にする (d) `search_news` の結果に記事の取込み時刻を含める。prompt に検索回数の目安・「前提を壊す事実を確かめられなければ accept」・「介入の噂や警戒だけでは news_shock にしない」を書く。
 
 ## 修正内容
 
