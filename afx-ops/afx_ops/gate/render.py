@@ -427,6 +427,30 @@ def _reevaluation_event_text(state: str | None, phase: str | None, name: str | N
     return None
 
 
+_STATUS_HINT = "SSH の端末から `afx ctl status` を確認してください。"
+# 価格系列の停止・再開待ちの固定本文。金額・件数・経過時間・内部識別子は載せない
+DATA_FEED_EVENT_TEXTS = {
+    "stopped": "監視対象の価格系列でデータの欠落を検知しました。SSH の端末から `afx ctl status` で取得状態を確認してください。復旧後も同画面で再開操作の要否を確認してください。",
+    "awaiting_resume": ("監視対象の価格系列でデータ取得の回復を確認しました。人の再開操作を待っています。" + _STATUS_HINT
+                        + "案内が通常の再開なら `afx ctl --as approver data resume` を実行してください。"
+                        "未処理の足がある建玉の確認が必要と出た場合は、建玉を確認し、再開を承認するときだけ"
+                        " `afx ctl --as approver data resume --acknowledge` を実行してください。"),
+    "resume_accepted": "再開要求を受理しました。" + _STATUS_HINT,
+    "resume_already_ready": "既に停止は解除されています。" + _STATUS_HINT,
+    "resume_rejected": "再開要求は受理されませんでした。SSH の端末から `afx ctl status` で理由を確認し、必要なら再要求してください。",
+    "resumed": "監視対象の価格系列のデータ停止から復帰し、データによる停止を解除しました。" + _STATUS_HINT + "他の停止条件は同画面で確認できます。",
+}
+DATA_FEED_REQUEST_TEXT = "再開要求を記録しました。次の開場中の判定で結果を通知します。"
+DATA_FEED_LEGACY_REQUEST_TEXT = "データ取得の再開を要求しました。"
+
+
+def _data_feed_event_text(state: str, generation: object) -> str | None:
+    """data_feed の guard 通知の固定本文。受付は generation が無ければ結果を約束しない互換本文。"""
+    if state == "resume_requested":
+        return DATA_FEED_LEGACY_REQUEST_TEXT if type(generation) is not int else DATA_FEED_REQUEST_TEXT
+    return DATA_FEED_EVENT_TEXTS.get(state)
+
+
 def _event_text_for_code(payload: dict[str, object], plugin_name: str | None,
                          approval_id: int | None, *, integer_limit: int = 18) -> str:
     code = payload["code"]
@@ -456,7 +480,9 @@ def _event_text_for_code(payload: dict[str, object], plugin_name: str | None,
         if guard == "kill_switch" and state in {"latched", "released"}:
             text, generation = ("kill switch が作動しました" if state == "latched" else "kill switch が解除されました"), _event_integer(payload.get("generation"), limit=integer_limit)
             return text + (f" (世代 {generation})" if generation is not None else "") + "。"
-        if guard == "data_feed" and state == "resume_requested": return "データ取得の再開を要求しました。"
+        if guard == "data_feed":
+            text = _data_feed_event_text(state, payload.get("generation"))
+            if text is not None: return text
         return f"ガード {escape_discord(guard)} の状態が {escape_discord(state)} になりました。"
     if code == "service_health_changed":
         component, health = _event_value(payload.get("component_code")), _event_value(payload.get("health_code"))

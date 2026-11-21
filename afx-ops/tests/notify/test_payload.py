@@ -111,3 +111,14 @@ def test_a_submitted_improve_notice_with_a_gate_field_is_refused(key):
                         "tool_calls": 3, key: ["scale_dependent"]}}
     with pytest.raises(PayloadError):
         encode_event(event)
+
+
+@pytest.mark.parametrize("state", ["stopped", "awaiting_resume", "resume_requested", "resume_accepted",
+                                   "resume_rejected", "resume_already_ready", "resumed"])
+@pytest.mark.parametrize("generation", [None, 0, 66])
+def test_data_feed_guard_event_passes_the_existing_payload_check(state, generation):
+    event = {"id": 5, "ts": "2026-10-11T00:00:00+00:00", "code": "guard_state_changed", "ref": "instance",
+             "fields": {"guard_kind": "data_feed", "state": state, "generation": generation}}
+    assert encode_event(event) == {"event_id": 5, "ts": "2026-10-11T00:00:00+00:00",
+                                   "code": "guard_state_changed", "ref": "instance",
+                                   "guard_kind": "data_feed", "state": state, "generation": generation}

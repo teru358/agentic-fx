@@ -176,3 +176,50 @@ def test_a_deploy_job_failure_names_its_approval_only_when_one_is_given(state, r
     rendered = render_event(_event("job_state_changed", {
         "job_kind": "approve", "state": state, "result_code": result_code}), approval_id=7)
     assert rendered.content == expected
+
+
+_DATA_FEED_SENTENCES = {
+    "stopped": "監視対象の価格系列でデータの欠落を検知しました。SSH の端末から `afx ctl status` で取得状態を確認してください。復旧後も同画面で再開操作の要否を確認してください。",
+    "awaiting_resume": "監視対象の価格系列でデータ取得の回復を確認しました。人の再開操作を待っています。SSH の端末から `afx ctl status` を確認してください。案内が通常の再開なら `afx ctl --as approver data resume` を実行してください。未処理の足がある建玉の確認が必要と出た場合は、建玉を確認し、再開を承認するときだけ `afx ctl --as approver data resume --acknowledge` を実行してください。",
+    "resume_accepted": "再開要求を受理しました。SSH の端末から `afx ctl status` を確認してください。",
+    "resume_already_ready": "既に停止は解除されています。SSH の端末から `afx ctl status` を確認してください。",
+    "resume_rejected": "再開要求は受理されませんでした。SSH の端末から `afx ctl status` で理由を確認し、必要なら再要求してください。",
+    "resumed": "監視対象の価格系列のデータ停止から復帰し、データによる停止を解除しました。SSH の端末から `afx ctl status` を確認してください。他の停止条件は同画面で確認できます。",
+}
+
+
+@pytest.mark.parametrize(("state", "expected"), sorted(_DATA_FEED_SENTENCES.items()))
+def test_data_feed_guard_event_renders_a_fixed_sentence_without_internal_values(state, expected):
+    rendered = render_event(_event("guard_state_changed", {
+        "guard_kind": "data_feed", "state": state, "generation": 66}))
+    assert rendered.content == expected
+    assert "66" not in rendered.content
+    assert "世代" not in rendered.content
+
+
+@pytest.mark.parametrize("generation", [0, 7, 66])
+def test_data_feed_request_with_an_epoch_promises_a_result_notice(generation):
+    rendered = render_event(_event("guard_state_changed", {
+        "guard_kind": "data_feed", "state": "resume_requested", "generation": generation}))
+    assert rendered.content == "再開要求を記録しました。次の開場中の判定で結果を通知します。"
+
+
+@pytest.mark.parametrize("generation", [None])
+def test_data_feed_request_without_a_valid_epoch_keeps_the_compatible_sentence(generation):
+    rendered = render_event(_event("guard_state_changed", {
+        "guard_kind": "data_feed", "state": "resume_requested", "generation": generation}))
+    assert rendered.content == "データ取得の再開を要求しました。"
+    assert "通知します" not in rendered.content
+
+
+@pytest.mark.parametrize("state", sorted(_DATA_FEED_SENTENCES) + ["resume_requested"])
+def test_kill_switch_guard_event_never_takes_a_data_feed_sentence(state):
+    rendered = render_event(_event("guard_state_changed", {
+        "guard_kind": "kill_switch", "state": state, "generation": 3}))
+    assert rendered.content == f"ガード kill\\_switch の状態が {escape_discord(state)} になりました。"
+
+
+def test_data_feed_guard_sentences_carry_no_amounts_counts_or_durations():
+    for text in [*_DATA_FEED_SENTENCES.values()]:
+        assert not any(ch.isdigit() for ch in text) and "%" not in text
+        assert len(text) <= 600
