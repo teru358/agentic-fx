@@ -1,7 +1,7 @@
 ---
 id: datafeed-pending-auto-release-when-flat
 title: 建玉が全部決済されデータが健全に戻ったら、人の再開なしで戻すか
-status: 設計中
+status: 実装待ち
 priority: 中
 kind: 機能
 opened: 2026-11-21
@@ -10,7 +10,7 @@ related: [datafeed-outage-discord-notice]
 ---
 # [datafeed-pending-auto-release-when-flat] 建玉が全部決済されデータが健全に戻ったら、人の再開なしで戻すか
 
-**状態**: 設計中 / **優先**: 中 / **種別**: 機能
+**状態**: 実装待ち / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -29,3 +29,4 @@ related: [datafeed-outage-discord-notice]
 
 - 2026-11-21: 起票。
 - 2026-11-21: 利用者が自動解除の方向を承認。
+- 2026-11-21: 設計 docs/superpowers/specs/2026-11-21-datafeed-short-gap-and-flat-release-design.md C1 を利用者が承認。実装は datafeed-outage-discord-notice の merge の後。

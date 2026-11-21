@@ -1,7 +1,7 @@
 ---
 id: datafeed-rollover-band-expected-gap
 title: 日次ロールオーバー帯の 1 分足の無 tick を停止とみなすか
-status: 設計中
+status: 実装待ち
 priority: 中
 kind: 機能
 opened: 2026-11-21
@@ -10,7 +10,7 @@ related: [datafeed-outage-discord-notice]
 ---
 # [datafeed-rollover-band-expected-gap] 日次ロールオーバー帯の 1 分足の無 tick を停止とみなすか
 
-**状態**: 設計中 / **優先**: 中 / **種別**: 機能
+**状態**: 実装待ち / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -32,3 +32,4 @@ epoch 52〜66 の 15 件中 14 件が 22:0x〜22:5x UTC の USDJPY 1m の 1 分�
 
 - 2026-11-21: 起票。
 - 2026-11-21: 利用者が時間帯の例外案を退け、時間帯に依存しない方針の再提出を求めた。
+- 2026-11-21: 設計 docs/superpowers/specs/2026-11-21-datafeed-short-gap-and-flat-release-design.md C1 を利用者が承認。実装は datafeed-outage-discord-notice の merge の後。
