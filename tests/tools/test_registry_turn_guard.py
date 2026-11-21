@@ -74,12 +74,14 @@ def test_not_allowed_name_is_counted_as_invalid_for_search():
 def test_final_stage_stops_a_valid_call_but_not_the_validation_error():
     reg, calls = _registry()
     guard = _guard(turn=5)
+    guard.note_call("search_news")
     stop = reg.execute("search_news", {"query": "a"}, ALLOWED, guard=guard)
+    guard.note_call("search_news")
     err = reg.execute("search_news", {"query": 1}, ALLOWED, guard=guard)
     assert json.loads(stop)["error"] == "final_answer_only"
     assert "invalid arguments" in json.loads(err)["error"]
     assert calls == []
-    assert guard.final_stage_suppressed == 1
+    assert guard.final_stage_suppressed == 2
 
 
 def _positions_registry(func):

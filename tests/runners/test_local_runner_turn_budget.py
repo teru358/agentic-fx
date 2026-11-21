@@ -667,6 +667,17 @@ def test_final_stage_counts_the_calls_it_suppressed():
     assert tools.count("search_news") == 1
 
 
+def test_final_stage_counts_valid_and_invalid_calls_alike():
+    mixed = call_message(("a", "get_positions", {}),
+                         ("b", "search_news", '{"query": '),
+                         ("c", "search_news", {"query": 5}),
+                         ("d", "search_news", "[1]"))
+    result, _, tools = _run([search_call(1), mixed, ACCEPT], _mission(max_turns=3))
+    assert result.status == "completed"
+    assert result.turn_summary["final_stage_suppressed"] == 4
+    assert tools.count("search_news") == 1 and tools.count("get_positions") == 0
+
+
 def test_a_search_made_only_in_the_final_stage_is_not_an_attempt():
     gp = [call_message((f"g{n}", "get_positions", {})) for n in range(3)]
     result, _, _ = _run(gp + [search_call(4), ACCEPT], _mission(max_turns=5))

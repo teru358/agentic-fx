@@ -107,8 +107,11 @@ class TurnGuard:
 
     def note_call(self, name: object) -> None:
         """ツール名を識別した時点の試行記録 (引数の検証や抑止より前)。
-        最終段階の呼出しは実行を試みないので数えない。"""
-        if name == SEARCH_TOOL and not self.final_stage:
+        最終段階で受けた呼出しは実行しないので、検索の試行ではなく抑止数に数える。"""
+        if self.final_stage:
+            self.final_stage_suppressed += 1
+            return
+        if name == SEARCH_TOOL:
             self.search_attempted = True
 
     def note_invalid(self, name: object) -> None:
@@ -130,7 +133,6 @@ class TurnGuard:
     def decide(self, name: str, arguments: Any) -> str | None:
         """実行しない場合の固定結果を返す。None なら実行する。"""
         if self.final_stage:
-            self.final_stage_suppressed += 1
             return FINAL_ONLY_RESULT
         if name not in DEDUPE_TOOLS:
             return None
