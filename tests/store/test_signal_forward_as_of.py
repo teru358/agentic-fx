@@ -124,6 +124,25 @@ def test_an_unterminated_row_with_a_readable_deadline_is_not_unknown(conn, make)
     assert holes["unterminated"] == 2 and holes["deadline_unknown"] == 0
 
 
+def test_an_unterminated_limit_row_with_an_unreadable_fill_time_is_a_deadline_unknown(
+        conn, make):
+    sid = make.decide(at=NOW - 10 * WEEK, result=None, payload=LIMIT)
+    conn.execute("UPDATE signal_shadow SET entry_price=150.0, entry_at='garbage' WHERE id=?", (sid,))
+    conn.commit()
+    holes = summary(conn)["holes"]
+    assert holes["unterminated"] == 1
+    assert holes["deadline_unknown"] == 1 and holes["overdue_unterminated"] == 0
+
+
+def test_an_unterminated_row_without_a_known_entry_type_is_a_deadline_unknown(conn, make):
+    make.decide(at=NOW - 10 * WEEK, result=None, payload='{"action":"open"}')
+    make.decide(at=NOW - 9 * WEEK, result=None,
+                payload='{"action":"open","entry_type":"stop"}')
+    holes = summary(conn)["holes"]
+    assert holes["unterminated"] == 2 and holes["deadline_unknown"] == 2
+    assert holes["overdue_unterminated"] == 0
+
+
 def test_a_terminated_row_with_a_broken_payload_is_not_a_deadline_unknown(conn, make):
     make.decide(at=NOW - 10 * WEEK, result="tp", payload="not json")
     assert summary(conn)["holes"]["deadline_unknown"] == 0

@@ -79,3 +79,20 @@ def test_the_dst_switch_week_closes_at_the_new_offset():
                                      ("2027-1-29", False), ("x", False)])
 def test_a_week_text_is_parsed_only_as_a_real_date(text, ok):
     assert (rw.parse_label(text) is not None) is ok
+
+
+def test_a_non_utc_now_gives_the_same_weeks_as_the_same_instant_in_utc():
+    jst = timezone(timedelta(hours=9))
+    for now in (utc(2027, 1, 30, 22), utc(2027, 1, 31, 22), utc(2027, 2, 1, 1), utc(2027, 2, 6, 23)):
+        local = now.astimezone(jst)
+        assert rw.latest_due_week(local) == rw.latest_due_week(now)
+        assert rw.due_weeks(local, first=date(2027, 1, 18)) == rw.due_weeks(
+            now, first=date(2027, 1, 18))
+
+
+def test_a_naive_now_is_rejected():
+    naive = datetime(2027, 2, 6, 23)
+    with pytest.raises(ValueError):
+        rw.latest_due_week(naive)
+    with pytest.raises(ValueError):
+        rw.due_weeks(naive, first=date(2027, 1, 18))

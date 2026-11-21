@@ -6,7 +6,7 @@ NY 取引日 (`market_hours.trading_date`) の月〜金を 1 週とし、週の�
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from agentic_fx.core import market_hours
 from agentic_fx.core.fx_time import session_boundary_utc
@@ -58,8 +58,15 @@ def _next_monday(day: date) -> date:
     return day - timedelta(days=day.weekday()) + timedelta(days=7)
 
 
+def _utc(now: datetime) -> datetime:
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now is naive; tz-aware datetime required")
+    return now.astimezone(timezone.utc)
+
+
 def latest_due_week(now: datetime) -> date | None:
     """確定の猶予が過ぎた最新の週の印。"""
+    now = _utc(now)
     monday = now.date() - timedelta(days=now.date().weekday())
     for _ in range(8):
         close = close_of_week(monday)
@@ -71,6 +78,7 @@ def latest_due_week(now: datetime) -> date | None:
 
 def due_weeks(now: datetime, *, first: date) -> list[tuple[date, datetime]]:
     """`first` の週から、猶予が過ぎた週までを古い順に (週の印, 終端) で返す。"""
+    now = _utc(now)
     out: list[tuple[date, datetime]] = []
     day = first - timedelta(days=first.weekday())
     for _ in range(MAX_WEEKS):

@@ -333,7 +333,11 @@ def _deadline(row: sqlite3.Row, decided: datetime) -> datetime | None:
     except (TypeError, ValueError):
         return None
     kind = body.get("entry_type") if isinstance(body, dict) else None
+    if kind not in ("market", "limit"):
+        return None
     entry = _parse(row["entry_at"])
+    if entry is None and row["entry_at"] is not None:
+        return None
     try:
         return shadow_deadline(kind, decided,
                                entry.astimezone(timezone.utc) if entry is not None else None)

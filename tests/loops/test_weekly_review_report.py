@@ -152,6 +152,20 @@ def test_an_indeterminate_inventory_says_so(conn):
     assert "棚卸しは判定不能" in rep.render_report(conn, "2027-01-29")
 
 
+def test_an_indeterminate_inventory_with_no_rows_does_not_also_say_none(conn):
+    store.commit_week(conn, week(evaluation="degraded", degraded={"inventory_unavailable": 1},
+                                 inventory_state="indeterminate",
+                                 inventory_reason="scan_failed"), [], [])
+    section = rep.render_report(conn, "2027-01-29").split("## 未使用の指標")[1].split("\n## ")[0]
+    assert "棚卸しは判定不能" in section and "なし" not in section
+
+
+def test_a_normal_empty_inventory_says_none(conn):
+    store.commit_week(conn, week(), [], [])
+    section = rep.render_report(conn, "2027-01-29").split("## 未使用の指標")[1].split("\n## ")[0]
+    assert "なし" in section
+
+
 def test_the_stopped_names_are_listed(conn):
     store.commit_week(conn, week(stopped=[{"name": "old", "kind": "strategy"}]), [], [])
     text = rep.render_report(conn, "2027-01-29")

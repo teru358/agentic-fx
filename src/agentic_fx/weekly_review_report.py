@@ -106,6 +106,8 @@ def _inventory_lines(week: dict, items: list[dict]) -> list[str]:
     lines = ["", "## 未使用の指標 (棚卸し)"]
     if week["inventory_state"] != store.INVENTORY_NORMAL:
         lines.append(f"棚卸しは判定不能です ({week['inventory_reason'] or '-'})")
+        if not items:
+            return lines
     first = week.get("_first_inventory", False)
     if not items:
         lines.append("なし")
