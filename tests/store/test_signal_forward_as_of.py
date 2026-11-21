@@ -126,8 +126,8 @@ def test_an_unterminated_row_with_a_readable_deadline_is_not_unknown(conn, make)
 
 def test_an_unterminated_limit_row_with_an_unreadable_fill_time_is_a_deadline_unknown(
         conn, make):
-    sid = make.decide(at=NOW - 10 * WEEK, result=None, payload=LIMIT)
-    conn.execute("UPDATE signal_shadow SET entry_price=150.0, entry_at='garbage' WHERE id=?", (sid,))
+    sid = make.decide(at=NOW - 10 * WEEK, result="filled", payload=LIMIT)
+    conn.execute("UPDATE signal_shadow SET entry_at='garbage' WHERE id=?", (sid,))
     conn.commit()
     holes = summary(conn)["holes"]
     assert holes["unterminated"] == 1
