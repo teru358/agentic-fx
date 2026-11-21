@@ -20,6 +20,7 @@ from agentic_fx.core import display_time
 from agentic_fx.core.executor import _EXPOSURE
 from agentic_fx.core import market_hours
 from agentic_fx.core.timeutil import as_utc
+from agentic_fx.datafeed.guidance_text import UNKNOWN_COUNT
 from agentic_fx.store import ohlcv, orders
 
 # 永続状態機械の取りうる state。web の状態の印の割当表 (afx-ops) はこの語彙を写して持ち、test が突き合わせる
@@ -34,6 +35,42 @@ RESUME_RESULTS = ("accepted", "rejected_unprocessed", "rejected_watermark", "alr
 log = logging.getLogger(__name__)
 
 _PENDING_NOTICE_LIMIT = 64
+
+
+def resume_guidance(*, observe_failed: bool, state: str | None, request_pending: bool,
+                    last_result: str | None, awaiting_mark: bool,
+                    unprocessed: int | None) -> tuple[str, str]:
+    """status に出す (phase, next_action)。上の行ほど優先する真理値表で、この 1 関数だけが決める。
+
+    `state` が None は読取り失敗、`unprocessed` が None は件数を読めないこと (ゼロとみなさない)。
+    `last_result` は現在の epoch の直近の終端結果、`awaiting_mark` は同 epoch に再開待ちを
+    知らせた印。件数は ack の要否を決める行でだけ使い、読めなければ不明に倒す。
+    最新の watermark 判定は resume 消費時のもので、ここで健全性の判定はしない。
+    """
+    unknown = ("unknown", "check_status")
+    if observe_failed or state is None:
+        return unknown
+    if request_pending:
+        return ("resume_requested", "wait_tick")
+    if state == "ready":
+        return ("ready", "none")
+    if state not in ("restricted", "degraded"):
+        return unknown
+    if last_result == "rejected_watermark":
+        return ("resume_rejected", "restore_source")
+    if last_result == "rejected_unprocessed":
+        if unprocessed is None:
+            return unknown
+        return ("resume_rejected", "resume_with_ack" if unprocessed else "resume")
+    if state == "degraded":
+        if awaiting_mark:
+            if unprocessed is None:
+                return unknown
+            return ("awaiting_resume", "resume_with_ack" if unprocessed else "resume")
+        return ("stopped", "restore_source")
+    if not awaiting_mark:
+        return ("restricted", "wait_tick")
+    return unknown
 
 
 class _RequestChanged(Exception):
@@ -234,6 +271,36 @@ class OutageStateMachine:
             "unprocessed_by_pair": self._unprocessed_positions_by_pair(now, epoch, conn=conn),
             "gap_starts": gaps,
         }
+
+    def guidance_snapshot(self, now: datetime, *, conn=None) -> dict:
+        """API の status `data` に足す案内の値。読み取り専用 (行を作らない)。
+
+        行が読めなければ unknown (ready に倒さない)。件数は読めなければ "unknown" を返し、
+        ゼロとはみなさない。`conn` は `status()` と同じ意味で、API thread は自分の読取り接続を渡す。
+        """
+        now = as_utc(now)
+        try:
+            row = self._load_row(conn=conn)
+        except Exception:  # noqa: BLE001 — 読めないものは不明として返す
+            return {"phase": "unknown", "next_action": "check_status",
+                    "unprocessed_positions": UNKNOWN_COUNT, "resume_last_result": None,
+                    "resume_last_result_at": None, "awaiting_mark": False}
+        epoch = row.get("epoch", 0)
+        try:
+            unprocessed: int | None = self._unprocessed_position_count(now, epoch, conn=conn)
+        except Exception:  # noqa: BLE001 — 読めない件数をゼロにしない
+            unprocessed = None
+        result = row.get("resume_last_result")
+        marked = row.get("recovered_notified_epoch") == epoch
+        phase, action = resume_guidance(
+            observe_failed=self._observe_failed, state=row.get("state", "ready"),
+            request_pending=row.get("resume_requested_at") is not None,
+            last_result=result, awaiting_mark=marked, unprocessed=unprocessed)
+        return {"phase": phase, "next_action": action,
+                "unprocessed_positions": UNKNOWN_COUNT if unprocessed is None else unprocessed,
+                "resume_last_result": result,
+                "resume_last_result_at": row.get("resume_last_result_at"),
+                "awaiting_mark": marked}
 
     def observe(self, now: datetime, report: IngestTickReport) -> str:
         """1 tick 分の観測を反映し、遷移後の `state` を返す。
