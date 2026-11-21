@@ -20,6 +20,7 @@ from agentic_fx.core import display_time
 from agentic_fx.core.executor import _EXPOSURE
 from agentic_fx.core import market_hours
 from agentic_fx.core.timeutil import as_utc
+from agentic_fx.datafeed import notice_rules
 from agentic_fx.datafeed.guidance_text import UNKNOWN_COUNT
 from agentic_fx.store import ohlcv, orders
 
@@ -365,6 +366,8 @@ class OutageStateMachine:
         state, epoch = outcome.state, outcome.epoch
         # 通知の記録は activity の書込みより先に。activity の例外で記録を飛ばさない
         self._record_notices(epoch, now, outcome.notices)
+        if state == "degraded":
+            self._record_timed_stop(epoch, now)
         for event, summary in outcome.activities:
             self._write_activity(event, summary)
         if state == "degraded":
@@ -464,8 +467,12 @@ class OutageStateMachine:
         activities: list[tuple[str, str]] = []
         notices: list[tuple[str, str]] = []
         request_pending = row.get("resume_requested_at") is not None
-        # この epoch で停止または待ちを知らせる対象になったか (復帰の通知の条件)
-        noticed = bool(confirmed) or recovered_notified_epoch == epoch
+        # この epoch で停止または待ちを知らせる対象になったか (復帰の通知の条件)。
+        # confirmed と待ちの印は tick の最初の値。時間条件の停止の記録は必要なときだけ読む
+        known_stop = bool(confirmed) or recovered_notified_epoch == epoch
+
+        def noticed() -> bool:
+            return known_stop or self._stop_recorded(epoch)
         opened = False
 
         def degrade() -> None:
@@ -525,7 +532,7 @@ class OutageStateMachine:
                         restricted_since = None
                         deadline = None
                         activities.append(recovered_activity())
-                        if noticed:
+                        if noticed():
                             notices.append(("resumed", ""))
                     else:
                         # 復帰はしないが健全に戻っている — 人の resume 待ちとして
@@ -548,7 +555,7 @@ class OutageStateMachine:
                     restricted_since = None
                     deadline = None
                     activities.append(recovered_activity())
-                    if noticed:
+                    if noticed():
                         notices.append(("resumed", ""))
             else:
                 ready_streak = 0
@@ -880,6 +887,40 @@ class OutageStateMachine:
         if entries and not self._write_notices(epoch, now, entries):
             self._pending_notices.append((epoch, now, list(entries)))
             self._trim_pending_notices()
+
+    def _stop_recorded(self, epoch: int) -> bool:
+        """この epoch の停止の記録があるか。読めなければ無いとみなす (観測を止めない)。"""
+        try:
+            return self.conn.execute(
+                "SELECT 1 FROM datafeed_outage_notices WHERE epoch=? AND notice_state='stopped'",
+                (epoch,)).fetchone() is not None
+        except Exception:  # noqa: BLE001 - 通知の記録が読めなくても観測は続ける
+            return False
+
+    def _record_timed_stop(self, epoch: int, now: datetime) -> None:
+        """連続の問題観測 (confirmed) に届かない停止を、開場時間の経過で一度だけ記録する。
+
+        同じ epoch に待ちの印・停止か待ちの記録があれば何もしない。再開の要求中、または
+        要求への結果が既にある epoch は、人が状況を知って操作しているので知らせない。
+        開場中の観測 tick の commit 後だけで呼ぶ。停止の判定・遷移は変えず、失敗しても例外を出さない。"""
+        try:
+            row = self._load_row()
+            if row.get("state") != "degraded" or row.get("recovered_notified_epoch") == epoch:
+                return
+            if (row.get("resume_requested_at") is not None
+                    or row.get("resume_last_result") is not None):
+                return
+            if self.conn.execute(
+                    "SELECT 1 FROM datafeed_outage_notices WHERE epoch=? "
+                    "AND notice_state IN ('stopped', 'awaiting_resume')",
+                    (epoch,)).fetchone() is not None:
+                return
+            if not notice_rules.stop_after_open_minutes(row.get("entered_degraded_at"), now):
+                return
+        except Exception:  # noqa: BLE001 - 通知の判断が読めなくても観測は続ける
+            log.warning("datafeed_notice_deferred")
+            return
+        self._record_notices(epoch, now, [("stopped", "")])
 
     def _write_notices(self, epoch: int, now: datetime,
                        entries: list[tuple[str, str]]) -> bool:
