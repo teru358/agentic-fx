@@ -660,9 +660,9 @@ def test_summary_marks_a_decision_taken_in_the_final_stage_after_budget():
 def test_final_stage_counts_the_calls_it_suppressed():
     three = call_message(("a", "get_positions", {}), ("b", "get_positions", {}),
                          ("c", "search_news", {"query": "x"}))
-    result, _, tools = _run([search_call(1), three, three, ACCEPT],
-                            _mission(max_turns=5))
-    assert result.status == "completed"
+    result, _, tools = _run([search_call(1), three, three],
+                            _mission(max_turns=3))
+    assert result.status == "max_turns"
     assert result.turn_summary["final_stage_suppressed"] == 6
     assert tools.count("search_news") == 1
 
