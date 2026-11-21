@@ -1956,10 +1956,11 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                 conn, conn, label, close_at, now=now,
                 read_inputs=lambda c: read_model_inputs.collect_inputs(
                     plugins_dir, c, raise_retryable=True),
-                settings=settings, write_scope=writer_admission.scheduler_write),
+                settings=settings, write_scope=writer_admission.deferred_write),
             report=lambda conn, label: weekly_review_report.ensure_report(
                 conn, label, reports_dir=weekly_reports_dir, anchor=root),
-            write_scope=writer_admission.scheduler_write, stop_event=stop_event)
+            write_scope=writer_admission.deferred_write, stop_event=stop_event,
+            clock=clock.now)
         scheduler.register_weekly_review(weekly_tick.poll)
         # 取りこぼした改善通知と kill switch 遷移の event を、listener を開く前・
         # supervisor の開始前に出す。失敗は固定語で保留し、起動は続ける。

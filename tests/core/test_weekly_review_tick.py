@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
 from agentic_fx.core import review_weeks
+from agentic_fx.core.writer_admission import WriteDeferred
 from agentic_fx.core.weekly_review_tick import (
     ABORT_AFTER, MAX_ATTEMPTS_PER_DAY, POLL_INTERVAL, WeeklyReviewTick)
 from agentic_fx.store import alert_state
@@ -404,3 +407,122 @@ def test_the_run_stops_between_weeks_when_asked(rig):
                             stop_event=stop)
     tick.run_once(AFTER_W3)
     assert [label for label, _ in rig.calls] == [W2]
+
+
+# ---------------------------------------------------------------- 読めない記録・時計・書込みの見送り
+
+def test_an_unreadable_attempt_record_counts_as_the_limit_for_that_utc_day(rig, caplog):
+    rig.set_start(W2)
+    c = rig.conn()
+    key = alert_state.weekly_review_attempt_key(W2.isoformat(), AFTER_W2.date().isoformat())
+    alert_state.set(c, key, "not json", now=AFTER_W2)
+    c.close()
+    with caplog.at_level(logging.WARNING):
+        rig.tick().run_once(AFTER_W2)
+    assert rig.calls == []
+    assert "attempt record unreadable" in caplog.text
+
+
+def test_an_attempt_record_of_the_wrong_shape_counts_as_the_limit(rig):
+    rig.set_start(W2)
+    c = rig.conn()
+    key = alert_state.weekly_review_attempt_key(W2.isoformat(), AFTER_W2.date().isoformat())
+    alert_state.set(c, key, json.dumps({"count": "x", "attempts": 1}), now=AFTER_W2)
+    c.close()
+    rig.tick().run_once(AFTER_W2)
+    assert rig.calls == []
+
+
+def test_the_next_utc_day_after_an_unreadable_record_is_tried_normally(rig):
+    rig.set_start(W2)
+    c = rig.conn()
+    key = alert_state.weekly_review_attempt_key(W2.isoformat(), AFTER_W2.date().isoformat())
+    alert_state.set(c, key, "not json", now=AFTER_W2)
+    c.close()
+    rig.tick().run_once(AFTER_W2 + DAY)
+    assert [label for label, _ in rig.calls] == [W2]
+
+
+def test_an_unreadable_start_falls_back_to_the_oldest_recorded_week_with_a_warning(rig, caplog):
+    c = rig.conn()
+    rig.finalize(c, W1, review_weeks.close_of_week(W1), AFTER_W2)
+    alert_state.set(c, alert_state.WEEKLY_REVIEW_START_KEY, "not json", now=AFTER_W2)
+    c.close()
+    rig.calls.clear()
+    with caplog.at_level(logging.WARNING):
+        rig.tick().run_once(AFTER_W3)
+    assert [label for label, _ in rig.calls] == [W2, W3]
+    assert "start week unreadable" in caplog.text
+    c = rig.conn()
+    assert json.loads(alert_state.get(c, alert_state.WEEKLY_REVIEW_START_KEY)) == {
+        "week": W1.isoformat()}
+    c.close()
+
+
+def test_an_unreadable_start_with_no_recorded_week_uses_the_latest_due_week(rig, caplog):
+    c = rig.conn()
+    alert_state.set(c, alert_state.WEEKLY_REVIEW_START_KEY, json.dumps({"week": "x"}),
+                    now=AFTER_W2)
+    c.close()
+    with caplog.at_level(logging.WARNING):
+        rig.tick().run_once(AFTER_W2)
+    assert [label for label, _ in rig.calls] == [W2]
+    assert "start week unreadable" in caplog.text
+
+
+def test_the_clock_is_read_again_for_each_week(rig):
+    rig.set_start(W2)
+    times = [datetime(2027, 2, 6, 23, 59, tzinfo=UTC), datetime(2027, 2, 7, 0, 1, tzinfo=UTC)]
+    reads = []
+
+    def clock():
+        reads.append(1)
+        return times[min(len(reads), len(times)) - 1]
+    tick = WeeklyReviewTick(open_conn=rig.conn, finalize=rig.finalize, report=rig.report,
+                            clock=clock)
+    tick.run_once(times[0])
+    assert [(label, now) for label, now in rig.calls] == [(W2, times[0]), (W3, times[1])]
+    assert rig.state(W2, times[0])["count"] == 1
+    assert rig.state(W3, times[1])["count"] == 1
+    assert rig.state(W3, times[0]) is None
+
+
+def refusing_scope(refuse_on):
+    """`refuse_on` 回目の入場で WriteDeferred を送出する書込み範囲。"""
+    entered = []
+
+    @contextmanager
+    def scope():
+        entered.append(1)
+        if len(entered) in refuse_on:
+            raise WriteDeferred()
+        yield
+    scope.entered = entered
+    return scope
+
+
+def test_a_deferred_start_save_ends_the_run_quietly_and_retries_later(rig):
+    scope = refusing_scope({1})
+    tick = rig.tick(write_scope=scope)
+    tick.run_once(AFTER_W2)
+    assert rig.calls == []
+    tick.run_once(AFTER_W2 + timedelta(minutes=20))
+    assert [label for label, _ in rig.calls] == [W2]
+
+
+def test_a_deferred_week_commit_does_not_use_an_attempt(rig):
+    rig.set_start(W2)
+    scope = refusing_scope({2})          # 1 回目は実行中の保存、2 回目が週の確定の保存
+
+    def finalize(conn, label, close_at, now):
+        with scope():
+            return rig.finalize(conn, label, close_at, now)
+    tick = WeeklyReviewTick(open_conn=rig.conn, finalize=finalize, report=rig.report,
+                            write_scope=scope)
+    tick.run_once(AFTER_W2)
+    assert rig.recorded() == {}
+    state = rig.state(W2, AFTER_W2)
+    assert state["count"] == 0 and state["attempts"] == []
+    tick.run_once(AFTER_W2 + timedelta(minutes=20))
+    assert set(rig.recorded()) == {W2.isoformat()}
+    assert rig.state(W2, AFTER_W2)["count"] == 1

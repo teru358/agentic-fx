@@ -24,6 +24,10 @@ from dataclasses import dataclass
 from typing import Callable, Iterator
 
 
+class WriteDeferred(Exception):
+    """書込み要求フラグが立っていて、worker 側の書込みを始められない (後で再試行する)。"""
+
+
 #: scheduler の `request()` が、すでに始まっている worker の transaction の終了を待つ上限
 DRAIN_WAIT_SEC = 0.2
 
@@ -166,6 +170,15 @@ class WriterAdmission:
             yield True
         finally:
             self.end()
+
+    @contextmanager
+    def deferred_write(self) -> Iterator[None]:
+        """scheduler thread 以外の書込み (週次の確定など) を包む。フラグは立てず、
+        lease を保つ。フラグが立っていれば始めず `WriteDeferred` を送出する。"""
+        with self.lease(lambda: None) as admitted:
+            if not admitted:
+                raise WriteDeferred()
+            yield
 
     # --- 観測 (正しさには使わない) -----------------------------------------
 

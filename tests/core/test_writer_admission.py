@@ -6,7 +6,7 @@ import threading
 
 import pytest
 
-from agentic_fx.core.writer_admission import WriterAdmission
+from agentic_fx.core.writer_admission import WriteDeferred, WriterAdmission
 
 
 class Clock:
@@ -250,3 +250,41 @@ def test_lease_returns_the_slot_on_commit_and_on_exception():
 def test_end_without_a_lease_is_a_bug():
     with pytest.raises(RuntimeError):
         WriterAdmission().end()
+
+
+def test_a_deferred_write_scope_takes_a_lease_without_raising_the_flag():
+    w = WriterAdmission()
+    with w.deferred_write():
+        assert not w.requested()
+        assert w.stats().beginning == 1
+    assert w.stats().beginning == 0
+
+
+def test_a_deferred_write_scope_is_refused_while_the_flag_is_up():
+    w = WriterAdmission()
+    w.request()
+    try:
+        with pytest.raises(WriteDeferred):
+            with w.deferred_write():
+                raise AssertionError("must not run")
+    finally:
+        w.release()
+    assert w.stats().beginning == 0 and w.stats().yielded == 1
+
+
+def test_a_deferred_write_scope_returns_its_lease_when_the_body_raises():
+    w = WriterAdmission()
+    with pytest.raises(RuntimeError):
+        with w.deferred_write():
+            raise RuntimeError("boom")
+    assert w.stats().beginning == 0
+
+
+def test_a_scheduler_request_waits_for_a_running_deferred_write():
+    w = WriterAdmission(drain_wait_sec=0.05)
+    with w.deferred_write():
+        w.request()
+        try:
+            assert w.stats().wait_overruns == 1
+        finally:
+            w.release()

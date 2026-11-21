@@ -23,6 +23,7 @@ from typing import Callable
 
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.core import review_weeks
+from agentic_fx.core.writer_admission import WriteDeferred
 from agentic_fx.store import alert_state
 from agentic_fx.store import weekly_review as store
 
@@ -61,12 +62,14 @@ def _parse_record(raw: object) -> dict | None:
 class WeeklyReviewTick:
     def __init__(self, *, open_conn: Callable[[], sqlite3.Connection], finalize: Finalize,
                  report: Report | None = None, write_scope: Callable | None = None,
-                 stop_event: threading.Event | None = None) -> None:
+                 stop_event: threading.Event | None = None,
+                 clock: Callable[[], datetime] | None = None) -> None:
         self._open_conn = open_conn
         self._finalize = finalize
         self._report = report
         self._write_scope = write_scope
         self._stop_event = stop_event
+        self._clock = clock
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._last_poll: datetime | None = None
@@ -110,6 +113,10 @@ class WeeklyReviewTick:
     def _scope(self):
         return self._write_scope() if self._write_scope is not None else nullcontext()
 
+    def _now(self, fallback: datetime) -> datetime:
+        """週ごとに時計を読み直す (長い追いつきの間に UTC 日をまたぎうる)。"""
+        return self._clock() if self._clock is not None else fallback
+
     def _stopped(self) -> bool:
         return self._stop_event is not None and self._stop_event.is_set()
 
@@ -125,14 +132,17 @@ class WeeklyReviewTick:
             for label, close in review_weeks.due_weeks(now, first=start):
                 if label.isoformat() in recorded:
                     continue
-                if now > close + ABORT_AFTER:
-                    self._abort(conn, label, close, now)
+                current = self._now(now)
+                if current > close + ABORT_AFTER:
+                    self._abort(conn, label, close, current)
                     continue
                 if self._stopped():
                     break
-                self._attempt(conn, label, close, now)
+                self._attempt(conn, label, close, current)
             self._prune(conn, now)
             self._reports(conn, now)
+        except WriteDeferred:
+            _log.info("weekly review deferred: writer busy")
         finally:
             conn.close()
 
@@ -144,7 +154,15 @@ class WeeklyReviewTick:
             saved = None
         if saved is not None:
             return saved
-        label = review_weeks.latest_due_week(now)
+        label = None
+        if raw:
+            # 保存済みの開始週が読めない。未確定の週を飛ばさない側に倒す。
+            _log.warning("weekly review start week unreadable; re-deriving")
+            recorded = [day for day in map(review_weeks.parse_label,
+                                           store.recorded_weeks(conn)) if day is not None]
+            label = min(recorded) if recorded else None
+        if label is None:
+            label = review_weeks.latest_due_week(now)
         if label is None:
             raise RuntimeError("no due week found")
         with self._scope():
@@ -160,9 +178,12 @@ class WeeklyReviewTick:
 
     # ---- 試行 -----------------------------------------------------------------------
 
-    def _load(self, conn: sqlite3.Connection, key: str) -> dict:
-        record = _parse_record(alert_state.get(conn, key))
-        return record if record is not None else {"count": 0, "attempts": []}
+    def _load(self, conn: sqlite3.Connection, key: str) -> dict | None:
+        """試行記録。無ければ空の記録、あっても読めなければ None。"""
+        raw = alert_state.get(conn, key)
+        if raw is None:
+            return {"count": 0, "attempts": []}
+        return _parse_record(raw)
 
     def _save(self, conn: sqlite3.Connection, key: str, record: dict, now: datetime) -> None:
         with self._scope():
@@ -172,6 +193,10 @@ class WeeklyReviewTick:
                  now: datetime) -> None:
         key = alert_state.weekly_review_attempt_key(label.isoformat(), _day(now))
         record = self._load(conn, key)
+        if record is None:
+            # 壊れた記録で上限を 0 に戻さない。その週 × UTC 日は上限到達とみなす。
+            _log.warning("weekly review attempt record unreadable; skipping this day")
+            return
         if record["count"] >= MAX_ATTEMPTS_PER_DAY:
             return
         attempt = secrets.token_hex(8)
@@ -181,12 +206,24 @@ class WeeklyReviewTick:
         state = DONE
         try:
             self._finalize(conn, label, close, now)
+        except WriteDeferred:
+            # 書込みを始められなかっただけで、試行には数えない。
+            if conn.in_transaction:
+                conn.rollback()
+            current = self._load(conn, key)
+            if current is not None:
+                current["attempts"] = [a for a in current["attempts"] if a["id"] != attempt]
+                current["count"] = max(0, current["count"] - 1)
+                self._save(conn, key, current, now)
+            raise
         except Exception as exc:  # noqa: BLE001 - 失敗は記録して次へ
             state = FAILED
             _log.warning("weekly review %s failed: %s", label, safe_error_text(exc))
             if conn.in_transaction:
                 conn.rollback()
         current = self._load(conn, key)
+        if current is None:
+            return
         for item in current["attempts"]:
             if item["id"] == attempt:
                 item["state"] = state

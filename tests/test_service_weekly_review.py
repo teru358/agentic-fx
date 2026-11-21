@@ -4,7 +4,10 @@ from __future__ import annotations
 import stat
 from datetime import datetime, timezone
 
+import pytest
+
 from agentic_fx.core.contracts import FixedClock
+from agentic_fx.core.writer_admission import WriteDeferred
 from agentic_fx.runners.fake_runner import FakeRunner
 from agentic_fx.service import _scheduler_tick_once, build_app
 from agentic_fx.store import alert_state
@@ -60,5 +63,31 @@ def test_the_attempt_is_recorded_as_done(tmp_path):
         key = alert_state.weekly_review_attempt_key(LAST_WEEK, NOW.date().isoformat())
         record = json.loads(alert_state.get(app.conn_core, key))
         assert record["count"] == 1 and record["attempts"][0]["state"] == "done"
+    finally:
+        app.close()
+
+
+def test_the_weekly_write_scope_does_not_raise_the_scheduler_flag(tmp_path):
+    app = _app(tmp_path)
+    try:
+        writer = app.writer_admission
+        with app.weekly_review_tick._write_scope():
+            assert not writer.requested()
+            assert writer.stats().beginning == 1
+        assert writer.stats().beginning == 0 and writer.stats().requests == 0
+    finally:
+        app.close()
+
+
+def test_the_weekly_write_scope_is_refused_while_the_scheduler_flag_is_up(tmp_path):
+    app = _app(tmp_path)
+    try:
+        app.writer_admission.request()
+        try:
+            with pytest.raises(WriteDeferred):
+                with app.weekly_review_tick._write_scope():
+                    raise AssertionError("must not run")
+        finally:
+            app.writer_admission.release()
     finally:
         app.close()
