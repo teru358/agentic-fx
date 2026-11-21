@@ -386,3 +386,18 @@ def test_all_tools_have_schemas():
     for t in tools:
         assert t.parameters["type"] == "object"
         assert t.description
+
+
+def test_news_tools_expose_ingest_time_without_url():
+    rag = MagicMock()
+    rag.search_news.return_value = [
+        {"title": "News", "body": "Content", "source_name": "Source",
+         "url": "https://feed.example/x", "added_at": "2026-07-22T12:00:00+00:00"}]
+    reg = ToolRegistry()
+    reg.register_all(news_tools.build(rag))
+    result = reg.func("search_news")(query="test")
+    assert result[0]["ingested_at"] == "2026-07-22T12:00:00+00:00"
+    assert "added_at" not in result[0]
+    assert "url" not in result[0]
+    assert set(result[0]) == {"title", "body", "source_name", "ingested_at"}
+

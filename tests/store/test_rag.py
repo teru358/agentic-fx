@@ -285,3 +285,12 @@ def test_add_news_collapses_duplicate_rag_ids_in_batch(tmp_path):
          "source_name": "s"}
     assert rag.add_news([a, b], NOW) == 1
     assert rag.count_news() == 1
+
+
+def test_search_news_returns_first_ingest_time_with_utc_offset(tmp_path):
+    rag = _rag(tmp_path)
+    rag.add_news([ARTS[0]], NOW)
+    rag.add_news([ARTS[0]], NOW + timedelta(hours=10))
+    hits = rag.search_news("US dollar CPI", n=1)
+    assert hits[0]["added_at"] == NOW.isoformat()
+    assert hits[0]["added_at"].endswith("+00:00")

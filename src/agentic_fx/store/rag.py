@@ -162,6 +162,7 @@ class Rag:
     def search_news(self, query: str, n: int = 5) -> list[dict]:
         """意味検索で news を引く。body は元記事の本文 (embedding 用に
         連結した "title\\nbody" テキストではない — メタデータに別途持つ)。
+        added_at は初回取込み時刻 (UTC offset 付き ISO 文字列)。
         """
         with self._locked():
             count = self._count_news_unlocked()
@@ -169,7 +170,7 @@ class Rag:
                 return []
             res = self._news.query(query_texts=[query], n_results=min(n, count))
             return [{"url": m["url"], "title": m["title"], "body": m["body"],
-                     "source_name": m["source_name"]}
+                     "source_name": m["source_name"], "added_at": m["added_at"]}
                     for m in res["metadatas"][0]]
 
     def count_news(self) -> int:
