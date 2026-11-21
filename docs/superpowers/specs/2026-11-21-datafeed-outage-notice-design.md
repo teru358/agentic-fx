@@ -1,4 +1,4 @@
-# データ停止・再開待ちの Discord 通知 設計 C0.2
+# データ停止・再開待ちの Discord 通知 設計 C1 (利用者承認待ち)
 
 作成日: 2026-11-21 JST。対象: `docs/tickets/open/datafeed-outage-discord-notice.md`。
 基準: C0.1（commit `c71ed55e`）。静的確認、本番 DB の readonly SELECT、既存ログの読取りに基づく改訂。実装・test・配備はしていない。
@@ -217,8 +217,8 @@ ctl は停止理由と次の操作の二行、web は data カード直下に同
 | task | 範囲 | 単独 merge の境界 |
 |---|---|---|
 | T1 | 既存 guard event の data_feed 固定描画、generation=None の互換受付と epoch 付き受付の描き分け、bot/notify の配送確認 | producer 未有効でも既存 event を扱い、互換受付で結果通知を約束しない consumer を先に出せる |
-| T2 | 通知表・判定結果列の migration、新規/照会/ack 置換の契約、終端結果永続化、commit 後の記録 helper、pending の待ち条件補完 | event 化は未有効。将来の sweep は有効化前の記録を除外する。記録失敗と状態更新の分離を検証できる |
-| T4 | API data の phase・現在件数・判定結果・next_action、ctl/web の案内、ctl/shell の新規・照会・ack 置換の応答文 | T2 の後。真理値表・ack 要否・旧 API fallback が使用可能。T3 の必須前提 |
+| T2 | 通知表・判定結果列の migration、新規/照会/ack 置換の契約と、その契約に要る ctl/shell の応答文 (新規・照会・ack 置換を区別し、照会では既存の要求と有効な ack を保ったことを示す)、終端結果永続化、commit 後の記録 helper、pending の待ち条件補完 | event 化は未有効。将来の sweep は有効化前の記録を除外する。記録失敗と状態更新の分離を検証できる。契約と応答文が同じ版で入るので、途中配備でも再要求の結果を読み違えない |
+| T4 | API data の phase・現在件数・判定結果・next_action、ctl/web の案内 | T2 の後。真理値表・ack 要否・旧 API fallback が使用可能。T3 の必須前提 |
 | T3 | ops lane sweep、event と対応の同時保存、時間条件、起動補完、有効化時刻、結果通知と同時の受付 generation 切替、導入/rollback | T1/T2/T4 の後に daemon の版で有効化。fault/cursor/通信量と隔離受入を確認する |
 
 ## 利用者に問う事項
@@ -271,3 +271,5 @@ ctl は停止理由と次の操作の二行、web は data カード直下に同
 | 2026-11-21 | C0 | 停止・待ち・実再開の固定通知、永続遷移と sweep、導入補完、status 案内、上限と受入を提案 | 再発時の長時間停止と再開操作の見落としを防ぐ | —（未 commit） |
 | 2026-11-21 | C0.1 | 受付・拒否通知、停止の時間条件と順序、記録失敗の隔離、既存 guard 契約、status 先行導入、別チケットの問いへ改訂 | 設計レビュー 1 周目と利用者の裁定を反映 | |
 | 2026-11-21 | C0.2 | 再要求と ack 置換、要求の終端結果と停止解除、受付の互換本文と有効化境界を明確化 | 設計レビュー 2 周目の指摘を反映 | |
+| 2026-11-21 | C0.3 | 再要求の応答文を契約と同じ T2 に移す | 設計レビュー 3 周目の指摘 (途中配備で応答が契約に追随しない) | |
+| 2026-11-21 | C1 | 利用者承認待ちの版 | 3 周 (opus → sol → sol) で収束 | |
