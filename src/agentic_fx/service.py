@@ -2162,7 +2162,7 @@ def _data_guidance(outage, conn, now) -> dict:
         _log.warning("data guidance unavailable: %s", type(exc).__name__)
         return {"phase": "unknown", "next_action": "check_status",
                 "unprocessed_positions": "unknown", "resume_last_result": None,
-                "resume_last_result_at": None, "awaiting_mark": False}
+                "resume_last_result_at": None}
 
 
 def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity,

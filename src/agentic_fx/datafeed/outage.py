@@ -284,7 +284,7 @@ class OutageStateMachine:
         except Exception:  # noqa: BLE001 — 読めないものは不明として返す
             return {"phase": "unknown", "next_action": "check_status",
                     "unprocessed_positions": UNKNOWN_COUNT, "resume_last_result": None,
-                    "resume_last_result_at": None, "awaiting_mark": False}
+                    "resume_last_result_at": None}
         epoch = row.get("epoch", 0)
         try:
             unprocessed: int | None = self._unprocessed_position_count(now, epoch, conn=conn)
@@ -299,8 +299,7 @@ class OutageStateMachine:
         return {"phase": phase, "next_action": action,
                 "unprocessed_positions": UNKNOWN_COUNT if unprocessed is None else unprocessed,
                 "resume_last_result": result,
-                "resume_last_result_at": row.get("resume_last_result_at"),
-                "awaiting_mark": marked}
+                "resume_last_result_at": row.get("resume_last_result_at")}
 
     def observe(self, now: datetime, report: IngestTickReport) -> str:
         """1 tick 分の観測を反映し、遷移後の `state` を返す。

@@ -144,7 +144,8 @@ def test_the_snapshot_of_a_machine_that_never_observed_is_ready(tmp_path):
     assert snap["phase"] == "ready" and snap["next_action"] == "none"
     assert snap["unprocessed_positions"] == 0
     assert snap["resume_last_result"] is None and snap["resume_last_result_at"] is None
-    assert snap["awaiting_mark"] is False
+    assert set(snap) == {"phase", "next_action", "unprocessed_positions", "resume_last_result",
+                         "resume_last_result_at"}
 
 
 def test_a_recorded_request_shows_wait_tick_and_keeps_the_last_result(tmp_path):
@@ -162,11 +163,9 @@ def test_the_awaiting_mark_is_this_epoch_only(tmp_path):
     conn, machine = _rig(tmp_path)
     _set(conn, machine, state="degraded", epoch=4, recovered_notified_epoch=3)
     snap = machine.guidance_snapshot(WED, conn=conn)
-    assert snap["awaiting_mark"] is False
     assert (snap["phase"], snap["next_action"]) == ("stopped", "restore_source")
     _set(conn, machine, recovered_notified_epoch=4)
     snap = machine.guidance_snapshot(WED, conn=conn)
-    assert snap["awaiting_mark"] is True
     assert (snap["phase"], snap["next_action"]) == ("awaiting_resume", "resume")
 
 
@@ -177,9 +176,10 @@ def test_the_current_unprocessed_count_decides_whether_an_acknowledge_is_needed(
     conn.execute("INSERT INTO datafeed_outage_gap (pair, interval, epoch, gap_start) "
                  "VALUES (?, ?, ?, ?)", (PAIR, "1m", 4, (WED - timedelta(minutes=31)).isoformat()))
     conn.commit()
+    _bar(conn, WED - timedelta(minutes=2))
     _open_position(conn, WED - timedelta(minutes=20))
     snap = machine.guidance_snapshot(WED, conn=conn)
-    assert snap["unprocessed_positions"] >= 1
+    assert snap["unprocessed_positions"] == 1
     assert (snap["phase"], snap["next_action"]) == ("resume_rejected", "resume_with_ack")
     conn.execute("UPDATE orders SET status='closed'")
     conn.commit()
@@ -225,3 +225,59 @@ def test_the_snapshot_never_writes_a_row(tmp_path):
     conn, machine = _rig(tmp_path)
     machine.guidance_snapshot(WED, conn=conn)
     assert conn.execute("SELECT COUNT(*) FROM datafeed_outage_state").fetchone()[0] == 0
+
+
+# ---- 停止の補足 (pending / confirmed)・開場/休場は案内を変えない -------------------
+
+SAT = datetime(2026, 10, 3, 10, 0, tzinfo=UTC)
+
+SCENARIOS = [
+    ("ready", dict(state="ready", epoch=3), False, ("ready", "none")),
+    ("ready+request", dict(state="ready", epoch=3, resume_requested_at=WED.isoformat()), False,
+     ("resume_requested", "wait_tick")),
+    ("degraded+request", dict(state="degraded", epoch=3, resume_requested_at=WED.isoformat(),
+                              recovered_notified_epoch=3), False, ("resume_requested", "wait_tick")),
+    ("rejected_watermark", dict(state="degraded", epoch=3, resume_last_result="rejected_watermark",
+                                resume_last_result_at=WED.isoformat()), False,
+     ("resume_rejected", "restore_source")),
+    ("rejected_unprocessed+positions", dict(state="restricted", epoch=3,
+                                            resume_last_result="rejected_unprocessed",
+                                            resume_last_result_at=WED.isoformat()), True,
+     ("resume_rejected", "resume_with_ack")),
+    ("rejected_unprocessed+none", dict(state="degraded", epoch=3,
+                                       resume_last_result="rejected_unprocessed",
+                                       resume_last_result_at=WED.isoformat()), False,
+     ("resume_rejected", "resume")),
+    ("awaiting+positions", dict(state="degraded", epoch=3, recovered_notified_epoch=3), True,
+     ("awaiting_resume", "resume_with_ack")),
+    ("awaiting+none", dict(state="degraded", epoch=3, recovered_notified_epoch=3), False,
+     ("awaiting_resume", "resume")),
+    ("stopped", dict(state="degraded", epoch=3), True, ("stopped", "restore_source")),
+    ("restricted", dict(state="restricted", epoch=3), False, ("restricted", "wait_tick")),
+]
+
+
+@pytest.mark.parametrize("now", [WED, SAT], ids=["weekday", "weekend"])
+@pytest.mark.parametrize("confirmed", [0, 1])
+@pytest.mark.parametrize("pending", [0, 1])
+@pytest.mark.parametrize(("name", "cols", "positions", "expected"), SCENARIOS,
+                         ids=[row[0] for row in SCENARIOS])
+def test_pending_confirmed_and_the_market_hours_do_not_change_the_guidance(
+        tmp_path, name, cols, positions, expected, pending, confirmed, now):
+    from agentic_fx.ops import client
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, pending_human_confirmation=pending, confirmed=confirmed, **cols)
+    if positions:
+        conn.execute("INSERT INTO datafeed_outage_gap (pair, interval, epoch, gap_start) "
+                     "VALUES (?, ?, ?, ?)",
+                     (PAIR, "1m", 3, (WED - timedelta(minutes=31)).isoformat()))
+        _bar(conn, WED - timedelta(minutes=2))
+        _open_position(conn, WED - timedelta(minutes=20))
+    snap = machine.guidance_snapshot(now, conn=conn)
+    assert (snap["phase"], snap["next_action"]) == expected
+    assert snap["unprocessed_positions"] == (1 if positions else 0)
+    # API の data をそのまま ctl に通すと、同じ組の固定文が出る
+    feed = {"state": cols["state"], **snap}
+    lines = client.format_status({"data": feed}).splitlines()
+    assert lines[lines.index(f"data: {cols['state']}") + 1:][:2] == list(
+        guidance_text.guidance_lines(feed))

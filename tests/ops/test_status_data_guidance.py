@@ -90,8 +90,9 @@ def test_the_guidance_does_not_touch_the_scheduler_connection(tmp_path, monkeypa
     try:
         _seed(app, state="degraded", epoch=2, recovered_notified_epoch=2)
         expected = _data(app)
-        monkeypatch.setattr(app.outage, "conn", SimpleNamespace(
-            execute=lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("outage.conn used"))))
-        assert _data(app) == expected
+        with monkeypatch.context() as scoped:
+            scoped.setattr(app.outage, "conn", SimpleNamespace(
+                execute=lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("outage.conn used"))))
+            assert _data(app) == expected
     finally:
         app.close()

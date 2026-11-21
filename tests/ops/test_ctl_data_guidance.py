@@ -10,7 +10,7 @@ from agentic_fx.ops import client
 def _feed(**extra):
     base = {"state": "degraded", "phase": "stopped", "next_action": "restore_source",
             "unprocessed_positions": 0, "resume_last_result": None,
-            "resume_last_result_at": None, "awaiting_mark": False}
+            "resume_last_result_at": None}
     return {**base, **extra}
 
 

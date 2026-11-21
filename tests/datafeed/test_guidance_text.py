@@ -48,14 +48,14 @@ def test_an_acknowledge_is_requested_only_for_a_confirmed_check_of_the_positions
     assert gt.RESUME in plain and "--acknowledge`" not in plain
 
 
-def test_an_awaiting_mark_adds_a_reminder_to_recheck_the_feed_to_actionable_steps():
+def test_the_awaiting_phase_always_adds_a_reminder_to_recheck_the_feed():
     for action in ("resume", "resume_with_ack"):
-        _, with_mark = gt.guidance_lines(_feed("awaiting_resume", action, awaiting_mark=True,
-                                               unprocessed_positions=1))
-        _, without = gt.guidance_lines(_feed("awaiting_resume", action, awaiting_mark=False,
-                                             unprocessed_positions=1))
-        assert "取得状態を再確認してください" in with_mark
-        assert "取得状態を再確認してください" not in without
+        _, step = gt.guidance_lines(_feed("awaiting_resume", action, unprocessed_positions=1))
+        assert "取得状態を再確認してください" in step
+    for phase, action in sorted(gt.PAIRS - {("awaiting_resume", "resume"),
+                                            ("awaiting_resume", "resume_with_ack")}):
+        _, step = gt.guidance_lines(_feed(phase, action, unprocessed_positions=1))
+        assert "取得状態を再確認してください" not in step, (phase, action)
 
 
 def test_restore_source_does_not_assert_the_cause_of_the_outage():

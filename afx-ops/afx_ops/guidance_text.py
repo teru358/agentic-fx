@@ -59,7 +59,6 @@ _ACTION = {
 }
 _RESUME_NO_ACK_NEEDED = ("未処理の足がある建玉は現在ありません。--acknowledge なしで再要求できます ("
                          + RESUME + ")。判定は次の開場中の tick です")
-_ACTIONABLE = ("resume", "resume_with_ack")
 
 
 def checked_pair(feed: dict) -> tuple[str, str]:
@@ -96,6 +95,6 @@ def guidance_lines(feed: object) -> tuple[str, str] | None:
         text = _RESUME_NO_ACK_NEEDED
     else:
         text = _ACTION[action]
-    if feed.get("awaiting_mark") is True and action in _ACTIONABLE:
+    if phase == "awaiting_resume":
         text += "。" + _RECHECK
     return "停止理由: " + reason, "次の操作: " + text
