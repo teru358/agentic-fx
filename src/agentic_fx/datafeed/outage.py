@@ -300,8 +300,8 @@ class OutageStateMachine:
             observe_failed=self._observe_failed, state=row.get("state", "ready"),
             request_pending=row.get("resume_requested_at") is not None,
             last_result=result, awaiting_mark=marked, unprocessed=unprocessed)
-        shown = "degraded" if self._observe_failed else row.get("state", "ready")
-        return {"state": shown, "phase": phase, "next_action": action,
+        return {"state": "degraded" if self._observe_failed else row.get("state", "ready"),
+                "phase": phase, "next_action": action,
                 "unprocessed_positions": UNKNOWN_COUNT if unprocessed is None else unprocessed,
                 "resume_last_result": result,
                 "resume_last_result_at": row.get("resume_last_result_at")}
