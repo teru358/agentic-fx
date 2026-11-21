@@ -364,3 +364,63 @@ def test_the_datafeed_sweep_runs_with_the_improve_setting_off(rig):
 
 def test_the_producer_key_is_a_known_alert_state_key(rig):
     alert_state.get(rig.conn, datafeed_notices.PRODUCER_KEY)
+
+
+# ---- 有効化の時刻は構築時に置く ------------------------------------------
+
+def test_the_enabled_time_is_stored_when_the_service_is_built_even_if_the_lane_is_busy(
+        ops_env, monkeypatch):
+    service = ops_env.service(datafeed_notices=True)
+    assert alert_state.get(ops_env.conn, datafeed_notices.PRODUCER_KEY) == FLOOR.isoformat()
+    from agentic_fx.ops.contracts import ErrorCode, OpsError
+
+    def busy(*args, **kwargs):
+        raise OpsError(ErrorCode.UNAVAILABLE)
+
+    monkeypatch.setattr(service, "_ops_lane", busy)
+    ops_env.wall.advance(hours=1)
+    service.emit_pending_notices(improve_enabled=False)          # lane が空かず何もできない
+    assert alert_state.get(ops_env.conn, datafeed_notices.PRODUCER_KEY) == FLOOR.isoformat()
+
+
+def test_a_record_made_while_the_lane_was_busy_at_startup_is_sent_later(ops_env):
+    service = ops_env.service(datafeed_notices=True)
+    _notice(ops_env.conn, 66, "resume_rejected", key="k", at=FLOOR + timedelta(minutes=2))
+    ops_env.wall.advance(hours=1)
+    service.emit_pending_notices(improve_enabled=False)
+    assert _events(ops_env.conn) == [("resume_rejected", 66)]
+
+
+# ---- 1 件の失敗が後続を止めない ------------------------------------------
+
+def test_a_record_that_keeps_failing_is_skipped_and_the_later_ones_still_go(rig):
+    _first_sweep(rig)
+    for epoch in (66, 67, 68):
+        _notice(rig.conn, epoch, "stopped", at=FLOOR + timedelta(minutes=epoch - 60))
+    rig.conn.execute(
+        "CREATE TRIGGER block_one BEFORE UPDATE ON datafeed_outage_notices "
+        "WHEN OLD.epoch=66 BEGIN SELECT RAISE(ABORT,'blocked'); END")
+    rig.conn.commit()
+    for _ in range(3):
+        _sweep(rig)
+    assert _events(rig.conn) == [("stopped", 67), ("stopped", 68)]
+    assert _link(rig.conn, 66, "stopped") is None
+    rig.conn.execute("DROP TRIGGER block_one")
+    rig.conn.commit()
+    _sweep(rig)
+    assert _events(rig.conn) == [("stopped", 67), ("stopped", 68), ("stopped", 66)]
+
+
+def test_a_failure_of_every_record_stops_the_pass_after_a_few_attempts(rig, monkeypatch):
+    _first_sweep(rig)
+    for epoch in range(10):
+        _notice(rig.conn, epoch, "stopped", at=FLOOR + timedelta(minutes=1 + epoch))
+    calls = []
+
+    def fail(*args, **kwargs):
+        calls.append(1)
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(rig.service.events, "insert_data_feed_guard", fail)
+    _sweep(rig)
+    assert 1 <= len(calls) <= 3

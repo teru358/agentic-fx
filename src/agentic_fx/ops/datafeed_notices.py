@@ -27,6 +27,9 @@ _RANK = {"stopped": 0, "awaiting_resume": 1, "resume_accepted": 2, "resume_rejec
 _TERMINAL = frozenset({"resume_accepted", "resume_rejected", "resume_already_ready"})
 _SKIP_LOG_LIMIT = 256
 _skip_logged: set[tuple] = set()
+# 保存に失敗した記録ごとの回数 (メモリだけ。次の tick で再試行する)
+_failed_records: dict[tuple, int] = {}
+_FAILURE_STREAK_LIMIT = 3
 
 
 def _parse_utc(text: object) -> datetime | None:
@@ -59,6 +62,13 @@ def _enabled_at(conn, now: datetime) -> tuple[datetime, bool]:
     return now, True
 
 
+def ensure_enabled(conn, now: datetime) -> bool:
+    """有効化の時刻を (無ければ) 置く。この呼出しで初めて置いたときだけ真。
+
+    daemon の構築時に呼ぶ。ops lane の成否に依らないので、その後に作られる記録は下限より前にならない。"""
+    return _enabled_at(conn, now)[1]
+
+
 def producer_enabled_at(conn, now: datetime) -> datetime:
     """通知生成を有効にした daemon を初めて起動した時刻。無い (または読めない) ときだけ今を置く。
 
@@ -84,7 +94,7 @@ def sweep(conn, events: EventStore, now: datetime) -> int:
         if occurred >= floor:
             due.append((occurred, epoch, _RANK[state], key, state))
     due.sort()
-    done = 0
+    done = streak = 0
     for occurred, epoch, _rank, key, state in due:
         if done >= BATCH_LIMIT:
             break
@@ -106,8 +116,17 @@ def sweep(conn, events: EventStore, now: datetime) -> int:
             continue
         except Exception:  # noqa: BLE001 -- 通知の失敗で状態更新・保護処理を止めない
             _rollback(conn)
+            _failed_records[(epoch, state, key)] = _failed_records.get((epoch, state, key), 0) + 1
+            if len(_failed_records) > _SKIP_LOG_LIMIT:
+                _failed_records.clear()
             _log.warning("datafeed_notice_deferred")
-            return done
+            # 1 件の失敗は飛ばして後続を続ける。続けて失敗するなら DB 全体の障害とみなして止める
+            streak += 1
+            if streak >= _FAILURE_STREAK_LIMIT:
+                return done
+            continue
+        _failed_records.pop((epoch, state, key), None)
+        streak = 0
         done += 1
     return done
 
@@ -119,17 +138,18 @@ def _rollback(conn) -> None:
         pass
 
 
-def supplement(conn, now: datetime) -> int:
+def supplement(conn, now: datetime, *, introduced: bool = False) -> int:
     """導入時点で停止中の episode から、通常キーの記録を 0〜1 件だけ補う。
 
     優先順: 要求あり = 補完しない / 待ちの印あり = 待ち / confirmed または開場時間の停止条件 = 停止 /
     それ以外 (ready・restricted・条件未到達) = 補完しない。補った記録の発生時刻は導入時刻。
+    `introduced` は daemon の構築時に有効化の時刻を初めて置いたことを表す。
     導入前の同じキーの未 event 化の記録は、その一件だけ導入時刻へ移す。導入後の記録・
     event 化済みの記録は動かさないので、再実行しても増えず時刻も動かない。"""
-    floor, first_time = _enabled_at(conn, now)
-    # 補った記録の発生時刻: 初回の導入時は導入時刻、後の再起動では実際に補った時刻
+    floor = producer_enabled_at(conn, now)
+    # 補った記録の発生時刻: 初回の導入時 (`introduced`) は導入時刻、後の再起動では実際に補った時刻
     # (条件が後から成立した停止を導入時刻へ遡らせない)
-    made_at = floor if first_time else now.astimezone(timezone.utc)
+    made_at = floor if introduced else now.astimezone(timezone.utc)
     row = conn.execute(
         "SELECT state, epoch, confirmed, entered_degraded_at, resume_requested_at, "
         "resume_last_result_at, recovered_notified_epoch FROM datafeed_outage_state WHERE id=1").fetchone()

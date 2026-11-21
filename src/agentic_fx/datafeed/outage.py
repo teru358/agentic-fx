@@ -472,7 +472,9 @@ class OutageStateMachine:
         known_stop = bool(confirmed) or recovered_notified_epoch == epoch
 
         def noticed() -> bool:
-            return known_stop or self._stop_recorded(epoch)
+            return (known_stop or self._stop_recorded(epoch)
+                    or any(e == epoch and ("stopped", "") in items
+                           for e, _t, items in self._pending_notices))
         opened = False
 
         def degrade() -> None:
@@ -885,8 +887,14 @@ class OutageStateMachine:
         書くのは固定語・整数・要求時刻だけ。同じ鍵は `ON CONFLICT DO NOTHING` で重複させない。
         """
         if entries and not self._write_notices(epoch, now, entries):
-            self._pending_notices.append((epoch, now, list(entries)))
-            self._trim_pending_notices()
+            # 保留に同じ (epoch, 状態, 要求キー) があれば重ねない。書込みが続けて失敗する間に
+            # 同じ記録が積まれて、保留の上限で別の結果の記録を押し出さないため
+            queued = {(e, state, key) for e, _t, items in self._pending_notices
+                      for state, key in items}
+            fresh = [(state, key) for state, key in entries if (epoch, state, key) not in queued]
+            if fresh:
+                self._pending_notices.append((epoch, now, fresh))
+                self._trim_pending_notices()
 
     def _stop_recorded(self, epoch: int) -> bool:
         """この epoch の停止の記録があるか。読めなければ無いとみなす (観測を止めない)。"""
@@ -902,7 +910,7 @@ class OutageStateMachine:
 
         同じ epoch に待ちの印・停止か待ちの記録があれば何もしない。再開の要求が未消費の間は、
         人が操作中なので知らせない。要求への結果が出ていれば、その判定時刻から開場時間を
-        数え直す。開場中の観測 tick の commit 後だけで呼ぶ。停止の判定・遷移は変えず、失敗しても例外を出さない。"""
+        数え直す (この epoch でまだ停止を知らせていないときだけ。知らせた後は結果の通知で足りる)。開場中の観測 tick の commit 後だけで呼ぶ。停止の判定・遷移は変えず、失敗しても例外を出さない。"""
         try:
             row = self._load_row()
             if row.get("state") != "degraded" or row.get("recovered_notified_epoch") == epoch:

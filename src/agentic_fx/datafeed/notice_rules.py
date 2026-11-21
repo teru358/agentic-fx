@@ -27,7 +27,8 @@ def stop_after_open_minutes(entered_degraded_at: str | None, now: datetime) -> b
 
 def timer_start(entered_degraded_at: str | None, last_result_at: str | None) -> str | None:
     """時間条件を数え始める時刻。要求への結果が出ていれば、その判定時刻から数え直す
-    (判定は人が状況を見た時点で、その後も続く停止を改めて知らせるため)。結果の時刻が
+    (まだ停止を知らせていない epoch で、判定の後も続く停止を知らせるため。停止を知らせた後の
+    epoch には呼び出し側が使わない)。結果の時刻が
     読めなければ degraded に入った時刻を使う。"""
     if last_result_at:
         try:

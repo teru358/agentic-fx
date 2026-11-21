@@ -172,3 +172,63 @@ def test_a_confirmed_stop_after_a_request_is_recorded_as_usual(tmp_path):
     _tick(conn, machine, WED + timedelta(minutes=2), failed=True)   # 2 連続: confirmed
     assert machine.status()["confirmed"] == 1
     assert _states(conn) == ["resume_rejected", "stopped"]
+
+
+def _block_notice_writes(conn):
+    conn.execute("CREATE TRIGGER block_notice BEFORE INSERT ON datafeed_outage_notices "
+                 "BEGIN SELECT RAISE(ABORT,'blocked'); END")
+    conn.commit()
+
+
+def _unblock_notice_writes(conn):
+    conn.execute("DROP TRIGGER block_notice")
+    conn.commit()
+
+
+def test_a_stop_whose_write_keeps_failing_is_queued_once_and_never_pushes_out_a_result(
+        tmp_path, caplog):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="degraded", epoch=3, entered_degraded_at=WED.isoformat())
+    _block_notice_writes(conn)
+    machine.request_resume(WED, acknowledge=False)
+    _tick(conn, machine, WED + timedelta(minutes=1), failed=True)   # 拒否の記録も失敗して保留
+    with caplog.at_level(logging.WARNING):
+        for index in range(2, 100):
+            _tick(conn, machine, WED + timedelta(minutes=index), failed=index % 2 == 1)
+    queued = [(state, key != "") for _e, _t, entries in machine._pending_notices
+              for state, key in entries]
+    assert sorted(queued) == [("resume_rejected", True), ("stopped", False)]
+    assert not any(r.getMessage() == "datafeed_notice_dropped" for r in caplog.records)
+    _unblock_notice_writes(conn)
+    _tick(conn, machine, WED + timedelta(minutes=100), failed=False)
+    assert sorted(_states(conn)) == ["resume_rejected", "stopped"]
+
+
+def test_a_recovery_counts_a_stop_that_is_still_queued_and_records_the_resumption(tmp_path):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="degraded", epoch=3, entered_degraded_at=WED.isoformat())
+    _block_notice_writes(conn)
+    _alternate(conn, machine, WED + timedelta(minutes=1), 10)       # 停止の記録が失敗して保留
+    assert _pending_states(machine) == ["stopped"]
+    for minute in range(11, 14):
+        _tick(conn, machine, WED + timedelta(minutes=minute))       # 自動復帰
+    assert machine.state == "ready"
+    _unblock_notice_writes(conn)
+    _tick(conn, machine, WED + timedelta(minutes=14))
+    assert _states(conn) == ["stopped", "resumed"]
+
+
+def _pending_states(machine):
+    return [state for _e, _t, entries in machine._pending_notices for state, _k in entries]
+
+
+def test_a_stop_already_announced_is_not_announced_again_after_a_rejection(tmp_path):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="degraded", epoch=3, entered_degraded_at=WED.isoformat())
+    _tick(conn, machine, WED + timedelta(minutes=1), failed=True)
+    _tick(conn, machine, WED + timedelta(minutes=2), failed=True)   # confirmed: 停止を記録
+    machine.request_resume(WED + timedelta(minutes=3), acknowledge=False)
+    _tick(conn, machine, WED + timedelta(minutes=4), failed=True)   # 拒否
+    for index in range(5, 40):
+        _tick(conn, machine, WED + timedelta(minutes=index), failed=index % 2 == 0)
+    assert _states(conn) == ["stopped", "resume_rejected"]

@@ -774,6 +774,14 @@ class OpsService:
         # 再開要求の受付は記録時の epoch を generation に持つ。偽なら従来の受付 (generation なし) だけ
         self._datafeed_notices = datafeed_notices is True
         self._datafeed_supplemented = False
+        self._datafeed_introduced = False
+        if self._datafeed_notices:
+            # 有効化の時刻は構築時に置く。ops lane が塞がっていても、その後の記録が下限より前にならない
+            try:
+                self._datafeed_introduced = notice_sweep.ensure_enabled(
+                    conn, _aware(wall_clock()).astimezone(timezone.utc))
+            except Exception:  # noqa: BLE001 -- 置けなければ最初の回収で置く
+                _log.warning("datafeed_notice_deferred")
         self._ask_submitter = ask_submitter
         self._improve_supervisor = improve_supervisor
         self._plugins_root = plugins_root
@@ -2101,7 +2109,7 @@ class OpsService:
         now = _aware(self._wall_clock()).astimezone(timezone.utc)
         if not self._datafeed_supplemented:
             try:
-                notice_sweep.supplement(self._conn, now)
+                notice_sweep.supplement(self._conn, now, introduced=self._datafeed_introduced)
                 self._datafeed_supplemented = True
             except Exception:  # noqa: BLE001
                 _log.warning("datafeed_notice_deferred")
