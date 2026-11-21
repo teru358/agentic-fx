@@ -1,21 +1,23 @@
-# 1 分足の穴の受容・停滞時の保護と flat 後の自動復帰 設計 C0.7
+# 1 分足の穴の受容・停滞時の保護と flat 後の自動復帰 設計 C0.8
 
-後続の 1 分足が届いている穴は、時間帯・連続本数・発生回数に依らず受け入れ、合成しない。停滞中は新規リスクを止め、後続到着で現在の停滞が解ければ通常の ready 判定に戻す。背景検証・接触検査は約定・決済を変更しない。
+後続の 1 分足が届いている穴は、時間帯・連続本数・発生回数に依らず受け入れ、合成しない。停滞中は新規リスクを止め、回復時は接触検査を先に済ませてから復帰を判定する。接触検査は約定・決済を書き換えない。
 
 利用者が確認する資金保護の変化は次のとおり。
 
 | 動作 | 現行からの変化・確認点 |
 |---|---|
-| 建玉ありの停滞・取得失敗・空 | 即 degraded から、連続 5 分以内は restricted に変わる。新規・指値約定・リスク増は止め、決済・取消・既存 SL/TP の保護は続ける |
-| flat の停滞・取得失敗・空からの回復 | restricted の健全 3 tick 待ちを、期限内かつ auto=true なら同 tick の E に変える。1m の取得失敗・空も即 degraded から D の猶予に変え、同じ E で復帰できる（現行 `outage.py:308-309`, `:362-396`） |
-| 上位 hard の取得失敗 | 建玉ありでは即 degraded だったが、同 tick に 1m も失敗・空・停滞していれば 1m の連続未到着の 5 分猶予に合流する（現行 `outage.py:303-309`, `:373-387`） |
-| 後続到着と穴の取り直し | 現在の停滞が解ければ、背景検証を待たず復帰できる。穴の約 2 分後に同 source を取り直し、正常応答で範囲を確認して残る穴は「取引なし」と認定。確かめられなければ次の 3 tick まで再試行し、記録・注記だけで続行する |
-| restricted の上限 | 開場時間で連続 30 分を超えれば、足が届いていても degraded・停止通知にする |
-| 接触・判定不明 | 対象足の SL/TP・指値到達または判定不明は、すでに flat でも人の確認と ack を要する。約定・決済は書き換えない |
-| 通常停止後の flat | 全 exposure ゼロ・健全 3 tick・auto=true なら通常 pending があっても自動解除する。接触待ちは解除しない |
-| 範囲外の既存の穴 | ready 中の同 tick の複数到着で古い方の足、鮮度切れの足、金曜末尾の足を通常保護が見ない問題は残る。今より弱くはしない。この一群は `docs/tickets/open/normal-protection-evaluates-latest-bar-only.md` にまとめ、本書では変更しない（根拠: `src/agentic_fx/service.py:1829-1832`, `scheduler.py:44`, `:942-949`, `ingest.py:159-162`） |
+| 建玉ありの停滞・取得失敗・空 | 即 degraded から、連続 10 分以内は restricted に変わる。新規・指値約定・リスク増は止め、決済・取消・既存 SL/TP の保護は続ける |
+| flat の停滞・取得失敗・空からの回復 | 期限は既定 1800 秒のまま。期限内 restricted は auto=true・同 tick 健全・接触なしなら E で復帰し、健全 3 tick を追加要求しない（現行 `outage.py:362-396`） |
+| 上位 hard の不調 | 同 tick に 1m も失敗・空・停滞なら、上位 hard の失敗・空・停滞を 1m の猶予に合流。それ以外は現行規則 |
+| 後続到着と取り直し | 通常取得を水位の 10 分前まで広げ、発見の次の開場 tick から同じ要求で再取得する。後着検出は固定窓内の best effort。足の不在を無 tick の証明とはせず、穴は受容する |
+| restricted の上限 | 開場時間で連続 30 分超なら、足が届いていても degraded・停止通知 |
+| 自動解除前の検査 | restricted・degraded を通した non-ready epoch の間に届いた足のうち、当該注文について通常保護が評価しないものを検査。接触・判定不明なら flat でも人の確認と ack が必要 |
+| 通常停止後の flat | 全 exposure ゼロ・健全 3 tick・auto=true・必要な接触検査完了なら、通常 pending があっても自動解除。接触待ちは解除しない |
+| auto_resume_when_flat の意味 | false は flat の H に加え、建玉あり restricted の E も止める。取得・検査は続け、健全 3 tick 後は degraded の手動待ち |
+| 手動再開の健全 | 現行の定義は不変。全 hard key について停滞なし、直近結果が True と確認できることが必要。未取得の上位 hard を自動復帰の健全で代用しない（`outage.py:327-329`, `:609-613`） |
+| 範囲外の既存の穴 | ready 中だけで生じる同 tick の古い足・鮮度切れ・金曜末尾足を通常保護が見ない問題は `docs/tickets/open/normal-protection-evaluates-latest-bar-only.md` に委ねる。通常保護の時刻順評価は追加しない（`src/agentic_fx/service.py:1829-1832`, `scheduler.py:942-949`） |
 
-作成・改訂日: 2026-11-21 JST。方針は `docs/tickets/open/datafeed-rollover-band-expected-gap.md:26` の改定裁定と `docs/tickets/open/datafeed-pending-auto-release-when-flat.md:23` に従う。旧裁定の「1 本だけ」「穴だけで restricted」「合計 2 本で degraded」は置き換える。以下の保存形式・観測境界は設計判断。今回は本書のみ改訂し、実装・テスト実行・配備は行わない。
+作成・改訂日: 2026-11-21 JST。方針は `docs/tickets/open/datafeed-rollover-band-expected-gap.md:26-27` と `docs/tickets/open/datafeed-pending-auto-release-when-flat.md:23-24` の「処置案・裁定」に従う。旧裁定の本数制限・即停止・停滞 5 分は置き換える。今回は本書のみ改訂し、実装・テスト実行・配備は行わない。
 
 ## 確認した実体
 
@@ -23,7 +25,7 @@
 
 | 事項 | 実体・根拠 |
 |---|---|
-| 停止と穴は別の数 | epoch 52–66 の入口は 15 件、うち 14 件が 22 時台 UTC。例は `logs/activity.log:12671`, `:13043`, `:14102`, `:15530`。下記 SQL の穴は 11 夜・35 区間・42 分。restricted 中の後続の停滞は streak をリセットするだけで epoch を増やさない (`outage.py:407-408`) |
+| 停止と穴は別の数 | epoch 52–66 の入口は 15 件、うち 14 件が 22 時台 UTC。例は `logs/activity.log:12671`, `:13043`, `:14102`, `:15530`。下記 SQL の穴は全期間で 15 夜・54 区間・80 分。restricted 中の後続の停滞は streak をリセットするだけで epoch を増やさない (`outage.py:407-408`) |
 | 現行の停止・復帰 | exposure があれば即 degraded (`outage.py:373-388`)。flat は 1800 秒の restricted (`:370-384`)。degraded の自動解除は `not pending` が必須 (`:409-418`) |
 | 健全の定義 | 取得結果と最新 watermark の停滞を見る (`outage.py:302-329`, `:548-569`)。上位 hard 足は当 tick の failed/empty/stalled が無ければ前回結果を据え置き、未知を false としない (`:317-326`) |
 | 通常取得 | `ingest.py:211-225` の下限は watermark の 1 本前。古い穴は自動では取り直さない。閉場中は取得しない (`:159-162`)、上位足は次の確定まで取得待ち (`:248-252`) |
@@ -34,9 +36,9 @@
 | exposure と近似件数 | 全集合は `src/agentic_fx/core/executor.py:29-31`。既存の未処理近似は OPEN/PENDING_FILL と時刻だけ (`outage.py:669-718`) で、全 exposure ゼロや適用済みを証明しない |
 | cache の書き手 | 本番 scheduler は DB を読むだけ。ingest が取得結果を保存 (`ingest.py:316-320`)。provider の保存は readonly で抑止 (`src/agentic_fx/datafeed/price_provider.py:220-221`, `:425-426`)。healthcheck も readonly (`src/agentic_fx/service.py:1599-1610`)。この本番経路で scheduler が cache を温めるという `service.py:1602-1606` の注記は実体と異なる |
 
-## 過去 11 夜への当てはめ
+## 全期間への当てはめ
 
-既存の本番 DB 調査は次の readonly SQL による。今回追加した後述の停止記録との突合も readonly で行った。出力は時刻と件数のみ。これは現在残る cache の穴の形であり、当時の取得応答・実際の到着時刻・後着足の接触を再現するものではない。休場をまたぐ差はここでは 600 分以上として除き、実装では後述の期待時刻列を使う。
+本番 DB は readonly で照合した。対象 cache の保持範囲は 2026-10-21 13:26〜11-20 21:58 UTC。以下は日付制限なしの全期間 SQL であり、出力は時刻・件数のみ。600 分以上の差は休場をまたぐため除外する簡便集計で、実装では期待時刻列で休場を除く。現在残る穴の形であり、過去の到着時刻や接触の再現ではない。
 
 ```sh
 sqlite3 -readonly data/agentic.db "WITH b AS (
@@ -44,43 +46,47 @@ sqlite3 -readonly data/agentic.db "WITH b AS (
  LAG(julianday(bar_time)) OVER (ORDER BY bar_time) pj,
  LAG(bar_time) OVER (ORDER BY bar_time) pt
  FROM ohlcv_cache WHERE symbol='USDJPY' AND interval='1m'
- AND source='mt5-live' AND bar_time>='2026-11-01')
- SELECT pt,bar_time,CAST(round((j-pj)*1440)-1 AS INT) missing
- FROM b WHERE (j-pj)*1440>1.5 AND (j-pj)*1440<600 ORDER BY bar_time;"
+ AND source='mt5-live'), g AS (
+ SELECT pt,bar_time,CAST(round((j-pj)*1440)-1 AS INT) n
+ FROM b WHERE (j-pj)*1440>1.5 AND (j-pj)*1440<600)
+ SELECT pt,bar_time,n FROM g ORDER BY bar_time;"
 
 sqlite3 -readonly data/agentic.db "WITH b AS (
  SELECT bar_time,julianday(bar_time) j,
  LAG(julianday(bar_time)) OVER (ORDER BY bar_time) pj
  FROM ohlcv_cache WHERE symbol='USDJPY' AND interval='1m'
- AND source='mt5-live' AND bar_time>='2026-11-01'), g AS (
+ AND source='mt5-live'), g AS (
  SELECT date(bar_time) night,CAST(round((j-pj)*1440)-1 AS INT) n
  FROM b WHERE (j-pj)*1440>1.5 AND (j-pj)*1440<600)
- SELECT night,count(*),sum(n),max(n),sum(n>5) FROM g GROUP BY night;"
+ SELECT night,count(*),sum(n),max(n),sum(n>10) FROM g GROUP BY night;
+ SELECT min(bar_time),max(bar_time),count(*) FROM ohlcv_cache
+ WHERE symbol='USDJPY' AND interval='1m' AND source='mt5-live';"
 ```
 
-時系列も既存の readonly 調査による。grace=30 秒を仮定し、直前足 `pt` から `S=pt+150秒`、後続足から回復可能時刻 `R=bar_time+90秒` を算出した（`market_hours.py:85-88`, `ingest.py:224-225`）。
+grace=30 秒、直前足 pt から S=pt+150秒、後続足から回復可能時刻 R=bar_time+90秒（`src/agentic_fx/core/market_hours.py:85-88`, `ingest.py:224-225`）。穴欄は UTC の時:分で両端を含む。通常取得が確定直後に追随し、auto=true・接触なし・他の hard 不調なし・observe が継続する仮定では S→R の長さは欠け本数と同じ分数となり、各区間 D→E、間は ready。約 60.3 秒周期の実 tick の restricted 長を実測した表ではない。
 
-以下は UTC。穴欄は 22 時台の足の開始分、両端を含む。`S→R` は原則 22 時台の分:秒。通常取得が確定直後に追随し、auto=true・接触なし・他の hard 不調なしとした設計の当てはめであり、実測の restricted 長ではない。実際は `S` を過ぎた最初の tick から `R` 以後の最初の健全 tick までとなる（約 60.3 秒周期）。
+| 夜 (2026 年) | 穴の開始時刻・範囲 | 区間数 / 欠け分数 / 最大連続 | S→R の長さ (分) |
+|---|---|---|---|
+| 10-22 | 21:02 | 1 / 1 / 1 | 1 |
+| 10-25 | 21:02、04、06、09、13–17、20–28、35、37、39–40、43、54 | 11 / 24 / 9 | 1/1/1/1/5/9/1/1/2/1/1 |
+| 10-27 | 21:04–08、31、34–35、38、41–42 | 5 / 11 / 5 | 5/1/2/1/2 |
+| 10-29 | 21:04、06 | 2 / 2 / 1 | 1/1 |
+| 11-01 | 22:07、12、34、37–40、53、57–58 | 6 / 10 / 4 | 1/1/1/4/1/2 |
+| 11-02 | 22:13 | 1 / 1 / 1 | 1 |
+| 11-03 | 22:08、11、43 | 3 / 3 / 1 | 1/1/1 |
+| 11-05 | 22:07、09、21、27、34 | 5 / 5 / 1 | 1/1/1/1/1 |
+| 11-08 | 22:09、16、25、29、48–50 | 5 / 7 / 3 | 1/1/1/1/3 |
+| 11-09 | 22:02–03 | 1 / 2 / 2 | 2 |
+| 11-15 | 22:01 | 1 / 1 / 1 | 1 |
+| 11-16 | 22:02、05、13、16、29 | 5 / 5 / 1 | 1/1/1/1/1 |
+| 11-17 | 22:03、09、23、25 | 4 / 4 / 1 | 1/1/1/1 |
+| 11-18 | 22:17 | 1 / 1 / 1 | 1 |
+| 11-19 | 22:39、41、43 | 3 / 3 / 1 | 1/1/1 |
+| 合計 | 15 夜 | 54 / 80 / 9 | 1 本44、2 本5、3 本1、4 本1、5 本2、9 本1 区間 |
 
-| 夜 (2026 年) | 穴の開始分 | 区間数 / 欠け分数 / 最大連続 | restricted の S→R、各回の長さ | 回復 |
-|---|---|---|---|---|
-| 11-01 | 07、12、34、37–40、53、57–58 | 6 / 10 / 4 | 08:30→09:30、13:30→14:30、35:30→36:30、38:30→42:30、54:30→55:30、58:30→23:00:30（1/1/1/4/1/2 分） | 各回 E、間は ready |
-| 11-02 | 13 | 1 / 1 / 1 | 14:30→15:30（1 分） | E |
-| 11-03 | 08、11、43 | 3 / 3 / 1 | 09:30→10:30、12:30→13:30、44:30→45:30（各 1 分） | 各回 E |
-| 11-05 | 07、09、21、27、34 | 5 / 5 / 1 | 08:30→09:30、10:30→11:30、22:30→23:30、28:30→29:30、35:30→36:30（各 1 分） | 各回 E、07 と 09 の間も ready |
-| 11-08 | 09、16、25、29、48–50 | 5 / 7 / 3 | 10:30→11:30、17:30→18:30、26:30→27:30、30:30→31:30、49:30→52:30（1/1/1/1/3 分） | 各回 E |
-| 11-09 | 02–03 | 1 / 2 / 2 | 03:30→05:30（2 分） | E |
-| 11-15 | 01 | 1 / 1 / 1 | 02:30→03:30（1 分） | E |
-| 11-16 | 02、05、13、16、29 | 5 / 5 / 1 | 03:30→04:30、06:30→07:30、14:30→15:30、17:30→18:30、30:30→31:30（各 1 分） | 各回 E |
-| 11-17 | 03、09、23、25 | 4 / 4 / 1 | 04:30→05:30、10:30→11:30、24:30→25:30、26:30→27:30（各 1 分） | 各回 E、23 と 25 の間も ready |
-| 11-18 | 17 | 1 / 1 / 1 | 18:30→19:30（1 分） | E |
-| 11-19 | 39、41、43 | 3 / 3 / 1 | 40:30→41:30、42:30→43:30、44:30→45:30（各 1 分） | 各回 E、取り直し待ちで連結しない |
-| 合計 | 11 夜 | 35 / 42 / 4 | 各停滞は 1〜4 分 | 穴を理由とする F は 0 |
-| 11-13（穴なし、epoch 57） | 12:29〜12:35 の実足は全て存在 | 0 / 0 / 0 | S=12:33:30、restricted 実測入口 12:33:53。境界 12:38:30、12:38:54 は未試行、回復は 12:40 台（約 7 分） | 建玉ありは F、flat は 1800 秒内で復帰可能 |
+10-25 の 5 本は S=21:14:30→R=21:19:30、9 本は 21:21:30→21:30:30。10-27 の 5 本は 21:05:30→21:10:30。いずれも 600 秒以内で、上記仮定で穴を理由とする F は 0。反復穴も後続到着ごとに停滞計時を切り、取り直しのために restricted を連結しない。
 
-11-05 の 07/09、11-17 の 23/25、11-19 の 39/41/43 の背景 due はそれぞれ 10:30/12:30、26:30/28:30、42:30/44:30/46:30。後の due を待って restricted を延長しないため、2 分間隔の反復でも停止が連続せず、建玉ありでも穴だけで degraded にならない。exposure が穴と重ならなければ取り直し自体を省く。
-
-停止記録の epoch 52–56・58–66 は、次の readonly SQL で `gap_start` の次の分と cache を突合した。結果は 14 件、全件 `present=0`。過去の到着履歴ではなく、現在も穴が残ることだけを示す。
+穴が無い epoch 57 も別に確認した。gap_start=11-13 12:31、S=12:33:30、実入口 12:33:53、回復は 12:40 台（約 7 分）。旧仕様の健全 3 tick 後の復帰は `logs/activity.log:14102-14103`、時刻規則未検証は `logs/agentic.log:65553-65557`。継続観測の下では新しい 10 分猶予内だが、当時の全 report を SQL だけでは再現できない。
 
 ```sh
 sqlite3 -readonly data/agentic.db "SELECT g.epoch,g.gap_start,
@@ -93,62 +99,44 @@ sqlite3 -readonly data/agentic.db "SELECT g.epoch,g.gap_start,
  GROUP BY g.epoch,g.pair,g.interval,g.gap_start ORDER BY g.epoch;"
 ```
 
-epoch 57 は DB の gap_start=12:31 と期待確定式から S を照合した。入口・旧仕様の健全 3 tick 後の復帰 12:42:54 は `logs/activity.log:14102-14103`、12:37〜12:39 台の時刻規則未検証は `logs/agentic.log:65553-65557`。cache に穴が無いことは停滞が無かった証明ではない。
-
-この 11 夜について示したのは穴の形に対する復帰であり、全停滞の無停止を主張しない。cache の始まりは 11-01 22:01 で、22:00 不在が保持境界か日曜最初の穴かは不明。過去の到着時刻・取得失敗・接触はこの SQL では復元できない。
+この突合は 14 件すべて present=0。現在の穴の残存だけを示し、全期間の後着ゼロや将来の無接触を証明しない。
 
 ## 穴と停滞の検出・時刻
 
-対象は registry の hard 1m key `(pair, interval, storage_source)`。soft 系列の不調は昇格理由にしない。上位 hard 足の不調は原則として現行規則を維持する。ただし同 tick に 1m も失敗・空・停滞していれば、上位 hard の失敗はその 1m の連続未到着にまとめ、同じ 300 秒 / flat 設定期限で扱う。上位足の内部欠けを新たに全列挙したり、次の 15m 成功を待ったりしない。
+対象は registry の hard 1m key `(pair, interval, storage_source)`。soft 不調は昇格理由にしない。足時刻は UTC 開始時刻、区間は半開 `[start,end)`。期待時刻列は `src/agentic_fx/core/market_hours.py:77-88`、開閉場・祝日・DST は `:30-43` を使う。
 
-足時刻は UTC 開始時刻、区間は半開 `[start,end)`。期待時刻列は `src/agentic_fx/core/market_hours.py:77-88` と同じとし、週末・祝日・DST は `:30-43` の開閉場を使う。「直前」「後続」はこの列上の前後であり、単純な ±60 秒ではない。
+- S は key ごとの連続未到着の起点。最後の watermark の次の期待足の確定予定時刻（grace 込み、`outage.py:557-569`）とし、水位なしの初回失敗だけ観測時刻を使う。失敗・空の繰返しでは延ばさない。
+- 新しい確定足で旧計時を終える。回復足は旧水位の次の期待足以降で最初に存在する足。最新期待足が依然未到着なら最新水位から次の S を求める。後続ありの内部穴は停滞と混ぜない。
+- 上限は S 以後の開場秒数で exposure あり 600 秒、flat は `flat_stall_max_sec`（既定1800秒、0は猶予なし）。flat↔exposure だけで S を動かさない。複数 key は各 S と期限を評価し、最も厳しい結果を採る。
+- 継続観測中は観測で期限判定する。現在も停滞・失敗・空なら上限超で F、ちょうどは D。停滞が解けていれば旧 S の境界との足時刻比較を追加せず、健全なら E。境界後最初の tick で回復を観測すれば E、11 本の穴の途中で 600 秒超を観測すれば F。
+- 再起動後および前回 observe の `updated_at` からの開場時間が規定 2 tick 分を超えた場合は継続回復と区別する。2 tick は120秒（`scheduler.py:47` の `TICK_INTERVAL_SEC=60`、発火は `src/agentic_fx/service.py:2941`）とする。commit 前水位・保存 S から旧停滞の期限超過を先に判定し、超過なら一括到着でも F、同 tick に E/H で解除しない。到着時刻を足の確定時刻から推測しない。ready の初観測でも同様とする。
+- 同 tick の 1m 失敗・空・停滞には、上位 hard の失敗・空・停滞も合流させる。それ以外の上位不調は G。上位の内部欠け列挙は追加しない。
+- restricted の連続開始は既存 `restricted_since` を保存し、S の更新で動かさない。連続開場 1800 秒超は Q。restricted を抜けたときだけこの計時を切る。
 
-- key ごとの検査端点を state と同じ transaction で保存する。端点から今回の最新確定足までの期待時刻列と同 source の実足を比較し、後続のある内部穴を登録する。末尾未到着は停滞であり、不在認定しない。複数 pair・連続・反復の穴を個別に扱う。
-- 接触検査の対象は、穴の時刻に後から現れた足と、restricted の episode の起点以降に届いた足のうち通常保護が評価しない足（最新以外、および `now − ts > 5 分` の最新）だけ。後者は保存済みの停滞前の 1m 水位を起点とし、その水位より後の同 source の cache を同 tick の observe で検査する。最新だけを読む通常保護と鮮度判定が根拠（`src/agentic_fx/service.py:1829-1832`, `scheduler.py:44`, `:942-949`）。ready 中だけで生じた鮮度切れ等は範囲外のままとする。
-- restricted 開始時に key ごとの停滞前の 1m 水位を state と同じ transaction で保存し、episode の終了まで保持する。到着ごとに区間を切らず、S が進んでもこの起点は動かさない。水位なしは明示して保存し、復元時に欠損と混同しない。穴発見の検査端点とは別であり、端点もこの起点も接触評価の完了を表さない。
-- 停滞の起点 `S` は最後の watermark の次の期待足の確定予定時刻（grace 込み、`outage.py:557-569`）。取得失敗・空応答も「新しい足が来ない」連続時間として同じ期限で扱い、水位がない初回の失敗だけはその観測時刻を S とする。失敗・空の繰返しで S を延ばさない。
-- 新しい確定足が届けば、旧 S の期限内回復かを先に判定して、それまでの連続停滞の計時を終える。なお最新期待足が未到着なら、その最新水位から次の S を求める。古い穴の due は新しい S と無関係であり、穴が反復しても足が届くたびに計時を切る。現在も停滞していれば restricted、現在の停滞が解け同 tick の健全条件が揃えば E。
-- S 以後の開場秒数で、exposure ありは 300 秒、flat は `flat_stall_max_sec` 秒を上限とする。休場は除外し、0 設定は flat の猶予なし。flat↔exposure の変化だけでは S を動かさず期限を切り替える。
-- 5 分ちょうどは猶予内。境界以降最初の開場 tick で通常取得結果を先に照合し、回復足の本来の確定時刻が境界以内なら期限内回復とする。境界外の足しかない、依然停滞、backoff・時刻規則未検証などで 1m が未試行なら回復なしとして F。成功でも古い水位のままなら回復ではない。背景検証の成否はこの判定に含めない。
-- tick 冒頭の now を prepare/observe に共用する（`src/agentic_fx/service.py:2480-2485`, `:2938-2962`）。再起動・tick の長時間停止で境界を逃しても期限超過を保持し、不明な到着時刻を推測して期限内回復としない。初観測が ready のまま期限超過なら直接 F とする（現行 `outage.py:370-373` は壁時計による flat の期限判定であり、本案では開場秒数と exposure 別期限へ変更する）。
-- restricted の開始時刻も保存し、開場時間で連続 1800 秒を超えたら足の到着に関係なく degraded・停止通知とする。S の更新ではこの開始時刻を延ばさず、restricted を抜けたときだけ連続時間を切る。flat の設定期限と独立した固定上限なので、`flat_stall_max_sec > 1800` でもこの上限が先に効く。
+## 通常取得での取り直しと保存
 
-## 背景の取り直しと保存
+hard 1m の通常取得下限を watermark−10 分とし、上限 now、同じ primary/source・要求・try・budget・保存単位で取り直す。水位なしは現行 planner の範囲。prepare の書込みなし契約（`ingest.py:138-142`）と正規化（`src/agentic_fx/datafeed/closed_bars.py:16-34`）を維持し、補間・fallback・tick 取得はしない。hard 優先・soft は残 budget、backoff・時刻規則未検証も現行の通常取得規則（`ingest.py:146-148`, `:182-193`, `:258-275`）。失敗は通常 report に反映する。
 
-穴の初回発見を `detected_at`、最初の欠けた足の確定予定時刻を `missing_since`、`probe_due_at=missing_since+120秒` として保存する。生存期間が穴と重なる exposure が 0 件なら候補を省き、取り直さない。現在 terminal でも穴の当時に生存していれば対象とする。重複の有無を確定できない場合は省略しない。
+prepare は取得した有効足のうち「取得前水位以前で同 source の cache に無い時刻」を読取りだけで後着と判定し、取得前水位・新規時刻・後着足を report に載せる。内部穴の発見 tick の後、次の開場 tick から通常取得の規則で再取得する。穴は窓内にある間、通常取得の機会ごとに読み直す。後着検出の範囲は固定 10 分の遡り内（通常約10分、未試行で機会は減る）。窓を外れた古い穴は追跡しない。non-ready の一括到着検査はこの窓に制限されない。
 
-取り直しは state・auto 設定に依らず、due 以降最初の開場 tick から行う。通常取得（hard/soft と既存の backoff を含む）を先に済ませ、既存 ingest budget の残りがある場合だけ実行する。残りが無ければ次の tick へ回す。通常取得を probe のために遅らせない。成功した範囲検証は 1 回で終了し、完了した候補を無期限に取り直さない。
+cache 保存（現行 `ingest.py:316-320`）は、内部 commit のある `src/agentic_fx/store/ohlcv.py:144-152` を呼ぶため、ingest 用に commit を呼出し側へ委ねる経路へ改める。その上で同じ transaction で「未検査の後着」を 1 表に保存する。主キーは key/source/足時刻、値は足の OHLCV・検出時刻。observe は表を読んで接触検査し、非接触なら行を削除、接触/不明なら確認待ちと参照へ移して行を削除する。削除と state 保存は同一 transaction。再取得や再起動で未検査を失わず、判定失敗は削除しない。金額は記録しない。
 
-`prepare(now, gap_probe=...)` は保存済み due 候補を読んで要求するだけとし、書込みなしの契約（`ingest.py:138-142`）を維持する。穴の発見・候補作成・結果適用・端点更新は後述の `outage_transition()` だけで計算し、observe の短い core_lock 内 transaction で保存する。初回の probe は候補を保存した次の開場 tick 以降に行う。発見 tick の通常応答で probe を代用しない。prepare に穴判定や開始印の保存を重複実装しない。
+### 保存・復元の対応
 
-同じ primary/source に穴の直前実足から直後の最初の実足までを要求する。半開 range の終端は直後足の開始+1 足幅とし、その足を含める。now まで広げず、fallback・tick 取得・補間をしない。同 key の重なる範囲は統合してよい。report は候補 ID・key/source・要求範囲・cutoff・応答時刻・穴の時刻の足と前後の境界足・結果を持つ。前後の実足は範囲確認にだけ使い、接触検査しない。
-
-不在認定と実足の接触検査は独立させる。同 source で有効な対象足は、切詰め・前後不足などで範囲を網羅できなくても直ちに検査する。接触・接触不明は A を優先し、残る未確認範囲だけを再試行・注記にする。有効性は通常取得と同じ `normalize_closed_range`（`ingest.py:224-225`, `src/agentic_fx/datafeed/closed_bars.py:16-34`）に揃える。timezone 付き時刻、要求の半開区間、grace 込みの確定条件を使い、重複時刻は先頭を採り時刻順にする。この関数を超える独自の内容検証は作らない。source 不一致の足は証拠にしない。
-
-`outage_transition()` は未完了候補の穴の時刻について、同 source の cache も毎回読む。通常取得や probe 保存後の crash で現れた足を、probe の応答・成否を待たず直ちに検査する（通常取得の下限は `ingest.py:211-212`、cache 保存は `:316-320`）。
-
-| 結果 | 扱い |
+| 保存先 | 内容・寿命 |
 |---|---|
-| 同 source の正常非空応答、前後の既知実足と対象範囲を確認でき、穴の足は不在 | `absent_validated`。取引なしと認定して候補を完了 |
-| 一部または全部が後着 | 有効な対象足を直ちに検査し、接触/不明なら A。残る穴の不在認定は範囲確認の成立時だけ行い、非接触だけでは state を変えない |
-| 空・例外・時刻規則未検証・切詰め・前後不足・source 不一致・予算切れ | 有効な実足の検査後、未確認範囲を初回機会の後、次の 3 開場 tick で再試行。予算切れや未試行も各 1 回と数える |
-| 再試行しても検証不能 | `unverified` と理由・回数を activity と status 注記へ保存し、候補を完了。未確認範囲を停止・復帰・手動再開の gate にしない。不在認定もせず、実足で検出した接触の停止は保持 |
-| 閉場・source 不一致 | 閉場は試行に数えず due を保持。候補の source が現在の key と一致しなければ候補・応答を破棄し activity に記録 |
-| 応答後 crash・結果未保存 | 読取りは冪等なので再起動後に再送可。開始印を保存せず、保存済み試行回数と due から続行 |
+| 既存 `datafeed_outage_state` | state/epoch/pending/confirmed/streak・要求・通知印。`restricted_since` は連続 restricted の起点、`updated_at` は前回 observe。`restricted_deadline_at` は表示用で期限計算を二重化しない（`outage.py:435-441`, `:496-512`） |
+| 既存 `datafeed_outage_gap.gap_start` | non-ready epoch の key ごとの固定起点。ready→non-ready で開き、restricted→degraded では開き直さず、ready への復帰で epoch 終了。上位のみの停止でも全 hard key を保存（`outage.py:514-536`） |
+| state と同じ transaction の追加 facts | key/source ごとの S（単一最小値だけにはしない）、上位 hard の直近取得結果、観測した自動/手動の健全真偽・時刻、接触待ち・注文/足参照。上位結果は `_last_attempt_ok` の process 内限定（`outage.py:134`）を改め、epoch 開始のクリア（`:310-316`）と復元を保存へ揃える |
+| 新しい未検査の後着表 | cache と原子的に保存、observe の判定後に消費。epoch 外の ready 中の後着も対象 |
 
-独立候補 ID は epoch に寿命を縛らない。保存項目は key/source/穴と要求範囲、detected_at/missing_since/due、試行回数・最終結果・理由・完了時刻、対象足の指紋・接触種別・注文参照。過去の不在の恒久索引や毎 tick の注文 snapshot は作らない。
-
-cache 保存後、core_lock 内の明示 transaction で穴発見の検査端点・候補・state・接触の確認待ち・S・restricted 開始時刻・key ごとの停滞前の 1m 水位・streak と status facts（直近 observe の健全真偽と時刻）を保存する。保存障害では解除を記録せず B とするが、保護 tick は続ける（`src/agentic_fx/service.py:2525-2536`）。現行の復帰に古い穴の検証は無く（`ingest.py:211-225`, `outage.py:389-418`）、背景の安全確認を追加する扱いとする。
-
-probe の要求・正規化・cache 保存は、通常取得と別の try・別の保存単位にする。失敗は probe の再試行・unverified だけに反映し、通常 report を全 hard key failed に置換しない。現行の prepare/commit 例外はその置換を行うため（`src/agentic_fx/service.py:2429-2435`, `:2487-2491`, `:2516-2519`）、この境界を分離する。
+`gap_start` は新しい水位列を作らず既存列を使う。水位なしを now に置換する現行 `outage.py:531` は改め、NULL を明示できる migration にする（現行 `src/agentic_fx/store/db.py:829-836`）。有効な起点なしは「当該 key の初回から」の意味として記録し、通常時は未検査表と今回新規足、crash 回収ではその key の確定 cache 全体を検査する。起点の読取り障害とは区別する。source は gap 行にも保存し、設定変更時に混同しない。
 
 ### 起動・停止中の区間
 
-ready で起動した場合は、最初の開場 observe が commit されるまで新規発注・指値約定・自動 ready・手動要求の消費を待たせる。non-ready は既存の停止を維持する。独立した永続 gate は作らず、初回 observe 待ちとして扱う。`_process_exits`・取消・決済・close retry は止めない。閉場 observe では起動待ちを解かない（`outage.py:280-284`）。
+ingest/outage が両方ある構成だけ、最初の開場 observe commit まで新規発注・指値約定・自動 ready・手動要求消費を待たせる。どちらかが無い構成には起動待ちを掛けない（`src/agentic_fx/service.py:2483-2485`, `:2507`, `:2526-2527`）。取消・決済・既存保護・close retry は続ける。閉場 observe では待ちを解かない（`outage.py:280-284`）。
 
-再起動は穴発見の検査端点・候補・due・回数・S・restricted 開始時刻・key ごとの停滞前の 1m 水位・接触待ちを復元する。最初の開場 observe で未完了候補の cache と、保存済みの episode 起点からの N の対象足を検査し、その結果の保存後に初回 observe 待ちを解く。通常取得の cache 保存（`ingest.py:316-320`）後・observe の commit 前に crash して水位が進んでいても、復元した起点から検査し、E より先に A を適用する。起点の欠損・水位なしで区間を確定できないなど必須状態が読めなければ B とし、現在の cache 水位や S から起点を作り直さない。対象の実足はあるが保護条件が不明なら A とする。
-
-穴発見の端点が無ければ現在の水位から始め activity に記録し、過去全履歴を遡らない。停止中の内部穴も受容し、重なる exposure があれば背景検証する。保持期間外などで実足を取得できない候補は再試行・注記で終え、穴の古さだけで停止しない。旧 S と restricted 開始時刻の期限は延ばさず、streak は再起動で 0 にする。
+再起動は既存 gap_start・restricted_since・S・updated_at・上位結果・接触待ちを復元し、streak は0にする。未検査の後着と、保存済み non-ready epoch の gap_start より後の cache を検査してから初回待ちを解く。後者の起点は crash 回収用で、通常 tick に毎回全区間を再走査しない。cache commit 後・observe 前の crash でも進んだ水位に起点を置換しない。episode なしの健全な ready 起動は N を適用しない。必須状態が読めなければ B、保護条件不明の実足なら A。crash 回収で通常保護の評価済みを証明できない組は保守的に検査するが、通常保護の完了報告・時刻順評価は追加しない。
 
 ## 後着足の接触検査
 
@@ -158,9 +146,9 @@ ready で起動した場合は、最初の開場 observe が commit されるま
 
 生存期間は新しい列を足さず、開始を `created_at`、終了を `closed_at` とする。足の `[ts,ts+1分)` とこの窓が重なる注文を対象とし、非終端は上限なし、closed_at のない他の終端は `updated_at` を保守的に使う。作成時刻の保存は `src/agentic_fx/store/orders.py:23-26`、決済時刻は tick の now（`src/agentic_fx/core/executor.py:959-961`）。`filled_at` で開始を狭めず、指値時代を含めて広く取る。時刻の欠損・不整合や broker 結果不明で安全とは断定しない。
 
-この広い窓には直前に通常保護で決済した注文も入り、実際には処置済みでも接触と判定し得る。偽の接触は人の再開待ちに倒して許容する。穴への後着では、穴が後から埋まることと直前の決済が重なった場合に起きる。readonly で `datafeed_outage_gap` の epoch 52–56・58–66 の 14 件と同 source の cache を突合したところ、全件で `gap_start` の次の分の穴が現在も残っていた。停止記録の水位保存は `outage.py:515-536`、cache の時刻・source は `src/agentic_fx/store/ohlcv.py:144-152` に対応する。これは後着が少ないことの傍証に限り、35 区間全体の過去の埋まりや将来の非発生を証明しない。
+この広い窓には直前に通常保護で決済した注文も入り、実際には処置済みでも接触と判定し得る。偽の接触は人の再開待ちに倒して許容する。穴への後着では、穴が後から埋まることと直前の決済が重なった場合に起きる。readonly で `datafeed_outage_gap` の epoch 52–56・58–66 の 14 件と同 source の cache を突合したところ、全件で `gap_start` の次の分の穴が現在も残っていた。停止記録の水位保存は `outage.py:515-536`、cache の時刻・source は `src/agentic_fx/store/ohlcv.py:144-152` に対応する。これは後着が少ないことの傍証に限り、54 区間全体の過去の埋まりや将来の非発生を証明しない。
 
-spread は評価時の `_spread_for`（`scheduler.py:1837-1842`）を使い、候補には固定保存しない。pair 規則が無い場合は通常保護と同じ 0.0、読取り失敗・非有限値は接触不明とする。対象足の指値到達も接触として扱う。
+spread は評価時の `_spread_for`（`scheduler.py:1837-1842`）を使い、足には固定保存しない。pair 規則が無い場合は通常保護と同じ 0.0、読取り失敗・非有限値は接触不明とする。対象足の指値到達も接触として扱う。
 
 | 区間と重なる状態・証拠 | 判定 |
 |---|---|
@@ -174,158 +162,140 @@ spread は評価時の `_spread_for`（`scheduler.py:1837-1842`）を使い、�
 
 ## 復帰と状態機械
 
-flat は全 pair を通じて `orders.list_by_status(conn,*_EXPOSURE)` が 0 行。集合は open / pending_fill / protection_pending / submitting / submitted / closing / cancelling / submit_unknown / cancel_unknown / close_unknown (`src/agentic_fx/core/executor.py:29-31`)。quantity=0 でも非終端なら flat ではない。未知 status・読取り失敗は flat 不明。approval_pending は含めないが、承認後 submit には既存 gate を適用する。
+flat は全 pair を通じ `orders.list_by_status(conn,*_EXPOSURE)` が0行。集合は open / pending_fill / protection_pending / submitting / submitted / closing / cancelling / submit_unknown / cancel_unknown / close_unknown（`src/agentic_fx/core/executor.py:29-31`）。quantity=0 でも非終端なら flat ではない。未知 status・読取り失敗は不明。approval_pending は含めず、承認後 submit に既存 gate を掛ける。
 
-健全は現行 `outage.py:317-326` を基礎に、1m hard 全 key の非空成功と水位回復を使う。上位 hard 足に episode 内の初回成功を追加要求しない。受容した内部穴に連続性を要求しない。degraded の flat 自動解除だけは、flat 成立後に水位が進む健全 3 tick を要求する。同じ now・同じ足の再取得は加算せず、失敗・空・deferred・停滞・exposure 再発で 0。閉場・再起動でも 0 から確認する。scheduler の決済は observe の後なので、全決済の次の observe から数える。
+自動復帰の健全は現行 `outage.py:317-326` を基礎に、1m hard 全 key の当 tick 非空成功・現在非停滞と、上位 hard の直近結果が False でないこと。上位結果は保存して再起動で失敗の記憶を失わない。受容穴の連続性は条件にしない。手動再開 J/K の健全は別で、現行 `outage.py:327-329`, `:609` のまま全 hard の `attempt_ok is not True` を未確認として拒否する。上位 hard 未取得は自動健全になり得ても手動健全にはならない。
 
-通常 pending は表示と履歴の印で、flat 自動解除の gate ではない。接触の確認待ちは自動解除を禁止する。穴の取り直しは auto の値に依らず行う。`auto_resume_when_flat=false` が変えるのは自動 ready だけで、停滞回復時は健全 3 tick で degraded の手動待ちへ進む。手動再開に背景検証の完了は要求しない。
+degraded の flat 自動解除は、flat 成立後に水位が進む健全3 tick。同じ now・同じ足は加算せず、失敗・空・未試行・停滞・exposure 再発・閉場・再起動で0。決済は observe の後（`src/agentic_fx/service.py:2502-2506`, `:2527-2536`）なので次の observe から数える。通常 pending は履歴の印で H の gate にしない。接触待ちは flat でも自動解除を禁止する。auto=false は E/H を止めるが取得・検査は続け、restricted の健全3 tick 後は degraded の手動待ちにする。
 
-**`outage_transition(row, facts) -> (row_next, effects)`** 一つに、穴の発見・候補作成・試行結果・検査端点・接触検査・状態の計算を集める。注文の `core/transitions.transition` とは別名にする。facts は保存済み端点・候補・episode 起点の停滞前の 1m 水位、通常応答・probe 結果、注文履歴・spread、健全、時刻・設定・手動要求。`_observe_open` と `_consume_resume_request` はその結果だけを保存する。A/B は安全優先、C は状態判定と独立、G の上位 hard 不調は D/E より優先するが、1m と同時の取得失敗は D/F にまとめる。D〜I が自動判定、J/K がその後の手動要求消費、L/M が共通の順序・閉場規則、N〜R が一括到着・起動・維持・長期 restricted の補完規則。行 ID を test に対応させる。
+N の単位は「足と注文の組」。通常 tick では、その commit で新たに入った足のうち当該注文に通常保護が評価しない組だけを検査する。OPEN の最新・鮮度内で通常保護の対象になる足は除外し、最新以外・鮮度切れの新規足は含める。PENDING_FILL は non-ready の tick では指値約定が止まるため最新も含める（`scheduler.py:342-348`）。回復 tick も接触判定を先に行い、その後で E/H を許可する。前 tick に最新として通常保護が SL 決済した足を、次 tick に古くなっただけで再検査しない（OPEN は `scheduler.py:1786-1797`、処理済み時刻は `:1827-1835`）。未検査の後着は ready を含め独立に検査する。
 
-| ID | 入力・現状態 | 次状態・効果 |
-|---|---|---|
-| A | 対象足に接触または接触不明、任意 state・flat の別なし | degraded、pending=1、接触の確認待ち、streak=0、停止通知。ready なら停止 epoch を開く |
-| B | 保存障害・必須状態の読取り不能 | gate を閉じ解除しない。保存可能なら degraded、pending=建玉あり or 既存 pending、streak=0。ready からなら停止 epoch を開く。背景 probe の失敗・unverified は含めない |
-| C | 内部穴の発見・背景検証だけ | 候補・結果・注記を保存し、state・epoch を変えない。D〜K は通常 facts から別に判定 |
-| D | 1m 停滞・失敗・空、連続未到着が猶予内、ready/restricted | restricted。exposure ありでも即昇格しない。後続で水位が進めば古い計時を終える |
-| E | 期限内 restricted、同 tick に gate key 全て succeeded・非空・現在非停滞、上位 hard も健全、auto=true | ready、pending=0。取り直しの due・成否・未完了を待たず、追加の健全 3 tick も要求しない |
-| F | 連続未到着が期限超過、または期限外の足だけで回復、ready/restricted | degraded。初観測ですでに期限超過の ready は restricted を経由せず停止 epoch を開く。exposure ありなら pending=1。flat は同じ S の 1800 秒（設定値）を適用 |
-| G | 上位 hard 足の停滞・失敗・空（1m と同時の失敗を除く） | 起点は停滞 key の S の最小値（現行 `outage.py:367`）。現行規則：flat は 1800 秒の restricted（失敗・空は現行どおり即 degraded）、exposure ありは即 degraded。内部穴の数と混ぜない |
-| H | degraded、接触待ちなし、flat、auto=true、健全 | 健全 1〜2 tick は維持、3 で ready と pending=0 を一括保存。背景検証待ちは条件にしない |
-| I | degraded、接触待ちあり / exposure あり / auto=false | 自動解除なし。健全なら人の再開待ち。auto=false の restricted 回復も健全 3 tick でこの待ちへ |
-| J | 手動要求、不健全 | `rejected_watermark`。背景候補の未完了・unverified を理由に拒否しない |
-| K | 手動要求、健全 | 未処理近似と接触/不明の注文参照の和集合を ack 対象とする。未 ack は `rejected_unprocessed`。接触は flat でも ack 必須。受理時に接触待ちも解除 |
-| L | 自動判定と手動要求の競合 | 観測→自動判定→要求消費。先に ready なら `already_ready`。要求 key の比較更新で置換済み要求を消さない |
-| M | 閉場 | 要求・probe は保留、streak を増やさず、due/S を動かさない。開場後最初の観測へ |
-| N | restricted の episode 起点以降の到着、任意 state | 保存済みの停滞前の 1m 水位より後を区間とし、通常保護が見ない最新以外と鮮度 5 分超の最新を生存窓内の注文へ接触検査。区間は到着ごとに切らない。接触/不明は A、なければ D〜K の通常判定。flat でも省略しない |
-| O | 起動後最初の開場 observe、任意 state | 候補の cache と、復元した episode 起点からの N の対象足を検査し A/C を先に適用。検査すべき episode (保存済みの restricted の episode) があるのに起点を復元できないときだけ B。episode が無ければ N は適用せず、そのまま通常の状態行を判定する |
-| P | degraded × 停滞・失敗・空・期限超過 | degraded と既存 pending・接触待ちを維持、streak=0 |
-| Q | restricted の連続開場時間が 1800 秒超 | 足が届いていても degraded、既存 pending を保持し建玉ありなら pending=1、streak=0、停止通知。E より優先 |
-| R | ready、同 tick に健全、異常なし | ready を維持 |
+non-ready epoch は ready→restricted/degraded で開始、ready に戻るまで継続する。restricted→degraded・flat 化・到着ごとには起点を動かさない。N は degraded の回復一括到着にも掛け、flat の H より先に完了させる。起動時だけ gap_start から回収し、通常 tick の検査範囲を過去全区間へ広げない。ready 中だけで生じる複数到着・鮮度切れ等は範囲外のまま。
 
-不変条件:
+**`outage_transition(row, facts) -> (row_next, effects)`** 一つで接触・停滞・復帰・手動要求を計算し、observe と要求消費は結果だけ保存する。facts は前回 updated_at・key ごとの S・既存 gap_start・通常 report（取得前水位と今回新規足）・未検査の後着・注文履歴・spread・自動/手動の健全・時刻・設定・要求。A/B、N/O の検査、Q、独立した G、D〜I、J/K の順に安全条件を適用する。L/M は共通規則。行 ID を実装時の test に対応させる。
 
-1. non-ready でも決済・取消・close retry・既存 SL/TP の保護を続ける（`scheduler.py:342-348`）。
-2. 後続ありの穴は数・時刻で止めず補間しない。失敗・空を不在認定せず、背景検証不能は注記で終える。
-3. 接触検査は穴への後着と、restricted の episode 起点以降に届いた通常保護の対象外（最新以外・鮮度 5 分超の最新）に限る。起点は永続化し、到着・S 更新・再起動で動かさない。通常保護の評価経路は変えず、広い生存窓による偽の接触は人の確認待ちとして許容する。
-4. 5 分は連続未到着ごとに測る。後続到着で計時を終え、背景 due は restricted を延長しない。再起動・deferred・ack だけで期限を延ばさない。
-5. degraded の自動解除は全 exposure ゼロを要求し、接触待ちは flat でも解除しない。期限内 restricted の E は exposure ありでも許す。
-6. データ停止の解除で他の kill switch・リスク・承認 gate を解除しない。
+| ID | 入力・現状態 | 1m 未試行の扱い | 次状態・効果 |
+|---|---|---|---|
+| A | 対象組に接触/不明、任意 state・flat | 検査可能な保存足にも適用 | degraded、pending=1、接触待ち・参照、streak=0。ready なら epoch を開き、接触停止通知 |
+| B | 保存障害・必須状態の読取り不能 | 同じ | gate を閉じ解除しない。保存可能なら degraded、pending=建玉あり or 既存 pending、streak=0。ready なら epoch を開く。通常取得失敗は D/F |
+| C | 内部穴の発見・通常取り直しだけ | 新たな取得なし | state/epoch を変えず、他の facts で状態判定。後着なら N/A を先に適用 |
+| D | 1m 停滞・失敗・空、猶予内、ready/restricted | 停滞なら D、非停滞なら T | restricted。ready からは epoch を開き全 hard の gap 行を取得前水位で保存、attempt_ok をクリアして当 tick 結果だけ反映。S を保存し、継続中は gap_start/restricted_since を動かさない |
+| E | restricted、継続観測で回復、当 tick の自動健全、auto=true | E 不可 | N/O 完了・接触なしなら ready、pending=0。追加3 tick や取り直し完了を待たない |
+| F | 停滞の開場秒数が期限超、または再起動/観測中断で旧期限超 | 停滞継続なら F | degraded、streak=0。ready なら停止 epoch を開く。建玉ありなら pending=1、flat は設定期限。回復一括到着でもこの tick は解除しない |
+| G | 1m と同時でない上位 hard の停滞・失敗・空 | 上位 facts で判定 | 現行規則：exposure ありは即 degraded、flat の失敗・空も即 degraded、flat の停滞は設定期限の restricted。停滞 key の S の最小値で判定（`outage.py:367-387`） |
+| H | degraded、接触待ちなし、flat、auto=true、自動健全 | 加算せず streak=0 | epoch 内の必要な N/O 完了後、健全1〜2 tick は維持、3で ready と pending=0 を一括保存 |
+| I | degraded、接触待ちあり / exposure あり / auto=false | 健全確認に加算しない | 自動解除なし。健全なら人の待ち。auto=false の restricted も健全3 tick 後この待ちへ |
+| J | 手動要求、手動健全でない | 直近結果が未確認なら拒否 | rejected_watermark。取り直しの成否を独立の拒否理由にしない |
+| K | 手動要求、手動健全 | 全 hard の直近 True・停滞なしなら判定可 | 未処理近似と接触/不明の注文参照の和集合を ack 対象とする。未 ack は rejected_unprocessed。flat でも接触 ack 必須。受理で接触待ち解除 |
+| L | 自動判定と手動要求の競合 | 同じ | 観測→自動判定→要求消費。先に ready なら already_ready。要求 key 比較更新で置換済み要求を消さない |
+| M | 閉場 | 取得・要求消費を保留 | streak=0、S/gap_start/restricted_since を保持。壁時計で期限超過にしない |
+| N | non-ready epoch 内の新規足、または未検査の後着 | 保存足は検査する | 足と注文の組ごとに上記対象を検査。degraded の一括到着・flat でも省略せず、接触/不明は A。非接触なら通常判定 |
+| O | 最初の開場 observe | 必要な検査は省略しない | 未検査表と保存済み epoch の gap_start から回収し N/A を先行。episode なしは N を適用しない。必須状態の読取り障害は B。検査・保存後に起動待ち解除 |
+| P | degraded、停滞・失敗・空・期限超過 | 維持、streak=0 | degraded と既存 pending・接触待ちを維持 |
+| Q | restricted の連続開場時間1800秒超 | 同じ | 足到着に依らず degraded、既存 pending を保持し建玉ありなら1、streak=0、confirmed=1・停止通知。E より優先 |
+| R | ready、当 tick 自動健全、異常なし | T | ready 維持 |
+| T | 他のどの行にも当たらない | 非停滞の未試行を含む | 現 state を維持し、新 epoch/gap を作らない。attempt_ok は据置き（失敗/空なら False、成功なら True）、健全 streak は加算せず0 |
+
+不変条件は、(1) non-ready でも決済・取消・既存保護を続ける、(2) 後続ありの穴は数・時刻で止めず補間しない、(3) 接触検査は穴への後着と non-ready epoch の通常保護対象外に限り約定・決済を書き換えない、(4) 10 分は連続未到着ごとで、再起動・未試行・ack で延ばさない、(5) H は全 exposure ゼロと必要検査の完了を要求し接触待ちは解除しない、(6) 他の kill switch・リスク・承認 gate は解除しない、である。
 
 ## 通知と status
 
-outnotice を先に merge する。その実体の語彙は worktree `outage.py:30-34`、表示表は `:48-81`、要求比較更新は `:854-869`。C0 の引用から行番号が動いているため、今回読み直した位置を使う。
+通知の基盤は outnotice（commit `2e6e3b48`）を先に merge する。以下の行番号はこの commit に固定する。`resume_guidance` は `outage.py:48-81`、要求比較更新は `:856-869`、通知の一意キーは `(epoch,notice_state,request_key)`（`:934-944`）。
 
-| 事実 | 通知の記録・confirmed |
+| 事実 | 通知・記録 |
 |---|---|
-| ready 中の穴の発見・取り直し・非接触・不在 | Discord 無通知。停止 epoch も problem_streak も進めない。内部記録のみ |
-| 期限内 restricted・期限内自動復帰 | 従来の短い restricted と同じく無通知。activity に復帰理由を記録 |
-| 接触/不明による degraded | 同 tick に confirmed=1、候補 ID（候補外は key・足指紋から作る永続検出 ID）を request_key として既存固定本文の stopped を検出単位で 1 回記録。flat・既存の stopped/待ち印・要求中でも抑止しない |
-| 通常の失敗・停滞による degraded | outnotice の連続問題 2 tick / 開場時間 10 分の停止条件を維持。restricted 中の停滞も problem_streak は進めるが通知は degraded でのみ判定 |
-| restricted が連続開場時間 30 分超 | 同 tick に confirmed=1 とし、通常停止の stopped を同 epoch 1 回記録 |
-| probe の失敗・再試行終了 | Discord 無通知。activity と status 注記だけ。state・confirmed・problem_streak を変えない |
-| 回復後の人の待ち | awaiting_resume を同 epoch 1 回。接触の stopped を先に保存し、両方が初回なら順序も固定 |
-| 通常 degraded の flat 自動解除 | 停止/待ち記録のある epoch だけ既存 resumed を 1 回。自動確認中は新しい awaiting_resume を出さない |
-| 手動要求 | accepted/rejected/already_ready を必ず終端記録。接触 episode の受理は既存の手動再開通知を使う |
+| 穴・取り直し・非接触・不在、期限内 restricted と E | Discord 無通知。内部 activity のみ。穴だけで epoch/problem_streak を進めない |
+| 接触/不明 | confirmed=1、同 epoch の固定 request_key `contact` で stopped を1回。通常停止の空キーと分け、既存停止/待ち印・要求中・flat でも初回接触を抑止しない。追加接触は activity/status の参照追加だけ |
+| 通常 degraded | 連続問題2 tick / 開場10分の既存停止条件。restricted 中も problem_streak は進め、通知は degraded で判定 |
+| restricted 連続30分超 | confirmed=1、通常停止を同 epoch 1回 |
+| 回復後の人の待ち | awaiting_resume を同 epoch 1回。初回接触 stopped を先に保存 |
+| H | 停止/待ち記録のある epoch だけ resumed を1回。自動確認中に新たな awaiting_resume を出さない |
+| 手動要求 | accepted/rejected/already_ready を必ず終端記録 |
 
-現行の一意キーは `(epoch,notice_state,request_key)`（worktree `outage.py:940-944`, `store/db.py:834-842`）。接触は通常停止の空 request_key と分け、worktree `outage.py:577-578`, `:908-920` の抑止を通さず記録する。配送 retry は outnotice を継承する。安全状態 commit 後の別 transaction で保存する (worktree `outage.py:879-888`, `:925-944`)。記録前 crash の欠落限界は同じだが、接触の確認待ちから起動時に stopped の未記録を再照合する。通知失敗で保護 tick や安全状態を戻さない。価格・金額・口座情報を本文に含めない。
+配送 retry は基盤を継承する。安全状態 commit 後に別 transaction で通知を保存する（固定 commit の `outage.py:881-888`, `:934-944`）。接触待ちから未記録の contact 通知を起動時に再照合し、再送でも同キーで重複させない。通知失敗で安全状態を戻さず、保護 tick を止めない。Discord は固定本文とし、価格・金額・口座情報を含めない。
 
-status は observe が保存した健全真偽・時刻、ready_streak、state、接触待ち・参照、未完了候補と最終結果から一つの `resume_guidance` で決める。API 側で健全を再計算しない（worktree `outage.py:48-56`）。既存の unknown → 要求あり → ready を最優先にし、以後は下表を古い拒否・待ち印より先に判定する。
+status は保存した自動/手動健全・時刻・streak・state・接触待ち/参照から一つの resume_guidance で決め、API で健全を再計算しない。unknown→要求あり→ready を最優先とし、以後は以下を古い拒否・待ち印より先に判定する。
 
 | 条件 | phase | next_action |
 |---|---|---|
-| restricted、現在不健全 / auto=false の健全確認中 | restricted | wait_tick |
-| degraded、接触/不明の確認待ち、健全 | awaiting_resume | resume_with_ack |
-| degraded、接触待ちなし・flat・auto=true・健全確認中 | recovering | wait_tick |
-| degraded、現在不健全 | stopped | restore_source |
-| degraded、手動待ち、ack 対象あり / なし | awaiting_resume | resume_with_ack / resume |
-| 必須事実の読取り不能 | unknown | check_status |
+| restricted | restricted | wait_tick |
+| degraded、接触待ちあり、手動健全 | awaiting_resume | resume_with_ack |
+| degraded、接触待ちなし・flat・auto=true、自動健全確認中 | recovering | wait_tick |
+| degraded、データ不健全 | stopped | restore_source |
+| degraded、手動待ち、手動健全 | awaiting_resume | ack 対象により resume_with_ack / resume |
+| 必須 facts の読取り不能 | unknown | check_status |
 
-要求の終端結果は既存のまま（worktree `outage.py:34`）。未完了・検証不能候補は ready を含む各 phase の独立した注記として理由・回数・区間を出し、再開を拒まない。ack 件数は既存近似だけでなく接触/不明の参照も重複除去して含めるため、近似 0 でも案内が resume に戻らない。過去の拒否は別欄に保持し、現在の recovering より優先しない。`auto_resume_possible` も pending 一つで決めず、この表の条件に揃える。
-
-API の内部状態 4 項目の追加は取りやめ、phase・既存案内と今回必要な背景検証の注記・接触参照を公開する。`guidance_text.py` の許可組・ctl・web を同時に更新する。recovering は「健全な足の確認を続けています。条件が揃えば自動解除します」。旧クライアントは未知 phase を unknown と表示する。
+ack 件数には接触/不明参照も重複除去して含め、近似0でも resume に戻さない。上位未確認で自動健全だけ成立する場合は自動確認と手動不可を区別する。古い拒否は別欄。auto_resume_possible は全 exposure・接触待ち・健全条件に揃える。内部状態4項目の公開は追加せず、phase・既存案内・接触参照を使う。guidance_text.py・ctl・web を同期し、recovering は「健全な足の確認を続けています。条件が揃えば自動解除します」。旧クライアントの未知 phase は unknown。
 
 ## 実装と適用順
 
-main への merge が本番ペーパー運用への配備になる。outnotice を先に merge し、その後の schema_version で migration を追加する。接触純関数と価格更新ガードは先に適用できる。停滞猶予・背景検証・接触停止・flat 解除・表示は一つの branch に揃え、1 回の merge で同時に有効化する。既存 epoch 66 も同じ条件で扱う。検証は実装時に行う。
+main への merge が本番ペーパー運用への配備になる。outnotice 後の schema_version に migration を追加する。接触純関数と価格更新ガードを先に適用できるが、停滞猶予・通常取り直し・接触停止・flat 解除・表示は一つの branch、1回の merge で同時有効化する。既存 epoch 66 も同条件。今回は実装しない。
 
-- 接触判定: 生存窓の重複・SL/TP・指値到達を純関数化し、update 用の価格許可集合を分ける。
-- 保存: 穴発見端点、独立候補・due/回数/結果/理由/対象足指紋、S・restricted 開始時刻・key ごとの停滞前の 1m 水位、接触待ち・注文参照、observe の健全真偽・時刻・streak を追加。旧 fixture と冪等移行を更新する。
-- 取得: 読取りだけの prepare、通常取得後の残 budget による限定要求、通常取得とは別の例外・保存単位を実装する。
-- 状態: `outage_transition` に停滞期限・上位 hard の合流・30 分上限・候補処理・cache の後着検査・停滞後の一括到着検査・起動待ちを集める。
-- 復帰・表示: flat 解除と接触 ack 優先、接触通知の別キー、status facts を接続する。ctl/web・afx-ops・設定 example・docstring・通知設計・運用手順を同期する。
-- 受入: 11 夜の時系列、穴なし停滞、境界・接触・通知を fake/Dunia で確認する。
+- 接触判定と価格更新ガード：生存窓・SL/TP・指値到達を純関数化し、insert と update の価格許可集合を分ける。
+- 保存と取得：通常取得の固定窓・読取りだけの後着判別・report を追加。未検査の後着と cache を同じ transaction、判定消費と state を同じ transaction にする。既存列/表の再利用・S/上位結果・健全/接触 facts・NULL 起点の移行と冪等性を確認する。
+- 状態：outage_transition に10分・上位不調の合流・30分上限・注文ごとの対象選択・N/O・起動待ち・未試行の据置きを集める。
+- 復帰と表示：手動健全を保ち、H の検査優先と ack、epoch ごとの接触通知を接続。ctl/web・afx-ops・設定 example・docstring・通知設計・運用手順を同期する。
 
 ## test と受入
 
-以下は実装時の検証であり、今回は test を回さない。`outage_transition` の状態表の全行を入口 × state で検証し、observe と手動要求が同じ facts で同じ結論になることを確認する。
+以下は実装時の検証であり、今回は test を回さない。状態表全行を入口×state で確認し、observe と手動要求は同じ facts から計算する。
 
 | 境界・入力 | 期待 |
 |---|---|
-| 内部穴 0/1/連続 2〜4/多数・任意時刻・複数 pair | C。後続ありなら穴の数で停止しない。補間なし |
-| 11 夜、特に 11-05 の 07/09、11-17 の 23/25、11-19 の 39/41/43 | 各停滞の S→R で D→E、間は ready。古い due・失敗が次の restricted を延ばさない |
-| due 直前/ちょうど、連続 4 分後の初回発見 | 候補保存後、due 以降の次の開場 tick から probe。発見 tick の通常応答では代用しない。state は待たない |
-| 停滞・通常取得の失敗/空、300 秒直前/ちょうど/超過、回復足の確定が期限内/外 | D/E/F。失敗/空だけで即 degraded にしない。新しい足で連続計時を切り、現在非停滞・同 tick 成功の E は 3 tick を待たない |
-| ready で停止・建玉あり、開場時間で 5 分超の再起動/長時間 tick 停止、後続なし | 最初の observe で直接 F、停止 epoch を開き pending=1。restricted を経由しない。flat は同じ S から設定期限を判定 |
-| episode なし・ready・健全で再起動 | O は N を適用せず ready を維持し、B に落ちない |
-| 境界 tick の backoff 待ち・時刻規則未検証・未試行、epoch 57 の穴なし約 7 分停滞 | 回復なしで F。epoch 57 は建玉ありなら 5 分超で degraded |
-| 通常取得成功後に budget なし、probe が空/例外/不整合/source 違い | 通常取得を優先。初回機会と次の 3 tick（予算切れも数える）で打切り、注記だけ。停止・手動拒否なし |
-| 前後・範囲確認の成立した正常非空で全不在/一部後着/全部後着 | 不在を認定し、後着対象足を検査。非接触は無処置 |
-| 前後不足・切詰めの部分応答に有効な接触足/非接触足あり | 接触なら即 A、停止通知・接触待ちを保存。残範囲だけ再試行し、打切り注記でも接触停止は消さない。非接触でも範囲確認なしに不在認定しない |
-| 穴と重なる exposure なし、現在 terminal だが当時は生存 | 前者は probe を省略、後者は検査。flat の取得失敗で復帰を退行させない |
-| 停滞後の一括到着、最新以外に SL/TP・指値到達あり/なし、すでに flat | N。保存済みの episode 起点から通常保護の対象外の足を検査し、接触/不明なら A、非接触なら通常の復帰条件。到着ごとに起点を進めず、約定・決済は変更しない |
-| restricted 中、最新足が鮮度 5 分超のまま期限内回復し、後続も一括到着 | N。鮮度切れだった最新足も episode 起点から検査し、接触/不明なら E より A を優先。非接触かつ現在健全なら E |
-| 建玉ありの restricted が週末をまたぎ、金曜末尾足が日曜最初の開場 tick に到着 | M は起点・開始時刻を保持。開場後は N で鮮度切れの最新を含め検査し、接触/不明なら A、非接触なら開場秒数による D/E/F。ready 中だけの金曜末尾足は範囲外 |
-| long/short、SL/TP/両方/指値到達、open gap、非接触 | 真偽だけ評価。通常保護が見られなかった足は指値が未約定でも到達で A、仮約定・決済価格・損益変更なし |
-| 全 exposure・terminal、生存途中の生成/決済、保護条件・時刻不明 | 生存重複を保守的に評価。実足の接触判定不明は A、取得不能とは区別 |
-| update_fields 経由の direction/requested_price/SL/TP 更新 | 実行時ガードで拒否。transitions.transition の keyword 引数経由でも拒否 |
-| flat の 1800 秒/設定 0、flat↔exposure、上位 hard 不調、soft 不調 | S は状態変化だけで延ばさない。上位 hard は G、同 tick の 1m 失敗・空・停滞と重なる上位取得失敗は D/F にまとめる。soft は昇格理由にしない |
-| pending 後 flat、quantity=0、別 pair、未知 status、flat 2 tick 後 exposure 再発 | H は全 exposure ゼロから健全 3 回。同じ足/now は加算せず、不明・再発は解除しない |
-| 接触時すでに flat/接触後 flat、auto=false、未完了 probe | 接触は I、flat でも ack 必須。auto=false は自動 ready だけ止め、背景検証は続ける。未完了は手動再開を妨げない |
-| due 超過、応答後/commit 前 crash、再起動・保持期間外・端点なし | due・回数・S・restricted 開始時刻・episode 起点の 1m 水位・接触待ちを復元、冪等再送可。端点なしは現水位から開始して記録。最初の開場 observe commit まで ready 起動でも新規・指値約定・自動 ready・手動要求消費を待たせ、決済・取消は続ける |
-| restricted 中の一括到着を cache 保存後・observe の commit 前に crash → 再起動 | O。state と共に保存済みの停滞前の 1m 水位を復元し、進んだ cache 水位に置換せず N の対象足を検査。接触/不明なら A、起点を復元できなければ B、未検査のまま E にしない |
-| 休場前後の穴、祝日・DST | 期待時刻列で休場を除く。週末後も due を作り直さない |
-| 手動競合・ack 置換・閉場・新 epoch | J/K/L/M、一要求一終端結果。unverified を理由に拒否しない |
-| 既存 stopped/待ち印・要求中に接触、新検出の再送 | 別 request_key で接触 stopped を 1 回。注文 ID・足時刻を activity/ctl で確認可。現在 facts を古い拒否より優先 |
-| 作成を含む足・作成前に終わった足・closed_at を含む足・終了後の足、直前に通常決済した注文 | 作成側から closed_at までの広い窓との重複で選ぶ。直前決済を含む偽の接触でも A を許容し、人の確認を待つ |
-| 対象足と重なる protection_pending・unknown、保護条件不明 | 接触不明として A |
-| probe の要求・正規化の例外、probe 足の保存失敗 | 通常 report は変えず state は変わらない。再試行・注記だけ |
-| 穴の時刻に cache で足が現れ、probe は全回失敗 | cache の実足を直ちに検査。接触なら A、unverified で見落とさない |
-| 毎足 3 分遅れで restricted が連続、開場 30 分ちょうど/超過 | ちょうどは上限内、超過で Q と停止通知。後続到着で開始時刻を更新しない |
-| degraded 中の停滞/期限超過、必須状態の保存障害 | P は degraded 維持・streak=0。B は建玉あり or 既存 pending を保持 |
-| 保存・通知・任意注文の検査失敗 | 保存障害では解除せず、残る注文の通常保護・取消・決済は続く。通知失敗で安全状態を戻さない |
+| 全期間54区間・任意時刻・複数 pair・反復穴 | 後続ありの内部穴は C。表の仮定では D→E を区間ごとに切り、穴だけで F にしない |
+| 5/6/9/10/11 本、建玉あり/なし | 継続観測では10分ちょうどまで D、回復なら E。建玉あり11本は停滞中の600秒超観測で F。flat は設定期限。初観測が回復なら観測規則、観測中断なら F の別条件を確認 |
+| 取得失敗/空、600秒直前/ちょうど/超過、水位不変成功 | 同じ S で D/F、成功でも停滞なら E 不可。回復足で旧計時を切り、新たな停滞は次の S |
+| epoch 57 の穴なし約7分停滞、境界 tick 未試行 | 継続観測なら10分猶予。未試行は E 不可、停滞期限超なら F |
+| ready/restricted × 1m未試行・非停滞（backoff/時刻規則未検証/取得時刻前） | T で現 state、epoch/gap/attempt_ok 据置き、streak=0 |
+| 1m と上位 hard が同 tick に失敗/空/停滞、上位単独不調、soft 不調 | 同時は D/F、単独は G、soft は昇格理由にしない |
+| 上位 hard の失敗を保存→再起動→1m回復・上位未取得 | 記憶を失わず E/H 不可。上位未知でも J/K は手動健全で拒否し、未取得を True にしない |
+| 穴発見の次の開場 tick、固定窓内/外の後着 | 同じ通常要求で再取得。窓内の新規時刻を後着表へ保存し検査、窓外を無期限追跡しない |
+| 通常要求の空/例外/時刻規則未検証、budget なし | 通常 report から D/F/T。新しい後着なしを非接触・無 tick の証明にしない |
+| 部分応答に有効な後着足、他の足は不在 | 有効足を即検査、接触は A。不在部分だけで gate を足さず、非接触で既存接触待ちを消さない |
+| restricted 中、鮮度内の最新足で PENDING_FILL の指値到達 | N→A。最新だからという理由で見落とさず、仮約定しない |
+| tick t の最新足 X で通常保護が SL 決済、t+1 で X が古い足になる | 新規 commit 足でない X を再検査せず、通常の複数 tick で偽の A を作らない |
+| 建玉あり40分不通→F→40本一括到着、途中足で接触→flat | degraded も同じ epoch。N→A、H を止め、人の ack を要求。非接触なら通常の H 条件 |
+| non-ready で鮮度切れ最新・週末をまたぐ一括到着 | 通常保護対象外の新規組は N、休場は計時除外。ready 中だけの金曜末尾足は範囲外 |
+| restricted 中に停止→再起動の一括到着、ready 初観測で旧期限超 | updated_at と旧 S で中断判定し F。同 tick の回復を E/H にしない。N/O の接触は A 優先 |
+| 未検査後着の cache commit 後・observe 前 crash | 表から必ず再検査。検査と state 保存前 crash は未消費、保存後 crash は重複停止通知なし |
+| non-ready の一括到着を cache 保存後・observe 前 crash | 既存 gap_start から回収。進んだ cache 水位に置換せず、接触を見ずに H に進まない |
+| episode なしの健全 ready 起動、NULL 起点、必須状態読取り不能 | 前者は N なし。明示 NULL は初回足を検査、読取り障害は B。ingest/outage なし構成は起動待ちなし |
+| long/short、SL/TP/両方/指値、open gap、保護条件不明 | 接触真偽だけ評価、不明も A。通常保護の約定/決済/損益を変更しない |
+| 全 exposure・terminal、生存途中の生成/決済、作成前/終了後の足 | 作成時刻側〜closed_at の広い窓。後着と直前決済が重なる偽の接触は人の確認待ちとして許容 |
+| direction/requested_price/SL/TP の update、transition の keyword 経由 | 実行時ガードで拒否 |
+| flat の1800秒/設定0、flat↔exposure、restricted 30分ちょうど/超過 | 状態変化で S を延ばさず、Q は足到着に依らず超過時停止 |
+| pending 後flat、quantity=0、別pair、未知status、flat2 tick 後exposure再発 | H は全 exposure ゼロから健全3回。同足/nowは非加算、再発・不明では解除しない |
+| 接触時すでにflat、接触後flat、auto=false | 接触は常に ack 必須。auto=false は建玉あり E と H を止め、取得/検査は続ける |
+| degraded・1m回復・上位 hard未取得で手動要求 | 現行の手動健全で J。自動健全を J/K に流用しない |
+| 手動競合・ack置換・閉場・新epoch | J/K/L/M、一要求一終端結果。検査未完了は解除を先にしない |
+| 既存停止/待ち印・要求中で初回接触、追加接触・再送・通知保存前crash | contact キーで同 epoch 1回、追加は activity/status のみ、起動時再照合。現在 facts を古い拒否より優先 |
+| 状態保存・通知・任意注文検査の失敗 | 保存障害では解除せず、他の注文の通常保護・取消・決済を続ける。通知失敗で安全状態を戻さない |
 
-fixture は readonly SQL の 11 夜の時刻を使い、価格は合成する。fake bridge・仮時計・一時 SQLite・通知 double で背景検証と復帰が独立することを示す。本番 DB/cache の変更、bridge の停止、Discord の試験送信は行わない。
+fixture は全期間 SQL の時刻と合成価格を使う。fake bridge・仮時計・一時 SQLite・通知 double で確認し、本番 DB/cache の変更、bridge 停止、Discord 試験送信は行わない。
 
 ## 利用者の確認項目
 
-冒頭の「利用者が確認する資金保護の変化」の一覧を確認項目とする。追加の問いはない。約定時刻・上位足出来高による不在の反証や tick 数の強化は加えない。
+冒頭の資金保護の変化の表を確認項目とする。追加の問いはない。約定時刻・上位足出来高による不在の反証や tick 数の強化は加えない。
 
 ## 付録: 文書・前提とコードの食い違い
 
-参照元とコードは今回は変更しない。実装時の同期に含める。
+参照元とコードは今回は変更せず、実装時の同期に含める。
 
-| # | 文書・前提 | 実体・本案での扱い |
-|---|---|---|
-| 1 | 15 epoch のうち 14 件を孤立 1 本と扱う | epoch と穴は別。SQL は 11 夜 35 区間。連続 4 本もあるが、新方針では数で停止しない |
-| 2 | cache 不在で無 tick を証明 | rates を写すだけ (`mt5_bridge/mt5_client.py:675-705`)。取引なしは裁定に基づく運用認定 |
-| 3 | 9/24 設計の backfilling・SL/TP replay が存在 | 現行の対象外 (`outage.py:3-9`)。`docs/superpowers/specs/2026-09-24-outage-stop-and-backfill-design.md:85-96` を実装済みとしない |
-| 4 | 停止後は常に手動復帰 | 現行も flat 自動解除あり (`outage.py:409-418`)。通常 pending 後の flat へ拡張 |
-| 5 | restricted は flat だけ | 現行は exposure ありで即 degraded (`outage.py:373-388`)。新方針は建玉ありの停滞にも 5 分猶予 |
-| 6 | 2 分が停滞の猶予 | 2 分は穴の背景再取得の待ち。停滞は 300 秒 / flat 1800 秒 (`outage.py:370-384` を変更) |
-| 7 | 健全は全足連続の証明 | 最新水位・取得結果のみ (`outage.py:302-329`)。受容穴の連続性は復帰条件にしない |
-| 8 | 通常 ingest が古い穴を再取得 | watermark−1 本 (`ingest.py:211-225`)。保存候補の範囲を通常取得後に best effort で検証 |
-| 9 | 未処理近似 0 なら exposure なし | `outage.py:699-716` は OPEN/PENDING_FILL だけ。全 `_EXPOSURE` ゼロで flat 判定 |
-| 10 | pending 後の flat は自動解除 | main `outage.py:410` と通知 worktree `outage.py:548-559` は not pending 必須。通常 pending は除き、接触の確認待ちは残す |
-| 11 | 通知設計の帯例外・flat 解除は未裁定 | `docs/superpowers/specs/2026-11-21-datafeed-outage-notice-design.md:241-242` より改定チケット裁定を優先 |
-| 12 | 待ち印・拒否だけで次の手動操作が決まる | worktree `outage.py:48-81` に現在の接触・recovering の優先行と背景検証の注記を追加 |
-| 13 | auto_resume_possible は pending で false | worktree `outage.py:321-335` を全 exposure と接触の確認待ちに揃える |
-| 14 | entry_same_bar=True で TP も検査 | `paper_fills.py:52-57` は TP を抑止。接触は SL/TP の真偽を直接評価、仮約定不要 |
-| 15 | SL/TP が変わるので毎 tick snapshot 必須 | insert 設定 (`src/agentic_fx/core/executor.py:679-687`) 後の変更経路はない。`src/agentic_fx/store/orders.py:7-14`, `:40-42` は direction を既に拒否。他 3 価格を update 用集合から除く。生存窓は既存の作成・終了時刻から広く取る |
-| 16 | 通知と安全状態は同一 transaction | worktree `outage.py:879-888`, `:925-944` は後段の別保存。この分離を維持 |
-| 17 | scheduler が provider 経由で 1m cache を温める | `src/agentic_fx/service.py:1602-1606` の注記と実体が不一致。本番は `:1829-1832`, `:1878` の DB 読取り、保存は `ingest.py:316-320` |
-| 18 | example・docstring は flat の短停滞だけを説明 | `config/settings.yaml.example:63-65`, `outage.py:3-7` を停滞 5 分・穴受容・接触の人手優先へ同期。`config/settings.yaml.example:64` の健全 3 tick は degraded の flat 解除と auto=false の手動待ちに適用し、期限内 restricted の E は同 tick の健全で復帰することを明記。`:65` の auto_resume_when_flat は建玉あり restricted の回復も制御することを追記 |
-| 19 | 初観測の期限超過は開場時間で全状態に適用済み | 現行 `outage.py:370-373` は壁時計と flat の設定期限で判定。本案では ready/restricted の exposure ありも開場秒数で判定し、週末の壁時計だけでは昇格させない |
+| 文書・前提 | 実体・本案での扱い |
+|---|---|
+| epoch 数と穴数を同一視、11-01がcacheの始まり | 全期間は10-21から、54区間。epoch は別の数 |
+| cache 不在で無 tick を証明 | rates を写すだけ（`mt5_bridge/mt5_client.py:675-705`）。不在は穴として受容し、後着は固定窓で検出 |
+| backfill/replay が既にある | 現行対象外（`outage.py:3-9`）。通常保護の時刻順評価を追加しない |
+| restricted はflatだけ、建玉あり即停止 | 現行 `outage.py:373-388` を建玉あり停滞10分へ変更 |
+| 停止後は常に手動、pending があればflatでも解除不可 | 現行 `outage.py:409-418` の not pending を通常停止について外し、N完了・接触待ちなしで H |
+| 自動健全と手動健全は同じ | 自動は `outage.py:317-326`、手動は `:327-329`, `:609`。手動は緩めない |
+| 通常取得で古い穴も検証済み | 現行 `ingest.py:211-225` は水位−1本。固定10分へ広げ、窓外を保証しない |
+| 近似0はflat、TPもentry_same_barで確認 | 近似は OPEN/PENDING_FILL 限定（`outage.py:699-716`）、flat は全 exposure。`paper_fills.py:52-57` は TP 抑止。接触は真偽を直接評価 |
+| 保護価格は変わる、毎tick snapshotが必要 | insert 設定（`src/agentic_fx/core/executor.py:679-687`）。update 用許可集合を分け不変にする |
+| 通知と安全状態は同じtransaction | 通知基盤の固定 commit `outage.py:881-888` は別保存。後着/cache と判定/state の原子性とは区別 |
+| scheduler がcacheを温める | `src/agentic_fx/service.py:1602-1606` の注記は実体と不一致。本番は `:1829-1832`, `:1878` のDB読取り、保存は `ingest.py:319` |
+| example/docstring はflatの短停滞だけ | `config/settings.yaml.example:63-65`, `outage.py:3-7` を10分・穴受容・検査優先へ同期。健全3 tick は H と auto=false の手動待ち、Eは同tick。autoは建玉ありEも制御 |
+| 長時間停止も回復足の確定時刻で期限内復帰できる | 現行 `outage.py:370-373` の壁時計判定を開場秒数・exposure別期限へ変更し、updated_at の観測中断を区別 |
 
 ## 変更履歴
 
@@ -338,4 +308,5 @@ fixture は readonly SQL の 11 夜の時刻を使い、価格は合成する。
 | 2026-11-21 | C0.4 | 通常保護の時刻順評価と評価済み時刻への集約、完了・決済足の定義、probe の分離、停滞・起動・通知・適用順と受入を改訂 | 設計レビュー 4 周目の指摘を反映 | 44bbea64 |
 | 2026-11-21 | C0.5 | 接触検査を穴への後着と停滞後の一括到着に限定し、生存窓・状態表・適用範囲・受入を整理。通常保護の時刻順評価・引渡しの永続化・境界足の指紋比較・金曜末尾足の特別扱いを削除 | 設計レビュー 5 周目の指摘を受け、範囲を承認済みの方針に削る | 99100c2f |
 | 2026-11-21 | C0.6 | restricted 中の鮮度切れの最新足を接触検査へ含め、episode 起点の水位を保存・復元。資金保護の変化・偽の接触の根拠・通知の参照・履歴・受入を修正 | 設計レビュー 6 周目の指摘を反映 | 6f002a52 |
-| 2026-11-21 | C0.7 | 起動時に起点の復元を求めるのは保存済みの episode があるときだけに限り、episode なしの再起動の受入を足す | 設計レビュー 7 周目の指摘を反映 | |
+| 2026-11-21 | C0.7 | 起動時に起点の復元を求めるのは保存済みの episode があるときだけに限り、episode なしの再起動の受入を足す | 設計レビュー 7 周目の指摘を反映 | fb6606e9 |
+| 2026-11-21 | C0.8 | 停滞 600 秒、epoch 全体の接触検査、通常取得による取り直しと保存・状態・通知・受入を整理 | 独立チェックの指摘と利用者裁定 (停滞 10 分・自動解除前の検査) を反映し、取り直しを通常取得に寄せて単純化 | |
