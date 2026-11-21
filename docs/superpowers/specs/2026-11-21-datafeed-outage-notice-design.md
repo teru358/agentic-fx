@@ -1,19 +1,22 @@
-# データ停止・再開待ちの Discord 通知 設計 C0.1
+# データ停止・再開待ちの Discord 通知 設計 C0.2
 
 作成日: 2026-11-21 JST。対象: `docs/tickets/open/datafeed-outage-discord-notice.md`。
-基準: C0（commit `1f630734`）。静的確認、本番 DB の readonly SELECT、既存ログの読取りに基づく改訂。実装・test・配備はしていない。
+基準: C0.1（commit `c71ed55e`）。静的確認、本番 DB の readonly SELECT、既存ログの読取りに基づく改訂。実装・test・配備はしていない。
 
 ## 利用者に届くもの
 
-監視対象の価格系列でデータの欠落を検知して停止が続くとき、取得が戻って人の再開操作を待つとき、再開要求を記録したとき、その要求を拒否したとき、実際に ready に戻ったときに、既存 bot が Discord の通知先へ知らせる。新規判断・新規リスクの停止判定は変更しない。通知の失敗で停止を長引かせない。
+監視対象の価格系列でデータの欠落を検知して停止が続くとき、取得が戻って人の再開操作を待つとき、再開要求を記録したとき、その要求の判定が終わったとき、実際に ready に戻ったときに、既存 bot が Discord の通知先へ知らせる。新規判断・新規リスクの停止判定は変更しない。通知の失敗で停止を長引かせない。
 
-一つの episode（永続 epoch）につき停止・待ち・復帰は各一回、受付・拒否は人の要求ごとに送る。同じ epoch で待ちを記録した後は停止通知を作らない。短い restricted だけで自動復帰した episode と未処理足の更新は送らない。通知は発生時の記録なので、遅れて届いた場合は SSH の端末で `afx ctl status` を確認する。
+一つの episode（永続 epoch）につき停止・待ち・復帰は各一回、受付は新規記録ごと、終端結果（受理・拒否・既に解除済み）は消費した要求ごとに送る。照会や ack 変更では受付を増やさない。同じ epoch で待ちを記録した後は停止通知を作らない。短い restricted だけの自動復帰と未処理足の更新は送らないが、要求への終端結果は返す。通知は発生時の記録なので、遅れて届いた場合は SSH の端末で `afx ctl status` を確認する。
 
 | 契機 | 固定本文 |
 |---|---|
 | 停止確認 | 監視対象の価格系列でデータの欠落を検知しました。SSH の端末から `afx ctl status` で取得状態を確認してください。復旧後も同画面で再開操作の要否を確認してください。 |
 | 再開待ち | 監視対象の価格系列でデータ取得の回復を確認しました。人の再開操作を待っています。SSH の端末から `afx ctl status` を確認してください。案内が通常の再開なら `afx ctl --as approver data resume` を実行してください。未処理の足がある建玉の確認が必要と出た場合は、建玉を確認し、再開を承認するときだけ `afx ctl --as approver data resume --acknowledge` を実行してください。 |
-| 要求受付 | 再開要求を記録しました。次の開場中の判定で受理か拒否かを通知します。 |
+| 要求受付（epoch 付き） | 再開要求を記録しました。次の開場中の判定で結果を通知します。 |
+| 要求受付（generation=None の互換本文） | データ取得の再開を要求しました。 |
+| 要求受理 | 再開要求を受理しました。SSH の端末から `afx ctl status` を確認してください。 |
+| 既に解除済み | 既に停止は解除されています。SSH の端末から `afx ctl status` を確認してください。 |
 | 要求拒否 | 再開要求は受理されませんでした。SSH の端末から `afx ctl status` で理由を確認し、必要なら再要求してください。 |
 | ready 復帰 | 監視対象の価格系列のデータ停止から復帰し、データによる停止を解除しました。SSH の端末から `afx ctl status` を確認してください。他の停止条件は同画面で確認できます。 |
 
@@ -21,7 +24,7 @@
 
 `resume` は要求の記録であり、成功応答だけでは再開していない。次の開場中の観測 tick が全 hard key の取得確認と watermark を再検査し、未処理足がある OPEN/PENDING_FILL がなければ受理する。ある場合は `--acknowledge` による明示承認が必要で、データ不健全は迂回できない。未処理足の判定は保守的な近似であり、SL/TP replay の完了を意味しない。拒否された要求は消費されるため、状態を直して再要求する。休場中の要求は開場まで残る（`src/agentic_fx/datafeed/outage.py:236-254`, `:280-285`, `:597-648`, `:669-718`。以下、`outage.py` は同ファイル）。
 
-長時間の再開待ちへの時間駆動の再通知は初版では行わない（裁定済み）。受付と拒否で操作への返事を残し、配送 retry と status の案内を使う。停止確認の時間条件は未通知の停止を一度知らせるための条件であり、再通知ではない。
+長時間の再開待ちへの時間駆動の再通知は初版では行わない（裁定済み）。受付と終端結果で操作への返事を残し、配送 retry と status の案内を使う。停止確認の時間条件は未通知の停止を一度知らせるための条件であり、再通知ではない。
 
 ## 現行の根拠
 
@@ -40,6 +43,8 @@
 | 改善 outbox は終端 snapshot と event を照合し、期間下限を設け、不正な一件を skip する。遷移記録の前例はこちらを使う | `events.py:199-211`; `src/agentic_fx/ops/service.py:1489-1505` |
 | kill switch は ops lane 内で event を照合。共通回収は起動時・tick 後に呼び、improve の設定と失敗から隔離する | `src/agentic_fx/ops/service.py:2031-2104`; `src/agentic_fx/service.py:2554-2563` |
 | EventStore.emit は自分で commit する。best effort は失敗時 rollback し失敗数を保持する | `events.py:150-197` |
+| 未消費要求は単一行の時刻・ack を上書きする。ready 消費は要求を消すだけで結果を残さない | `outage.py:460-467`, `:599-608` |
+| 観測で epoch が増えてから要求を消費する。消費時の全 hard key と現 epoch の未処理建玉を再検査する | `outage.py:254`, `:327-329`, `:362-365`, `:609-627` |
 | guard_state_changed は三 field と ref=instance を使用。data_feed の既存 event は resume_requested だけ | `events.py:27`, `:45`, `:101-107`; `src/agentic_fx/ops/service.py:1754-1768`; `afx-ops/afx_ops/gate/render.py:453-460` |
 | API data は state のみ、ctl は一語、web は警告カード。shell に詳細はあるが daemon 運用では shell を起動しない | `src/agentic_fx/service.py:2221-2225`, `:3050-3052`; `src/agentic_fx/ops/client.py:779-781`; `afx-ops/afx_ops/web/render.py:240-278`; `src/agentic_fx/commands.py:715-760`; `deploy/afx.service.direct:12` |
 
@@ -70,17 +75,29 @@ state/gap の確定と通知記録は別 transaction にする。通知記録を
 
 ### 発生側
 
-新表 `datafeed_outage_notices` は主キー `(epoch, notice_state, request_key)`、列は `occurred_at`（UTC）と nullable な `event_id`。通知状態は `stopped / awaiting_resume / resume_rejected / resumed`。`request_key` は拒否だけ消費対象の `resume_requested_at`、他は空文字とする。要求ごとのキーは要求記録時に衝突しない UTC 時刻にする。受付は既存の操作経路の event を使い、この表へ二重に記録しない。
+新表 `datafeed_outage_notices` は主キー `(epoch, notice_state, request_key)`、列は `occurred_at`（UTC）と nullable な `event_id`。通知状態は `stopped / awaiting_resume / resume_accepted / resume_rejected / resume_already_ready / resumed`。`request_key` は終端結果の三種類では消費対象の `resume_requested_at`、他は空文字とする。要求ごとのキーは要求記録時に衝突しない UTC 時刻にする。受付は既存の操作経路の event を使い、この表へ二重に記録しない。
 
-`datafeed_outage_state` に `resume_last_result`（`accepted / rejected_unprocessed / rejected_watermark` または NULL）、判定時刻 `resume_last_result_at`、対象要求時刻 `resume_last_request_at` を加える。判定結果は要求消費・状態更新と同じ transaction に残す。両方の拒否条件に該当した場合は rejected_watermark を優先する。新要求は過去の結果を上書きせず、要求ありの表示を優先し、新 epoch では結果をリセットする。既に ready の要求消費は解除遷移を作らない。
+`datafeed_outage_state` に `resume_last_result`（`accepted / rejected_unprocessed / rejected_watermark / already_ready` または NULL）、判定時刻 `resume_last_result_at`、対象要求時刻 `resume_last_request_at` を加える。判定結果は要求消費・状態更新と同じ transaction に残す。両方の拒否条件に該当した場合は rejected_watermark を優先する。新要求は過去の結果を上書きせず、要求ありの表示を優先し、新 epoch では結果をリセットする。既に ready の要求消費も `already_ready` と判定時刻・対象要求時刻を確定して消去する。解除遷移は作らず、要求への終端結果を記録する。
+
+要求記録は read→判定→更新を同じ書込み transaction 内で行い、tick の消費との競合でも一つの未消費要求だけを扱う。ctl と shell は共通の結果区分を使う（現状の上書きは `outage.py:460-467`）。
+
+| 未消費要求 | 操作 | 応答と記録 |
+|---|---|---|
+| なし | resume（ack の有無を問わない） | 新しい要求時刻を記録し、受付を一件作る |
+| あり | 同じ ack、または ack ありに対する ack なし | 「既に記録済み・開場判定待ち」。時刻・ack を保ち、新しい受付を作らない。ack を取り消さない |
+| ack なしであり | ack あり | 新しい要求時刻・ack ありへ置換し、「先の要求を ack 付き要求に置き換えました。開場判定待ち」と応答する。追加の受付は作らない。先の要求への別の結果通知は作らず、消費された一件だけに終端結果を出す |
+
+新規記録・照会・置換の結果と記録時の epoch を呼出し元へ返し、受付の有無と generation を確定する。事前の gap_summary だけから新規受付と判断しない（現状は `src/agentic_fx/service.py:2252-2258`; `src/agentic_fx/ops/service.py:1763-1764`）。
+
+要求の記録時と消費時で epoch が変わっても、要求は消さず現行と同じく消費時の epoch に対して再検査する。受付の generation は記録時、終端結果と停止解除の generation は消費時の epoch。対応は要求時刻で保持し、世代番号の一致から受理を推定しない。ready 中の要求の後に新しい停止が始まった場合も、非 ready なら現 epoch の取得確認・watermark・未処理建玉を再検査し、ack があっても不健全なら拒否する。消費時も ready の要求と、観測が先に自動 ready に戻した要求は `already_ready` とする（`outage.py:254`, `:327-329`, `:362-365`, `:604-627`）。ack の効力と資金保護の判定条件は変更しない。
 
 記録の条件は次のとおり。
 
 - 停止: degraded で confirmed が立ったとき、または `entered_degraded_at` から開場時間で N 分（初版の既定10分）が過ぎても待ち・ready にならないとき。一度だけ記録する。confirmed 列の意味は変えない。待ちの記録または同 epoch の待ちの印があれば、後から停止を記録しない。
 - 時間条件: `market_hours.is_market_open` と日次境界を用いて UTC の区間内の開場時間だけを積算する（`market_hours.py:30-61`）。永続の開始時刻から再計算し、休場・祝日を除き、再起動で時計を戻さない。判定は開場中の既存 tick だけで行う。
 - 待ち: healthy かつ degraded で、自動 ready の条件が成立せず、要求も未記録のときに一度記録する。pending が残って flat になったケースも含む。`recovered_notified_epoch` と activity の条件もこの定義に揃える。要求中は待ちを促さず、既存の待ちの印を消さない。停止 gate・自動復帰・pending 解除条件は変えない。
-- 拒否: 消費した要求ごとに記録する。要求時刻と固定結果を確定済みの判定結果から渡す。拒否後の再要求は別のキーになり、再度通知できる。
-- 復帰: degraded→ready の自動復帰は同 epoch に停止または待ち記録がある場合。手動の非 ready→ready は要求への受理結果として記録する。restricted だけの自動復帰は記録しない。
+- 終端結果: 消費した要求ごとに受理・拒否・既に解除済みのいずれか一件を記録する。要求時刻と固定結果を確定済みの判定結果から渡す。拒否後の再要求は別のキーになり、再度通知できる。ready 中の要求と、消費前に自動 ready へ戻った要求にも「既に停止は解除されています」と返す。
+- 復帰: degraded→ready の自動復帰は同 epoch に停止または待ち記録がある場合。手動の非 ready→ready も実際の停止解除として一度記録する。要求受理とは別の記録・通知であり、同時なら受理→復帰の順とする。restricted だけの自動復帰は記録しないが、要求があれば既に解除済みの返事は出す。
 
 通知記録の書き手は commit 後の専用 helper 一つとし、起動補完も同じ helper を呼ぶ。state/gap と要求消費の transaction を抜けた後に、固定語・整数・要求時刻だけを `INSERT ... ON CONFLICT DO NOTHING` で保存する。通知用接続で短い transaction を所有し、例外は rollback して固定語 `datafeed_notice_deferred` をログへ残す。通知の例外を observe の失敗へ伝播させない。外向き payload の検査と描画は sweep/consumer 側で行う。
 
@@ -98,27 +115,27 @@ state/gap の確定と通知記録は別 transaction にする。通知記録を
 }
 ```
 
-state は `stopped / awaiting_resume / resume_requested / resume_rejected / resumed`。追加の field は設けない。既存の検査をそのまま通る（`events.py:27`, `:45`, `:101-107`; `afx-ops/afx_ops/notify/payload.py:22`, `:36`, `:54-85`）。生成側はこの固定語と非負整数だけを渡す。旧 consumer も既知 code として汎用文で扱える（`afx-ops/afx_ops/gate/render.py:453-460`）。data_feed の描画に上の固定本文を追加し、内部整数は本文に描画しない。
+state は `stopped / awaiting_resume / resume_requested / resume_accepted / resume_rejected / resume_already_ready / resumed`。追加の field は設けない。既存の検査をそのまま通る（`events.py:27`, `:45`, `:101-107`; `afx-ops/afx_ops/notify/payload.py:22`, `:36`, `:54-85`）。有効化後の生成側はこの固定語と非負整数だけを渡す。互換受付の generation=None も既存の検査を通る。旧 consumer も既知 code として汎用文で扱える（`afx-ops/afx_ops/gate/render.py:453-460`）。data_feed の描画に上の固定本文を追加し、内部整数は本文に描画しない。
 
-受付 event は既存 `resume_data` の操作経路で残し、新しい生成側では generation を要求時の epoch に揃える。受付は ready への解除とは別である。bot の通常通知・all と notify で同じ固定本文を使う。操作監査の terminal event は既存設定どおりとする。
+受付 event は既存 `resume_data` の操作経路で、新規記録の場合だけ残す。照会・ack 置換は応答と既存操作監査だけに残す。有効化前は既存の generation=None と互換本文を保ち、結果通知を約束しない（`src/agentic_fx/ops/service.py:1760-1765`; `afx-ops/afx_ops/gate/render.py:459`）。consumer は generation=None と非負整数を描き分ける。通知記録と status の先行配備では受付の generation を変更しない。producer の有効化と同時に受付を要求時の epoch へ切り替え、この受付だけ「結果を通知します」と案内する。新たな field は足さない。受付・終端結果・実際の停止解除を区別する。bot の通常通知・all と notify で同じ固定本文を使う。操作監査の terminal event は既存設定どおりとする。
 
 ### sweep・重複抑止
 
 `OpsService.emit_pending_notices` に datafeed helper を別 try で加える。起動時と tick 末尾の回収点を使い、improve 設定・kill switch 成否から独立させる。observe の lock 区間から ops lane を取得しない。
 
-重複判定は単一 daemon の ops lane 内で行う。通常遷移は code・ref・guard_kind・generation・state で照合する。拒否は同 epoch に複数存在するため、state 一致だけで既出としない。記録の要求キーと event_id の対応で照合する。event_id は配送済みの印ではなく、生成済み event との対応である。
+重複判定は単一 daemon の ops lane 内で行う。通常遷移は code・ref・guard_kind・generation・state で照合する。終端結果は同 epoch に複数存在するため、state 一致だけで既出としない。記録の要求キーと event_id の対応で照合する。event_id は配送済みの印ではなく、生成済み event との対応である。
 
-拒否を含む sweep の event INSERT と記録への event_id 保存は同じ通知 transaction で確定し、途中 crash なら両方 rollback する。このため EventStore に commit しない INSERT primitive を分け、既存の時刻・schema 検査を再利用する。既存 emit の自動 commit をこの transaction に入れない（`events.py:150-160`）。表間の対応を含む重複抑止は ops lane 内の照合と対応保存だけで行う。kill switch の照合は guard_kind で絞る既存契約を維持する（`events.py:263-277`）。
+終端結果を含む sweep の event INSERT と記録への event_id 保存は同じ通知 transaction で確定し、途中 crash なら両方 rollback する。このため EventStore に commit しない INSERT primitive を分け、既存の時刻・schema 検査を再利用する。既存 emit の自動 commit をこの transaction に入れない（`events.py:150-160`）。表間の対応を含む重複抑止は ops lane 内の照合と対応保存だけで行う。kill switch の照合は guard_kind で絞る既存契約を維持する（`events.py:263-277`）。
 
-T3 の daemon を初めて起動した時刻を `producer_enabled_at` として通知用の管理行に永続化する。sweep は `occurred_at >= producer_enabled_at` の記録だけを扱う。再起動・rollback 後の再導入でこの下限を更新しない。T2 だけを先に配備した間の古い停止・復帰は送らず、現在の active episode は下記の補完で扱う。
+通知生成を有効にする daemon を初めて起動した時刻を `producer_enabled_at` として通知用の管理行に永続化する。sweep は `occurred_at >= producer_enabled_at` の記録だけを扱う。再起動・rollback 後の再導入でこの下限を更新しない。通知記録だけを先に配備した間の古い停止・復帰は送らず、現在の active episode は下記の補完で扱う。
 
-回収は発生時刻、epoch、同時刻なら停止→待ち→拒否→復帰の順。既存 poll 上限以下の有限 batch とし、残りは次 tick へ送る。下限以後に永続化できた記録は次 epoch に進んでも回収する。schema 違反の一件は固定語で skip し後続を止めず、保存失敗は rollback して再試行する。event.ts は発生時刻を下回らない。DB の巻戻し・消失と将来の retention は別問題とする。
+回収は発生時刻、epoch、同時刻なら停止→待ち→終端結果→復帰の順。既存 poll 上限以下の有限 batch とし、残りは次 tick へ送る。下限以後に永続化できた記録は次 epoch に進んでも回収する。schema 違反の一件は固定語で skip し後続を止めず、保存失敗は rollback して再試行する。event.ts は発生時刻を下回らない。DB の巻戻し・消失と将来の retention は別問題とする。
 
 ### bot・notify・導入順
 
-既存の通知対象判定を維持し、五種類とも通常の ops 通知で配送する。受付を抑止しない。bot は event_id cursor、投稿後の保存、一時失敗 retry、恒久失敗時の停止、health 表示を再利用する（`afx-ops/afx_ops/bot/adapter.py:809-819`, `:875-898`, `:971-989`）。notify は任意とし、未設定でも live 起動を妨げない。
+既存の通知対象判定を維持し、七種類とも通常の ops 通知で配送する。新規要求の受付を配送し、照会・ack 置換では受付を生成しない。bot は event_id cursor、投稿後の保存、一時失敗 retry、恒久失敗時の停止、health 表示を再利用する（`afx-ops/afx_ops/bot/adapter.py:809-819`, `:875-898`, `:971-989`）。notify は任意とし、未設定でも live 起動を妨げない。
 
-導入は T1 → T2 → T4 → T3。consumer の固定文と status の操作案内を先に出す。初回 bot/notify は過去全件を送らず high watermark へ cursor を置くため、初回 cursor 初期化を確認してから T3 を出す（`afx-ops/afx_ops/bot/adapter.py:814-819`; `afx-ops/afx_ops/notify/runtime.py:144-148`）。既存 cursor は消さない。旧 consumer が新 state を未知 code として拒否する危険はないが、固定文による操作案内には T1 が必要である。
+導入は consumer → 永続記録 → status 案内 → producer 有効化の順。consumer の固定文と status の操作案内を先に出す。初回 bot/notify は過去全件を送らず high watermark へ cursor を置くため、初回 cursor 初期化を確認してから producer を有効にする（`afx-ops/afx_ops/bot/adapter.py:814-819`; `afx-ops/afx_ops/notify/runtime.py:144-148`）。既存 cursor は消さない。旧 consumer が新 state を未知 code として拒否する危険はないが、固定文による操作案内には対応 consumer が必要である。
 
 起動補完は専用 helper だけが担当する。現在の epoch が degraded の場合、次の優先順で0〜1件を、発生時刻を導入時刻として通常キーに補う。本文は通常の固定文とする。
 
@@ -129,7 +146,7 @@ T3 の daemon を初めて起動した時刻を `producer_enabled_at` として�
 
 今回の snapshot は要求ありなので補完ゼロ。有効化前に同じキーの未 event 化記録があれば、補完対象の一件だけ発生時刻を導入時刻へ更新して回収対象にする。有効化後の記録と生成済みの対応は変更しない。補完処理を再実行しても同じキーは増えず、発生時刻も動かさない。休場中でも既存記録の配送・補完は行えるが、新たな観測・要求消費は行わない。
 
-producer の有効化は T3 を含む daemon の版で切り替える。設定 key は増やさない。rollback は T4 までの daemon へ戻し、consumer は固定文対応の版に残す。加算した表・列・管理行・未配送 event は削除しない。旧 daemon が追加情報を無視して動くことを受入で確認する。
+producer の有効化は通知生成に対応した daemon の版で切り替える。設定 key は増やさない。rollback は通知生成が未有効の直前の daemon へ戻し、consumer は固定文対応の版に残す。加算した表・列・管理行・未配送 event は削除しない。旧 daemon が追加情報を無視して動くことを受入で確認する。
 
 ## status で次の操作を見せる
 
@@ -153,7 +170,7 @@ API の `data` に既存 state を保ち、`phase`、`next_action`、`unprocesse
 
 開場・休場の両方で同じ表を使う。wait_tick は必ず「次の開場中の tick の判定待ち」と表示する。resume / resume_with_ack は休場中でも要求を記録できるが、判定は開場後である。待ち印は現在の健全性を保証しないため「取得状態を再確認してください」を添える。restore_source は接続原因を断定せず「取得状態を確認し、回復後に再要求」と案内する。拒否理由は固定語から説明し、件数がゼロになっていれば ack 不要の案内へ変える。最新の watermark 判定は resume 消費時に行い、status に別の health 判定器は作らない。
 
-ctl は停止理由と次の操作の二行、web は data カード直下に同じ固定案内を常時表示する。resume_with_ack は建玉確認後の明示承認だけを促し、自動付与しない。実行は SSH 端末からとし、web/Discord の実行ボタンは足さない。旧 API では既存 state 表示に戻し、不明を ready と扱わない。ctl と対話 shell の resume 応答も「次の開場中の tick で判定します」に揃える（現状は `src/agentic_fx/ops/client.py:1903-1907`; `src/agentic_fx/commands.py:757-760`）。
+ctl は停止理由と次の操作の二行、web は data カード直下に同じ固定案内を常時表示する。resume_with_ack は建玉確認後の明示承認だけを促し、自動付与しない。実行は SSH 端末からとし、web/Discord の実行ボタンは足さない。旧 API では既存 state 表示に戻し、不明を ready と扱わない。ctl と対話 shell の resume 応答は新規記録・照会・ack 置換を区別し、いずれも次の開場中の判定待ちと案内する（現状は `src/agentic_fx/ops/client.py:1903-1907`; `src/agentic_fx/commands.py:757-760`）。
 
 ## 失敗時と通信量
 
@@ -169,7 +186,7 @@ ctl は停止理由と次の操作の二行、web は data カード直下に同
 | 投稿成功後 cursor 保存前の crash | 同一 event の再投稿があり得る。表示の exactly-once は保証しない |
 | 恒久拒否 / 未設定 / 初回 cursor 初期化前の event | 配送 health で判別。無通知の可能性は取得・再開条件から切り離す |
 
-論理 event は「時間で増えない（人の操作か状態の一回の遷移でだけ増える）」を上限とする。停止は時間条件でも最初の一件だけで、待ち・復帰も epoch ごと一件。受付・拒否は要求回数に応じて増える。既存の操作監査通知は別枠である。pair ごとの分割、時間駆動の再通知、外部状態照会は追加せず、既存 poll 間隔・接続数・bridge 呼出しを増やさない。任意 notify の各配送先にも同じ論理 event を送る。
+論理 event は「時間で増えない（人の操作か状態の一回の遷移でだけ増える）」を上限とする。停止は時間条件でも最初の一件だけで、待ち・復帰も epoch ごと一件。受付は新規記録、終端結果は消費した要求の数に応じて増える。照会・ack 置換では Discord 通知を増やさない。既存の操作監査通知は別枠である。pair ごとの分割、時間駆動の再通知、外部状態照会は追加せず、既存 poll 間隔・接続数・bridge 呼出しを増やさない。任意 notify の各配送先にも同じ論理 event を送る。
 
 一時失敗 retry と投稿後 crash を含む物理 HTTP 試行回数に厳密な有限上限は置かない。通知を捨てることになるためである。
 
@@ -177,16 +194,16 @@ ctl は停止理由と次の操作の二行、web は data カード直下に同
 
 この改訂では test を実行しない。実装時に fake clock・tmp SQLite・偽 ingest/Discord transport で以下を確認する。
 
-1. failure→degraded→二連続の問題観測→待ち→受付→拒否→再要求→受理。固定本文と順序を比較し、金額・数値・生エラーを本文に出さない。要求ごとの拒否が消されないこと。
+1. failure→degraded→二連続の問題観測→待ち→受付→拒否→再要求→受理。固定本文と順序を比較し、金額・数値・生エラーを本文に出さない。要求ごとの終端結果が消されず、受理と停止解除が別通知になること。
 2. epoch 66 の実 transcript を fixture 化する。待ち→再起動→二 tick 失敗→deferred→休場中の要求→開場判定を再生し、待ち後の停止を出さず、開場時の受理・拒否の両分岐を通知する。
 3. 連続 confirmed に届かない degraded を、開場時間の10分で一度通知する。休場・祝日・再起動をまたいで時間を計り、待ち・ready が先なら停止を出さない。
 4. pending を立てた後の flat・auto=true の待ち、自動復帰、restricted のみの復帰、confirmed 前の待ちを網羅する。停止 gate と pending 解除条件は変わらないこと。
-5. ack なしの未処理足、ack ありでも不健全、両方の拒否理由、拒否後の再要求、既に ready の要求消費を網羅し、結果と時刻を永続化する。受付を実再開と誤認させないこと。
+5. ack なしの未処理足、ack ありでも不健全、両方の拒否理由、拒否後の再要求、ready 中の要求、restricted の要求が消費前に自動 ready になる場合、新 epoch をまたぐ要求を網羅し、消費した一件に終端結果と時刻を永続化・通知する。同一 ack の再要求と ack 取消しは元の時刻・ack を保持し、ack なし→ありだけ置換する。消費と競合しても新規・照会・置換の応答と受付件数が一致し、置換前の別結果は出さない。受付を実再開と誤認させないこと。
 6. 通知記録の重複 INSERT・migration 未適用・保存失敗が observe_failed を立てず、状態更新と資金保護を妨げないこと。state commit と記録の間の crash における補完範囲と欠落の限界も確認する。
-7. sweep の繰返し・再起動で各キー一件。event INSERT と event_id 対応保存の間の fault は両方 rollback し、拒否が二件でも正しく対応する。event 未生成のまま次 epoch へ進んでも有効化後の記録を回収する。kill switch と干渉せず、不正な一件で後続を止めないこと。
-8. T2 先行配備で溜まった closed episode は T3 で送らない。起動補完は snapshot の要求ありならゼロ、待ちなら待ち一件、停止なら停止一件。再実行して増えず、ready の過去履歴は補わない。
-9. 真理値表を ctl/web の入力にし、pending・confirmed の真偽、現在件数の変化、開場/休場、observe_failed、旧 API、読取り失敗を比較する。ack の要否が通知有効化前に使え、受付応答も開場中の判定と案内すること。
-10. 既存 guard schema と旧 consumer の汎用描画で新 state を扱えること。旧 daemon が追加の表・列・管理行を無視して起動・観測できること。初回 cursor→producer の順では届き、逆順では skip する既存境界を確認する。
+7. sweep の繰返し・再起動で各キー一件。event INSERT と event_id 対応保存の間の fault は両方 rollback し、同 epoch の終端結果が複数でも要求ごとに正しく対応する。event 未生成のまま次 epoch へ進んでも有効化後の記録を回収する。kill switch と干渉せず、不正な一件で後続を止めないこと。
+8. 通知記録の先行配備で溜まった closed episode は有効化時に送らない。起動補完は snapshot の要求ありならゼロ、待ちなら待ち一件、停止なら停止一件。再実行して増えず、ready の過去履歴は補わない。
+9. 真理値表を ctl/web の入力にし、pending・confirmed の真偽、現在件数の変化、開場/休場、observe_failed、旧 API、読取り失敗を比較する。ack の要否が通知有効化前に使え、新規・照会・ack 置換の応答も開場中の判定待ちと案内すること。
+10. consumer 単独、永続記録・status 案内までと旧 daemon では generation=None の互換本文で結果通知を約束しない。producer 配備で初めて epoch 付き受付と結果通知を有効にし、rollback 後は互換本文へ戻ること。既存 guard schema と旧 consumer の汎用描画で新 state を扱えること。旧 daemon が追加の表・列・管理行を無視して起動・観測できること。初回 cursor→producer の順では届き、逆順では skip する既存境界を確認する。
 11. 休場中の要求を消費せず、記録済み通知は配送する。bot/notify の一時不通・恒久停止・未設定が取得を止めず、投稿後 cursor 保存前の fault では表示重複だけが起こり得ること。
 
 可能なら Dunia の隔離 clone・専用 tmp DB/設定・fake 価格源・専用 Discord 試験 channel で通常遷移と拒否・再要求・受理、status 案内、再起動、導入順を確認する。多数の fault/retry は偽 transport で行う。利用できなければ未実施理由を残す。本番 process 停止、MT5 切断、本番 DB/ログの書換えは受入に使わない。
@@ -199,10 +216,10 @@ ctl は停止理由と次の操作の二行、web は data カード直下に同
 
 | task | 範囲 | 単独 merge の境界 |
 |---|---|---|
-| T1 | 既存 guard event の data_feed 固定描画、受付本文の改訂、bot/notify の配送確認 | producer 未有効でも既存 event を扱える consumer を先に出せる |
-| T2 | 通知表・判定結果列の migration、結果永続化、commit 後の記録 helper、pending の待ち条件補完 | event 化は未有効。将来の sweep は有効化前の記録を除外する。記録失敗と状態更新の分離を検証できる |
-| T4 | API data の phase・現在件数・判定結果・next_action、ctl/web の案内、resume 応答文 | T2 の後。真理値表・ack 要否・旧 API fallback が使用可能。T3 の必須前提 |
-| T3 | ops lane sweep、event と対応の同時保存、時間条件、起動補完、有効化時刻、導入/rollback | T1/T2/T4 の後に daemon の版で有効化。fault/cursor/通信量と隔離受入を確認する |
+| T1 | 既存 guard event の data_feed 固定描画、generation=None の互換受付と epoch 付き受付の描き分け、bot/notify の配送確認 | producer 未有効でも既存 event を扱い、互換受付で結果通知を約束しない consumer を先に出せる |
+| T2 | 通知表・判定結果列の migration、新規/照会/ack 置換の契約、終端結果永続化、commit 後の記録 helper、pending の待ち条件補完 | event 化は未有効。将来の sweep は有効化前の記録を除外する。記録失敗と状態更新の分離を検証できる |
+| T4 | API data の phase・現在件数・判定結果・next_action、ctl/web の案内、ctl/shell の新規・照会・ack 置換の応答文 | T2 の後。真理値表・ack 要否・旧 API fallback が使用可能。T3 の必須前提 |
+| T3 | ops lane sweep、event と対応の同時保存、時間条件、起動補完、有効化時刻、結果通知と同時の受付 generation 切替、導入/rollback | T1/T2/T4 の後に daemon の版で有効化。fault/cursor/通信量と隔離受入を確認する |
 
 ## 利用者に問う事項
 
@@ -210,12 +227,12 @@ ctl は停止理由と次の操作の二行、web は data カード直下に同
 
 | 問い | 裁定と理由 |
 |---|---|
-| Q1: ready 復帰も通知するか | **裁定済み: 送る。** 要求受付と実際の停止解除を区別できる。拒否も要求ごとに通知し、通信量は前述の「時間で増えない」で扱う |
-| Q2: 長時間の再開待ちを時間駆動で再通知するか | **裁定済み: 初版はなし。** 受付・拒否で操作への返事を残し、配送 retry と status の案内を使う |
+| Q1: ready 復帰も通知するか | **裁定済み: 送る。** 要求受付と実際の停止解除を区別できる。終端結果も消費した要求ごとに通知し、通信量は前述の「時間で増えない」で扱う |
+| Q2: 長時間の再開待ちを時間駆動で再通知するか | **裁定済み: 初版はなし。** 受付・終端結果で操作への返事を残し、配送 retry と status の案内を使う |
 
-受付投稿の維持、拒否通知、起動補完、SSH 操作、任意 notify、金額非表示は本案で確定し、再び問いにしない。
+新規要求の受付投稿の維持、終端結果の通知、起動補完、SSH 操作、任意 notify、金額非表示は本案で確定し、再び問いにしない。
 
-### 付録: 利用者に問う事項（別チケット）
+### 別チケットの問い
 
 次の二件は指揮者が別チケットとして起票し、利用者の裁定を得る。いずれも資金保護の規則に関わるため技術判断では変更せず、本設計の通知範囲にも含めない。
 
@@ -230,7 +247,7 @@ ctl は停止理由と次の操作の二行、web は data カード直下に同
 
 | # | 文書・前提 | 現行の実体と本案での扱い |
 |---|---|---|
-| 1 | チケット末尾は停止確認 + 待ちの二回 | Q1 は裁定済み。復帰と要求ごとの受付・拒否を含める。現行の復帰は activity のみ（`outage.py:358-360`, `:628-632`） |
+| 1 | チケット末尾は停止確認 + 待ちの二回 | Q1 は裁定済み。復帰と新規要求の受付・消費した要求の終端結果を含める。現行の復帰は activity のみ（`outage.py:358-360`, `:628-632`） |
 | 2 | 未処理足は毎分記録 | 時間駆動ではないが、足の近似値が毎分変わる健全時は実質毎分。再起動でも出得る（`outage.py:135-139`, `:245-251`, `:679-706`）。通知しない |
 | 3 | recovered_awaiting_resume は永続 state | 永続 state ではなく degraded の activity と印（`outage.py:23-24`, `:421-423`）。表示 phase と区別する |
 | 4 | 9/24 設計は失敗/停滞で即 degraded | 現在は flat の停滞に restricted がある（`outage.py:362-408`）。これだけの自動復帰は通知しない |
@@ -239,13 +256,13 @@ ctl は停止理由と次の操作の二行、web は data カード直下に同
 | 7 | watermark がない gap 起点は必要本数から計算 | 現行は now を仮置き（`outage.py:514-536`）。本件では変えない |
 | 8 | pending があれば健康回復後に必ず待ちを知らせる | 現行は flat・auto=true の待ち条件が漏れる（`outage.py:351`, `:410-423`）。待ち条件だけ補完し、pending 解除は別チケットの問いとする |
 | 9 | 待ちの印があれば現在も健全 | 同 epoch の再悪化でも印は消えない（`outage.py:365`, `:421-441`）。待ち後の停止を抑え、status と拒否で再確認を促す |
-| 10 | 本番でも shell の詳細で ack 要否を確認できる | daemon 運用では shell を起動しない（`src/agentic_fx/service.py:3050-3052`）。T4 を通知有効化の前提にする |
+| 10 | 本番でも shell の詳細で ack 要否を確認できる | daemon 運用では shell を起動しない（`src/agentic_fx/service.py:3050-3052`）。status 案内を通知有効化の前提にする |
 | 11 | guard event を使えば停止/復帰も既に届く | 現行 data_feed は受付だけ（`src/agentic_fx/ops/service.py:1764`; `afx-ops/afx_ops/gate/render.py:459`）。既存契約に状態と固定描画を追加する |
 | 12 | 現 state の sweep だけで全履歴を保証できる | ready・次 epoch で印が消える（`outage.py:363-365`, `:413-418`, `:619-626`）。別 transaction の遷移記録を使い、記録前 crash の限界を明示する |
 | 13 | event を補えば初回 consumer にも必ず届く | 初回 poll は末尾へ cursor を初期化して配送しない（`afx-ops/afx_ops/bot/adapter.py:814-819`; `afx-ops/afx_ops/notify/runtime.py:144-148`）。初回だけ導入順を守る |
 | 14 | 再起動をまたいで Discord 表示も厳密に一回 | 投稿後に cursor 保存（`afx-ops/afx_ops/bot/adapter.py:875-898`, `:971-977`）。生成の重複抑止と表示重複の窓を区別する |
 | 15 | 要求後、開場最初の tick で ready になった | 今回は要求記録までの観測。開場後は拒否もあり得る（`outage.py:609-648`）。チケットは判定予定へ訂正し、実結果は後日 readonly で追記する |
-| 16 | resume 応答は次の tick で判定 | 休場中は消費されない（`outage.py:236-237`, `:280-285`）。ctl/shell とも次の開場中の tick と案内する |
+| 16 | resume 応答は次の tick で判定 | 休場中は消費されない（`outage.py:236-237`, `:280-285`）。ctl/shell とも新規・照会・ack 置換を区別し、次の開場中の判定待ちと案内する |
 
 ## 変更履歴
 
@@ -253,3 +270,4 @@ ctl は停止理由と次の操作の二行、web は data カード直下に同
 |---|---|---|---|---|
 | 2026-11-21 | C0 | 停止・待ち・実再開の固定通知、永続遷移と sweep、導入補完、status 案内、上限と受入を提案 | 再発時の長時間停止と再開操作の見落としを防ぐ | —（未 commit） |
 | 2026-11-21 | C0.1 | 受付・拒否通知、停止の時間条件と順序、記録失敗の隔離、既存 guard 契約、status 先行導入、別チケットの問いへ改訂 | 設計レビュー 1 周目と利用者の裁定を反映 | |
+| 2026-11-21 | C0.2 | 再要求と ack 置換、要求の終端結果と停止解除、受付の互換本文と有効化境界を明確化 | 設計レビュー 2 周目の指摘を反映 | |
