@@ -1,7 +1,7 @@
 ---
 id: datafeed-pending-auto-release-when-flat
 title: 建玉が全部決済されデータが健全に戻ったら、人の再開なしで戻すか
-status: 設計待ち
+status: 設計中
 priority: 中
 kind: 機能
 opened: 2026-11-21
@@ -10,7 +10,7 @@ related: [datafeed-outage-discord-notice]
 ---
 # [datafeed-pending-auto-release-when-flat] 建玉が全部決済されデータが健全に戻ったら、人の再開なしで戻すか
 
-**状態**: 設計待ち / **優先**: 中 / **種別**: 機能
+**状態**: 設計中 / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
