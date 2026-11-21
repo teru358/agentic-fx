@@ -170,6 +170,14 @@ class WorkerRunner(AgentRunner):
         永続資源を持たない (LocalRunner との対称性のための空実装)。"""
 
     def run(self, mission: Mission) -> MissionResult:
+        result = self._run_mission(mission)
+        if mission.turn_policy is not None and result.turn_summary is None:
+            # 起動失敗・親側の期限超過など result frame を経ない終端でも、
+            # 0 回ではなく「計測欠損」として残す。
+            result.turn_summary = dict(MISSING_SUMMARY)
+        return result
+
+    def _run_mission(self, mission: Mission) -> MissionResult:
         w = self._settings.worker
         with tempfile.TemporaryDirectory(prefix="afx-mission-") as base:
             workdir = Path(base)

@@ -54,6 +54,9 @@ def finalize_mission(conn: sqlite3.Connection, activity: ActivityLog,
             _log.exception("failed to record mission_finalize_conflict")
     summary = getattr(result, "turn_summary", None)
     if finished and summary is not None:
-        activity.write(Category.AGGREGATE, "turn_summary",
-                       format_turn_summary(summary), ref_id=str(mid))
+        try:
+            activity.write(Category.AGGREGATE, "turn_summary",
+                           format_turn_summary(summary), ref_id=str(mid))
+        except Exception:  # noqa: BLE001 — 計測の記録は終端を壊さない
+            _log.exception("failed to record turn_summary")
     return True

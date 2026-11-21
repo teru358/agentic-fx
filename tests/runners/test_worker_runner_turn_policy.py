@@ -107,3 +107,75 @@ def test_no_policy_never_records_a_summary(monkeypatch, tmp_path):
     _, result = _drive(monkeypatch, tmp_path / "second", None,
                        {"turn_summary": _summary()})
     assert result.turn_summary is None
+
+
+def _runner_with_child(monkeypatch, tmp_path, child_fn):
+    from tests.runners.test_worker_runner import _spawn_runner, _tiny_worker_settings
+
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+    kept: list = []
+
+    def child():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        kept.extend([child_in, child_out])
+        child_in.readline()
+        child_fn(child_out)
+
+    threading.Thread(target=child, daemon=True).start()
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    runner, _, _ = _spawn_runner(
+        monkeypatch, tmp_path, FakeProc(), _tiny_worker_settings(), close_on_kill=w)
+    return runner, w
+
+
+@pytest.mark.parametrize("policy,expected", [
+    ("signal", {"missing": True}), (None, None)])
+def test_startup_failure_records_missing_only_with_a_policy(
+        monkeypatch, tmp_path, policy, expected):
+    runner, w = _runner_with_child(monkeypatch, tmp_path, lambda out: None)
+    try:
+        result = runner.run(Mission(prompt="p", tools=[], output_schema={},
+                                    max_turns=3, timeout_sec=5.0,
+                                    turn_policy=policy))
+    finally:
+        try:
+            os.close(w)
+        except OSError:
+            pass
+    assert result.status == "failed"
+    assert result.turn_summary == expected
+
+
+@pytest.mark.parametrize("policy,expected", [
+    ("cron", {"missing": True}), (None, None)])
+def test_parent_deadline_records_missing_only_with_a_policy(
+        monkeypatch, tmp_path, policy, expected):
+    def child_fn(out):
+        write_frame(out, {"type": "ready", "seq": 1, "ok": True})
+
+    runner, w = _runner_with_child(monkeypatch, tmp_path, child_fn)
+    try:
+        result = runner.run(Mission(prompt="p", tools=[], output_schema={},
+                                    max_turns=3, timeout_sec=0.3,
+                                    turn_policy=policy))
+    finally:
+        try:
+            os.close(w)
+        except OSError:
+            pass
+    assert result.status in ("timeout", "failed")
+    assert result.turn_summary == expected

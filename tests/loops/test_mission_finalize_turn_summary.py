@@ -57,3 +57,18 @@ def test_a_conflicting_second_finalize_writes_no_second_summary(tmp_path):
     finalize_mission(conn, activity, clock, mid, result)
     finalize_mission(conn, activity, clock, mid, result)
     assert sum("\tturn_summary\t" in l for l in _lines(tmp_path)) == 1
+
+
+def test_a_failing_summary_write_does_not_break_the_finalize(tmp_path):
+    conn, mid, activity, clock = _setup(tmp_path)
+
+    class Raising:
+        def write(self, *a, **k):
+            if a[1] == "turn_summary":
+                raise OSError("disk")
+
+    result = MissionResult("completed", {}, [])
+    result.turn_summary = tbm.TurnGuard("signal", 6).summary("completed", None)
+    assert finalize_mission(conn, Raising(), clock, mid, result) is True
+    row = conn.execute("select status from missions where id=?", (mid,)).fetchone()
+    assert row[0] == "completed"
