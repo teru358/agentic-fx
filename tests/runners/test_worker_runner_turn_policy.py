@@ -166,6 +166,7 @@ def test_parent_deadline_records_missing_only_with_a_policy(
         monkeypatch, tmp_path, policy, expected):
     def child_fn(out):
         write_frame(out, {"type": "ready", "seq": 1, "ok": True})
+        threading.Event().wait()
 
     runner, w = _runner_with_child(monkeypatch, tmp_path, child_fn)
     try:
@@ -177,5 +178,25 @@ def test_parent_deadline_records_missing_only_with_a_policy(
             os.close(w)
         except OSError:
             pass
-    assert result.status in ("timeout", "failed")
+    assert result.status == "timeout"
     assert result.turn_summary == expected
+
+
+@pytest.mark.parametrize("status,reason", [
+    ("failed", "tool_budget_abort: x"), ("timeout", None)])
+def test_summary_follows_the_final_status_when_the_parent_overrides_it(
+        monkeypatch, tmp_path, status, reason):
+    runner, w = _runner_with_child(monkeypatch, tmp_path, lambda out: None)
+    os.close(w)
+    summary = _summary()
+    assert summary["terminal"] == "completed"
+
+    def fake(mission):
+        from agentic_fx.runners.base import MissionResult
+        return MissionResult(status, None, [], reason=reason,
+                             turn_summary=dict(summary))
+
+    monkeypatch.setattr(runner, "_run_mission", fake)
+    result = runner.run(_mission("signal"))
+    assert result.turn_summary["terminal"] == status
+    assert result.turn_summary["reason"] == reason

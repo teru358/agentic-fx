@@ -217,9 +217,10 @@ class LocalRunner(AgentRunner):
                 return _finish("timeout")
             final_stage = False
             if guard is not None:
+                entering_final = not guard.final_entered
                 guard.begin_request(_turn + 1)
                 final_stage = guard.final_stage
-                if final_stage:
+                if final_stage and entering_final:
                     pending.append(turn_budget.switch_text(mission.output_schema))
                 if pending:
                     self._sink(messages, {"role": "user",

@@ -175,6 +175,12 @@ class WorkerRunner(AgentRunner):
             # 起動失敗・親側の期限超過など result frame を経ない終端でも、
             # 0 回ではなく「計測欠損」として残す。
             result.turn_summary = dict(MISSING_SUMMARY)
+        elif result.turn_summary is not None and not result.turn_summary.get("missing"):
+            # 親が終端を上書きした場合 (budget abort・timeout 等) も、記録する要約を
+            # 最終の status / reason に合わせる。
+            result.turn_summary["terminal"] = result.status
+            result.turn_summary["reason"] = (
+                " ".join(result.reason.split())[:120] if result.reason else None)
         return result
 
     def _run_mission(self, mission: Mission) -> MissionResult:

@@ -17,6 +17,9 @@ POLICIES = (POLICY_SIGNAL, POLICY_CRON)
 MIN_TURNS = 3
 FINAL_STAGE_TURNS = 2
 SEARCH_TOOL = "search_news"
+#: 同一呼出しの抑止と再試行の上限を適用するツール。mission の間は結果が変わらない
+#: (建玉は発注時に risk gate が確かめ直す)。価格・足など値が変わるツールは対象外。
+DEDUPE_TOOLS = ("search_news", "get_positions")
 SEARCH_BUDGET = 5
 #: 同じ引数の取得失敗は 1 回だけ再試行を許す (失敗 2 回で打ち止め)。
 MAX_FAILURES_PER_KEY = 2
@@ -89,7 +92,7 @@ class TurnGuard:
         self.search_duplicate = 0
         self.search_over_budget = 0
         self.duplicate_suppressed = 0
-        self.final_stage_executions = 0
+        self.final_stage_suppressed = 0
         self._succeeded: set[str] = set()
         self._failures: dict[str, int] = {}
 
@@ -103,8 +106,9 @@ class TurnGuard:
             self.final_entered = True
 
     def note_call(self, name: object) -> None:
-        """ツール名を識別した時点の試行記録 (引数の検証や抑止より前)。"""
-        if name == SEARCH_TOOL:
+        """ツール名を識別した時点の試行記録 (引数の検証や抑止より前)。
+        最終段階の呼出しは実行を試みないので数えない。"""
+        if name == SEARCH_TOOL and not self.final_stage:
             self.search_attempted = True
 
     def note_invalid(self, name: object) -> None:
@@ -126,7 +130,10 @@ class TurnGuard:
     def decide(self, name: str, arguments: Any) -> str | None:
         """実行しない場合の固定結果を返す。None なら実行する。"""
         if self.final_stage:
+            self.final_stage_suppressed += 1
             return FINAL_ONLY_RESULT
+        if name not in DEDUPE_TOOLS:
+            return None
         key = canonical_key(name, arguments)
         if key in self._succeeded:
             return self._duplicate(name, DUPLICATE_RESULT)
@@ -142,14 +149,16 @@ class TurnGuard:
         return None
 
     def record(self, name: str, arguments: Any, ok: bool) -> None:
-        key = canonical_key(name, arguments)
-        if ok:
-            self._succeeded.add(key)
-            if name == SEARCH_TOOL:
+        if name in DEDUPE_TOOLS:
+            key = canonical_key(name, arguments)
+            if ok:
+                self._succeeded.add(key)
+            else:
+                self._failures[key] = self._failures.get(key, 0) + 1
+        if name == SEARCH_TOOL:
+            if ok:
                 self.search_succeeded += 1
-        else:
-            self._failures[key] = self._failures.get(key, 0) + 1
-            if name == SEARCH_TOOL:
+            else:
                 self.search_exec_error += 1
 
     def _duplicate(self, name: str, result: str) -> str:
@@ -174,7 +183,7 @@ class TurnGuard:
             "search_duplicate": self.search_duplicate,
             "search_over_budget": self.search_over_budget,
             "duplicate_suppressed": self.duplicate_suppressed,
-            "final_stage_executions": self.final_stage_executions,
+            "final_stage_suppressed": self.final_stage_suppressed,
             "terminal": status,
             "reason": (" ".join(reason.split())[:_MAX_REASON] if reason else None),
         }
@@ -184,7 +193,7 @@ _BOOL_FIELDS = ("final_stage", "decided_in_final", "decided_after_budget",
                 "search_attempted")
 _INT_FIELDS = ("requests", "search_executed", "search_succeeded", "search_invalid",
                "search_exec_error", "search_duplicate", "search_over_budget",
-               "duplicate_suppressed", "final_stage_executions")
+               "duplicate_suppressed", "final_stage_suppressed")
 _STATUSES = ("completed", "failed", "timeout", "max_turns")
 _MAX_REASON = 120
 MISSING_SUMMARY: dict[str, Any] = {"missing": True}

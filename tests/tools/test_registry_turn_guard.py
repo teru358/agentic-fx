@@ -79,21 +79,44 @@ def test_final_stage_stops_a_valid_call_but_not_the_validation_error():
     assert json.loads(stop)["error"] == "final_answer_only"
     assert "invalid arguments" in json.loads(err)["error"]
     assert calls == []
-    assert guard.final_stage_executions == 0
+    assert guard.final_stage_suppressed == 1
+
+
+def _positions_registry(func):
+    reg = ToolRegistry()
+    calls = []
+
+    def wrapped():
+        calls.append(1)
+        return func()
+
+    reg.register(ToolDef("get_positions", "p", {"type": "object"}, wrapped))
+    return reg, calls
+
+
+def _raise():
+    raise RuntimeError("x")
 
 
 def test_exception_and_error_dict_results_count_as_failures():
+    for func in (_raise, lambda: {"error": "nope"}):
+        reg, calls = _positions_registry(func)
+        guard = _guard()
+        for _ in range(2):
+            reg.execute("get_positions", {}, ["get_positions"], guard=guard)
+        third = reg.execute("get_positions", {}, ["get_positions"], guard=guard)
+        assert json.loads(third)["error"] == "duplicate_call"
+        assert len(calls) == 2
+
+
+def test_tools_outside_the_allowlist_are_never_suppressed():
     reg, calls = _registry()
     guard = _guard()
-    reg.execute("boom", {}, ALLOWED, guard=guard)
-    reg.execute("boom", {}, ALLOWED, guard=guard)
-    third = reg.execute("boom", {}, ALLOWED, guard=guard)
-    assert json.loads(third)["error"] == "duplicate_call"
-    assert [c[0] for c in calls] == ["boom", "boom"]
-    reg.execute("errdict", {}, ALLOWED, guard=guard)
-    reg.execute("errdict", {}, ALLOWED, guard=guard)
-    third = reg.execute("errdict", {}, ALLOWED, guard=guard)
-    assert json.loads(third)["error"] == "duplicate_call"
+    for _ in range(3):
+        reg.execute("errdict", {}, ALLOWED, guard=guard)
+        reg.execute("boom", {}, ALLOWED, guard=guard)
+    assert len(calls) == 6
+    assert guard.duplicate_suppressed == 0
 
 
 def test_suppressed_calls_do_not_fire_on_execute_or_on_result():

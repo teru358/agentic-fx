@@ -91,7 +91,9 @@ def test_final_stage_requests_omit_tools_and_switch_once_with_schema():
     # 切替文は 4 回目の応答の後 (request 5) に 1 回、request 6 は再掲
     assert sum(tbm.SWITCH_TEXT in u for u in _users(replay.bodies[3])) == 0
     assert sum(tbm.SWITCH_TEXT in u for u in _users(replay.bodies[4])) == 1
-    assert sum(tbm.SWITCH_TEXT in u for u in _users(replay.bodies[5])) == 2
+    # request 6 は切替文を繰り返さない (履歴の 1 件のみ)
+    assert sum(tbm.SWITCH_TEXT in u for u in _users(replay.bodies[5])) == 1
+    assert tbm.SWITCH_TEXT not in _users(replay.bodies[5])[-1]
     assert schema_json in _users(replay.bodies[4])[-1]
     for body in replay.bodies:
         tb.assert_no_consecutive_user_rows(body)
@@ -113,7 +115,7 @@ def test_final_stage_answer_completes_without_running_a_tool():
     assert result.output == {"decision": "accept", "reject_code": None}
     assert len(replay.bodies) == 5
     assert result.turn_summary["decided_in_final"] is True
-    assert result.turn_summary["final_stage_executions"] == 0
+    assert result.turn_summary["final_stage_suppressed"] == 0
 
 
 def test_answer_before_the_final_stage_is_not_marked_final():
@@ -140,7 +142,7 @@ def test_structured_call_in_final_stage_is_stopped_per_id_and_repair_is_merged()
     stops = [json.loads(m["content"]) for m in last[-3:-1]]
     assert all(s["error"] == "final_answer_only" for s in stops)
     assert tbm.FINAL_ONLY_TEXT in last[-1]["content"]
-    assert tbm.SWITCH_TEXT in last[-1]["content"]
+    assert tbm.SWITCH_TEXT not in last[-1]["content"]
     assert tools.count("search_news") == 1 and tools.count("get_positions") == 0
     tb.assert_no_consecutive_user_rows(replay.bodies[2])
 
@@ -310,7 +312,7 @@ def test_schema_repair_in_final_stage_is_kept_and_completes():
     result, replay, _ = _run([search_call(1), bad, ACCEPT], _mission(max_turns=3))
     assert result.status == "completed"
     user = _users(replay.bodies[2])[-1]
-    assert "スキーマに合いません" in user and tbm.SWITCH_TEXT in user
+    assert "スキーマに合いません" in user and tbm.SWITCH_TEXT not in user
     tb.assert_no_consecutive_user_rows(replay.bodies[2])
 
 
@@ -403,17 +405,14 @@ def test_argument_formatting_is_ignored_but_string_contents_are_not():
     assert result.turn_summary["search_duplicate"] == 1
 
 
-def test_object_key_order_is_ignored_and_array_order_is_kept():
-    names = ["multi"]
-    script = [
-        call_message(("a", "multi", '{"x": 1, "y": [1, 2]}')),
-        call_message(("b", "multi", '{"y": [1, 2], "x": 1}')),
-        call_message(("c", "multi", '{"y": [2, 1], "x": 1}')),
-        call_message(("d", "multi", '{"x": "1", "y": [1, 2]}')),
-        text_message('{"action": "hold"}')]
+def test_tools_outside_the_dedupe_allowlist_run_every_time():
+    names = ["get_price"]
+    script = [call_message((f"p{n}", "get_price", {"pair": "USDJPY"}))
+              for n in range(3)] + [text_message('{"action": "hold"}')]
     result, _, tools = _run(script, _mission(policy="cron", max_turns=8, tools=names),
                             names=names)
-    assert tools.count("multi") == 3
+    assert tools.count("get_price") == 3
+    assert result.turn_summary["duplicate_suppressed"] == 0
 
 
 def test_transient_error_is_retried_once_and_counts_toward_the_budget():
@@ -534,12 +533,12 @@ def test_an_empty_search_result_is_a_success():
     assert result.turn_summary["search_succeeded"] == 1
 
 
-def test_search_first_tried_in_the_final_stage_then_accept_fails():
+def test_search_first_tried_in_the_final_stage_does_not_block_a_later_accept():
     result, _, tools = _run([call_message(("a", "get_positions", {})),
                              search_call(2), ACCEPT], _mission(max_turns=3))
     assert tools.count("search_news") == 0
-    assert result.status == "failed"
-    assert result.reason == tbm.REASON_SEARCH_UNAVAILABLE
+    assert result.status == "completed"
+    assert result.turn_summary["search_attempted"] is False
 
 
 def test_valid_reject_after_failed_searches_is_a_normal_completion():
@@ -646,7 +645,7 @@ def test_summary_carries_counts_and_no_query_text():
     for body in replay.bodies:
         text = json.dumps(body, ensure_ascii=False)
         assert "duplicate_suppressed" not in text
-        assert "final_stage_executions" not in text
+        assert "final_stage_suppressed" not in text
 
 
 def test_summary_marks_a_decision_taken_in_the_final_stage_after_budget():
@@ -656,3 +655,20 @@ def test_summary_marks_a_decision_taken_in_the_final_stage_after_budget():
     assert result.turn_summary["decided_in_final"] is True
     assert result.turn_summary["decided_after_budget"] is True
     assert result.turn_summary["final_stage"] is True
+
+
+def test_final_stage_counts_the_calls_it_suppressed():
+    three = call_message(("a", "get_positions", {}), ("b", "get_positions", {}),
+                         ("c", "search_news", {"query": "x"}))
+    result, _, tools = _run([search_call(1), three, three, ACCEPT],
+                            _mission(max_turns=5))
+    assert result.status == "completed"
+    assert result.turn_summary["final_stage_suppressed"] == 6
+    assert tools.count("search_news") == 1
+
+
+def test_a_search_made_only_in_the_final_stage_is_not_an_attempt():
+    gp = [call_message((f"g{n}", "get_positions", {})) for n in range(3)]
+    result, _, _ = _run(gp + [search_call(4), ACCEPT], _mission(max_turns=5))
+    assert result.status == "completed"
+    assert result.turn_summary["search_attempted"] is False

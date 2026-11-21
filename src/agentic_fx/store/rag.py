@@ -110,7 +110,7 @@ class Rag:
         内部 ID にだけ使う。
 
         `published` は入力 dict のキーとして受け取るが保存しない:
-        - search_news の出力契約 (url/title/body/source_name) に published は
+        - search_news の出力契約 (url/title/body/source_name/added_at。tool は added_at を ingested_at として出し、url は出さない) に published は
           含まれない
         - `published` は None を取りうる (fetch_web は常に None。fetchers.py
           参照) が、chromadb の metadata は None 値を扱えないため、保存すると

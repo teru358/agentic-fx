@@ -82,3 +82,17 @@ def test_format_has_no_free_text_and_marks_missing():
     line = tbm.format_turn_summary(_summary())
     assert "\n" not in line and "requests=0" in line and "terminal=completed" in line
     assert tbm.format_turn_summary(tbm.MISSING_SUMMARY) == "missing=1"
+
+
+def test_a_call_in_the_final_stage_is_not_a_search_attempt():
+    guard = tbm.TurnGuard("signal", 6)
+    guard.begin_request(5)
+    guard.note_call("search_news")
+    assert guard.search_attempted is False
+    guard.final_stage = False
+    guard.note_call("search_news")
+    assert guard.search_attempted is True
+
+
+def test_dedupe_allowlist_is_search_and_positions_only():
+    assert set(tbm.DEDUPE_TOOLS) == {"search_news", "get_positions"}
