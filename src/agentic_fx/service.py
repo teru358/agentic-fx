@@ -3146,8 +3146,13 @@ def run_service(root: Path, *, daemon: bool = False,
         report_still_busy = (join_report is not None
                              and not join_report(timeout=supervisor_join_timeout_sec))
         weekly_tick = getattr(app, "weekly_review_tick", None)
-        if weekly_tick is not None:
-            weekly_tick.join(timeout=_ECON_WORKER_JOIN_TIMEOUT_SEC)
+        if weekly_tick is not None and not weekly_tick.join(
+                timeout=_ECON_WORKER_JOIN_TIMEOUT_SEC):
+            # 週次の thread は DB に書ける。日次 report の thread と同じく、残っている間は
+            # 使う資源を閉じない (保存は 1 transaction で、process 終了時の書きかけは残らない)。
+            _log.warning("weekly review thread did not stop within %.0fs",
+                         _ECON_WORKER_JOIN_TIMEOUT_SEC)
+            report_still_busy = True
         # F3 (fix round 1): watchdog の join を service_stopped 記録より前に
         # 行う。notifier は最大 10 秒ブロックしうるため、記録を先にすると
         # 「graceful」記録の後に watchdog がまだ activity へ書き込める窓が
