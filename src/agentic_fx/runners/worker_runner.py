@@ -628,7 +628,9 @@ class WorkerRunner(AgentRunner):
                        "output_schema": mission.output_schema,
                        "max_turns": mission.max_turns,
                        "timeout_sec": mission.timeout_sec,
-                       "turn_policy": mission.turn_policy},
+                       # 無効 (None) のときはキーごと送らない (既定の handshake を変えない)
+                       **({"turn_policy": mission.turn_policy}
+                          if mission.turn_policy is not None else {})},
             "worker_profile": self._worker_profile,
             "now": now.isoformat(),
             "credentials": credentials or {},

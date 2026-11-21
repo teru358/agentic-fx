@@ -72,7 +72,8 @@ def _summary():
 @pytest.mark.parametrize("policy", [None, "signal", "cron"])
 def test_handshake_carries_the_policy(monkeypatch, tmp_path, policy):
     handshake, _ = _drive(monkeypatch, tmp_path, policy)
-    assert handshake["mission"]["turn_policy"] == policy
+    assert handshake["mission"].get("turn_policy") == policy
+    assert ("turn_policy" in handshake["mission"]) is (policy is not None)
 
 
 def test_result_frame_summary_reaches_the_mission_result(monkeypatch, tmp_path):
