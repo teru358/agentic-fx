@@ -319,16 +319,19 @@ class OutageStateMachine:
 
     def _may_resume_unattended(self, row: dict, conn) -> bool:
         """停止中の epoch が、建玉が無く pending も無く自動復帰が有効で、人の操作なしに
-        戻り得るか。読めなければ False (戻ると言わない)。"""
-        if row.get("state") != "degraded" or not self.auto_resume_when_flat:
+        戻り得るか。確認できた値だけで真にする: pending は整数 0、設定は厳密な True、
+        建玉の読取りは空の list。欠落・型違い・読取り失敗は False (戻るとは言わない)。"""
+        if row.get("state") != "degraded" or self.auto_resume_when_flat is not True:
             return False
-        if row.get("pending_human_confirmation", 0):
+        pending = row.get("pending_human_confirmation")
+        if type(pending) is not int or pending != 0:
             return False
         try:
             c = conn if conn is not None else self.conn
-            return not orders.list_by_status(c, *_EXPOSURE)
+            exposure = orders.list_by_status(c, *_EXPOSURE)
         except Exception:  # noqa: BLE001 — 読めないものは戻るとは言わない
             return False
+        return type(exposure) is list and not exposure
 
     def observe(self, now: datetime, report: IngestTickReport) -> str:
         """1 tick 分の観測を反映し、遷移後の `state` を返す。

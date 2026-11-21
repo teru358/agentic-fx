@@ -319,20 +319,35 @@ def test_the_snapshot_state_reads_degraded_while_an_observe_failure_marker_is_up
 
 # ---- 件数を数える条件 ----------------------------------------------------
 
-def _forbid_count(machine, monkeypatch):
-    def boom(*_a, **_k):
-        raise AssertionError("count must not be read")
+def _count_calls(machine, monkeypatch):
+    """件数の読取りの呼出し回数を記録する (本体の except に吸収されない観測)。"""
+    calls = []
+    real = machine._unprocessed_position_count
 
-    monkeypatch.setattr(machine, "_unprocessed_position_count", boom)
+    def counted(*a, **k):
+        calls.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(machine, "_unprocessed_position_count", counted)
+    return calls
 
 
 def test_a_ready_row_does_not_count_positions(tmp_path, monkeypatch):
     conn, machine = _rig(tmp_path)
     _set(conn, machine, state="ready", epoch=3)
-    _forbid_count(machine, monkeypatch)
+    calls = _count_calls(machine, monkeypatch)
     snap = machine.guidance_snapshot(WED, conn=conn)
+    assert calls == []
     assert (snap["phase"], snap["next_action"]) == ("ready", "none")
     assert snap["unprocessed_positions"] == "unknown"
+
+
+def test_the_call_counter_sees_a_count_for_a_degraded_row(tmp_path, monkeypatch):
+    conn, machine = _rig(tmp_path)
+    _set(conn, machine, state="degraded", epoch=3)
+    calls = _count_calls(machine, monkeypatch)
+    machine.guidance_snapshot(WED, conn=conn)
+    assert calls == [1]
 
 
 @pytest.mark.parametrize("state", ["degraded", "restricted"])
@@ -403,3 +418,54 @@ def test_an_unreadable_row_returns_the_shared_unknown_payload(tmp_path, monkeypa
     monkeypatch.setattr(machine, "_load_row",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     assert machine.guidance_snapshot(WED, conn=conn) == unknown_guidance()
+
+
+# ---- 自動で戻る注記は、確認できた値だけで真にする --------------------------------
+
+GOOD_ROW = {"state": "degraded", "pending_human_confirmation": 0}
+
+
+def _possible(tmp_path, row, *, auto=True, orders_result=None, monkeypatch=None):
+    conn, machine = _rig(tmp_path)
+    machine.auto_resume_when_flat = auto
+    if orders_result is not None:
+        monkeypatch.setattr("agentic_fx.datafeed.outage.orders.list_by_status",
+                            lambda *a, **k: orders_result())
+    return machine._may_resume_unattended(row, conn)
+
+
+def test_the_confirmed_values_make_it_true(tmp_path):
+    assert _possible(tmp_path, dict(GOOD_ROW)) is True
+
+
+@pytest.mark.parametrize("pending", [None, "0", "", 1, 2, True, False, 0.0, [], "false"])
+def test_a_pending_value_that_is_not_the_integer_zero_is_false(tmp_path, pending):
+    row = {"state": "degraded", "pending_human_confirmation": pending}
+    assert _possible(tmp_path, row) is False
+
+
+def test_a_missing_pending_is_false(tmp_path):
+    assert _possible(tmp_path, {"state": "degraded"}) is False
+
+
+@pytest.mark.parametrize("auto", ["false", "true", "", 1, 0, None, [], "no"])
+def test_an_auto_resume_setting_that_is_not_the_strict_true_is_false(tmp_path, auto):
+    assert _possible(tmp_path, dict(GOOD_ROW), auto=auto) is False
+
+
+@pytest.mark.parametrize("result", [None, "", (), "none", {}, 0, False, [1], ({"id": 1},)])
+def test_a_positions_read_that_is_not_an_empty_list_is_false(tmp_path, monkeypatch, result):
+    assert _possible(tmp_path, dict(GOOD_ROW), orders_result=lambda: result,
+                     monkeypatch=monkeypatch) is False
+
+
+def test_an_empty_list_from_the_positions_read_is_true(tmp_path, monkeypatch):
+    assert _possible(tmp_path, dict(GOOD_ROW), orders_result=lambda: [],
+                     monkeypatch=monkeypatch) is True
+
+
+def test_a_failed_positions_read_is_false(tmp_path, monkeypatch):
+    def boom():
+        raise RuntimeError("unreadable")
+
+    assert _possible(tmp_path, dict(GOOD_ROW), orders_result=boom, monkeypatch=monkeypatch) is False
