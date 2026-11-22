@@ -181,7 +181,7 @@ def test_a_deploy_job_failure_names_its_approval_only_when_one_is_given(state, r
 _DATA_FEED_SENTENCES = {
     "stopped": "監視対象の価格系列でデータの欠落を検知しました。SSH の端末から `afx ctl status` で取得状態を確認してください。復旧後も同画面で再開操作の要否を確認してください。",
     "awaiting_resume": "監視対象の価格系列でデータ取得の回復を確認しました。人の再開操作を待っています。SSH の端末から `afx ctl status` を確認してください。案内が通常の再開なら `afx ctl --as approver data resume` を実行してください。未処理の足がある建玉の確認が必要と出た場合は、建玉を確認し、再開を承認するときだけ `afx ctl --as approver data resume --acknowledge` を実行してください。",
-    "contact_stopped": "監視対象の価格系列で、停止中に届いた足が建玉の保護価格または指値に触れた可能性を検知し、停止しました。SSH の端末から `afx ctl status` を確認してください。対象の注文と足を確認し、再開を承認するときだけ `afx ctl --as approver data resume --acknowledge` を実行してください。",
+    "contact_stopped": "監視対象の価格系列で、停止中に届いた足が建玉の保護価格または指値に触れた可能性を検知した、または触れたかどうかを判定できなかったため、停止しました。SSH の端末から `afx ctl status` を確認してください。対象の注文と足を確認し、再開を承認するときだけ `afx ctl --as approver data resume --acknowledge` を実行してください。",
     "resume_accepted": "再開要求を受理しました。SSH の端末から `afx ctl status` を確認してください。",
     "resume_already_ready": "既に停止は解除されています。SSH の端末から `afx ctl status` を確認してください。",
     "resume_rejected": "再開要求は受理されませんでした。SSH の端末から `afx ctl status` で理由を確認し、必要なら再要求してください。",

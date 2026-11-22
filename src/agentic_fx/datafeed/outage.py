@@ -78,7 +78,8 @@ class GuidanceFacts:
 def resume_guidance(*, observe_failed: bool, state: str | None, request_pending: bool,
                     last_result: str | None, awaiting_mark: bool,
                     unprocessed: int | None,
-                    facts: GuidanceFacts | None = None) -> tuple[str, str]:
+                    facts: GuidanceFacts | None = None,
+                    startup_wait: bool = False) -> tuple[str, str]:
     """status に出す (phase, next_action)。上の行ほど優先する真理値表で、この 1 関数だけが決める。
 
     `state` が None は読取り失敗、`unprocessed` が None は件数を読めないこと (ゼロとみなさない)。
@@ -90,6 +91,8 @@ def resume_guidance(*, observe_failed: bool, state: str | None, request_pending:
     unknown = ("unknown", "check_status")
     if observe_failed or state is None:
         return unknown
+    if startup_wait:
+        return ("starting", "wait_tick")
     if request_pending:
         return ("resume_requested", "wait_tick")
     if state == "ready":
@@ -386,14 +389,16 @@ class OutageStateMachine:
         phase, action = resume_guidance(
             observe_failed=self._observe_failed, state=state,
             request_pending=row.get("resume_requested_at") is not None,
-            last_result=result, awaiting_mark=marked, unprocessed=unprocessed, facts=facts)
+            last_result=result, awaiting_mark=marked, unprocessed=unprocessed, facts=facts,
+            startup_wait=self._startup_wait)
         try:
             contacts = [{"order_id": c.order_id, "bar_time": _iso(c.bar_time), "kind": c.kind}
                         for c in outage_facts.list_contacts(
                             conn if conn is not None else self.conn, epoch=epoch)]
         except Exception:  # noqa: BLE001 — 参照を読めなければ案内も不明として返す
             return unknown_guidance()
-        return {"state": "degraded" if self._observe_failed else row.get("state", "ready"),
+        return {"state": "degraded" if (self._observe_failed or self._startup_wait)
+                else row.get("state", "ready"),
                 "phase": phase, "next_action": action, "contacts": contacts,
                 "unprocessed_positions": UNKNOWN_COUNT if unprocessed is None else unprocessed,
                 "resume_last_result": result,
@@ -619,6 +624,9 @@ class OutageStateMachine:
                     continue
                 if kf.stall_start is not None:
                     old_starts.append(kf.stall_start)
+                elif gap_break and kf.observed_through is not None:
+                    # 観測が規定を超えて途切れた間の停滞は、保存した水位の次の確認時刻から数える
+                    old_starts.append(self._expected(key[1], kf.observed_through))
         late_found: list = []
         late_keys: list = []
         n_first: list = []
@@ -660,6 +668,7 @@ class OutageStateMachine:
             ready_confirm_ticks=self.ready_confirm_ticks,
             flat_stall_max_sec=self.flat_stall_max_sec, problem_streak=problem_streak)
         next_row, effects = outage_transition.outage_transition(row, facts)
+        migration_pending = migration_pending or effects.set_migration
         epoch = next_row["epoch"]
         if effects.opened:
             self._open_gaps(epoch, self._gap_origins(key_facts, report, watermarks))

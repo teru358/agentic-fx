@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 PHASES = ("unknown", "resume_requested", "ready", "resume_rejected", "awaiting_resume",
-          "stopped", "restricted", "recovering")
+          "stopped", "restricted", "recovering", "starting")
 # daemon が返す (phase, next_action) の組。これ以外は不明として扱う
 PAIRS = frozenset({
     ("unknown", "check_status"),
@@ -22,6 +22,7 @@ PAIRS = frozenset({
     ("stopped", "restore_source"),
     ("restricted", "wait_tick"),
     ("recovering", "wait_tick"),
+    ("starting", "wait_tick"),
 })
 UNKNOWN_COUNT = "unknown"
 
@@ -36,6 +37,7 @@ _REASON = {
     "stopped": "データの欠落を検知して停止しています",
     "restricted": "データの欠落を検知し、制限状態で自動復帰を判定しています",
     "recovering": "健全な足の確認を続けています。条件が揃えば自動解除します",
+    "starting": "起動直後で、最初の開場中の観測を待っています。新規リスクは止まっています",
 }
 _REJECTED_REASON = {
     "rejected_watermark": "前回の要求は、取得状態が確認できず拒否されました",

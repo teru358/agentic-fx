@@ -51,10 +51,10 @@ DATA_STATES = {"ready": OK, "degraded": WARN, "restricted": WARN}
 # DATA_STATES と同じく warn、読めないものは不明 (正常には倒さない)
 DATA_PHASES = {"ready": OK, "resume_requested": WARN, "resume_rejected": WARN,
                "awaiting_resume": WARN, "stopped": WARN, "restricted": WARN,
-               "recovering": WARN, "unknown": UNKNOWN}
+               "recovering": WARN, "starting": WARN, "unknown": UNKNOWN}
 DATA_PHASE_TEXT = {"ready": "停止なし", "resume_requested": "再開要求の判定待ち",
                    "resume_rejected": "再開要求が拒否", "awaiting_resume": "再開操作待ち",
-                   "stopped": "停止中", "restricted": "制限中", "recovering": "自動解除の確認中",
+                   "stopped": "停止中", "restricted": "制限中", "recovering": "自動解除の確認中", "starting": "起動待ち",
                    "unknown": UNKNOWN_WORD}
 # bot の gateway health・calendar・worker・容量の語彙は、この表のキーが唯一の定義 (render が写さず導く)
 BOT_HEALTH = {"healthy": OK, "unhealthy": DANGER, "stalled": DANGER, "stale": WARN, "unknown": WARN,

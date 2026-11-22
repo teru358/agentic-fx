@@ -4,8 +4,10 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timedelta
 
+from agentic_fx.core.contracts import OrderStatus
 from agentic_fx.core.protection_contact import NON_TERMINAL_STATUSES
 
+_KNOWN_STATUSES = tuple(status.value for status in OrderStatus)
 _OPTIONAL = {
     "intent_id", "approval_id", "client_order_id", "quantity",
     "filled_quantity", "remaining_quantity", "avg_fill_price",
@@ -64,21 +66,29 @@ def list_by_status(conn: sqlite3.Connection, *statuses) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+_ISO_GLOB = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:*"
+
+
 def list_overlapping(conn: sqlite3.Connection, pairs: list[str], start: datetime,
                      end: datetime) -> list[dict]:
     """[start, end) と生存期間が重なり得る注文 (全状態、id 順)。
 
-    作成が end 以前で、非終端か終了 (closed_at、無ければ updated_at) が start 以後のもの。
+    時間で除外するのは、既知の状態で、作成・終了の時刻が読め、重ならないと分かる注文だけ。
+    未知の状態・読めない時刻の注文は候補に残し、評価 (接触の判定) が不明として扱う。
     保存の時刻表記が UTC 以外でも取りこぼさないよう上下を 1 日広げる。厳密な重なりの判定は
-    呼び出し側 (接触の評価) が窓で行う。"""
+    呼び出し側が窓で行う。"""
     if not pairs:
         return []
     pair_marks = ",".join("?" * len(pairs))
     live_marks = ",".join("?" * len(NON_TERMINAL_STATUSES))
+    known_marks = ",".join("?" * len(_KNOWN_STATUSES))
     day = timedelta(days=1)
     rows = conn.execute(
-        f"SELECT * FROM orders WHERE pair IN ({pair_marks}) AND created_at < ? AND "
-        f"(status IN ({live_marks}) OR COALESCE(closed_at, updated_at) > ?) ORDER BY id",
-        [*pairs, (end + day).isoformat(), *NON_TERMINAL_STATUSES,
-         (start - day).isoformat()]).fetchall()
+        f"SELECT * FROM orders WHERE pair IN ({pair_marks}) AND ("
+        f"status NOT IN ({known_marks}) OR created_at NOT GLOB ? "
+        f"OR COALESCE(closed_at, updated_at) NOT GLOB ? "
+        f"OR (created_at < ? AND (status IN ({live_marks}) "
+        f"OR COALESCE(closed_at, updated_at) > ?))) ORDER BY id",
+        [*pairs, *_KNOWN_STATUSES, _ISO_GLOB, _ISO_GLOB, (end + day).isoformat(),
+         *NON_TERMINAL_STATUSES, (start - day).isoformat()]).fetchall()
     return [dict(r) for r in rows]

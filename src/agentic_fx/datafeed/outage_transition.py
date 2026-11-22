@@ -105,6 +105,8 @@ class Effects:
     blocked: bool = False
     # 復帰した (ready への遷移)
     recovered: bool = False
+    # 起点を復元できず、人の確認待ち (移行確認待ち) にする
+    set_migration: bool = False
     rows: dict = field(default_factory=dict)
 
 
@@ -227,9 +229,15 @@ def outage_transition(row: dict, f: Facts) -> tuple[dict, Effects]:
     if not skip_rest and first_found:
         contact_found(first_found)
 
-    restricted_over = (
-        state == "restricted" and restricted_since is not None
-        and _open_seconds(_parse(restricted_since), now) > RESTRICTED_MAX_SEC)
+    set_migration = False
+    if state == "restricted" and restricted_since is None:
+        # 連続の起点を復元できない行は、上限を無効にせず人の確認へ安全側に倒す
+        restricted_over = True
+        set_migration = True
+    else:
+        restricted_over = (
+            state == "restricted"
+            and _open_seconds(_parse(restricted_since), now) > RESTRICTED_MAX_SEC)
 
     if not skip_rest:
         if overdue:
@@ -238,6 +246,11 @@ def outage_transition(row: dict, f: Facts) -> tuple[dict, Effects]:
             if state != "degraded":
                 degrade()
                 activities.append(degraded_activity())
+            if restricted_over and not confirmed:
+                confirmed = 1
+                confirmed_stop = True
+                if notified_epoch != epoch:
+                    notices.append(("stopped", ""))
         elif restricted_over:
             if state != "degraded":
                 degrade()
@@ -338,4 +351,5 @@ def outage_transition(row: dict, f: Facts) -> tuple[dict, Effects]:
     return next_row, Effects(
         opened=opened, problem_streak=problem_streak, activities=tuple(activities),
         notices=tuple(notices), new_contacts=tuple(new_contacts),
-        confirmed_stop=confirmed_stop, blocked=blocked, recovered=recovered)
+        confirmed_stop=confirmed_stop, blocked=blocked, recovered=recovered,
+        set_migration=set_migration)
