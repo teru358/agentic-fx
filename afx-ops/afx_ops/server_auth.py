@@ -16,11 +16,11 @@ from __future__ import annotations
 
 import errno
 import os
-import time
 import select
 import socket
 import stat
 import struct
+import time
 from pathlib import Path
 
 # 共有契約の語彙 (本体 client の ServerAuthError.reason と同じ)。
@@ -178,6 +178,8 @@ def lock_holders(lock_path: Path, *, proc_locks: Path = PROC_LOCKS,
     ``/proc/locks`` の値が食い違うので、共有契約では食い違うときにその pid が lock file
     を fd で開いていることを確かめて数える。``dev_fallback=False`` ではこの救済をせず
     数えない (固有 admission を通した経路は dev の一致を前提にする)。
+    欠けた読みは行を落とすだけで足さず、flock は排他で保持者は 1 つ、daemon は lock 後に
+    socket を開くため、別 PID だけの読みは本当の不一致として読み直さない。
     """
     try:
         st = os.stat(lock_path)
@@ -379,6 +381,7 @@ def check_lock_device(lock_path: Path, *, proc_locks: Path = PROC_LOCKS) -> None
     ``/proc/locks`` の dev が食い違う filesystem (btrfs・overlayfs 等) と判断し、readlink で
     救済せず拒否する。同 inode の行が無い場合の判定は後段の共有 verifier に任せる。stat や
     ``/proc/locks`` を読めなければ保持者を確定できないので共有契約と同じ語で止める。
+    期待 dev の行が無いときの拒否は読み直しの間隔を最大 7 回待ってから返る。
     """
     try:
         st = os.stat(lock_path)

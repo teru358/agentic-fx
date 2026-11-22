@@ -214,6 +214,8 @@ def lock_holders(lock_path: Path, *, proc_locks: Path = Path("/proc/locks")) -> 
     inode の一致は必須。装置番号は btrfs・overlayfs・NFS では stat の値 (匿名 dev) と
     ``/proc/locks`` の値 (superblock の dev) が食い違うので、一致すれば速い経路で数え、
     食い違うときはその pid が lock file を fd で開いていることを確かめて数える。
+    欠けた読みは行を落とすだけで足さず、flock は排他で保持者は 1 つ、daemon は lock 後に
+    socket を開くため、別 PID だけの読みは本当の不一致として読み直さない。
     """
     try:
         st = os.stat(lock_path)

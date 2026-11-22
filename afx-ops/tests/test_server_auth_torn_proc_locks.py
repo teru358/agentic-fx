@@ -93,7 +93,7 @@ def _verify(tmp_path, path, contents):
     left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         return server_auth.verify_peer(left, uid=os.getuid(), lock_path=path,
-                                       proc_locks=_SequencedLocks(tmp_path, contents))
+                                       proc_locks=contents if isinstance(contents, _SequencedLocks) else _SequencedLocks(tmp_path, contents))
     finally:
         left.close()
         right.close()
@@ -131,3 +131,18 @@ def test_verify_peer_refuses_when_a_later_read_fails(tmp_path, lock):
 def test_verify_peer_accepts_the_peer_seen_after_an_empty_read(tmp_path, lock):
     path, device = lock
     assert _verify(tmp_path, path, ["", _row(os.getpid(), device)]) == os.getpid()
+
+
+@pytest.mark.parametrize("peer_later", [False, True])
+def test_verify_peer_stops_at_another_holder_after_empty(tmp_path, lock, peer_later):
+    """欠けた読みは行を足さず、排他 flock の保持者は 1 つ。daemon は lock 後に
+    socket を開くので、別 PID だけの読みを本当の不一致と扱う。"""
+    path, device = lock
+    contents = ["", _row(os.getpid() + 1, device)]
+    if peer_later:
+        contents.append(_row(os.getpid(), device))
+    locks = _SequencedLocks(tmp_path, contents)
+    with pytest.raises(ServerAuthError) as info:
+        _verify(tmp_path, path, locks)
+    assert info.value.reason == "not_lock_holder"
+    assert locks.opened == 2
