@@ -89,8 +89,19 @@ def test_unknown_keys_are_rejected_so_an_older_parser_would_reject_the_new_ones(
 
 # ---- rollback の手順 -------------------------------------------------------
 
+_OUTAGE_KEY_COMMENT = re.compile(
+    r"^(\s+(?:flat_stall_max_sec|ready_confirm_ticks|auto_resume_when_flat):\s*\S+)\s+#.*$", re.M)
+
+
+def _without_outage_comments(text: str) -> str:
+    """停止の判定の設定 3 キーの行末コメントを外す。説明文は設定の意味の変更で書き直すので、
+    history_sync の新キーの rollback を見るこの比較には含めない (キーと値は比較する)。"""
+    return _OUTAGE_KEY_COMMENT.sub(r"\1", text)
+
+
 def test_rolling_the_example_back_restores_the_v5_bytes_exactly():
-    assert _rollback_text(_example_text()) == (FIXTURES / "v5.yaml").read_text(encoding="utf-8")
+    assert _without_outage_comments(_rollback_text(_example_text())) == _without_outage_comments(
+        (FIXTURES / "v5.yaml").read_text(encoding="utf-8"))
 
 
 def test_a_config_with_the_new_keys_set_has_exactly_the_v5_key_set_after_the_rollback_steps():

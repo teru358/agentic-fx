@@ -280,6 +280,10 @@ class OutageStateMachine:
 
     # ---- public -------------------------------------------------------
 
+    def release_startup_wait(self) -> None:
+        """観測が来ない構成 (価格取得を持たない) は、起動待ちを掛けない。"""
+        self._startup_wait = False
+
     @property
     def state(self) -> str:
         # observe() をまだ一度も呼んでいない (行が無い) 場合は既定の

@@ -190,6 +190,13 @@ def test_init_healthcheck_is_readonly(tmp_path):
     assert provider.call_args.kwargs["readonly"] is True
 
 
+
+def _settle_startup(app):
+    """起動直後の data state は、最初の開場中の観測が済むまで待つ。何も取りに行かない観測を 1 回済ませる。"""
+    from agentic_fx.datafeed.outage import EMPTY_REPORT
+    app.outage.observe(app.clock.now(), EMPTY_REPORT)
+    return app
+
 def _seam_app(tmp_path, runner):
     """run_service のテスト用シームで注入する App を組み立てる (F4)。
 
@@ -757,6 +764,7 @@ def test_service_tick_records_deferred_with_supervisor_phase(tmp_path):
 
     _init(tmp_path)
     app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+    _settle_startup(app)
     hung = False
     try:
         record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
@@ -807,6 +815,7 @@ def test_cron_tick_records_decision_bar_provenance_end_to_end(tmp_path):
     fake = FakeRunner([MissionResult("completed",
                                      {"action": "hold", "reasoning": "w"}, [])])
     app = build_app(tmp_path, runner=fake, clock=FixedClock(NOW))
+    _settle_startup(app)
     record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
                     equity=1_000_000)
     bar_time = NOW - timedelta(hours=1, seconds=30)
@@ -1248,6 +1257,7 @@ def test_signal_not_taken_by_any_mission_is_abandoned_only_after_fresh_until(tmp
     _init(tmp_path)
     app = build_app(tmp_path, runner=FakeRunner([]), clock=clock,
                     embedding_fn=FakeEmbedding())
+    _settle_startup(app)
     app.scheduler.on_improve_tick = None
     submitted = []
 
@@ -1296,6 +1306,7 @@ def test_default_1h_cron_keeps_its_prompt_and_rhythm_with_pending_signal(tmp_pat
     clock = _MutableClock(NOW)
     app = build_app(tmp_path, runner=fake, clock=clock,
                     embedding_fn=FakeEmbedding())
+    _settle_startup(app)
     app.scheduler.on_improve_tick = None
     app.scheduler.signal_due_fn = lambda _now: False
     assert app.settings.datafeed.decision_timeframe == "1h"
@@ -1364,6 +1375,7 @@ def test_on_trade_mission_runs_loop_and_reflection(tmp_path):
                                      {"action": "hold", "reasoning": "w"},
                                      [])])
     app = build_app(tmp_path, runner=fake, clock=FixedClock(NOW))
+    _settle_startup(app)
     from agentic_fx.core.accounting import record_snapshot
     record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
                     equity=1_000_000)
@@ -1413,6 +1425,7 @@ def test_on_trade_mission_wrapper_also_runs_reflection(tmp_path):
         MissionResult("completed", {"content": "振り返り"}, []),
     ])
     app = build_app(tmp_path, runner=fake, clock=FixedClock(NOW))
+    _settle_startup(app)
     from agentic_fx.core.accounting import record_snapshot
     from agentic_fx.store import orders as orders_store
     record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
@@ -1544,6 +1557,7 @@ def test_tick_propagates_trigger_to_missions_row(tmp_path):
                                      {"action": "hold", "reasoning": "w"},
                                      [])])
     app = build_app(tmp_path, runner=fake, clock=FixedClock(NOW))
+    _settle_startup(app)
     from agentic_fx.core.accounting import record_snapshot
     record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
                     equity=1_000_000)
@@ -1675,6 +1689,7 @@ def test_f1a_signal_maintenance_wiring_inserts_rows_via_real_tick(tmp_path):
               return_value=None):
         app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
                         embedding_fn=FakeEmbedding())
+        _settle_startup(app)
         record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
                         equity=1_000_000)
         _seed_1m(app.conn_core, app.settings.datafeed.primary,
@@ -1721,6 +1736,7 @@ def test_live_plugin_failure_reaches_the_production_activity_log(tmp_path):
               return_value=None):
         app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
                         embedding_fn=FakeEmbedding())
+        _settle_startup(app)
         record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
                         equity=1_000_000)
         _seed_1m(app.conn_core, app.settings.datafeed.primary,
@@ -3516,7 +3532,8 @@ def test_scheduler_tick_runs_when_ingest_prepare_raises(tmp_path, caplog):
 
     assert seen == [app.clock.now()]
     assert app.activity.write.call_count == 2
-    assert app.outage.state == "degraded"
+    # 全 hard key の取得失敗として観測する。flat なので猶予内の restricted (新規リスクは止まる)
+    assert app.outage.state == "restricted"
 
 
 def _observe_that_cannot_save(app, monkeypatch):
@@ -4364,6 +4381,7 @@ def test_15m_ingest_commit_healthcheck_and_scheduler_contract(tmp_path):
         schedule={"trade_interval_min": 15})
     app = build_app(tmp_path, runner=FakeRunner([]), clock=clock,
                     embedding_fn=FakeEmbedding())
+    _settle_startup(app)
     try:
         assert app.ingest.registry.required_closed_bars("USDJPY", "15m") == 1
         fired = []
@@ -5458,6 +5476,7 @@ def test_db_healthcheck_accepts_latest_closed_hourly_bar_until_end_plus_grace(tm
         def now(self): return self.t
     clock = _Clock(datetime(2026, 9, 22, 10, 59, tzinfo=timezone.utc))
     app = build_app(tmp_path, clock=clock)
+    _settle_startup(app)
     bars = [Bar("USDJPY", "1h", datetime(2026, 9, 22, h, 0, tzinfo=timezone.utc),
                 150.0, 150.1, 149.9, 150.0, 10.0) for h in range(5, 10)]
     ohlcv_store.upsert_cache_bars(app.conn_core, bars, source="yfinance")
@@ -5480,6 +5499,7 @@ def test_db_healthcheck_raises_while_the_data_state_is_restricted(tmp_path):
         def now(self): return self.t
     clock = _Clock(datetime(2026, 9, 22, 10, 59, tzinfo=timezone.utc))
     app = build_app(tmp_path, clock=clock)
+    _settle_startup(app)
     try:
         bars = [Bar("USDJPY", "1h", datetime(2026, 9, 22, h, 0, tzinfo=timezone.utc),
                     150.0, 150.1, 149.9, 150.0, 10.0) for h in range(5, 10)]
@@ -5510,7 +5530,7 @@ def test_scheduler_tick_observes_a_failed_report_when_ingest_commit_raises(tmp_p
 
     _scheduler_tick_once(app)
 
-    assert app.outage.state == "degraded"
+    assert app.outage.state == "restricted"
     assert seen == [app.clock.now()]
     events = [call.args[1] for call in app.activity.write.call_args_list]
     assert events.count("ingest_commit_failed") == 1
@@ -5551,7 +5571,8 @@ class _OutageClock:
 
 
 def test_outage_lifecycle_stop_gate_awaiting_resume_and_manual_recovery(tmp_path):
-    """10:00 ready → 10:01 取得失敗でその tick に degraded →
+    """10:00 最初の観測で ready → 10:01 取得失敗 (建玉ありの猶予 10 分内なので restricted) →
+    10:12 失敗が 10 分を超えて degraded →
     cron 停止・新規約定なし・既存 OPEN の保護は継続 →
     復旧しても自動では ready に戻らず `datafeed_recovered_awaiting_resume` を
     観測 → `data resume` は未処理建玉があると拒否 →
@@ -5605,20 +5626,25 @@ def test_outage_lifecycle_stop_gate_awaiting_resume_and_manual_recovery(tmp_path
 
         from agentic_fx.service import _scheduler_tick_once
 
-        # 10:00 時点はまだ観測前 (既定 "ready")
+        # 起動直後は最初の開場中の観測が済むまで待つ。10:00 の観測 (何も取りに行かない) で ready になる
+        assert app.outage.state == "degraded"
+        _settle_startup(app)
         assert app.outage.state == "ready"
 
-        # 10:01 取得失敗 → その tick で degraded
+        # 10:01 取得失敗 → 建玉があっても猶予 (10 分) 内なので restricted。新規リスクは止まる
         fail["v"] = True
         clock.current = t0 + timedelta(minutes=1)
         _scheduler_tick_once(app)
-        assert app.outage.state == "degraded"
+        assert app.outage.state == "restricted"
         assert app.outage.status()["epoch"] == 1
         assert app.outage.status()["confirmed"] == 0
 
-        # 10:02 2 tick 連続失敗 → confirmed=1 (通知専用、gate は変わらない)
-        clock.current = t0 + timedelta(minutes=2)
+        # 10:12 失敗が起点 (10:01) から 10 分を超え (660 秒)、その tick で degraded。
+        # 問題観測が 2 tick 連続しているので confirmed=1 (通知専用、gate は変わらない)
+        clock.current = t0 + timedelta(minutes=12)
         _scheduler_tick_once(app)
+        assert app.outage.state == "degraded"
+        assert app.outage.status()["epoch"] == 1
         assert app.outage.status()["confirmed"] == 1
 
         # 停止中は新規 trade mission が一切走っていない (cron/signal とも)
@@ -5627,9 +5653,9 @@ def test_outage_lifecycle_stop_gate_awaiting_resume_and_manual_recovery(tmp_path
         # 既存 OPEN 建玉は保護対象のまま残っている (壊れていない・喪失していない)
         assert orders_store.get(app.conn_core, oid)["status"] == "open"
 
-        # 10:05 復旧 (fetch 成功)。自動では ready に戻らない。
+        # 10:13 復旧 (fetch 成功)。自動では ready に戻らない。
         fail["v"] = False
-        clock.current = t0 + timedelta(minutes=5)
+        clock.current = t0 + timedelta(minutes=13)
         _scheduler_tick_once(app)
         assert app.outage.state == "degraded"
         activity_text = (tmp_path / "logs" / "activity.log").read_text(
@@ -5639,7 +5665,7 @@ def test_outage_lifecycle_stop_gate_awaiting_resume_and_manual_recovery(tmp_path
         # `data resume` — OPEN 1 件・未処理の足あり → 次 tick で拒否
         out = app.commands.dispatch("data resume")
         assert "1 件" in out
-        clock.current = t0 + timedelta(minutes=6)
+        clock.current = t0 + timedelta(minutes=14)
         _scheduler_tick_once(app)
         assert app.outage.state == "degraded"
         assert "data_resume_rejected" in activity_text or "data_resume_rejected" in (
@@ -5687,6 +5713,7 @@ def test_outage_state_and_gate_survive_process_restart(tmp_path):
             attempted=frozenset({("USDJPY", "1m")}), succeeded=frozenset(),
             failed=frozenset({(("USDJPY", "1m"), "ConnectError")}),
             deferred=frozenset(), empty=frozenset())
+        app.outage.flat_stall_max_sec = 0   # 猶予なし: 最初の失敗 tick で停止する
         state = app.outage.observe(t0, report)
         assert state == "degraded"
         epoch_before = app.outage.status()["epoch"]
@@ -5722,6 +5749,7 @@ def test_db_healthcheck_fails_closed_when_outage_degraded(tmp_path):
     clock = _OutageClock(t0)
     app = build_app(tmp_path, runner=FakeRunner([]), clock=clock,
                     embedding_fn=FakeEmbedding())
+    _settle_startup(app)
     try:
         _outage_seed_bar(app.conn_core, "USDJPY", "1h", t0 - timedelta(hours=1))
         assert app.trade_loop.provider.healthcheck("USDJPY") == "yfinance"
@@ -5729,6 +5757,7 @@ def test_db_healthcheck_fails_closed_when_outage_degraded(tmp_path):
             attempted=frozenset({("USDJPY", "1m")}), succeeded=frozenset(),
             failed=frozenset({(("USDJPY", "1m"), "ConnectError")}),
             deferred=frozenset(), empty=frozenset())
+        app.outage.flat_stall_max_sec = 0   # 猶予なし: 最初の失敗 tick で停止する
         assert app.outage.observe(t0, report) == "degraded"
         with pytest.raises(DataUnhealthy, match="degraded"):
             app.trade_loop.provider.healthcheck("USDJPY", now=t0)

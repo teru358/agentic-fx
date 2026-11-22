@@ -2498,6 +2498,9 @@ def _scheduler_tick_body(app: App) -> None:
     now = app.clock.now()
     ingest_result = None
     prepare_failed = False
+    if app.outage is not None and app.ingest is None:
+        # 価格取得を持たない構成は観測が来ない。最初の観測を待つ起動待ちは掛けない
+        app.outage.release_startup_wait()
     if app.ingest is not None:
         try:
             _, report = app.ingest.prepare(now)

@@ -38,6 +38,7 @@ from unittest.mock import patch
 import pytest
 
 from agentic_fx.core.contracts import Bar, FixedClock, InstrumentSpec, Quote
+from agentic_fx.datafeed.outage import EMPTY_REPORT
 from agentic_fx.loops.signal_decision_contract import DECISION_SCHEMA
 from agentic_fx.plugin import approval, strategy_gate
 from agentic_fx.plugin.gate_pytest import GateResult
@@ -207,6 +208,8 @@ def test_approved_strategy_signal_starts_dedicated_mission(tmp_path):
                           200.0, 10.0)}
 
     app = _build_app(tmp_path, runner=fake, bars=bars)
+    # 起動直後の data state は最初の開場中の観測が済むまで待つ。その観測を済ませてから試す
+    app.outage.observe(app.clock.now(), EMPTY_REPORT)
     # Verify that the approved strategy is included in the inventory.
     assert any(m.name == "sma_cross" for m in
               plugin_loader.approved_plugins(
