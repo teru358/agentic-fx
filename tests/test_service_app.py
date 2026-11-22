@@ -5536,6 +5536,21 @@ def test_scheduler_tick_observes_a_failed_report_when_ingest_commit_raises(tmp_p
     assert events.count("ingest_commit_failed") == 1
 
 
+def test_an_app_without_an_ingest_has_no_startup_wait(tmp_path):
+    """観測が来ない構成 (価格取得を持たない) は、最初の開場中の観測を待たない。"""
+    from agentic_fx.service import _scheduler_tick_once
+
+    app = _seam_app(tmp_path, FakeRunner([]))
+    try:
+        app.ingest = None
+        assert app.outage.state == "degraded"          # 構築直後は待つ
+        app.scheduler.tick = lambda now: []
+        _scheduler_tick_once(app)
+        assert app.outage.state == "ready"
+    finally:
+        app.close()
+
+
 def test_scheduler_tick_does_not_commit_ingest_bars_when_prepare_raises(tmp_path):
     from agentic_fx.service import _scheduler_tick_once
 

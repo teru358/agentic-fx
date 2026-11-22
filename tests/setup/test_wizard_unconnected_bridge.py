@@ -27,7 +27,7 @@ def latest_closed_bar(pair, interval, end):
     return Bar(pair, interval, boundary, 1, 1, 1, 1, 1)
 
 
-def test_a_root_finished_without_a_bridge_degrades_then_recovers_when_the_bridge_answers(tmp_path):
+def test_a_root_finished_without_a_bridge_restricts_then_recovers_when_the_bridge_answers(tmp_path):
     root = make_root(tmp_path)
     deps, *_ = make_deps(tmp_path)
     io = ScriptedWizardIO(responder=fresh_responder(("価格源", "2")))
@@ -57,7 +57,8 @@ def test_a_root_finished_without_a_bridge_degrades_then_recovers_when_the_bridge
     now = TUESDAY
     _, report = ingest.prepare(now, conn)
     ingest.commit(conn)
-    assert outage.observe(now, report) == "degraded"
+    # flat の取得失敗は猶予内の restricted (新規リスクだけ止める)。停止にはしない
+    assert outage.observe(now, report) == "restricted"
 
     bridge_up["value"] = True
     states = []
@@ -66,7 +67,8 @@ def test_a_root_finished_without_a_bridge_degrades_then_recovers_when_the_bridge
         _, report = ingest.prepare(now, conn)
         ingest.commit(conn)
         states.append(outage.observe(now, report))
+    # 橋が答えれば、追加の健全 tick を待たず、足が届いた tick で復帰する
     assert states[-1] == "ready"
-    assert states.index("ready") >= settings.datafeed.outage.ready_confirm_ticks - 1
-    assert "ready" not in states[: settings.datafeed.outage.ready_confirm_ticks - 1]
+    assert "degraded" not in states
+    assert states.index("ready") <= 2
     conn.close()

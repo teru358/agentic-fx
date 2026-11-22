@@ -736,3 +736,22 @@ def test_a_closed_market_observation_resets_the_healthy_count_and_keeps_the_star
     assert (after["epoch"], after["updated_at"], after["entered_degraded_at"]) == (
         before["epoch"], before["updated_at"], before["entered_degraded_at"])
     assert outage_facts.load_key_facts(conn, SRC)[KEY] == facts_before
+
+
+# ---- 通知の再照合 ----------------------------------------------------------------
+
+def test_a_contact_without_its_notice_record_is_recorded_at_the_first_observe_after_a_restart(
+        tmp_path):
+    conn, machine = _rig(tmp_path)
+    _state(conn, machine, "degraded", observed=_at(10, 0), confirmed=1, updated=_at(10, 4))
+    outage_facts.add_contact(conn, epoch=3, order_id=5, pair=PAIR, bar_time=_at(10, 2),
+                             kind="sl", detected_at=_at(10, 3))
+    conn.commit()
+    assert _notices(conn) == []                      # 状態を保存した後、通知の保存の前に落ちた
+    restarted = OutageStateMachine(conn, hard_keys=frozenset({KEY}), interval_widths=WIDTHS,
+                                   grace=GRACE, storage_source=SRC)
+    _bars(conn, _at(10, 1), _at(10, 4))
+    restarted.observe(_at(10, 6), _ok())
+    assert [n for n in _notices(conn) if n[1] == "stopped"] == [(3, "stopped", "contact")]
+    restarted.observe(_at(10, 7), _ok())
+    assert [n for n in _notices(conn) if n[1] == "stopped"] == [(3, "stopped", "contact")]
