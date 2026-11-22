@@ -75,7 +75,6 @@ def test_cold_start_keeps_the_planner_window_and_reports_no_late_bars(tmp_path):
     assert start < NOW - timedelta(hours=12)
     assert report.late_bars == ()
     assert dict(report.pre_watermarks)[KEY_1M] is None
-    assert dict(report.new_times)[KEY_1M] == (_m(2), _m(3))
 
 
 def test_prepare_reports_late_bars_without_writing(tmp_path):
@@ -86,7 +85,6 @@ def test_prepare_reports_late_bars_without_writing(tmp_path):
     ingest = Ingest(_settings(("1m",)), fetch=fetch)
     _, report = ingest.prepare(NOW, conn)
     assert dict(report.pre_watermarks)[KEY_1M] == _m(3)
-    assert dict(report.new_times)[KEY_1M] == (_m(4),)
     assert [(b.ts, b.close) for b in report.late_bars] == [(_m(2), 2.0)]
     assert [b.ts for b in load_cache_bars(conn, "USDJPY", "1m", source=SRC)] == [_m(0), _m(1), _m(3)]
     assert outage_facts.list_late_bars(conn, SRC) == []
@@ -108,11 +106,10 @@ def test_nothing_new_and_nothing_missing_reports_no_late_bars(tmp_path):
     fetch, _ = _recording_fetch({"1m": [_bar(_m(1)), _bar(_m(2)), _bar(_m(3))]})
     _, report = Ingest(_settings(("1m",)), fetch=fetch).prepare(NOW, conn)
     assert report.late_bars == ()
-    assert dict(report.new_times)[KEY_1M] == ()
     assert KEY_1M in report.succeeded
 
 
-def test_a_failed_request_reports_neither_new_times_nor_late_bars(tmp_path):
+def test_a_failed_request_reports_no_late_bars(tmp_path):
     conn = _db(tmp_path)
     _seed(conn, [_m(0), _m(3)])
 
@@ -121,7 +118,6 @@ def test_a_failed_request_reports_neither_new_times_nor_late_bars(tmp_path):
 
     _, report = Ingest(_settings(("1m",)), fetch=fetch).prepare(NOW, conn)
     assert report.late_bars == ()
-    assert KEY_1M not in dict(report.new_times)
     assert KEY_1M not in dict(report.pre_watermarks)
 
 

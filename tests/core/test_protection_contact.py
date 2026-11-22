@@ -182,3 +182,21 @@ def test_results_are_ordered_by_bar_time_then_order_id_and_inputs_are_untouched(
     assert got == [(1, bars[1].ts, "sl"), (2, bars[1].ts, "sl"),
                    (1, bars[0].ts, "sl"), (2, bars[0].ts, "sl")]
     assert [first, second] == snapshot
+
+
+def test_spread_once_per_pair_and_ordered_contacts():
+    calls = []
+    def spread(pair):
+        calls.append(pair)
+        return 0.0
+    orders = [_order(id=2), _order(id=1), _order(id=3, pair="EURUSD")]
+    bars = [_bar(2, l=147.0), _bar(1, l=147.0), _bar(1, l=147.0, pair="EURUSD")]
+    result = protection_contact(orders, bars, spread)
+    assert calls.count("USDJPY") == calls.count("EURUSD") == 1
+    assert [(c.bar_time, c.order_id) for c in result] == [(bars[1].ts, 1), (bars[1].ts, 2), (bars[2].ts, 3), (bars[0].ts, 1), (bars[0].ts, 2)]
+
+
+def test_the_live_status_words_match_the_order_store():
+    from agentic_fx.core import protection_contact as pc
+    from agentic_fx.core.contracts import NON_TERMINAL_STATUSES
+    assert pc._NON_TERMINAL == frozenset(NON_TERMINAL_STATUSES)

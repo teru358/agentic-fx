@@ -195,7 +195,6 @@ class Ingest:
         soft_failed: dict[tuple[str, str], str] = {}
         soft_waiting: set[tuple[str, str]] = set()
         pre_watermarks: dict[tuple[str, str], datetime | None] = {}
-        new_times: dict[tuple[str, str], tuple[datetime, ...]] = {}
         late_bars: list = []
         soft_keys = {key for key in self.keys if not self._is_hard(key)}
         for key in self._ordered_keys():
@@ -256,8 +255,6 @@ class Ingest:
                             if watermark is not None and b.ts <= watermark
                             and b.ts not in cached]
                     pre_watermarks[key] = watermark
-                    new_times[key] = tuple(b.ts for b in bars
-                                           if watermark is None or b.ts > watermark)
                     late_bars.extend(late)
                 self._pending[key] = bars
                 self.last_request_count += 1
@@ -340,7 +337,6 @@ class Ingest:
             soft_empty=frozenset(soft_empty),
             soft_backoff_waiting=frozenset(soft_waiting),
             pre_watermarks=tuple(sorted(pre_watermarks.items(), key=lambda kv: kv[0])),
-            new_times=tuple(sorted(new_times.items(), key=lambda kv: kv[0])),
             late_bars=tuple(sorted(late_bars, key=lambda b: (b.ts, b.symbol, b.interval))))
         self._late = list(report.late_bars)
         return self.last_request_count, report

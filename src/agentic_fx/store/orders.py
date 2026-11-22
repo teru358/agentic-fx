@@ -4,8 +4,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timedelta
 
-from agentic_fx.core.contracts import OrderStatus
-from agentic_fx.core.protection_contact import NON_TERMINAL_STATUSES
+from agentic_fx.core.contracts import NON_TERMINAL_STATUSES, OrderStatus
 
 _KNOWN_STATUSES = tuple(status.value for status in OrderStatus)
 _OPTIONAL = {

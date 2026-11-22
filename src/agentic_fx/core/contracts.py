@@ -69,6 +69,14 @@ class OrderStatus(StrEnum):
     INVALIDATED = "invalidated"
 
 
+# 終了時刻の上限を持たない (生存中の可能性がある) 注文の状態語
+NON_TERMINAL_STATUSES = tuple(sorted(s.value for s in (
+    OrderStatus.OPEN, OrderStatus.PENDING_FILL, OrderStatus.PROTECTION_PENDING,
+    OrderStatus.SUBMITTING, OrderStatus.SUBMITTED, OrderStatus.CLOSING,
+    OrderStatus.CANCELLING, OrderStatus.SUBMIT_UNKNOWN, OrderStatus.CANCEL_UNKNOWN,
+    OrderStatus.CLOSE_UNKNOWN)))
+
+
 @dataclass(frozen=True, slots=True)
 class Quote:
     symbol: str

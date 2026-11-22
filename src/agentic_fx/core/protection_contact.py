@@ -32,9 +32,6 @@ _FILLED_TERMINAL = "closed"
 _UNFILLED_TERMINAL = frozenset({"cancelled", "expired"})
 _NEVER_LIVE = frozenset({"approval_pending", "rejected", "invalidated"})
 _NON_TERMINAL = frozenset({_HELD, _PENDING}) | _UNCERTAIN
-# 終了時刻の上限を持たない (生存中の可能性がある) 状態語
-NON_TERMINAL_STATUSES = tuple(sorted(_NON_TERMINAL))
-
 
 @dataclass(frozen=True, slots=True)
 class Contact:
@@ -113,7 +110,7 @@ def _unfilled_kind(order: dict, bar: Bar, spread: float) -> str | None:
     return _held_kind(order, bar, spread)
 
 
-def _classify(order: dict, bar: Bar, spread: float | None) -> str | None:
+def _classify(order: dict, bar: Bar, spread: Callable[[], float | None]) -> str | None:
     status = order.get("status")
     if status in _NEVER_LIVE:
         return None
@@ -128,6 +125,7 @@ def _classify(order: dict, bar: Bar, spread: float | None) -> str | None:
         return None
     if status in _UNCERTAIN:
         return KIND_UNKNOWN
+    spread = spread()
     if spread is None:
         return KIND_UNKNOWN
     if status == _HELD:
@@ -147,14 +145,21 @@ def protection_contact(orders: Iterable[dict], bars: Sequence[Bar],
     足の `[ts, ts+1分)` と重なる注文が対象。現在 closed / cancelled でも、窓が重なれば除外しない。
     `spread` は pair を受けて価格単位の spread を返す関数か数値 (評価時の値。足には保存しない)。
     """
-    orders = list(orders)
+    orders = sorted(orders, key=lambda o: o.get("id") or 0)
+    spreads = {}
+
+    def resolve(pair):
+        if pair not in spreads:
+            spreads[pair] = _spread_of(spread, pair)
+        return spreads[pair]
+
     found: list[Contact] = []
     for bar in sorted(bars, key=lambda b: b.ts):
-        for order in sorted(orders, key=lambda o: o.get("id") or 0):
+        for order in orders:
             pair = order.get("pair")
             if pair != bar.symbol:
                 continue
-            kind = _classify(order, bar, _spread_of(spread, pair))
+            kind = _classify(order, bar, lambda: resolve(pair))
             if kind is not None:
                 found.append(Contact(order_id=order.get("id"), pair=pair,
                                      bar_time=bar.ts, kind=kind))
