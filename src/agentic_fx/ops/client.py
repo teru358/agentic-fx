@@ -197,6 +197,11 @@ def check_socket_path(path: Path, *, uid: int) -> None:
         raise ServerAuthError("socket_file")
 
 
+# /proc/locks は 1 回の read で 1 page ぶんしか返さず、lock の取得・解放が重なる間は読む度に
+# 行が抜ける (保持者の行も抜ける)。抜けた読みを「保持者なし」とせず読み直す。
+LOCK_READ_ATTEMPTS = 8
+
+
 def lock_holders(lock_path: Path, *, proc_locks: Path = Path("/proc/locks")) -> set[int]:
     """``/proc/locks`` から lock file の FLOCK WRITE 保持者の pid を集める。
 
@@ -213,11 +218,23 @@ def lock_holders(lock_path: Path, *, proc_locks: Path = Path("/proc/locks")) -> 
     except OSError:
         return set()
     device = (os.major(st.st_dev), os.minor(st.st_dev))
+    for _ in range(LOCK_READ_ATTEMPTS):
+        holders = _holders_in_proc_locks(proc_locks, st.st_ino, device, real_path)
+        if holders is None:
+            return set()
+        if holders:
+            return holders
+    return set()
+
+
+def _holders_in_proc_locks(proc_locks: Path, ino: int, device: tuple[int, int],
+                           real_path: str) -> set[int] | None:
+    """/proc/locks を 1 回読んで保持者を返す。読めなければ None。"""
     holders = set()
     try:
         text = proc_locks.read_text(encoding="ascii", errors="replace")
     except OSError:
-        return set()
+        return None
     for line in text.splitlines():
         parts = line.split()
         if len(parts) < 6 or "->" in parts:
@@ -231,7 +248,7 @@ def lock_holders(lock_path: Path, *, proc_locks: Path = Path("/proc/locks")) -> 
             pid = int(pid_text)
         except (IndexError, ValueError):
             continue
-        if ident[2] != st.st_ino:
+        if ident[2] != ino:
             continue
         if ident[:2] == device or _has_open_fd(pid, real_path):
             holders.add(pid)
