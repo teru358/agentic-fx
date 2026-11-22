@@ -45,13 +45,28 @@ def test_a_flat_ready_stop_past_the_configured_limit_stops_without_a_human_wait(
 
 
 @pytest.mark.parametrize("grace", [0, 1800])
-def test_a_short_restart_of_a_ready_machine_does_not_stop(tmp_path, grace):
+@pytest.mark.parametrize("position", [False, True])
+def test_a_short_restart_of_a_ready_machine_does_not_stop(tmp_path, grace, position):
     conn, machine = _rig(tmp_path)
     _state(conn, machine, "ready", observed=_at(10, 0), updated=_at(10, 3), epoch=3)
-    _order(conn)
+    if position:
+        _order(conn)
     _bars(conn, _at(10, 1), _at(10, 2))
     restarted = _restart(conn, flat_stall_max_sec=grace)
     assert restarted.observe(_at(10, 4), _ok()) == "ready"
+
+
+@pytest.mark.parametrize("seconds, observed, expected", [
+    (120, _at(10, 0), "ready"),
+    (121, _at(10, 0), "degraded"),
+    (121, _at(10, 3), "ready"),
+])
+def test_flat_interruption_boundary_evaluates_the_old_stall(tmp_path, seconds, observed, expected):
+    conn, machine = _rig(tmp_path, flat_stall_max_sec=0)
+    machine._first_observe = False
+    _state(conn, machine, "ready", observed=observed, updated=_at(10, 2), epoch=3)
+    _bars(conn, observed + timedelta(minutes=1), _at(10, 4))
+    assert machine.observe(_at(10, 2) + timedelta(seconds=seconds), _ok()) == expected
 
 
 # ---- 読めない注文は SQL の絞込みで落とさない ------------------------------------

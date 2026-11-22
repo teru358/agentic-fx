@@ -166,10 +166,9 @@ class IngestTickReport:
     soft_deferred: frozenset[tuple[str, str]] = frozenset()
     soft_empty: frozenset[tuple[str, str]] = frozenset()
     soft_backoff_waiting: frozenset[tuple[str, str]] = frozenset()
-    # hard 1m key の固定窓の取得 (成功した key だけ) の取得前水位・水位より新しい足の時刻・
+    # hard 1m key の固定窓の取得 (成功した key だけ) の取得前水位と
     # 取得前水位以前で同 source の cache に無かった足 (後着)。いずれも key 順・時刻順の tuple
     pre_watermarks: tuple = ()
-    new_times: tuple = ()
     late_bars: tuple = ()
 
 

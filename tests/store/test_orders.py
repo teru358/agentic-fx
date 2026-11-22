@@ -94,9 +94,36 @@ def test_list_overlapping_returns_live_orders_and_orders_ending_inside_the_windo
     later = make("USDJPY", "pending_fill", day + timedelta(days=3))
     other_pair = make("EURUSD", "open", day - timedelta(hours=1))
     unknown_end = make("USDJPY", "cancelled", day - timedelta(hours=3))
+    conn.execute("UPDATE orders SET updated_at=? WHERE id=?",
+                 ((day + timedelta(minutes=5)).isoformat(), unknown_end))
 
     found = [row["id"] for row in orders.list_overlapping(
         conn, ["USDJPY"], day, day + timedelta(minutes=30))]
     assert live in found and ended_inside in found and unknown_end in found
     assert old not in found and later not in found and other_pair not in found
     assert orders.list_overlapping(conn, [], day, day) == []
+
+
+def test_list_overlapping_keeps_unreadable_and_invalid_lifetimes(tmp_path):
+    from datetime import timedelta
+    conn = _conn(tmp_path)
+    day = datetime(2026, 11, 20, tzinfo=timezone.utc)
+    invalid = ["2020-99-99T00:00:00+00:00", "2026-02-31T00:00:00+00:00",
+               "2020-01-01T00:00:61+00:00", "2020-01-01T00:00:00"]
+    ids = []
+    for value in invalid:
+        oid = orders.insert(conn, pair="USDJPY", direction="long", entry_type="market",
+                            horizon="day", status="closed", now=day)
+        conn.execute("UPDATE orders SET created_at=?, closed_at=? WHERE id=?", (value, value, oid))
+        ids.append(oid)
+    old = orders.insert(conn, pair="USDJPY", direction="long", entry_type="market",
+                        horizon="day", status="closed", now=day - timedelta(days=5),
+                        closed_at=(day - timedelta(days=4)).isoformat())
+    overlap = orders.insert(conn, pair="USDJPY", direction="long", entry_type="market",
+                            horizon="day", status="closed", now=day - timedelta(days=1),
+                            closed_at=(day + timedelta(minutes=1)).isoformat())
+    live = orders.insert(conn, pair="USDJPY", direction="long", entry_type="market",
+                         horizon="day", status="open", now=day - timedelta(days=100))
+    found = [row["id"] for row in orders.list_overlapping(conn, ["USDJPY"], day, day + timedelta(hours=1))]
+    assert all(oid in found for oid in [*ids, overlap, live])
+    assert old not in found

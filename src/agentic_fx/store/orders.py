@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 
 from agentic_fx.core.contracts import NON_TERMINAL_STATUSES, OrderStatus
 
@@ -65,29 +65,39 @@ def list_by_status(conn: sqlite3.Connection, *statuses) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-_ISO_GLOB = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:*"
+def _parse_time(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        return parsed.astimezone(timezone.utc) if parsed.tzinfo is not None else None
+    except (ValueError, OverflowError):
+        return None
 
 
 def list_overlapping(conn: sqlite3.Connection, pairs: list[str], start: datetime,
                      end: datetime) -> list[dict]:
-    """[start, end) と生存期間が重なり得る注文 (全状態、id 順)。
+    """窓と重ならないと証明できない注文を、指定 pair から id 順に返す。
 
-    時間で除外するのは、既知の状態で、作成・終了の時刻が読め、重ならないと分かる注文だけ。
-    未知の状態・読めない時刻の注文は候補に残し、評価 (接触の判定) が不明として扱う。
-    保存の時刻表記が UTC 以外でも取りこぼさないよう上下を 1 日広げる。厳密な重なりの判定は
-    呼び出し側が窓で行う。"""
+    未知の状態、不正な時刻、逆転した生存期間は候補に残す。
+    """
     if not pairs:
         return []
-    pair_marks = ",".join("?" * len(pairs))
-    live_marks = ",".join("?" * len(NON_TERMINAL_STATUSES))
-    known_marks = ",".join("?" * len(_KNOWN_STATUSES))
-    day = timedelta(days=1)
+    marks = ",".join("?" * len(pairs))
     rows = conn.execute(
-        f"SELECT * FROM orders WHERE pair IN ({pair_marks}) AND ("
-        f"status NOT IN ({known_marks}) OR created_at NOT GLOB ? "
-        f"OR COALESCE(closed_at, updated_at) NOT GLOB ? "
-        f"OR (created_at < ? AND (status IN ({live_marks}) "
-        f"OR COALESCE(closed_at, updated_at) > ?))) ORDER BY id",
-        [*pairs, *_KNOWN_STATUSES, _ISO_GLOB, _ISO_GLOB, (end + day).isoformat(),
-         *NON_TERMINAL_STATUSES, (start - day).isoformat()]).fetchall()
-    return [dict(r) for r in rows]
+        f"SELECT * FROM orders WHERE pair IN ({marks}) ORDER BY id", pairs).fetchall()
+    start, end = start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+    result = []
+    for row in rows:
+        order = dict(row)
+        status = order["status"]
+        created = _parse_time(order["created_at"])
+        finished = None if status in NON_TERMINAL_STATUSES else _parse_time(
+            order["closed_at"] if order["closed_at"] is not None else order["updated_at"])
+        valid = (status in _KNOWN_STATUSES and created is not None
+                 and (status in NON_TERMINAL_STATUSES
+                      or (finished is not None and finished >= created)))
+        if valid and (created >= end or (finished is not None and finished <= start)):
+            continue
+        result.append(order)
+    return result
