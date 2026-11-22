@@ -197,9 +197,12 @@ def check_socket_path(path: Path, *, uid: int) -> None:
         raise ServerAuthError("socket_file")
 
 
-# /proc/locks は 1 回の read で 1 page ぶんしか返さず、lock の取得・解放が重なる間は読む度に
-# 行が抜ける (保持者の行も抜ける)。抜けた読みを「保持者なし」とせず読み直す。
+# /proc/locks は 1 回の read で 1 page ぶん (環境によっては) しか返さず、lock の取得・解放が
+# 重なる間は読む度に行が抜けることがある (保持者の行も抜ける)。抜けた読みを「保持者なし」と
+# せず、短い間隔を置いて最大 LOCK_READ_ATTEMPTS 回まで読み直す。全回空なら不許可のまま。
+# 限界: 保持者が見えた読みより後の入れ替わりは防げない (daemon は起動中 lock を持ち続ける前提)。
 LOCK_READ_ATTEMPTS = 8
+LOCK_REREAD_INTERVAL = 0.003
 
 
 def lock_holders(lock_path: Path, *, proc_locks: Path = Path("/proc/locks")) -> set[int]:
@@ -218,7 +221,9 @@ def lock_holders(lock_path: Path, *, proc_locks: Path = Path("/proc/locks")) -> 
     except OSError:
         return set()
     device = (os.major(st.st_dev), os.minor(st.st_dev))
-    for _ in range(LOCK_READ_ATTEMPTS):
+    for attempt in range(LOCK_READ_ATTEMPTS):
+        if attempt:
+            time.sleep(LOCK_REREAD_INTERVAL)
         holders = _holders_in_proc_locks(proc_locks, st.st_ino, device, real_path)
         if holders is None:
             return set()

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import errno
 import os
+import time
 import select
 import socket
 import stat
@@ -139,10 +140,12 @@ def _flock_rows(proc_locks: Path) -> list[tuple[int, int, int, int]]:
     return rows
 
 
-# /proc/locks は 1 回の read で 1 page ぶんしか返さず、lock の取得・解放が重なる間は読む度に
-# 行が抜ける (保持者の行も抜ける)。抜けた読みを「保持者なし」とせず読み直す。読み 1 回で
-# 抜ける率は lock が多く入れ替わる最中でも 1 割に届かず、8 回続けて抜ける確率は 1e-8 未満。
+# /proc/locks は 1 回の read で 1 page ぶん (環境によっては) しか返さず、lock の取得・解放が
+# 重なる間は読む度に行が抜けることがある (保持者の行も抜ける)。抜けた読みを「保持者なし」と
+# せず、短い間隔を置いて最大 LOCK_READ_ATTEMPTS 回まで読み直す。全回空なら不許可のまま。
+# 限界: 保持者が見えた読みより後の入れ替わりは防げない (daemon は起動中 lock を持ち続ける前提)。
 LOCK_READ_ATTEMPTS = 8
+LOCK_REREAD_INTERVAL = 0.003
 
 
 def _flock_rows_until(proc_locks: Path, accept) -> list[tuple[int, int, int, int]]:
@@ -151,6 +154,7 @@ def _flock_rows_until(proc_locks: Path, accept) -> list[tuple[int, int, int, int
     for _ in range(LOCK_READ_ATTEMPTS - 1):
         if accept(rows):
             break
+        time.sleep(LOCK_REREAD_INTERVAL)
         rows = _flock_rows(proc_locks)
     return rows
 
