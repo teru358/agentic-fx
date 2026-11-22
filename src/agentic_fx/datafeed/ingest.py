@@ -16,6 +16,7 @@ from agentic_fx.datafeed.outage import EMPTY_REPORT, IngestTickReport
 from agentic_fx.datafeed.planner import RequirementPlanner
 from agentic_fx.datafeed.requirements import build_registry
 from agentic_fx.datafeed import sources
+from agentic_fx.store import outage_facts
 from agentic_fx.store.ohlcv import upsert_cache_bars
 
 _log = logging.getLogger("agentic_fx.ingest")
@@ -25,6 +26,10 @@ _log = logging.getLogger("agentic_fx.ingest")
 # empty / failed / not-advancing attempt, and never beyond one bar width.
 SOFT_BACKOFF_BASE_SEC = 60
 
+
+# hard 1m key の通常取得は、水位のこの時間前から now までを毎回同じ要求で読み直す。
+# 取得前水位以前で cache に無い足 (後着) の検出は、この固定窓の内側に限る
+LATE_WINDOW = timedelta(minutes=10)
 
 UNVERIFIED_ALERT_AFTER = timedelta(seconds=300)
 UNVERIFIED_ERROR_TEXT = "bridge time rule unverified while market open"
@@ -64,6 +69,8 @@ class Ingest:
         self.next_probe_at: dict[tuple[str, str], datetime] = {}
         self._backoff: dict[tuple[str, str], int] = {}
         self._pending: dict[tuple[str, str], list] = {}
+        self._late: list = []
+        self._late_detected_at: datetime | None = None
         self._deferred: list[tuple[str, str]] = []
         self._soft_deferred: list[tuple[str, str]] = []
         self._soft_last_attempt: dict[tuple[str, str], int] = {}
@@ -118,6 +125,17 @@ class Ingest:
                            (key[0], key[1], self.storage_source)).fetchone()
         return datetime.fromisoformat(row[0]) if row and row[0] else None
 
+    def _is_late_window_key(self, key) -> bool:
+        return key[1] == "1m" and self._is_hard(key)
+
+    def _cached_times(self, conn, key, start, end) -> set[datetime]:
+        rows = conn.execute(
+            "SELECT bar_time FROM ohlcv_cache WHERE symbol=? AND interval=? AND source=? "
+            "AND bar_time>=? AND bar_time<=?",
+            (key[0], key[1], self.storage_source, start.isoformat(),
+             end.isoformat())).fetchall()
+        return {datetime.fromisoformat(r[0]) for r in rows}
+
     def _request(self, pair, interval, start, end, timeout):
         params = inspect.signature(self.fetch).parameters
         if "timeout" in params:
@@ -154,6 +172,8 @@ class Ingest:
             raise ValueError("now must be timezone-aware")
         now = now.astimezone(timezone.utc)
         self._pending.clear()
+        self._late = []
+        self._late_detected_at = now
         self.last_request_count = 0
         self.budget_exhausted = False
         if not market_hours.is_market_open(now):
@@ -174,6 +194,9 @@ class Ingest:
         soft_empty: set[tuple[str, str]] = set()
         soft_failed: dict[tuple[str, str], str] = {}
         soft_waiting: set[tuple[str, str]] = set()
+        pre_watermarks: dict[tuple[str, str], datetime | None] = {}
+        new_times: dict[tuple[str, str], tuple[datetime, ...]] = {}
+        late_bars: list = []
         soft_keys = {key for key in self.keys if not self._is_hard(key)}
         for key in self._ordered_keys():
             soft = key in soft_keys
@@ -208,8 +231,11 @@ class Ingest:
                     self._soft_state[key] = "plan_failed"
                 continue
             (soft_attempted if soft else attempted).add(key)
+            window_key = self._is_late_window_key(key)
+            lookback = (LATE_WINDOW if window_key
+                        else timedelta(minutes=sources.INTERVAL_MIN[interval]))
             start = (now - timedelta(days=plan.days) if watermark is None
-                     else watermark - timedelta(minutes=sources.INTERVAL_MIN[interval]))
+                     else watermark - lookback)
             remaining = max(0.01, budget - (self.monotonic() - started))
             timeout = min(remaining, max(0.01, budget / 2)) if soft else remaining
             if soft:
@@ -223,6 +249,16 @@ class Ingest:
                 self._unverified_reported.discard(key)
                 bars = normalize_closed_range(raw, interval=interval, start=start,
                                               end=now, cutoff=now, grace=grace)
+                if window_key:
+                    cached = (set() if watermark is None
+                              else self._cached_times(conn, key, start, watermark))
+                    late = [b for b in bars
+                            if watermark is not None and b.ts <= watermark
+                            and b.ts not in cached]
+                    pre_watermarks[key] = watermark
+                    new_times[key] = tuple(b.ts for b in bars
+                                           if watermark is None or b.ts > watermark)
+                    late_bars.extend(late)
                 self._pending[key] = bars
                 self.last_request_count += 1
                 (soft_succeeded if soft else succeeded).add(key)
@@ -302,7 +338,11 @@ class Ingest:
             soft_failed=frozenset(soft_failed.items()),
             soft_deferred=frozenset(soft_deferred),
             soft_empty=frozenset(soft_empty),
-            soft_backoff_waiting=frozenset(soft_waiting))
+            soft_backoff_waiting=frozenset(soft_waiting),
+            pre_watermarks=tuple(sorted(pre_watermarks.items(), key=lambda kv: kv[0])),
+            new_times=tuple(sorted(new_times.items(), key=lambda kv: kv[0])),
+            late_bars=tuple(sorted(late_bars, key=lambda b: (b.ts, b.symbol, b.interval))))
+        self._late = list(report.late_bars)
         return self.last_request_count, report
 
     def _soft_miss(self, key, now: datetime, width: timedelta) -> None:
@@ -314,10 +354,23 @@ class Ingest:
         self.next_probe_at[key] = max(backoff_due, rate_due)
 
     def commit(self, conn) -> int:
+        """取得した足と未検査の後着足を 1 つの transaction で保存して commit する。"""
         written = 0
-        for bars in self._pending.values():
-            written += upsert_cache_bars(conn, bars, source=self.storage_source)
-        self._pending.clear()
+        try:
+            for bars in self._pending.values():
+                written += upsert_cache_bars(conn, bars, source=self.storage_source,
+                                             commit=False)
+            if self._late:
+                outage_facts.add_late_bars(conn, self._late, self.storage_source,
+                                           detected_at=self._late_detected_at)
+            conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            self._pending.clear()
+            self._late = []
         return written
 
     def _fetch_primary(self, pair, interval, start, end, *, timeout):

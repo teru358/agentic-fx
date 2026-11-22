@@ -22,7 +22,7 @@ from agentic_fx.core import market_hours
 from agentic_fx.core.timeutil import as_utc
 from agentic_fx.datafeed import notice_rules
 from agentic_fx.datafeed.guidance_text import UNKNOWN_COUNT
-from agentic_fx.store import ohlcv, orders
+from agentic_fx.store import ohlcv, orders, outage_facts
 
 # 永続状態機械の取りうる state。web の状態の印の割当表 (afx-ops) はこの語彙を写して持ち、test が突き合わせる
 DATA_STATES = ("ready", "restricted", "degraded")
@@ -119,6 +119,11 @@ class IngestTickReport:
     soft_deferred: frozenset[tuple[str, str]] = frozenset()
     soft_empty: frozenset[tuple[str, str]] = frozenset()
     soft_backoff_waiting: frozenset[tuple[str, str]] = frozenset()
+    # hard 1m key の固定窓の取得 (成功した key だけ) の取得前水位・水位より新しい足の時刻・
+    # 取得前水位以前で同 source の cache に無かった足 (後着)。いずれも key 順・時刻順の tuple
+    pre_watermarks: tuple = ()
+    new_times: tuple = ()
+    late_bars: tuple = ()
 
 
 EMPTY_REPORT = IngestTickReport(
@@ -591,6 +596,8 @@ class OutageStateMachine:
                          pending_human_confirmation=pending,
                          recovered_notified_epoch=recovered_notified_epoch,
                          ready_streak=ready_streak, updated_at=_iso(now))
+        self._save_facts(now, watermarks, expected, attempt_ok,
+                         auto_healthy=healthy, manual_healthy=not unconfirmed)
         return _Outcome(state=state, epoch=epoch, activities=activities,
                         attempt_ok=attempt_ok, problem_streak=problem_streak,
                         unconfirmed=unconfirmed, notices=notices)
@@ -703,6 +710,20 @@ class OutageStateMachine:
              restricted_deadline_at, pending_human_confirmation,
              recovered_notified_epoch, ready_streak, updated_at))
 
+    def _save_facts(self, now: datetime, watermarks: dict, expected: dict,
+                    attempt_ok: dict, *, auto_healthy: bool, manual_healthy: bool) -> None:
+        """この tick で見た水位・停滞の起点・直近の試行の成否・健全の真偽を保存する。
+        状態の保存と同じ transaction の中 (commit は呼び出し側)。ここで書いた値はまだ
+        どの判定にも使わない。"""
+        for pair, interval in self.hard_keys:
+            key = (pair, interval)
+            outage_facts.save_key_facts(
+                self.conn, pair, interval, self.storage_source,
+                observed_through=watermarks.get(key), stall_start=expected.get(key),
+                last_attempt_ok=attempt_ok.get(key), now=now)
+        outage_facts.save_health(self.conn, auto_healthy=auto_healthy,
+                                 manual_healthy=manual_healthy, now=now)
+
     def _open_gaps(self, epoch: int, now: datetime,
                    watermarks: dict[tuple[str, str], datetime | None]) -> None:
         """episode 突入時、各 (pair, interval) の `gap_start` を記録する。
@@ -723,9 +744,9 @@ class OutageStateMachine:
             gap_start = watermarks.get(key) or now
             self.conn.execute(
                 "INSERT INTO datafeed_outage_gap "
-                "(pair, interval, epoch, gap_start, replay_through) "
-                "VALUES (?, ?, ?, ?, NULL)",
-                (pair, interval, epoch, _iso(gap_start)))
+                "(pair, interval, epoch, gap_start, replay_through, source) "
+                "VALUES (?, ?, ?, ?, NULL, ?)",
+                (pair, interval, epoch, _iso(gap_start), self.storage_source))
 
     def _gap_start(self, pair: str, interval: str, epoch: int,
                   conn=None) -> datetime | None:
