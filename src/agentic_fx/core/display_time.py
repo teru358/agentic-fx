@@ -366,6 +366,20 @@ def datafeed_restricted(epoch: object, stalled: Iterable[object],
                  f"expected={utc_token(expected)} deadline={utc_token(deadline)}"))
 
 
+def late_bar_protection_contact(epoch: object, order_id: object, bar_time: object,
+                                kind: object) -> Built:
+    return _build(
+        "SYSTEM", "late_bar_protection_contact",
+        lambda: (f"epoch={epoch} order={order_id} bar={utc_token(bar_time)} kind={kind}"))
+
+
+def late_bar_contact_unknown(epoch: object, order_id: object, bar_time: object,
+                             kind: object) -> Built:
+    return _build(
+        "SYSTEM", "late_bar_contact_unknown",
+        lambda: (f"epoch={epoch} order={order_id} bar={utc_token(bar_time)} kind={kind}"))
+
+
 def time_rule_cutover(capture: dict) -> Built:
     """保存した capture の JSON (`activity_logged` は除く)。"""
     return _build(
@@ -388,6 +402,8 @@ BUILDERS: dict[tuple[str, str], Callable[..., Built]] = {
     ("NEWS", "econ_fetch_skipped"): econ_fetch_skipped,
     ("NEWS", "news_source_skipped"): news_source_skipped,
     ("SYSTEM", "datafeed_restricted"): datafeed_restricted,
+    ("SYSTEM", "late_bar_protection_contact"): late_bar_protection_contact,
+    ("SYSTEM", "late_bar_contact_unknown"): late_bar_contact_unknown,
     ("SYSTEM", "time_rule_cutover"): time_rule_cutover,
     ("SYSTEM", "kill_switch_reset"): kill_switch_reset,
 }

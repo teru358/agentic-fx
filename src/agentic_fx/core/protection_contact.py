@@ -32,6 +32,8 @@ _FILLED_TERMINAL = "closed"
 _UNFILLED_TERMINAL = frozenset({"cancelled", "expired"})
 _NEVER_LIVE = frozenset({"approval_pending", "rejected", "invalidated"})
 _NON_TERMINAL = frozenset({_HELD, _PENDING}) | _UNCERTAIN
+# 終了時刻の上限を持たない (生存中の可能性がある) 状態語
+NON_TERMINAL_STATUSES = tuple(sorted(_NON_TERMINAL))
 
 
 @dataclass(frozen=True, slots=True)
