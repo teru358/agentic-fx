@@ -27,3 +27,4 @@ plugin sma_cross_10_30 (USDJPY, 1h) の評価が毎時 00 分すぎ (取引 miss
 - 2026-10-10: 起票。
 - 2026-10-23: 関連: [multi-timeframe-indicator-deps, signal-producer-hourly-warning-before-confirmation] — 重複チケット signal-producer-hourly-warning-before-confirmation を本件に統合 (2026-10-23 棚卸し)
 - 2026-10-25: 種別: 不具合 — 種別を付与
+- 2026-11-23: 別の型を観測: 月曜の開場直後 (冬時間は 22:00Z) に、休場中で存在しない日曜 21:00Z の 1h bucket を plugin 2 本が毎分再試行し、23:00Z まで約 1 時間 WARNING を出す (11-16・11-23、各 100 行強)。足の到着待ちではなく休場帯の bucket を対象にしている
