@@ -431,6 +431,9 @@ _STATUS_HINT = "SSH の端末から `afx ctl status` を確認してください
 # 価格系列の停止・再開待ちの固定本文。金額・件数・経過時間・内部識別子は載せない
 DATA_FEED_EVENT_TEXTS = {
     "stopped": "監視対象の価格系列でデータの欠落を検知しました。SSH の端末から `afx ctl status` で取得状態を確認してください。復旧後も同画面で再開操作の要否を確認してください。",
+    "contact_stopped": ("監視対象の価格系列で、停止中に届いた足が建玉の保護価格または指値に触れた可能性を検知し、"
+                        "停止しました。" + _STATUS_HINT + "対象の注文と足を確認し、再開を承認するときだけ "
+                        "`afx ctl --as approver data resume --acknowledge` を実行してください。"),
     "awaiting_resume": ("監視対象の価格系列でデータ取得の回復を確認しました。人の再開操作を待っています。" + _STATUS_HINT
                         + "案内が通常の再開なら `afx ctl --as approver data resume` を実行してください。"
                         "未処理の足がある建玉の確認が必要と出た場合は、建玉を確認し、再開を承認するときだけ"

@@ -18,6 +18,10 @@ from .events import EventSchemaError, EventStore, MAX_POLL_LIMIT, data_feed_guar
 _log = logging.getLogger(__name__)
 
 PRODUCER_KEY = alert_state.DATAFEED_NOTICE_PRODUCER_KEY
+# 接触・不明の停止通知の記録は通常の停止と同じ notice_state で、request_key だけが異なる。
+# event では別の語にして、同じ epoch に通常の停止があっても抑止・重複排除されないようにする
+CONTACT_NOTICE_KEY = "contact"
+CONTACT_EVENT_STATE = "contact_stopped"
 # 1 回の回収で扱う記録の上限。残りは次の tick へ送る
 BATCH_LIMIT = min(50, MAX_POLL_LIMIT)
 
@@ -127,11 +131,13 @@ def sweep(conn, events: EventStore, now: datetime, *, retries: Retries | None = 
             break
         if not retries.due((epoch, state, key), now):
             continue
+        event_state = CONTACT_EVENT_STATE if (
+            state == "stopped" and key == CONTACT_NOTICE_KEY) else state
         try:
             event_id = None if state in _TERMINAL else data_feed_guard_event_id(
-                conn, generation=epoch, state=state)
+                conn, generation=epoch, state=event_state)
             if event_id is None:
-                event_id = events.insert_data_feed_guard(state, epoch, not_before=occurred)
+                event_id = events.insert_data_feed_guard(event_state, epoch, not_before=occurred)
             cur = conn.execute(
                 "UPDATE datafeed_outage_notices SET event_id=? "
                 "WHERE epoch=? AND notice_state=? AND request_key=? AND event_id IS NULL",

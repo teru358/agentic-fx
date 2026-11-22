@@ -735,6 +735,15 @@ class Commands:
         unprocessed_text = f"未処理建玉 {info['unprocessed_positions']} 件"
         if detail:
             unprocessed_text += f" ({detail})"
+        contacts = info.get("contacts") or []
+        if contacts:
+            unprocessed_text += " / 接触・不明: " + ", ".join(
+                f"注文 #{order_id} 足 {self._when(bar_time.isoformat())} {kind}"
+                for order_id, bar_time, kind in contacts[:5])
+            if len(contacts) > 5:
+                unprocessed_text += f" ほか {len(contacts) - 5} 件"
+        if info.get("migration_confirmation_pending"):
+            unprocessed_text += " / 移行確認待ち"
         if state == "restricted":
             since_text = (f"since {self._when(info['restricted_since'])}, "
                           f"deadline {self._when(info['restricted_deadline_at'])}")

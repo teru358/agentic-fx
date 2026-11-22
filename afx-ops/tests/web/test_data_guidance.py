@@ -147,3 +147,25 @@ def test_the_guidance_section_follows_the_section_that_holds_the_data_row():
     before = page[:page.index("<section><h2>データの案内</h2>")]
     assert before.rstrip().endswith("</dl></section>")
     assert before.rfind("<h2>稼働</h2>") > before.rfind("<h2>資金</h2>")
+
+
+def test_the_contact_references_are_shown_with_the_order_the_bar_and_the_kind():
+    feed = _feed(phase="awaiting_resume", next_action="resume_with_ack", unprocessed_positions=1,
+                 contacts=[{"order_id": 7, "bar_time": "2026-09-30T10:20:00+00:00", "kind": "sl"},
+                           {"order_id": 8, "bar_time": "2026-09-30T10:21:00+00:00",
+                            "kind": "unknown"}])
+    page = _page(feed)
+    assert "接触・不明: 注文 #7" in page and "損切り価格に接触" in page
+    assert "接触・不明: 注文 #8" in page and "接触の有無を判定できません" in page
+    assert "<form" not in page and "<button" not in page
+
+
+def test_a_malformed_contact_list_shows_nothing_extra():
+    page = _page(_feed(contacts=[{"order_id": "x"}, None]))
+    assert "接触・不明" not in page
+
+
+def test_the_recovering_phase_shows_the_fixed_sentence_without_a_command_note():
+    page = _page(_feed(phase="recovering", next_action="wait_tick"))
+    assert "健全な足の確認を続けています。条件が揃えば自動解除します" in page
+    assert "操作は SSH の端末から行ってください" not in page

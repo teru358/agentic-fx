@@ -172,6 +172,27 @@ API の `data` に既存 state を保ち、`phase`、`next_action`、`unprocesse
 
 ctl は停止理由と次の操作の二行、web は data カード直下に同じ固定案内を常時表示する。resume_with_ack は建玉確認後の明示承認だけを促し、自動付与しない。実行は SSH 端末からとし、web/Discord の実行ボタンは足さない。旧 API では既存 state 表示に戻し、不明を ready と扱わない。ctl と対話 shell の resume 応答は新規記録・照会・ack 置換を区別し、いずれも次の開場中の判定待ちと案内する（現状は `src/agentic_fx/ops/client.py:1903-1907`; `src/agentic_fx/commands.py:757-760`）。
 
+## 停滞の猶予と接触検査による変更 (1 分足の穴の受容)
+
+後続の足が届いている穴を受け入れ、停滞を猶予付きの restricted で受ける設計 (`2026-11-21-datafeed-short-gap-and-flat-release-design.md`) に合わせ、通知・案内を次のとおり変える。
+
+- 猶予内の restricted と、その自動復帰 (健全な当 tick) は通知しない。連続 30 分 (開場秒) を超えた restricted の停止は、通常の停止通知を同じ epoch に 1 回出す。
+- 停止中に届いた足、または穴への後着足が、建玉・未約定指値の保護価格に触れた (または判定できなかった) ときは、通常の停止とは別の通知記録 `(epoch, stopped, contact)` を 1 回作る。通常の停止・待ちの印・要求中・flat のいずれでも抑止しない。追加の接触は参照が増えるだけで、通知は増えない。起動時に、接触待ちがあるのに記録が無い epoch は同じ鍵で作り直す (重複しない)。event では `guard_kind=data_feed` の state を `contact_stopped` とし、通常の停止と重複排除が混ざらないようにする。本文は固定語で、価格・金額・件数・口座情報を含まない。
+- 復帰後の人の待ち (`awaiting_resume`) は、初回の接触通知の後に同じ epoch で 1 回。flat で自動解除できる epoch は、自動確認中に待ちを出さない。
+- 通常の停止後に flat で健全な tick が続いたときの自動解除 (`resumed`) は、停止または待ちの記録がある epoch だけ 1 回。通常の pending は自動解除を妨げない。接触待ち・移行確認待ちは妨げる。
+
+status の案内は observe が保存した現在の facts (自動・手動の健全、接触待ち、exposure) から 1 つの関数で決め、古い拒否や待ちの印より先に判定する。拒否の結果は別欄 (`resume_last_result`) に残る。
+
+| state | 条件 | phase | next_action |
+|---|---|---|---|
+| restricted | | restricted | wait_tick |
+| degraded | 全 exposure ゼロ・自動復帰が有効・接触待ちなし・移行確認待ちなし・自動の健全 | recovering | wait_tick |
+| degraded | 上の条件で、自動の健全でない | stopped | restore_source |
+| degraded | 上の条件に当たらず (建玉あり・接触待ち・移行確認待ち・自動復帰が無効)、手動の健全 | awaiting_resume | resume_with_ack (確認対象の件数が 1 以上) / resume |
+| degraded | 上の条件に当たらず、手動の健全でない (上位 hard の未取得を含む) | stopped | restore_source |
+
+確認対象の件数は、未処理の足がある建玉と接触・不明の注文参照の和集合 (同じ注文は 1 件) に、移行確認待ちを 1 件足した値で、近似がゼロでも接触があれば resume に戻さない。`recovering` の固定文は「健全な足の確認を続けています。条件が揃えば自動解除します」。API の `data` には接触・不明の参照 (注文 ID・足時刻・種別) の一覧 `contacts` が加わり、ctl と web が表示する。旧 client の未知の phase は unknown として扱う。
+
 ## 失敗時と通信量
 
 | 失敗 | 動き |
@@ -286,3 +307,4 @@ rollback は通知生成が未有効の直前の daemon へ戻す。consumer は
 | 2026-11-21 | C0.3 | 再要求の応答文を契約と同じ T2 に移す | 設計レビュー 3 周目の指摘 (途中配備で応答が契約に追随しない) | |
 | 2026-11-21 | C1 | 利用者承認 | 3 周 (opus → sol → sol) で収束 | |
 | 2026-11-21 | C1.1 | 導入と rollback の手順を付録に追加。要求が未消費の間は時間条件の停止を記録せず、停止をまだ知らせていない epoch では結果の判定時刻から数え直す。有効化の時刻は daemon の構築時に置く。再起動時の補完は実際に補った時刻を発生時刻にする | 実装時の判断 (人が操作中は知らせない。拒否後も続く停止は知らせる) | |
+| 2026-11-22 | C1.2 | 猶予付きの restricted・接触検査に合わせ、接触の停止通知 (`contact_stopped`)・recovering の案内・確認対象の件数・接触参照の表示を追加 | 1 分足の穴の受容の設計 (C1) の実装に伴う同期 | |
