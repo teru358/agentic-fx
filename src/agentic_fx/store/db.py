@@ -2451,11 +2451,12 @@ def init_db(conn: sqlite3.Connection, *, root: Path | None = None) -> None:
     _ensure_column(
         conn, "datafeed_outage_state", "restricted_deadline_at",
         "restricted_deadline_at TEXT")
-    for column in ("resume_last_result", "resume_last_result_at", "resume_last_request_at",
-                   "auto_healthy_at", "manual_healthy_at"):
+    for column in ("resume_last_result", "resume_last_result_at", "resume_last_request_at"):
         _ensure_column(conn, "datafeed_outage_state", column, f"{column} TEXT")
-    for column in ("auto_healthy", "manual_healthy"):
-        _ensure_column(conn, "datafeed_outage_state", column, f"{column} INTEGER")
+    # 新規 DB の DDL と同じ列順で足す (列順まで一致させる test がある)
+    for column, kind in (("auto_healthy", "INTEGER"), ("auto_healthy_at", "TEXT"),
+                         ("manual_healthy", "INTEGER"), ("manual_healthy_at", "TEXT")):
+        _ensure_column(conn, "datafeed_outage_state", column, f"{column} {kind}")
     _ensure_column(conn, "datafeed_outage_state", "migration_confirmation_pending",
                    "migration_confirmation_pending INTEGER NOT NULL DEFAULT 0")
     _rebuild_datafeed_outage_gap(conn)
