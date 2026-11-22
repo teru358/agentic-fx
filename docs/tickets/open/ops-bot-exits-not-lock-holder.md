@@ -18,9 +18,15 @@ afx-ops@bot が daemon 稼働中に `afx-ops: not_lock_holder` (exit 3) で終�
 
 ## 原因
 
+`/proc/locks` は 1 回の read で 1 page (約 70 行) しか返さず、lock の取得・解放が重なる間は読む度に行が抜ける (seq_file の位置が行の入れ替わりでずれる)。保持者 (daemon) の行が抜けた読みが `lock_holders` を空にし `!= {pid}` で終了していた。実測: lock を 8 process で入れ替えながら安定した保持行を読み続けると 1.0〜9.6% の読みで行が抜ける。判定 (pytest) の最中に lock が増えて 1 page を超える。bot の終了時刻 11-13 以降 18 件中 17 件が judge の実行区間に重なる (11-21 は 11 件すべて)。
+
 ## 処置案・裁定
 
+保持者が見えない読みは最大 8 回まで読み直す (1 回の抜け率 1 割未満なら 8 回続く確率は 1e-8 未満)。保持者を確かめられないときに通すことはしない。
+
 ## 修正内容
+
+afx-ops `server_auth.lock_holders` / `check_lock_device` と ctl 側 `client.lock_holders` に読み直しを入れた。
 
 ## 経緯
 
