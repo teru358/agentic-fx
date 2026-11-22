@@ -139,6 +139,33 @@ def _flock_rows(proc_locks: Path) -> list[tuple[int, int, int, int]]:
     return rows
 
 
+# /proc/locks は 1 回の read で 1 page ぶんしか返さず、lock の取得・解放が重なる間は読む度に
+# 行が抜ける (保持者の行も抜ける)。抜けた読みを「保持者なし」とせず読み直す。読み 1 回で
+# 抜ける率は lock が多く入れ替わる最中でも 1 割に届かず、8 回続けて抜ける確率は 1e-8 未満。
+LOCK_READ_ATTEMPTS = 8
+
+
+def _flock_rows_until(proc_locks: Path, accept) -> list[tuple[int, int, int, int]]:
+    """``accept(rows)`` が真になる読みを最大 ``LOCK_READ_ATTEMPTS`` 回まで探し、最後の読みを返す。"""
+    rows = _flock_rows(proc_locks)
+    for _ in range(LOCK_READ_ATTEMPTS - 1):
+        if accept(rows):
+            break
+        rows = _flock_rows(proc_locks)
+    return rows
+
+
+def _holders_in(rows, st, real_path: str, dev_fallback: bool) -> set[int]:
+    device = (os.major(st.st_dev), os.minor(st.st_dev))
+    holders = set()
+    for pid, major, minor, inode in rows:
+        if inode != st.st_ino:
+            continue
+        if (major, minor) == device or (dev_fallback and _has_open_fd(pid, real_path)):
+            holders.add(pid)
+    return holders
+
+
 def lock_holders(lock_path: Path, *, proc_locks: Path = PROC_LOCKS,
                  dev_fallback: bool = True) -> set[int]:
     """lock file の FLOCK WRITE 保持者の pid を集める。
@@ -153,18 +180,12 @@ def lock_holders(lock_path: Path, *, proc_locks: Path = PROC_LOCKS,
         real_path = os.path.realpath(lock_path)
     except OSError:
         return set()
-    device = (os.major(st.st_dev), os.minor(st.st_dev))
     try:
-        rows = _flock_rows(proc_locks)
+        rows = _flock_rows_until(
+            proc_locks, lambda rows: bool(_holders_in(rows, st, real_path, dev_fallback)))
     except OSError:
         return set()
-    holders = set()
-    for pid, major, minor, inode in rows:
-        if inode != st.st_ino:
-            continue
-        if (major, minor) == device or (dev_fallback and _has_open_fd(pid, real_path)):
-            holders.add(pid)
-    return holders
+    return _holders_in(rows, st, real_path, dev_fallback)
 
 
 def _has_open_fd(pid: int, real_path: str) -> bool:
@@ -359,11 +380,14 @@ def check_lock_device(lock_path: Path, *, proc_locks: Path = PROC_LOCKS) -> None
         st = os.stat(lock_path)
     except OSError:
         raise ServerAuthError("not_lock_holder") from None
+    device = (os.major(st.st_dev), os.minor(st.st_dev))
     try:
-        rows = _flock_rows(proc_locks)
+        rows = _flock_rows_until(
+            proc_locks,
+            lambda rows: any(inode == st.st_ino and (major, minor) == device
+                             for _pid, major, minor, inode in rows))
     except OSError as exc:
         raise ServerAuthError("not_lock_holder", _detail_of(exc)) from None
-    device = (os.major(st.st_dev), os.minor(st.st_dev))
     devices = {(major, minor) for _pid, major, minor, inode in rows if inode == st.st_ino}
     if devices and device not in devices:
         raise ServerAuthError("instance_lock_dev_mismatch")
