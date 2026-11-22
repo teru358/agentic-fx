@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agentic_fx.core.contracts import FixedClock
+from agentic_fx.datafeed.outage import EMPTY_REPORT
 from agentic_fx.runners.fake_runner import FakeRunner
 from agentic_fx.service import (
     App, _busy_resources_after_join, _scheduler_tick_once, build_app)
@@ -21,8 +22,11 @@ NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
 
 def _app(tmp_path):
     _init(tmp_path)
-    return build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
-                     embedding_fn=FakeEmbedding())
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                    embedding_fn=FakeEmbedding())
+    # 起動直後は最初の開場中の観測が終わるまで data state が待つ。その観測を済ませてから試す
+    app.outage.observe(NOW, EMPTY_REPORT)
+    return app
 
 
 def test_maintenance_callback_uses_dedicated_connection(tmp_path, monkeypatch):

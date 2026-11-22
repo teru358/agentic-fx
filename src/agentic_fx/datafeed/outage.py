@@ -1,11 +1,18 @@
 """MT5 (価格源) 不通の検出・永続化。
 
-`ready` / `restricted` / `degraded` の 3 状態を扱う永続状態機械。
-`restricted` は建玉も未約定指値も無いときの 1m 停滞を新規リスク停止だけで
-受ける状態 (期限内に健全な tick が続けば自動で ready へ戻る)。`degraded` は
-従来どおりの不通状態で、復旧は自動 (flat かつ設定が許すとき) か、人間が
+`ready` / `restricted` / `degraded` の 3 状態を扱う永続状態機械。遷移の規則は純関数
+`outage_transition` (outage_transition.py) にあり、ここは facts の読取りと保存だけを持つ。
+
+`restricted` は 1m の停滞・取得失敗・空を、新規リスク・指値約定・リスク増の停止だけで受ける状態
+(決済・取消・既存の SL/TP の保護は続く)。猶予は停滞の起点から開場秒で数え、建玉があれば 600 秒、
+全 exposure ゼロなら設定の `flat_stall_max_sec`。後続の足が届いている穴は停滞に数えず、足を合成しない。
+足が届けば同じ tick で ready に戻る。`degraded` は猶予超過・restricted の連続 30 分超・接触の検出などの
+停止で、復旧は自動 (flat・自動復帰が有効・接触待ちなしで、水位が進む健全 tick が続いたとき) か、人間が
 明示コマンドで要求してその要求が次の観測 tick で判定・消費される。
-`backfilling` への自動復旧・連続性検査・SL/TP replay は別モジュールで扱う
+
+停止中 (non-ready) に届いた足と、穴への後着足は、生存期間が重なる注文の保護価格・指値に触れたかを
+検査する (接触の真偽だけで、約定・決済・損益は書き換えない)。接触・不明は人の確認待ちにし、
+確認 (ack) があるまで自動では戻さない。`backfilling` への自動復旧・SL/TP replay は別モジュールで扱う
 対象で、ここには含まない。
 """
 from __future__ import annotations
@@ -17,10 +24,11 @@ from datetime import datetime, timedelta
 
 from agentic_fx.activity import Category
 from agentic_fx.core import display_time
+from agentic_fx.core.contracts import OrderStatus
 from agentic_fx.core.executor import _EXPOSURE
 from agentic_fx.core import market_hours
 from agentic_fx.core.timeutil import as_utc
-from agentic_fx.datafeed import notice_rules
+from agentic_fx.datafeed import notice_rules, outage_inspect, outage_transition
 from agentic_fx.datafeed.guidance_text import UNKNOWN_COUNT
 from agentic_fx.store import ohlcv, orders, outage_facts
 
@@ -36,6 +44,15 @@ RESUME_RESULTS = ("accepted", "rejected_unprocessed", "rejected_watermark", "alr
 log = logging.getLogger(__name__)
 
 _PENDING_NOTICE_LIMIT = 64
+# 前回の observe からの開場時間がこれを超えたら観測が途切れたとみなす (scheduler の 2 tick 分)
+_INTERRUPTION_SEC = 120
+
+
+def _no_spread(pair: str) -> float:
+    return 0.0
+
+
+_KNOWN_STATUSES = tuple(status.value for status in OrderStatus)
 
 
 def unknown_guidance() -> dict:
@@ -45,15 +62,30 @@ def unknown_guidance() -> dict:
             "resume_last_result_at": None, "auto_resume_possible": False}
 
 
+@dataclass(frozen=True, slots=True)
+class GuidanceFacts:
+    """案内を決める、observe が保存した現在の facts。API で健全を計算し直さない。
+
+    `auto_possible`: flat・自動復帰が有効・接触待ちも移行確認待ちも無い (人の操作なしに戻り得る)。
+    `auto_healthy` / `manual_healthy`: observe が最後に保存した自動復帰・手動再開の健全 (未観測は None)。
+    """
+
+    auto_possible: bool
+    auto_healthy: bool | None
+    manual_healthy: bool | None
+
+
 def resume_guidance(*, observe_failed: bool, state: str | None, request_pending: bool,
                     last_result: str | None, awaiting_mark: bool,
-                    unprocessed: int | None) -> tuple[str, str]:
+                    unprocessed: int | None,
+                    facts: GuidanceFacts | None = None) -> tuple[str, str]:
     """status に出す (phase, next_action)。上の行ほど優先する真理値表で、この 1 関数だけが決める。
 
     `state` が None は読取り失敗、`unprocessed` が None は件数を読めないこと (ゼロとみなさない)。
     `last_result` は現在の epoch の直近の終端結果、`awaiting_mark` は同 epoch に再開待ちを
     知らせた印。件数は ack の要否を決める行でだけ使い、読めなければ不明に倒す。
-    最新の watermark 判定は resume 消費時のもので、ここで健全性の判定はしない。
+    `facts` があれば、restricted / degraded は保存した現在の facts で決め、古い拒否・待ちの印は
+    見ない (別欄で出す)。無ければ従来どおり印と直近の終端結果で決める。
     """
     unknown = ("unknown", "check_status")
     if observe_failed or state is None:
@@ -64,6 +96,18 @@ def resume_guidance(*, observe_failed: bool, state: str | None, request_pending:
         return ("ready", "none")
     if state not in ("restricted", "degraded"):
         return unknown
+    if facts is not None:
+        if state == "restricted":
+            return ("restricted", "wait_tick")
+        if facts.auto_possible:
+            if facts.auto_healthy is True:
+                return ("recovering", "wait_tick")
+            return ("stopped", "restore_source")
+        if facts.manual_healthy is True:
+            if unprocessed is None:
+                return unknown
+            return ("awaiting_resume", "resume_with_ack" if unprocessed else "resume")
+        return ("stopped", "restore_source")
     if last_result == "rejected_watermark":
         return ("resume_rejected", "restore_source")
     if last_result == "rejected_unprocessed":
@@ -142,6 +186,8 @@ class _Outcome:
     problem_streak: int
     unconfirmed: frozenset
     notices: list = field(default_factory=list)
+    # 保存・読取りの障害で gate を閉じた tick (要求の判定は次の tick へ送る)
+    blocked: bool = False
 
 
 def _iso(dt: datetime) -> str:
@@ -169,7 +215,9 @@ class OutageStateMachine:
                  grace: timedelta, storage_source: str, activity=None,
                  ready_confirm_ticks: int = 3,
                  auto_resume_when_flat: bool = True,
-                 flat_stall_max_sec: int = 1800) -> None:
+                 flat_stall_max_sec: int = 1800,
+                 startup_recovery: bool = False,
+                 spread_fn=None) -> None:
         self.conn = conn
         self.hard_keys = frozenset(hard_keys)
         self.interval_widths = dict(interval_widths)
@@ -179,6 +227,16 @@ class OutageStateMachine:
         self.ready_confirm_ticks = ready_confirm_ticks
         self.auto_resume_when_flat = auto_resume_when_flat
         self.flat_stall_max_sec = flat_stall_max_sec
+        # 接触検査の spread (価格単位)。構築後に scheduler の値へ差し替えられる
+        self.spread_fn = spread_fn if spread_fn is not None else _no_spread
+        # ingest と組んで動く構成だけ真。最初の開場 observe が commit するまで、新規リスク・
+        # 指値約定・自動復帰・要求の消費を待たせ、保存済みの停止は保存した水位の後から検査する
+        self._startup_recovery = startup_recovery
+        self._startup_wait = startup_recovery
+        # プロセス内で最初の開場 observe を終えるまで真 (観測の途切れの判定に使う)
+        self._first_observe = True
+        # 失敗の記憶を保存から復元したか
+        self._attempt_restored = False
         # 継続した健全 tick はプロセスをまたいで数えない。
         self._reset_ready_streak = True
         # 「2 tick 連続」判定用のプロセス内カウンタ。`confirmed` フラグ自体は
@@ -228,7 +286,7 @@ class OutageStateMachine:
         # 'ready' を返す — この読み出し専用アクセサ自体は行を作らない。
         # 全 gate はこの読み口を見るので、直近の observe が失敗している間は
         # 行の値にかかわらず新規リスクを止める側 (degraded) を返す。
-        if self._observe_failed:
+        if self._observe_failed or self._startup_wait:
             return "degraded"
         return self._load_row().get("state", "ready")
 
@@ -237,7 +295,7 @@ class OutageStateMachine:
 
         API thread の status など、scheduler の接続を跨げない読み手向け。
         """
-        if self._observe_failed:
+        if self._observe_failed or self._startup_wait:
             return "degraded"
         return self._load_row(conn=conn).get("state", "ready")
 
@@ -280,9 +338,14 @@ class OutageStateMachine:
             "resume_acknowledge": row.get("resume_acknowledge", 0),
             "resume_last_result": row.get("resume_last_result"),
             "resume_last_result_at": row.get("resume_last_result_at"),
-            "unprocessed_positions": self._unprocessed_position_count(now, epoch, conn=conn),
+            "unprocessed_positions": self._ack_required(now, epoch, conn=conn)[0],
             "unprocessed_by_pair": self._unprocessed_positions_by_pair(now, epoch, conn=conn),
             "gap_starts": gaps,
+            "contacts": [(c.order_id, c.bar_time, c.kind)
+                         for c in outage_facts.list_contacts(
+                             conn if conn is not None else self.conn, epoch=epoch)],
+            "migration_confirmation_pending": bool(
+                row.get("migration_confirmation_pending")),
         }
 
     def guidance_snapshot(self, now: datetime, *, conn=None) -> dict:
@@ -308,36 +371,61 @@ class OutageStateMachine:
         if state in ("restricted", "degraded") or result in ("rejected_watermark",
                                                             "rejected_unprocessed"):
             try:
-                unprocessed = self._unprocessed_position_count(now, epoch, conn=conn)
+                unprocessed = self._ack_required(now, epoch, conn=conn)[0]
             except Exception:  # noqa: BLE001 — 読めない件数をゼロにしない
                 unprocessed = None
         marked = row.get("recovered_notified_epoch") == epoch
+        try:
+            facts = self._guidance_facts(row, conn) if state in ("restricted", "degraded") else None
+        except Exception:  # noqa: BLE001 — 必須の facts を読めなければ不明として返す
+            return unknown_guidance()
         phase, action = resume_guidance(
             observe_failed=self._observe_failed, state=state,
             request_pending=row.get("resume_requested_at") is not None,
-            last_result=result, awaiting_mark=marked, unprocessed=unprocessed)
+            last_result=result, awaiting_mark=marked, unprocessed=unprocessed, facts=facts)
+        try:
+            contacts = [{"order_id": c.order_id, "bar_time": _iso(c.bar_time), "kind": c.kind}
+                        for c in outage_facts.list_contacts(
+                            conn if conn is not None else self.conn, epoch=epoch)]
+        except Exception:  # noqa: BLE001 — 参照を読めなければ案内も不明として返す
+            return unknown_guidance()
         return {"state": "degraded" if self._observe_failed else row.get("state", "ready"),
-                "phase": phase, "next_action": action,
+                "phase": phase, "next_action": action, "contacts": contacts,
                 "unprocessed_positions": UNKNOWN_COUNT if unprocessed is None else unprocessed,
                 "resume_last_result": result,
                 "resume_last_result_at": row.get("resume_last_result_at"),
                 "auto_resume_possible": self._may_resume_unattended(row, conn)}
 
+    def _guidance_facts(self, row: dict, conn) -> GuidanceFacts:
+        """案内に使う保存済みの facts。読めなければ例外 (呼び出し側が不明として返す)。"""
+        c = conn if conn is not None else self.conn
+        health = outage_facts.load_health(c)
+        epoch = row.get("epoch", 0)
+        contacts = outage_facts.list_contacts(c, epoch=epoch)
+        exposure = orders.list_by_status(c, *_EXPOSURE)
+        auto_possible = (self.auto_resume_when_flat is True and not exposure and not contacts
+                         and not self._has_unknown_status(c)
+                         and not row.get("migration_confirmation_pending"))
+        return GuidanceFacts(auto_possible=auto_possible, auto_healthy=health.auto_healthy,
+                             manual_healthy=health.manual_healthy)
+
     def _may_resume_unattended(self, row: dict, conn) -> bool:
-        """停止中の epoch が、建玉が無く pending も無く自動復帰が有効で、人の操作なしに
-        戻り得るか。確認できた値だけで真にする: pending は整数 0、設定は厳密な True、
-        建玉の読取りは空の list。欠落・型違い・読取り失敗は False (戻るとは言わない)。"""
+        """停止中の epoch が、建玉が無く接触待ち・移行確認待ちも無く自動復帰が有効で、人の操作なしに
+        戻り得るか。確認できた値だけで真にする: 設定は厳密な True、建玉・接触の読取りは空の list。
+        欠落・型違い・読取り失敗は False (戻るとは言わない)。"""
         if row.get("state") != "degraded" or self.auto_resume_when_flat is not True:
             return False
-        pending = row.get("pending_human_confirmation")
-        if type(pending) is not int or pending != 0:
+        migration = row.get("migration_confirmation_pending")
+        if type(migration) is not int or migration != 0:
             return False
         try:
             c = conn if conn is not None else self.conn
             exposure = orders.list_by_status(c, *_EXPOSURE)
+            contacts = outage_facts.list_contacts(c, epoch=row.get("epoch", 0))
+            unknown = self._has_unknown_status(c)
         except Exception:  # noqa: BLE001 — 読めないものは戻るとは言わない
             return False
-        return type(exposure) is list and not exposure
+        return type(exposure) is list and not exposure and not contacts and not unknown
 
     def observe(self, now: datetime, report: IngestTickReport) -> str:
         """1 tick 分の観測を反映し、遷移後の `state` を返す。
@@ -366,6 +454,9 @@ class OutageStateMachine:
             return outcome
         # commit 済み。プロセス内の記録は commit が成功した後にだけ進める
         # (失敗した tick の観測を次の tick の判定に持ち越さない)。
+        self._first_observe = False
+        self._startup_wait = False
+        self._attempt_restored = True
         self._last_attempt_ok = outcome.attempt_ok
         self._problem_streak = outcome.problem_streak
         state, epoch = outcome.state, outcome.epoch
@@ -375,6 +466,8 @@ class OutageStateMachine:
             self._record_timed_stop(epoch, now)
         for event, summary in outcome.activities:
             self._write_activity(event, summary)
+        if outcome.blocked:
+            return state
         if state == "degraded":
             by_pair = self._unprocessed_positions_by_pair(now, epoch)
             if by_pair != self._last_unprocessed_by_pair:
@@ -411,7 +504,10 @@ class OutageStateMachine:
                 self.conn.execute(
                     "UPDATE datafeed_outage_state SET ready_streak=0 WHERE id=1")
             if not market_hours.is_market_open(now):
-                # 休場中は ingest 自体も due を立てない — 観測しない。
+                # 休場中は ingest 自体も due を立てない — 観測しない。連続の健全 tick は 0 に
+                # 戻し、停滞の起点・gap の起点・restricted の起点は保持する
+                self.conn.execute(
+                    "UPDATE datafeed_outage_state SET ready_streak=0 WHERE id=1")
                 result = self._load_row()["state"]
             else:
                 result = self._observe_open(now, report, self._load_row())
@@ -429,18 +525,60 @@ class OutageStateMachine:
     def _observe_open(self, now: datetime, report: IngestTickReport,
                       row: dict) -> "_Outcome":
         """遷移を計算して state/gap を書く (呼び出し側の write transaction の中)。
-        インスタンス属性は触らず、commit 後に反映する値を返す。"""
+        インスタンス属性は触らず、commit 後に反映する値を返す。
+
+        読取り (facts・注文・足) → `outage_transition` (純関数) → 保存、の順。状態・接触参照・
+        後着の表の消費・facts は同じ transaction で確定する。"""
         attempt_ok = dict(self._last_attempt_ok)
         problem_streak = self._problem_streak
+        epoch0 = row["epoch"]
+        read_error = False
+        try:
+            key_facts = outage_facts.load_key_facts(self.conn, self.storage_source)
+            contacts_now = outage_facts.list_contacts(self.conn, epoch=epoch0)
+            flat = self._is_flat(self.conn)
+        except Exception:  # noqa: BLE001 — 読めない必須状態は gate を閉じる側に倒す
+            log.warning("datafeed_state_unreadable")
+            key_facts, contacts_now, flat, read_error = {}, [], False, True
+        if not self._attempt_restored:
+            # 失敗の記憶だけを復元する。成功は新しい試行で確認し直す (手動再開の健全は緩めない)
+            for key, kf in key_facts.items():
+                if key in self.hard_keys and kf.last_attempt_ok is False:
+                    attempt_ok.setdefault(key, False)
         watermarks = self._read_watermarks(now)
         hard_failed = {key for key, _ in report.failed if key in self.hard_keys}
         hard_empty = self.hard_keys & report.empty
-        stalled = {key for key in self.hard_keys
-                   if self._is_stalled(now, key[1], watermarks.get(key))}
-        expected = {key: self._expected(key[1], watermarks[key]) for key in stalled}
-        flat = not orders.list_by_status(self.conn, *_EXPOSURE)
-        immediate = bool(hard_failed or hard_empty)
-        if row["state"] == "ready" and (immediate or stalled):
+        one_m = frozenset(key for key in self.hard_keys if key[1] == "1m") or self.hard_keys
+        views: list[outage_transition.KeyView] = []
+        stall_starts: dict[tuple[str, str], datetime | None] = {}
+        for key in sorted(self.hard_keys):
+            mark = watermarks.get(key)
+            stalled = self._is_stalled(now, key[1], mark)
+            if key in hard_failed:
+                status = outage_transition.STATUS_FAILED
+            elif key in hard_empty:
+                status = outage_transition.STATUS_EMPTY
+            elif key in report.succeeded:
+                status = outage_transition.STATUS_OK
+            else:
+                status = outage_transition.STATUS_IDLE
+            kf = key_facts.get(key)
+            same_run = kf is not None and kf.stall_start is not None and kf.observed_through == mark
+            carried = kf.stall_start if same_run else None
+            if stalled:
+                base = self._expected(key[1], mark)
+                start = min(carried, base) if carried is not None else base
+            elif status in (outage_transition.STATUS_FAILED, outage_transition.STATUS_EMPTY):
+                start = carried if carried is not None else now
+            elif status == outage_transition.STATUS_IDLE and carried is not None:
+                start = carried
+            else:
+                start = None
+            stall_starts[key] = start
+            views.append(outage_transition.KeyView(key, key in one_m, status, stalled, start))
+        any_problem = any(v.problem for v in views)
+        stalled_keys = {v.key for v in views if v.stalled}
+        if row["state"] == "ready" and any_problem:
             attempt_ok.clear()
         for key in self.hard_keys:
             if key in report.succeeded and key not in report.empty:
@@ -451,156 +589,133 @@ class OutageStateMachine:
         # 1m の hard key だけ (1m が無い構成では全 key)。上位足は取得の周期が
         # 長く、取りに行かない tick (deferred / not-attempted) が普通にあるので、
         # この tick で failed / empty / stalled でない限り前回の結果を据え置く。
-        gate_keys = frozenset(key for key in self.hard_keys if key[1] == "1m") or self.hard_keys
-        healthy = (not hard_failed and not hard_empty and not stalled
+        gate_keys = one_m
+        healthy = (not hard_failed and not hard_empty and not stalled_keys
                    and all(key in report.succeeded and key not in report.empty
                            for key in gate_keys)
                    and all(attempt_ok.get(key) is not False
                            for key in self.hard_keys - gate_keys))
         unconfirmed = frozenset(
             key for key in self.hard_keys
-            if key in stalled or attempt_ok.get(key) is not True)
-        state = row["state"]
+            if key in stalled_keys or attempt_ok.get(key) is not True)
+        prev_updated = _parse(row.get("updated_at"))
+        advanced = prev_updated is None or now > prev_updated
+        if advanced and all(key in key_facts for key in one_m):
+            advanced = any(watermarks.get(key) != key_facts[key].observed_through
+                           for key in one_m)
+        gap_break = (prev_updated is not None
+                     and market_hours.open_time_between(prev_updated, now).total_seconds()
+                     > _INTERRUPTION_SEC)
+        interrupted = self._first_observe or gap_break
+        old_starts: list[datetime] = []
+        if interrupted:
+            for key in self.hard_keys:
+                kf = key_facts.get(key)
+                if kf is None:
+                    continue
+                if kf.stall_start is not None:
+                    old_starts.append(kf.stall_start)
+        late_found: list = []
+        late_keys: list = []
+        n_first: list = []
+        n_latest: list = []
+        if not read_error:
+            try:
+                late_found, late_keys = outage_inspect.late_bar_findings(
+                    self.conn, self.storage_source, self.spread_fn)
+                if row["state"] != "ready" or interrupted:
+                    ranges = {key[0]: (key_facts[key].observed_through, watermarks[key])
+                              for key in self.hard_keys
+                              if key[1] == "1m" and key in key_facts
+                              and watermarks.get(key) is not None}
+                    n_first, n_latest = outage_inspect.new_bar_findings(
+                        self.conn, self.storage_source, ranges, self.spread_fn, now)
+            except Exception:  # noqa: BLE001 — 検査できなかった足は消費せず、gate を閉じる
+                log.warning("datafeed_contact_check_unreadable")
+                read_error, late_found, late_keys, n_first, n_latest = True, [], [], [], []
+        migration_pending = bool(row.get("migration_confirmation_pending"))
+        if (not read_error and self._startup_recovery and self._first_observe
+                and row["state"] != "ready"
+                and any(key not in key_facts for key in self.hard_keys)):
+            # 保存した観測済みの水位が無い既存の停止は、現在の cache で検査済みにせず人が確認する
+            migration_pending = True
         epoch = row["epoch"]
-        confirmed = row["confirmed"]
-        ready_streak = row.get("ready_streak", 0)
-        entered = row["entered_degraded_at"]
-        restricted_since = row.get("restricted_since")
-        deadline = row.get("restricted_deadline_at")
-        pending = row.get("pending_human_confirmation", 0)
-        recovered_notified_epoch = row.get("recovered_notified_epoch")
-        activities: list[tuple[str, str]] = []
-        notices: list[tuple[str, str]] = []
-        request_pending = row.get("resume_requested_at") is not None
-        # この epoch で停止または待ちを知らせる対象になったか (復帰の通知の条件)。
-        # confirmed と待ちの印は tick の最初の値。時間条件の停止の記録は必要なときだけ読む
-        known_stop = bool(confirmed) or recovered_notified_epoch == epoch
-
-        def noticed() -> bool:
-            return (known_stop or self._stop_recorded(epoch)
-                    or any(e == epoch and ("stopped", "") in items
-                           for e, _t, items in self._pending_notices))
-        opened = False
-
-        def degrade() -> None:
-            nonlocal state, entered, restricted_since, deadline, ready_streak, pending
-            was_restricted = state == "restricted"
-            state = "degraded"
-            entered = _iso(now)
-            if not was_restricted:
-                restricted_since = None
-                deadline = None
-            ready_streak = 0
-            pending = int(bool(pending) or not flat or not self.auto_resume_when_flat)
-
-        def degraded_activity() -> tuple[str, str]:
-            return ("datafeed_degraded",
-                    f"epoch={epoch} failed={sorted(hard_failed)} "
-                    f"empty={sorted(hard_empty)} stalled={sorted(stalled)}")
-
-        def recovered_activity() -> tuple[str, str]:
-            return ("datafeed_recovered_auto",
-                    f"epoch={epoch} streak={self.ready_confirm_ticks}")
-
-        if state == "ready" and (immediate or stalled):
-            epoch += 1
-            confirmed = 0
-            recovered_notified_epoch = None
-            opened = True
-            origin = min(expected.values()) if expected else None
-            # 停滞を初めて見た時点で既に期限を過ぎているとき (長い停滞の途中での
-            # 再起動、tick の大幅な遅延) は、restricted を経由させず直接 degraded。
-            past_deadline = (
-                origin is not None and self.flat_stall_max_sec > 0
-                and now > origin + timedelta(seconds=self.flat_stall_max_sec))
-            if immediate or not flat or self.flat_stall_max_sec == 0 or past_deadline:
-                degrade()
-                activities.append(degraded_activity())
-            else:
-                state = "restricted"
-                ready_streak = 0
-                restricted_since = _iso(origin)
-                deadline = _iso(origin + timedelta(seconds=self.flat_stall_max_sec))
-                _, restricted_event, restricted_body = display_time.datafeed_restricted(
-                    epoch, stalled, origin,
-                    origin + timedelta(seconds=self.flat_stall_max_sec))
-                activities.append((restricted_event, restricted_body))
-        elif state == "restricted":
-            if (deadline is not None and now > _parse(deadline)) or immediate or not flat:
-                degrade()
-                activities.append(degraded_activity())
-            elif healthy:
-                ready_streak += 1
-                if ready_streak >= self.ready_confirm_ticks:
-                    if self.auto_resume_when_flat and not pending:
-                        state = "ready"
-                        confirmed = 0
-                        ready_streak = 0
-                        restricted_since = None
-                        deadline = None
-                        activities.append(recovered_activity())
-                        if noticed():
-                            notices.append(("resumed", ""))
-                    else:
-                        # 復帰はしないが健全に戻っている — 人の resume 待ちとして
-                        # 同じ tick で知らせる。
-                        degrade()
-                        activities.append(degraded_activity())
-                        if recovered_notified_epoch != epoch and not request_pending:
-                            recovered_notified_epoch = epoch
-                            activities.append(("datafeed_recovered_awaiting_resume", f"epoch={epoch}"))
-                            notices.append(("awaiting_resume", ""))
-            else:
-                ready_streak = 0
-        elif state == "degraded":
-            if healthy and flat and self.auto_resume_when_flat and not pending:
-                ready_streak += 1
-                if ready_streak >= self.ready_confirm_ticks:
-                    state = "ready"
-                    confirmed = 0
-                    ready_streak = 0
-                    restricted_since = None
-                    deadline = None
-                    activities.append(recovered_activity())
-                    if noticed():
-                        notices.append(("resumed", ""))
-            else:
-                ready_streak = 0
-                # 自動 ready の条件 (flat・自動復帰有効・pending なし) が揃わないまま
-                # 健全に戻ったら、人の再開待ちとして一度だけ知らせる。要求中は促さない
-                if (healthy and not request_pending and recovered_notified_epoch != epoch
-                        and (not flat or not self.auto_resume_when_flat or pending)):
-                    recovered_notified_epoch = epoch
-                    activities.append(("datafeed_recovered_awaiting_resume", f"epoch={epoch}"))
-                    notices.append(("awaiting_resume", ""))
-
-        if immediate or stalled:
-            problem_streak += 1
-            if state == "degraded" and not confirmed and problem_streak >= 2:
-                confirmed = 1
-                activities.append(("data_outage_degraded", f"epoch={epoch} unprocessed_positions={self._unprocessed_position_count(now, epoch)}"))
-                if recovered_notified_epoch != epoch:
-                    notices.append(("stopped", ""))
-        else:
-            problem_streak = 0
-
-        if opened:
-            self._open_gaps(epoch, now, watermarks)
+        known_stop = bool(row["confirmed"]) or row.get("recovered_notified_epoch") == epoch
+        noticed = known_stop
+        if not noticed and row["state"] != "ready":
+            noticed = (self._stop_recorded(epoch)
+                       or any(e == epoch and ("stopped", "") in items
+                              for e, _t, items in self._pending_notices))
+        facts = outage_transition.Facts(
+            now=now, flat=flat, keys=tuple(views), healthy=healthy, advanced=advanced,
+            old_stall_starts=tuple(old_starts), read_error=read_error,
+            contact_wait=bool(contacts_now), migration_pending=migration_pending,
+            late_contacts=tuple(late_found), n_contacts=tuple(n_first),
+            n_latest_contacts=tuple(n_latest), noticed=noticed,
+            auto_resume=self.auto_resume_when_flat,
+            ready_confirm_ticks=self.ready_confirm_ticks,
+            flat_stall_max_sec=self.flat_stall_max_sec, problem_streak=problem_streak)
+        next_row, effects = outage_transition.outage_transition(row, facts)
+        epoch = next_row["epoch"]
+        if effects.opened:
+            self._open_gaps(epoch, self._gap_origins(key_facts, report, watermarks))
             self.conn.execute(
                 "UPDATE datafeed_outage_state SET resume_last_result=NULL, "
                 "resume_last_result_at=NULL, resume_last_request_at=NULL WHERE id=1")
-        self._save_state(state=state, epoch=epoch, confirmed=confirmed,
-                         entered_degraded_at=entered,
-                         restricted_since=restricted_since,
-                         restricted_deadline_at=deadline,
-                         pending_human_confirmation=pending,
-                         recovered_notified_epoch=recovered_notified_epoch,
-                         ready_streak=ready_streak, updated_at=_iso(now))
-        self._save_facts(now, watermarks, expected, attempt_ok,
-                         auto_healthy=healthy, manual_healthy=not unconfirmed)
-        return _Outcome(state=state, epoch=epoch, activities=activities,
-                        attempt_ok=attempt_ok, problem_streak=problem_streak,
-                        unconfirmed=unconfirmed, notices=notices)
+        self._save_state(updated_at=_iso(now), **next_row)
+        self.conn.execute(
+            "UPDATE datafeed_outage_state SET migration_confirmation_pending=? WHERE id=1",
+            (int(migration_pending),))
+        for item in effects.new_contacts:
+            outage_facts.add_contact(
+                self.conn, epoch=epoch, order_id=item.order_id, pair=item.pair,
+                bar_time=item.bar_time, kind=item.kind, detected_at=now)
+        if late_keys:
+            outage_facts.delete_late_bars(self.conn, self.storage_source, late_keys)
+        self._save_facts(now, watermarks, stall_starts, attempt_ok,
+                         auto_healthy=healthy, manual_healthy=not unconfirmed,
+                         keep_watermarks=read_error)
+        notices = list(effects.notices)
+        if self._first_observe and contacts_now:
+            # 接触の安全状態を commit した後、通知の保存の前に落ちていた場合の再照合
+            # (同じ鍵は重複しない)
+            notices.append(("stopped", outage_transition.CONTACT_NOTICE_KEY))
+        activities = list(effects.activities)
+        if effects.confirmed_stop:
+            activities.append((
+                "data_outage_degraded",
+                f"epoch={epoch} unprocessed_positions={self._unprocessed_position_count(now, epoch)}"))
+        return _Outcome(state=next_row["state"], epoch=epoch, activities=activities,
+                        attempt_ok=attempt_ok, problem_streak=effects.problem_streak,
+                        unconfirmed=unconfirmed, notices=notices,
+                        blocked=effects.blocked)
+
+    def _is_flat(self, conn) -> bool:
+        """全 pair を通じて exposure がゼロで、未知の status の注文も無い。
+
+        数量が 0 でも非終端なら flat ではない。未知の status は終端と証明できないので flat にしない。"""
+        return not orders.list_by_status(conn, *_EXPOSURE) and not self._has_unknown_status(conn)
+
+    @staticmethod
+    def _has_unknown_status(conn) -> bool:
+        marks = ",".join("?" * len(_KNOWN_STATUSES))
+        return conn.execute(
+            f"SELECT 1 FROM orders WHERE status NOT IN ({marks}) LIMIT 1",
+            _KNOWN_STATUSES).fetchone() is not None
+
+    def _gap_origins(self, key_facts: dict, report: IngestTickReport,
+                     watermarks: dict) -> dict[tuple[str, str], datetime | None]:
+        """epoch を開く tick の gap_start。この tick の取得より前の水位 (前回 observe 済みの水位と
+        取得前の水位の古い方) を使う。一括到着の足を起点より後に置かないため。無ければ現在の水位、
+        それも無ければ NULL (水位なしを now で代用しない)。"""
+        before = dict(report.pre_watermarks)
+        origins: dict[tuple[str, str], datetime | None] = {}
+        for key in self.hard_keys:
+            kf = key_facts.get(key)
+            candidates = [t for t in (kf.observed_through if kf else None, before.get(key))
+                          if t is not None]
+            origins[key] = min(candidates) if candidates else watermarks.get(key)
+        return origins
 
     def request_resume(self, now: datetime, *, acknowledge: bool = False,
                        conn=None) -> dict:
@@ -710,30 +825,29 @@ class OutageStateMachine:
              restricted_deadline_at, pending_human_confirmation,
              recovered_notified_epoch, ready_streak, updated_at))
 
-    def _save_facts(self, now: datetime, watermarks: dict, expected: dict,
-                    attempt_ok: dict, *, auto_healthy: bool, manual_healthy: bool) -> None:
+    def _save_facts(self, now: datetime, watermarks: dict, stall_starts: dict,
+                    attempt_ok: dict, *, auto_healthy: bool, manual_healthy: bool,
+                    keep_watermarks: bool = False) -> None:
         """この tick で見た水位・停滞の起点・直近の試行の成否・健全の真偽を保存する。
-        状態の保存と同じ transaction の中 (commit は呼び出し側)。ここで書いた値はまだ
-        どの判定にも使わない。"""
-        for pair, interval in self.hard_keys:
-            key = (pair, interval)
-            outage_facts.save_key_facts(
-                self.conn, pair, interval, self.storage_source,
-                observed_through=watermarks.get(key), stall_start=expected.get(key),
-                last_attempt_ok=attempt_ok.get(key), now=now)
+        状態の保存と同じ transaction の中 (commit は呼び出し側)。`keep_watermarks` は
+        検査を完了できなかった tick で、observe 済みの水位を進めない (次の tick が同じ範囲を
+        検査し直す) ための指定で、key ごとの facts は書かない。"""
+        if not keep_watermarks:
+            for pair, interval in self.hard_keys:
+                key = (pair, interval)
+                outage_facts.save_key_facts(
+                    self.conn, pair, interval, self.storage_source,
+                    observed_through=watermarks.get(key), stall_start=stall_starts.get(key),
+                    last_attempt_ok=attempt_ok.get(key), now=now)
         outage_facts.save_health(self.conn, auto_healthy=auto_healthy,
                                  manual_healthy=manual_healthy, now=now)
 
-    def _open_gaps(self, epoch: int, now: datetime,
-                   watermarks: dict[tuple[str, str], datetime | None]) -> None:
+    def _open_gaps(self, epoch: int,
+                   origins: dict[tuple[str, str], datetime | None]) -> None:
         """episode 突入時、各 (pair, interval) の `gap_start` を記録する。
 
-        `gap_start` = 直前 tick で succeeded だった直近の watermark
-        (= この tick の observe 時点で DB にまだ残っている最新の確定足)。
-        一度もバーが無い key は `now` を仮の起点にする (登録直後の pair 等、
-        必要本数からの計算開始点で厳密化する余地は残る — ここでは
-        gap_start 列の NOT NULL 制約を安全側の値で満たすことを優先する)。
-        """
+        `gap_start` は epoch の固定の起点 (呼び出し側が取得前の水位から決める)。一度も足が
+        無い key は NULL のまま記録し、現在時刻で代用しない。"""
         for key in self.hard_keys:
             pair, interval = key
             exists = self.conn.execute(
@@ -741,12 +855,13 @@ class OutageStateMachine:
                 "interval=? AND epoch=?", (pair, interval, epoch)).fetchone()
             if exists is not None:
                 continue
-            gap_start = watermarks.get(key) or now
+            gap_start = origins.get(key)
             self.conn.execute(
                 "INSERT INTO datafeed_outage_gap "
                 "(pair, interval, epoch, gap_start, replay_through, source) "
                 "VALUES (?, ?, ?, ?, NULL, ?)",
-                (pair, interval, epoch, _iso(gap_start), self.storage_source))
+                (pair, interval, epoch,
+                 None if gap_start is None else _iso(gap_start), self.storage_source))
 
     def _gap_start(self, pair: str, interval: str, epoch: int,
                   conn=None) -> datetime | None:
@@ -796,6 +911,23 @@ class OutageStateMachine:
             now=now, storage_source=self.storage_source, grace=self.grace,
             interval_widths=self.interval_widths)
 
+    def _ack_required(self, now: datetime, epoch: int, conn=None):
+        """再開の ack が確認する対象。(件数, 内訳 by_pair, 接触の参照, 移行確認待ち)。
+
+        件数は、未処理の足がある建玉と接触・不明の注文参照の和集合 (同じ注文は 1 件) に、
+        移行確認待ちを 1 件足した値。"""
+        c = conn if conn is not None else self.conn
+        by_pair = self._unprocessed_positions_by_pair(now, epoch, conn=c)
+        ids = unprocessed_order_ids(
+            c, hard_keys=self.hard_keys,
+            gap_start_fn=lambda pair, interval: self._gap_start(pair, interval, epoch, conn=c),
+            now=now, storage_source=self.storage_source, grace=self.grace,
+            interval_widths=self.interval_widths)
+        contacts = outage_facts.list_contacts(c, epoch=epoch)
+        migration = bool(self._load_row(conn=c).get("migration_confirmation_pending"))
+        total = len(ids | {x.order_id for x in contacts}) + (1 if migration else 0)
+        return total, by_pair, contacts, migration
+
     def _unprocessed_position_count(self, now: datetime, epoch: int,
                                     conn=None) -> int:
         c = conn if conn is not None else self.conn
@@ -828,9 +960,12 @@ class OutageStateMachine:
             self._record_notices(epoch, now, [("resume_already_ready", requested_at)])
             return state
         watermark_healthy = not unconfirmed_keys
-        unprocessed_by_pair = self._unprocessed_positions_by_pair(now, epoch)
-        unprocessed = sum(v["positions"] for v in unprocessed_by_pair.values())
+        unprocessed, unprocessed_by_pair, contact_refs, migration = self._ack_required(now, epoch)
         detail = format_unprocessed_positions(unprocessed_by_pair)
+        if contact_refs:
+            detail += ("; " if detail else "") + f"接触・不明 {len(contact_refs)} 件"
+        if migration:
+            detail += ("; " if detail else "") + "移行確認待ち"
         if watermark_healthy and (unprocessed == 0 or acknowledge):
             state = "ready"
             # state の更新と要求の消去・結果の記録は 1 つの transaction。途中で落ちたら
@@ -844,6 +979,12 @@ class OutageStateMachine:
                                  recovered_notified_epoch=row.get("recovered_notified_epoch"),
                                  ready_streak=0,
                                  updated_at=_iso(now))
+                # 接触・不明の確認は ack で済んだ。参照と移行確認待ちは同じ transaction で外す
+                self.conn.execute(
+                    "DELETE FROM datafeed_outage_contacts WHERE epoch=?", (epoch,))
+                self.conn.execute(
+                    "UPDATE datafeed_outage_state SET migration_confirmation_pending=0 "
+                    "WHERE id=1")
                 self._finish_resume_request(now, requested_at, acknowledge, "accepted")
             self._last_unprocessed_by_pair = None
             self._record_notices(epoch, now, [("resume_accepted", requested_at),
@@ -998,6 +1139,31 @@ class OutageStateMachine:
             self.activity.write(Category.SYSTEM, event, summary)
 
 
+def _iter_unprocessed(conn, *, hard_keys, gap_start_fn, now: datetime, storage_source: str,
+                      grace: timedelta, interval_widths: dict[str, timedelta]):
+    """(pair, 注文 id, 未処理と推定される 1m 足本数) を建玉ごとに返す (保守的な近似規則)。"""
+    pairs_1m = sorted({pair for pair, interval in hard_keys if interval == "1m"})
+    width_1m = interval_widths.get("1m", timedelta(minutes=1))
+    for pair in pairs_1m:
+        gap_start = gap_start_fn(pair, "1m")
+        if gap_start is None:
+            continue
+        lower_bound = market_hours.next_expected_trading_time(gap_start, width_1m)
+        latest_confirmed = ohlcv.latest_closed_cache_bar_time(
+            conn, pair, "1m", now=now, width=width_1m, grace=grace,
+            source=storage_source)
+        if latest_confirmed is None:
+            continue
+        for status, stamp in (("open", "filled_at"), ("pending_fill", "created_at")):
+            for row in orders.list_by_status(conn, status):
+                if row["pair"] != pair:
+                    continue
+                since = _parse(row.get(stamp))
+                floor = max(lower_bound, since) if since else lower_bound
+                if floor <= latest_confirmed:
+                    yield pair, row["id"], (latest_confirmed - floor) // width_1m + 1
+
+
 def unprocessed_positions_by_pair(conn, *, hard_keys, epoch: int, gap_start_fn,
                                   now: datetime, storage_source: str,
                                   grace: timedelta,
@@ -1011,49 +1177,30 @@ def unprocessed_positions_by_pair(conn, *, hard_keys, epoch: int, gap_start_fn,
     建玉別の適用 cursor を持たないため、「実際に適用済みかどうか」は判定
     できない — この関数は安全側に倒した近似 (未処理の可能性がある建玉を
     数える) であり、正確な適用済み判定はより精密な cursor を持つ後続の
-    仕組みに委ねる。
+    仕組みに委ねる。`gap_start` が NULL の key は数えない。
 
     返り値は pair ごとの内訳 ``{"positions": 建玉数, "bars": 未処理と
     推定される 1m 足本数の下限}``。``bars`` は pair 内の建玉ごとに
     ``(latest_confirmed - floor) // width_1m + 1`` を計算し、その pair の
     最大値を採る (保守的な近似の枠内で、人間が読める粗い目安として十分)。
     """
-    pairs_1m = sorted({pair for pair, interval in hard_keys if interval == "1m"})
-    width_1m = interval_widths.get("1m", timedelta(minutes=1))
     result: dict[str, dict[str, int]] = {}
-    for pair in pairs_1m:
-        gap_start = gap_start_fn(pair, "1m")
-        if gap_start is None:
-            continue
-        lower_bound = market_hours.next_expected_trading_time(gap_start, width_1m)
-        latest_confirmed = ohlcv.latest_closed_cache_bar_time(
-            conn, pair, "1m", now=now, width=width_1m, grace=grace,
-            source=storage_source)
-        if latest_confirmed is None:
-            continue
-        positions = 0
-        max_bars = 0
-        for row in orders.list_by_status(conn, "open"):
-            if row["pair"] != pair:
-                continue
-            filled_at = _parse(row.get("filled_at"))
-            floor = max(lower_bound, filled_at) if filled_at else lower_bound
-            if floor <= latest_confirmed:
-                positions += 1
-                bars = (latest_confirmed - floor) // width_1m + 1
-                max_bars = max(max_bars, bars)
-        for row in orders.list_by_status(conn, "pending_fill"):
-            if row["pair"] != pair:
-                continue
-            created_at = _parse(row.get("created_at"))
-            floor = max(lower_bound, created_at) if created_at else lower_bound
-            if floor <= latest_confirmed:
-                positions += 1
-                bars = (latest_confirmed - floor) // width_1m + 1
-                max_bars = max(max_bars, bars)
-        if positions:
-            result[pair] = {"positions": positions, "bars": max_bars}
+    for pair, _order_id, bars in _iter_unprocessed(
+            conn, hard_keys=hard_keys, gap_start_fn=gap_start_fn, now=now,
+            storage_source=storage_source, grace=grace, interval_widths=interval_widths):
+        entry = result.setdefault(pair, {"positions": 0, "bars": 0})
+        entry["positions"] += 1
+        entry["bars"] = max(entry["bars"], bars)
     return result
+
+
+def unprocessed_order_ids(conn, *, hard_keys, gap_start_fn, now: datetime,
+                          storage_source: str, grace: timedelta,
+                          interval_widths: dict[str, timedelta]) -> set[int]:
+    """`unprocessed_positions_by_pair` が数える建玉の注文 id。接触の参照と重複を除くのに使う。"""
+    return {order_id for _pair, order_id, _bars in _iter_unprocessed(
+        conn, hard_keys=hard_keys, gap_start_fn=gap_start_fn, now=now,
+        storage_source=storage_source, grace=grace, interval_widths=interval_widths)}
 
 
 def format_unprocessed_positions(by_pair: dict[str, dict[str, int]]) -> str:

@@ -37,7 +37,7 @@ def test_status_data_keeps_the_state_and_adds_the_guidance_keys(tmp_path):
         app.close()
 
 
-def test_a_degraded_row_with_the_awaiting_mark_asks_for_a_resume(tmp_path):
+def test_a_degraded_row_asks_for_a_resume_from_the_saved_facts_and_not_from_the_marks(tmp_path):
     _init(tmp_path)
     app = _app(tmp_path)
     try:
@@ -45,12 +45,16 @@ def test_a_degraded_row_with_the_awaiting_mark_asks_for_a_resume(tmp_path):
               resume_last_result="rejected_watermark", resume_last_result_at=NOW.isoformat())
         data = _data(app)
         assert data["state"] == "degraded"
-        assert (data["phase"], data["next_action"]) == ("resume_rejected", "restore_source")
+        # 保存した健全がまだ無いので停止中。古い拒否は別欄に残るだけで phase は決めない
+        assert (data["phase"], data["next_action"]) == ("stopped", "restore_source")
         assert data["resume_last_result"] == "rejected_watermark"
         assert data["resume_last_result_at"] == NOW.isoformat()
-        _seed(app, resume_last_result=None, resume_last_result_at=None)
+        # 移行確認待ちが残り、手動の健全が保存されていれば、確認 (ack) つきの再開を促す
+        _seed(app, resume_last_result=None, resume_last_result_at=None,
+              migration_confirmation_pending=1, auto_healthy=1, manual_healthy=1)
         data = _data(app)
-        assert (data["phase"], data["next_action"]) == ("awaiting_resume", "resume")
+        assert (data["phase"], data["next_action"]) == ("awaiting_resume", "resume_with_ack")
+        assert data["unprocessed_positions"] == 1
         _seed(app, resume_requested_at=NOW.isoformat())
         assert (_data(app)["phase"], _data(app)["next_action"]) == ("resume_requested", "wait_tick")
     finally:

@@ -1824,7 +1824,9 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             storage_source=ingest.storage_source, activity=activity,
             ready_confirm_ticks=settings.datafeed.outage.ready_confirm_ticks,
             auto_resume_when_flat=settings.datafeed.outage.auto_resume_when_flat,
-            flat_stall_max_sec=settings.datafeed.outage.flat_stall_max_sec)
+            flat_stall_max_sec=settings.datafeed.outage.flat_stall_max_sec,
+            # ingest と組んで動く構成だけ、最初の開場 observe の commit まで新規リスクを待たせる
+            startup_recovery=True)
 
         def db_latest_1m_bar(pair: str):
             source = "mt5-live" if settings.datafeed.primary == "mt5" else settings.datafeed.primary
@@ -1889,6 +1891,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                               econ_window=econ_window_settings,
                               pair_currencies=pair_currencies,
                               writer_admission=writer_admission)
+        # 接触検査は通常保護と同じ spread (scheduler の想定値) で評価する
+        outage.spread_fn = scheduler._spread_for
 
         # 起動時の補完: 対象 event × pair の set 台帳を保存済みの event に揃える。
         # 失敗しても取引は止めない。

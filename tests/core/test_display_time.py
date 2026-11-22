@@ -468,6 +468,10 @@ SAMPLES = {
         lambda: BUILDERS[("NEWS", "news_source_skipped")]("src: 先方の指示により ", T0),
     ("SYSTEM", "datafeed_restricted"):
         lambda: BUILDERS[("SYSTEM", "datafeed_restricted")](3, {"EURUSD"}, T0, T0 + timedelta(hours=2)),
+    ("SYSTEM", "late_bar_protection_contact"):
+        lambda: BUILDERS[("SYSTEM", "late_bar_protection_contact")](3, 7, T0, "sl"),
+    ("SYSTEM", "late_bar_contact_unknown"):
+        lambda: BUILDERS[("SYSTEM", "late_bar_contact_unknown")](3, 8, T0, "unknown"),
     ("SYSTEM", "time_rule_cutover"):
         lambda: BUILDERS[("SYSTEM", "time_rule_cutover")]({"t_c": T0.isoformat(), "activity_logged": False}),
     ("SYSTEM", "kill_switch_reset"):
@@ -479,6 +483,7 @@ def test_builder_table_is_exactly_the_documented_set():
     assert set(BUILDERS) == {
         ("NEWS", "news_fetch_skipped"), ("NEWS", "econ_fetch_skipped"),
         ("NEWS", "news_source_skipped"), ("SYSTEM", "datafeed_restricted"),
+        ("SYSTEM", "late_bar_protection_contact"), ("SYSTEM", "late_bar_contact_unknown"),
         ("SYSTEM", "time_rule_cutover"), ("SYSTEM", "kill_switch_reset")}
     assert set(SAMPLES) == set(BUILDERS)
 
@@ -505,6 +510,10 @@ def test_builder_bodies():
         "src: 先方の指示により 2026-11-06T10:30:00Z まで待つ"
     assert SAMPLES[("SYSTEM", "datafeed_restricted")]()[2] == \
         "epoch=3 stalled=['EURUSD'] expected=2026-11-06T10:30:00Z deadline=2026-11-06T12:30:00Z"
+    assert SAMPLES[("SYSTEM", "late_bar_protection_contact")]()[2] == \
+        "epoch=3 order=7 bar=2026-11-06T10:30:00Z kind=sl"
+    assert SAMPLES[("SYSTEM", "late_bar_contact_unknown")]()[2] == \
+        "epoch=3 order=8 bar=2026-11-06T10:30:00Z kind=unknown"
     assert SAMPLES[("SYSTEM", "time_rule_cutover")]()[2] == '{"t_c": "2026-11-06T10:30:00+00:00"}'
     assert SAMPLES[("SYSTEM", "kill_switch_reset")]()[2] == \
         "human explicit reset via shell gen=4 latched_at=2026-11-06T10:30:00Z"

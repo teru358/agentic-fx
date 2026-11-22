@@ -76,3 +76,27 @@ def test_transition_keyword_arguments_pass_through_the_same_guard(tmp_path):
         transitions.transition(c, oid, OrderStatus.CANCELLING, NOW, stop_loss=140.0)
     assert orders.get(c, oid)["status"] == "pending_fill"
     assert orders.get(c, oid)["stop_loss"] == 147.8
+
+
+def test_list_overlapping_returns_live_orders_and_orders_ending_inside_the_window(tmp_path):
+    from datetime import timedelta
+    conn = _conn(tmp_path)
+    day = datetime(2026, 9, 30, 10, 0, tzinfo=timezone.utc)
+
+    def make(pair, status, created, closed=None):
+        extra = {} if closed is None else {"closed_at": closed.isoformat()}
+        return orders.insert(conn, pair=pair, direction="long", entry_type="market",
+                             horizon="swing", status=status, now=created, **extra)
+
+    old = make("USDJPY", "closed", day - timedelta(days=5), day - timedelta(days=4))
+    live = make("USDJPY", "open", day - timedelta(hours=1))
+    ended_inside = make("USDJPY", "closed", day - timedelta(hours=2), day + timedelta(minutes=10))
+    later = make("USDJPY", "pending_fill", day + timedelta(days=3))
+    other_pair = make("EURUSD", "open", day - timedelta(hours=1))
+    unknown_end = make("USDJPY", "cancelled", day - timedelta(hours=3))
+
+    found = [row["id"] for row in orders.list_overlapping(
+        conn, ["USDJPY"], day, day + timedelta(minutes=30))]
+    assert live in found and ended_inside in found and unknown_end in found
+    assert old not in found and later not in found and other_pair not in found
+    assert orders.list_overlapping(conn, [], day, day) == []

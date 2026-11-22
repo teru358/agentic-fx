@@ -115,16 +115,17 @@ def test_a_closed_market_observation_writes_no_facts(tmp_path):
     assert outage_facts.load_key_facts(conn, SRC) == {}
 
 
-def test_opening_an_epoch_stores_the_source_and_keeps_the_current_null_substitute(tmp_path):
+def test_opening_an_epoch_stores_the_source_and_a_null_start_for_a_key_without_a_watermark(
+        tmp_path):
     conn = _db(tmp_path)
     m = _machine(conn)
     now = _at(10, 1)
-    assert m.observe(now, _report(failed=[(K1M, "ConnectError")], succeeded=[K1H])) == "degraded"
+    assert m.observe(now, _report(failed=[(K1M, "ConnectError")], succeeded=[K1H])) == "restricted"
     rows = {(r["pair"], r["interval"]): r for r in conn.execute(
         "SELECT * FROM datafeed_outage_gap")}
     assert {r["source"] for r in rows.values()} == {SRC}
-    # この task では、水位のない key の起点は従来どおり観測時刻
-    assert rows[K1M]["gap_start"] == now.isoformat()
+    # 水位のない key の起点は NULL (観測時刻で代用しない)
+    assert rows[K1M]["gap_start"] is None
 
 
 def test_a_closed_state_machine_row_keeps_working_with_a_null_gap_start(tmp_path):

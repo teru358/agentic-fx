@@ -14,6 +14,7 @@ from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.plugin.resolve import ResolvedIndicatorSet
 from agentic_fx.plugin.signal_producer import SignalProducer
 from agentic_fx.runners.fake_runner import FakeRunner
+from agentic_fx.datafeed.outage import EMPTY_REPORT
 from agentic_fx.service import _scheduler_tick_once, build_app
 from agentic_fx.store import signals
 from agentic_fx.store.db import connect
@@ -29,8 +30,11 @@ TICK = H + timedelta(hours=1, seconds=31)
 
 def _app(tmp_path):
     _init(tmp_path)
-    return build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
-                     embedding_fn=FakeEmbedding(), core_lock_factory=TrackedRLock)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                    embedding_fn=FakeEmbedding(), core_lock_factory=TrackedRLock)
+    # 起動直後は最初の開場中の観測が終わるまで data state が待つ。その観測を済ませてから試す
+    app.outage.observe(NOW, EMPTY_REPORT)
+    return app
 
 
 def _add_signal(conn, plugin: str) -> int | None:

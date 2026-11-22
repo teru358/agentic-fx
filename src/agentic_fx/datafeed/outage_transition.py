@@ -162,8 +162,7 @@ def outage_transition(row: dict, f: Facts) -> tuple[dict, Effects]:
     merged = any(k.one_m for k in problems)
     any_problem = bool(problems)
     limit_old = f.flat_stall_max_sec if f.flat else EXPOSURE_STALL_SEC
-    old_overdue = any(
-        limit_old <= 0 or _open_seconds(s, now) > limit_old for s in f.old_stall_starts)
+    old_overdue = any(_open_seconds(s, now) > limit_old for s in f.old_stall_starts)
     overdue = old_overdue or any(_over(f, k, merged) for k in problems)
     contact_wait = f.contact_wait
 
@@ -235,6 +234,7 @@ def outage_transition(row: dict, f: Facts) -> tuple[dict, Effects]:
     if not skip_rest:
         if overdue:
             open_epoch()
+            streak = 0
             if state != "degraded":
                 degrade()
                 activities.append(degraded_activity())
@@ -267,7 +267,9 @@ def outage_transition(row: dict, f: Facts) -> tuple[dict, Effects]:
             can_auto = f.auto_resume and not contact_wait and not f.migration_pending
             if state == "restricted":
                 if f.healthy and can_auto:
-                    state, confirmed, streak = "ready", 0, 0
+                    state = "ready"
+                    confirmed = 0
+                    streak = 0
                     restricted_since = deadline = None
                     pending = 0
                     recovered = True
@@ -292,7 +294,9 @@ def outage_transition(row: dict, f: Facts) -> tuple[dict, Effects]:
                     if f.advanced:
                         streak += 1
                     if streak >= f.ready_confirm_ticks:
-                        state, confirmed, streak = "ready", 0, 0
+                        state = "ready"
+                        confirmed = 0
+                        streak = 0
                         restricted_since = deadline = None
                         pending = 0
                         recovered = True
