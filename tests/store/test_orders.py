@@ -46,3 +46,33 @@ def test_list_by_status(tmp_path):
     rows = orders.list_by_status(c, OrderStatus.PENDING_FILL, OrderStatus.OPEN)
     assert len(rows) == 2
     assert len(orders.list_by_status(c, OrderStatus.CLOSED)) == 0
+
+
+def test_update_fields_rejects_protection_prices_and_leaves_the_row_unchanged(tmp_path):
+    import pytest
+    c = _conn(tmp_path)
+    oid = orders.insert(c, pair="USDJPY", direction="long", entry_type="limit",
+                        horizon="day", status=OrderStatus.PENDING_FILL, now=NOW,
+                        quantity=0.1, stop_loss=147.8, take_profit=149.0,
+                        requested_price=148.2)
+    for field in ("requested_price", "stop_loss", "take_profit"):
+        with pytest.raises(ValueError, match="immutable"):
+            orders.update_fields(c, oid, now=NOW, **{field: 1.0})
+    with pytest.raises(ValueError):
+        orders.update_fields(c, oid, now=NOW, direction="short")
+    row = orders.get(c, oid)
+    assert (row["requested_price"], row["stop_loss"], row["take_profit"]) == (148.2, 147.8, 149.0)
+    assert row["direction"] == "long"
+
+
+def test_transition_keyword_arguments_pass_through_the_same_guard(tmp_path):
+    import pytest
+    from agentic_fx.core import transitions
+    c = _conn(tmp_path)
+    oid = orders.insert(c, pair="USDJPY", direction="long", entry_type="limit",
+                        horizon="day", status=OrderStatus.PENDING_FILL, now=NOW,
+                        quantity=0.1, stop_loss=147.8, requested_price=148.2)
+    with pytest.raises(ValueError, match="immutable"):
+        transitions.transition(c, oid, OrderStatus.CANCELLING, NOW, stop_loss=140.0)
+    assert orders.get(c, oid)["status"] == "pending_fill"
+    assert orders.get(c, oid)["stop_loss"] == 147.8

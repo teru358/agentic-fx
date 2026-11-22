@@ -12,6 +12,10 @@ _OPTIONAL = {
     "broker_position_id", "broker_synced_at", "expires_at",
     "filled_at", "closed_at",
 }
+# 発注の保護条件 (価格・SL・TP) は insert で決まり、その後は変えない。direction は
+# insert の集合に無いので update も受けない。停止中の接触検査はこの不変を前提にする
+_IMMUTABLE_AFTER_INSERT = {"requested_price", "stop_loss", "take_profit"}
+_UPDATABLE = _OPTIONAL - _IMMUTABLE_AFTER_INSERT
 
 
 def insert(conn: sqlite3.Connection, *, pair: str, direction: str,
@@ -37,7 +41,10 @@ def get(conn: sqlite3.Connection, order_id: int) -> dict | None:
 
 def update_fields(conn: sqlite3.Connection, order_id: int, *,
                   now: datetime, **fields) -> None:
-    unknown = set(fields) - _OPTIONAL - {"status"}
+    frozen = set(fields) & _IMMUTABLE_AFTER_INSERT
+    if frozen:
+        raise ValueError(f"immutable order fields: {frozen}")
+    unknown = set(fields) - _UPDATABLE - {"status"}
     if unknown:
         raise ValueError(f"unknown order fields: {unknown}")
     fields = {k: (str(v) if k == "status" else v) for k, v in fields.items()}
