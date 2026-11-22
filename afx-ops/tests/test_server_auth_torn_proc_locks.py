@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import socket
 
 import pytest
 
@@ -17,7 +18,8 @@ class _SequencedLocks:
         self.paths = []
         for index, text in enumerate(contents):
             path = tmp_path / f"locks{index}"
-            path.write_text(text)
+            if text is not None:
+                path.write_text(text)
             self.paths.append(path)
         self.opened = 0
 
@@ -76,3 +78,56 @@ def test_check_lock_device_still_refuses_a_stable_device_mismatch(tmp_path, lock
     with pytest.raises(ServerAuthError) as info:
         server_auth.check_lock_device(path, proc_locks=locks)
     assert info.value.reason == "instance_lock_dev_mismatch"
+
+
+def test_rereads_are_spaced_by_a_short_sleep(tmp_path, lock, monkeypatch):
+    path, _device = lock
+    naps = []
+    monkeypatch.setattr(server_auth.time, "sleep", naps.append)
+    server_auth.lock_holders(path, proc_locks=_SequencedLocks(tmp_path, [""]))
+    assert naps == [server_auth.LOCK_REREAD_INTERVAL] * (server_auth.LOCK_READ_ATTEMPTS - 1)
+    assert 0 < server_auth.LOCK_REREAD_INTERVAL <= 0.005
+
+
+def _verify(tmp_path, path, contents):
+    left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        return server_auth.verify_peer(left, uid=os.getuid(), lock_path=path,
+                                       proc_locks=_SequencedLocks(tmp_path, contents))
+    finally:
+        left.close()
+        right.close()
+
+
+def test_verify_peer_refuses_when_the_reads_show_another_holder_after_empty(tmp_path, lock):
+    path, device = lock
+    with pytest.raises(ServerAuthError) as info:
+        _verify(tmp_path, path, ["", _row(os.getpid() + 1, device)])
+    assert info.value.reason == "not_lock_holder"
+
+
+def test_verify_peer_refuses_when_the_peer_and_another_holder_both_appear(tmp_path, lock):
+    path, device = lock
+    both = _row(os.getpid(), device) + _row(os.getpid() + 1, device)
+    with pytest.raises(ServerAuthError) as info:
+        _verify(tmp_path, path, ["", both])
+    assert info.value.reason == "not_lock_holder"
+
+
+def test_verify_peer_refuses_when_every_read_is_empty(tmp_path, lock):
+    path, _device = lock
+    with pytest.raises(ServerAuthError) as info:
+        _verify(tmp_path, path, [""])
+    assert info.value.reason == "not_lock_holder"
+
+
+def test_verify_peer_refuses_when_a_later_read_fails(tmp_path, lock):
+    path, _device = lock
+    with pytest.raises(ServerAuthError) as info:
+        _verify(tmp_path, path, ["", None])
+    assert info.value.reason == "not_lock_holder"
+
+
+def test_verify_peer_accepts_the_peer_seen_after_an_empty_read(tmp_path, lock):
+    path, device = lock
+    assert _verify(tmp_path, path, ["", _row(os.getpid(), device)]) == os.getpid()
