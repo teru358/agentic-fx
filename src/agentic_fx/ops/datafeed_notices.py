@@ -1,4 +1,4 @@
-"""データの停止・再開待ちの通知記録 (datafeed_outage_notices) を ops_events へ出す。
+"""データの停止・再開待ちの通知記録 (datafeed_outage_notices) を EventStore 経由で運用 event として出す。
 
 呼び出しは ops lane の中だけ。event の INSERT と記録への event_id 保存は同じ transaction で
 確定し、途中で失敗すれば両方戻す。重複は記録の event_id (終端結果は要求キーごと) と、通常遷移は
