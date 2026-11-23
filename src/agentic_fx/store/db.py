@@ -824,7 +824,22 @@ CREATE TABLE IF NOT EXISTS datafeed_outage_state (
   resume_requested_at TEXT,
   resume_acknowledge INTEGER NOT NULL DEFAULT 0,
   recovered_notified_epoch INTEGER,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  resume_last_result TEXT,
+  resume_last_result_at TEXT,
+  resume_last_request_at TEXT
+);
+-- 停止・再開待ち・要求の終端結果・復帰の発生記録。event 化の対応は event_id に持つ。
+-- request_key は終端結果の三種類では消費した要求の時刻、それ以外は空文字
+CREATE TABLE IF NOT EXISTS datafeed_outage_notices (
+  epoch INTEGER NOT NULL,
+  notice_state TEXT NOT NULL CHECK (notice_state IN
+    ('stopped', 'awaiting_resume', 'resume_accepted', 'resume_rejected',
+     'resume_already_ready', 'resumed')),
+  request_key TEXT NOT NULL DEFAULT '',
+  occurred_at TEXT NOT NULL,
+  event_id INTEGER,
+  PRIMARY KEY (epoch, notice_state, request_key)
 );
 CREATE TABLE IF NOT EXISTS datafeed_outage_gap (
   pair TEXT NOT NULL,
@@ -934,6 +949,7 @@ TABLE_NAMES = frozenset({
     "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
     "alert_state", "improve_waves", "improve_wave_slots", "plugin_switch_journal",
     "candidate_archives", "datafeed_outage_state", "datafeed_outage_gap",
+    "datafeed_outage_notices",
     "cron_cursor", "mission_decision_bars",
     "ops_requests", "ops_idempotency", "ops_events", "ops_policies",
     "plugin_deploy_ops", "plugin_deploy_op_signals", "plugin_deploy_op_history_forced",
@@ -2407,6 +2423,8 @@ def init_db(conn: sqlite3.Connection, *, root: Path | None = None) -> None:
     _ensure_column(
         conn, "datafeed_outage_state", "restricted_deadline_at",
         "restricted_deadline_at TEXT")
+    for column in ("resume_last_result", "resume_last_result_at", "resume_last_request_at"):
+        _ensure_column(conn, "datafeed_outage_state", column, f"{column} TEXT")
     conn.commit()
 
 

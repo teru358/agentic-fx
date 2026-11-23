@@ -98,7 +98,7 @@ def test_table_names_include_candidate_archives():
         "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
         "alert_state", "improve_waves", "improve_wave_slots",
         "plugin_switch_journal",
-            "candidate_archives", "datafeed_outage_state", "datafeed_outage_gap",
+            "candidate_archives", "datafeed_outage_state", "datafeed_outage_gap", "datafeed_outage_notices",
             "cron_cursor", "mission_decision_bars",
             "ops_requests", "ops_idempotency", "ops_events", "ops_policies",
             "plugin_deploy_ops", "plugin_deploy_op_signals", "plugin_deploy_op_history_forced",
@@ -666,3 +666,53 @@ def test_store_package_does_not_import_loops():
                    for n in names):
                 offenders.append((path.name, node.lineno))
     assert offenders == []
+
+
+def test_datafeed_outage_state_result_columns_and_notice_table_are_added_to_an_old_database(tmp_path):
+    import sqlite3
+
+    from agentic_fx.store.db import connect, init_db
+
+    fresh = connect(tmp_path / "fresh.db")
+    init_db(fresh)
+    legacy_path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(str(legacy_path))
+    legacy.execute("""
+        CREATE TABLE datafeed_outage_state (
+          id INTEGER PRIMARY KEY CHECK (id = 1),
+          state TEXT NOT NULL,
+          epoch INTEGER NOT NULL DEFAULT 0,
+          confirmed INTEGER NOT NULL DEFAULT 0,
+          entered_degraded_at TEXT,
+          restricted_since TEXT,
+          restricted_deadline_at TEXT,
+          ready_streak INTEGER NOT NULL DEFAULT 0,
+          pending_human_confirmation INTEGER NOT NULL DEFAULT 0,
+          resume_requested_at TEXT,
+          resume_acknowledge INTEGER NOT NULL DEFAULT 0,
+          recovered_notified_epoch INTEGER,
+          updated_at TEXT NOT NULL
+        )
+    """)
+    legacy.execute(
+        "INSERT INTO datafeed_outage_state (id, state, epoch, confirmed, resume_requested_at, "
+        "resume_acknowledge, updated_at) VALUES (1, 'degraded', 66, 1, "
+        "'2026-11-20T23:24:09.461457+00:00', 1, '2026-01-01T00:00:00+00:00')")
+    legacy.commit()
+    legacy.close()
+
+    migrated = connect(legacy_path)
+    init_db(migrated)
+    init_db(migrated)  # 2 回目でも例外にならない
+
+    def shape(conn, table):
+        return [(r["name"], r["type"], r["notnull"], r["dflt_value"], r["pk"])
+                for r in conn.execute(f"PRAGMA table_info({table})")]
+
+    assert sorted(shape(migrated, "datafeed_outage_state")) == sorted(
+        shape(fresh, "datafeed_outage_state"))
+    assert shape(migrated, "datafeed_outage_notices") == shape(fresh, "datafeed_outage_notices")
+    row = migrated.execute("SELECT * FROM datafeed_outage_state WHERE id=1").fetchone()
+    assert row["epoch"] == 66 and row["resume_acknowledge"] == 1
+    assert (row["resume_last_result"], row["resume_last_result_at"],
+            row["resume_last_request_at"]) == (None, None, None)

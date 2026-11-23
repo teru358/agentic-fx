@@ -293,3 +293,29 @@ def test_the_ops_setting_does_not_widen_what_the_trade_setting_hides():
     done = event(2, "job_state_changed", {"job_kind": "ask", "state": "done", "result_code": "ok"},
                  "job:" + _JOB)
     assert gate.plan_event(done, trade_notices="off", ops_notices="all").event_id == 2
+
+
+@pytest.mark.parametrize("ops_notices", ["default", "all"])
+def test_data_feed_guard_events_are_posted_with_fixed_sentences_beside_kill_switch(tmp_path, ops_notices):
+    guard = lambda event_id, kind, state, generation: event(
+        event_id, "guard_state_changed",
+        {"guard_kind": kind, "state": state, "generation": generation}, "instance")
+    client = _Client([
+        guard(1, "data_feed", "stopped", 66),
+        guard(2, "kill_switch", "latched", 3),
+        guard(3, "data_feed", "resume_requested", None),
+        guard(4, "data_feed", "resume_requested", 66),
+        guard(5, "data_feed", "resume_rejected", 66),
+    ])
+    adapter, channel, fd = _adapter(tmp_path, client, ops_notices=ops_notices)
+    try:
+        asyncio.run(_deliver(adapter))
+        assert len(channel.sent) == 5
+        assert channel.sent[0].startswith("監視対象の価格系列でデータの欠落を検知しました。")
+        assert channel.sent[1] == "kill switch が作動しました (世代 3)。"
+        assert channel.sent[2] == "データ取得の再開を要求しました。"
+        assert channel.sent[3] == "再開要求を記録しました。次の開場中の判定で結果を通知します。"
+        assert channel.sent[4].startswith("再開要求は受理されませんでした。")
+        assert (load(fd).cursor, load(fd).high_watermark) == (5, 5)
+    finally:
+        adapter.close(); os.close(fd)

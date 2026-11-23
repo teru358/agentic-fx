@@ -751,3 +751,14 @@ def test_startup_rebuilds_the_policy_file_from_its_records(tmp_path):
     path.write_text("# hand written\n", encoding="utf-8")
     assert _run(tmp_path, _app(tmp_path)) == 0
     assert path.read_text(encoding="utf-8").splitlines().count("- risk small") == 1
+
+
+def test_data_resume_response_tells_new_inquiry_and_replacement_apart(tmp_path):
+    from agentic_fx.ops.contracts import ShellCaller
+    _init(tmp_path)
+    app = _app(tmp_path)
+    outcomes = [app.ops.resume_data(ShellCaller.SHELL, acknowledge=ack)
+                for ack in (False, False, True, False)]
+    assert [r["request_outcome"] for r in outcomes] == ["new", "existing", "replaced", "existing"]
+    assert [r["acknowledge"] for r in outcomes] == [False, False, True, True]
+    assert all(isinstance(r["epoch"], int) for r in outcomes)

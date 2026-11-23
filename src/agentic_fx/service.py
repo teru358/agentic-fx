@@ -49,7 +49,7 @@ from agentic_fx.core.supervisor import MissionSupervisor, SubmitResult
 from agentic_fx.core.writer_admission import WriterAdmission
 from agentic_fx.datafeed import bridge_observe, cache_window, sources
 from agentic_fx.datafeed.ingest import Ingest
-from agentic_fx.datafeed.outage import IngestTickReport, OutageStateMachine
+from agentic_fx.datafeed.outage import IngestTickReport, OutageStateMachine, unknown_guidance
 from agentic_fx.datafeed.planner import RequirementPlanner, startup_disposition
 from agentic_fx.datafeed.reference_status import reference_rows
 from agentic_fx.datafeed.requirements import build_registry
@@ -2154,6 +2154,15 @@ class _GuardNoticeProbe:
                 pending_generation if pending_state is not None else None)
 
 
+def _data_guidance(outage, conn, now) -> dict:
+    """status の data に足す案内の値。読めなければ unknown (ready にも件数ゼロにも倒さない)。"""
+    try:
+        return dict(outage.guidance_snapshot(now, conn=conn))
+    except Exception as exc:  # noqa: BLE001 — 補助表示は status を止めない
+        _log.warning("data guidance unavailable: %s", type(exc).__name__)
+        return unknown_guidance()
+
+
 def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity,
                        health_latch, supervisor, improve_supervisor, plugins_dir,
                        outage, trade_event_sink=None, ingest=None,
@@ -2186,6 +2195,9 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
                                                "protection_pending")
                 recent = missions.recent(conn, 1)
                 data_state = str(outage.state_from(conn))
+                data_guidance = _data_guidance(outage, conn, clock.now())
+                # カードの state も案内と同じ 1 回の読取りから作る。読めなければ自分の読みに戻す
+                card_state = str(data_guidance.pop("state", data_state))
                 references = (
                     _reference_status_rows(conn, ingest, clock.now(), settings)
                     if ingest is not None else None)
@@ -2222,7 +2234,7 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
                   "orders": {"active": len(active)}, "mission": mission,
                   "health": {"latched": health_latch.is_latched(),
                              "failures": len(health_latch.summary())},
-                  "data": {"state": data_state}, "setup": setup}
+                  "data": {**data_guidance, "state": card_state}, "setup": setup}
         if references:
             status["references"] = references
         if guard_notice is not None:
@@ -2250,11 +2262,13 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
         lane = holder[0].lane_connection
         now = clock.now()
         info = outage.gap_summary(now, conn=lane)
-        outage.request_resume(now, acknowledge=acknowledge, conn=lane)
+        recorded = outage.request_resume(now, acknowledge=acknowledge, conn=lane)
         gaps = [{"pair": pair, "interval": interval,
                  "since": since.isoformat() if hasattr(since, "isoformat") else str(since)}
                 for (pair, interval), since in sorted(info["gap_starts"].items())]
-        return {"requested": True, "acknowledge": acknowledge, "state": info["state"],
+        return {"requested": True, "acknowledge": recorded["acknowledge"],
+                "request_outcome": recorded["outcome"], "epoch": recorded["epoch"],
+                "state": info["state"],
                 "unprocessed_positions": info["unprocessed_positions"], "gaps": gaps}
 
     service = OpsService(
@@ -2262,7 +2276,7 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
         policy_path=directives_path(root), state_store=state,
         status_provider=status_provider, log_path=root / "logs" / "agentic.log",
         activity_path=root / "logs" / "activity.log", data_resume=data_resume,
-        ask_submitter=ask_submitter, improve_supervisor=improve_supervisor,
+        datafeed_notices=True, ask_submitter=ask_submitter, improve_supervisor=improve_supervisor,
         plugins_root=plugins_dir, settings=settings, activity_log=activity,
         improve_reports_dir=root / "data" / "improve_reports",
         # HWM の付け直しだけが使う依存。core_lock か broker が無ければ付け直しだけ使えない。

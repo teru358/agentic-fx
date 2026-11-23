@@ -61,6 +61,21 @@ def next_rollover(now: datetime) -> datetime:
     return session_boundary_utc(day)
 
 
+def open_time_between(start: datetime, end: datetime) -> timedelta:
+    """UTC の区間 [start, end) のうち市場が開いている時間の合計。
+
+    開閉は日次境界 (NY 17:00) でしか変わらないので、境界ごとに区切って足す。
+    end が start 以前なら 0。"""
+    cursor, stop = _as_utc(start), _as_utc(end)
+    total = timedelta(0)
+    while cursor < stop:
+        boundary = min(next_rollover(cursor), stop)
+        if is_market_open(cursor):
+            total += boundary - cursor
+        cursor = boundary
+    return total
+
+
 def session_start(now: datetime) -> datetime:
     """Return the most recent closed-to-open boundary, including holidays."""
     boundary = trading_day_start(now)

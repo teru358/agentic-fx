@@ -1,26 +1,26 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 180 件。完了分は closed/。
+未完了: 181 件。完了分は closed/。
 
 ## 実装中 (5)
 
-### 不具合 (1)
+### 不具合 (2)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [live-confirmed-bars-into-history](open/live-confirmed-bars-into-history.md) | 高 | 2026-09-21 | backtest の履歴が自動で更新されず、評価が古い入力で通る |
+| [signal-mission-max-turns-failures](open/signal-mission-max-turns-failures.md) | 高 | 2026-11-21 | signal で起動する取引判断の 4 割が手数の上限で判断を出せずに終わる |
 
-### 機能 (4)
+### 機能 (3)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
-| [datafeed-outage-discord-notice](open/datafeed-outage-discord-notice.md) | 高 | 2026-10-31 | MT5 不通 (degraded) と復帰待ちを Discord に通知する |
 | [strategy-attribution-and-shadow-evaluation](open/strategy-attribution-and-shadow-evaluation.md) | 中 | 2026-10-16 | 戦略ごとの帰属と影の評価 (共有建玉のまま戦略別の成績を出す) |
 | [weekly-improve-rebacktests-deployed-strategies](open/weekly-improve-rebacktests-deployed-strategies.md) | 中 | 2026-10-25 | 週次改善の冒頭で稼働中の戦略を再 backtest し、成績を改善の方向性の材料にする |
 | [weekly-plugin-inventory-notice](open/weekly-plugin-inventory-notice.md) | 中 | 2026-10-29 | 週次の棚卸し: 未使用の指標と成績の悪い戦略を停止の提案として通知する |
 
-## 実装待ち (12)
+## 実装待ち (14)
 
 ### 不具合 (7)
 
@@ -34,10 +34,12 @@
 | [flaky-tool-schemas](open/flaky-tool-schemas.md) | 低 |  | 全ツールのスキーマテストがフル suite でだけ ERROR になる |
 | [improve-add-quotes](open/improve-add-quotes.md) | 低 |  | improve add がクォートを剥がさず表示が崩れる |
 
-### 機能 (1)
+### 機能 (3)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
+| [datafeed-pending-auto-release-when-flat](open/datafeed-pending-auto-release-when-flat.md) | 中 | 2026-11-21 | 建玉が全部決済されデータが健全に戻ったら、人の再開なしで戻すか |
+| [datafeed-rollover-band-expected-gap](open/datafeed-rollover-band-expected-gap.md) | 中 | 2026-11-21 | 日次ロールオーバー帯の 1 分足の無 tick を停止とみなすか |
 | [legacy-oc-tool-not-found](open/legacy-oc-tool-not-found.md) | 低 |  | 存在しない候補名を読むときの誘導が足りない |
 
 ### 保守 (4)
@@ -72,9 +74,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (157)
+## 設計待ち (156)
 
-### 不具合 (84)
+### 不具合 (85)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -111,6 +113,7 @@
 | [reference-daily-session-completeness](open/reference-daily-session-completeness.md) | 中 | 2026-11-14 | 非24時間銘柄の1d参照を取引セッションに沿って確定する |
 | [cancel-stall-in-cancelling-state](open/cancel-stall-in-cancelling-state.md) | 中 | 2026-11-16 | 取消の途中で DB 遷移に失敗した注文が CANCELLING に残り予約を占有する |
 | [account-snapshot-future-ts-treated-fresh](open/account-snapshot-future-ts-treated-fresh.md) | 中 | 2026-11-19 | 時計が戻ると未来時刻の口座 snapshot が新鮮と扱われ続ける |
+| [normal-protection-evaluates-latest-bar-only](open/normal-protection-evaluates-latest-bar-only.md) | 中 | 2026-11-21 | 通常の SL/TP・指値の判定が最新の 1m 足しか見ない |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
 | [tier-a-directive-ignored](open/tier-a-directive-ignored.md) | 中 |  | 自己テストの連続失敗の警告が無視され続け、止める仕組みが無い |
@@ -163,7 +166,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (43)
+### 機能 (41)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -177,8 +180,6 @@
 | [web-https-for-writes](open/web-https-for-writes.md) | 中 | 2026-11-08 | 同梱 web を HTTPS で動かし LAN から書込めるようにする |
 | [killswitch-reset-implicit-generation-and-dd-preview](open/killswitch-reset-implicit-generation-and-dd-preview.md) | 中 | 2026-11-16 | kill switch の解除で世代の入力を不要にし、確認画面に現在の DD と再ラッチの予告を出す |
 | [indicator-forward-response-evaluation](open/indicator-forward-response-evaluation.md) | 中 | 2026-11-18 | 指標の計算値を数学的な計算にかけ、通貨ペアの傾向を改善 agent に見せる分析の道具 |
-| [datafeed-pending-auto-release-when-flat](open/datafeed-pending-auto-release-when-flat.md) | 中 | 2026-11-21 | 建玉が全部決済されデータが健全に戻ったら、人の再開なしで戻すか |
-| [datafeed-rollover-band-expected-gap](open/datafeed-rollover-band-expected-gap.md) | 中 | 2026-11-21 | 日次ロールオーバー帯の 1 分足の無 tick を停止とみなすか |
 | [improve-targeted-run](open/improve-targeted-run.md) | 低 | 2026-09-12 | 現状は `improve add <text>` + 引数なし `improve` で LLM が open から自分… |
 | [pine-script-to-plugin](open/pine-script-to-plugin.md) | 低 | 2026-09-12 | Pine script を plugin に変換する手段が無い |
 | [indicator-reference-oracle-gate](open/indicator-reference-oracle-gate.md) | 低 | 2026-09-15 | indicator の正しさを確かめる門が無い |

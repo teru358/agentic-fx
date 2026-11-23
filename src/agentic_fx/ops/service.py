@@ -43,6 +43,7 @@ from agentic_fx.policy_projection import (POLICY_TEXT_LIMIT, MigrationRecordUnkn
                                           regenerate_policy_file, unmanaged_policy_lines)
 
 from . import base_view, redactor
+from . import datafeed_notices as notice_sweep
 from .activity import SuppressedActivity
 from .audit import AcceptedRequest, AuditStore, IdempotencyReplay
 from .contracts import (ACTOR_PRINCIPALS, IMPROVE_RUNS_DEFAULT_LIMIT,
@@ -741,7 +742,8 @@ class OpsService:
                  improve_supervisor=None, plugins_root: Path | None = None,
                  settings=None, activity_log=None,
                  improve_reports_dir: Path | None = None,
-                 rebase: RebaseWiring | None = None) -> None:
+                 rebase: RebaseWiring | None = None,
+                 datafeed_notices: bool = False) -> None:
         self.stop_event = stop_event or threading.Event()
         self._owns_decide_conn = decide_conn is None
         raw_decide = decide_conn if decide_conn is not None else self._open_peer(conn)
@@ -768,6 +770,24 @@ class OpsService:
         self._log_path = log_path
         self._activity_path = activity_path
         self._data_resume = data_resume
+        # データの停止・再開待ちの通知を作る構成か。真のとき sweep・起動補完が回り、
+        # 再開要求の受付は記録時の epoch を generation に持つ。偽なら従来の受付 (generation なし) だけ
+        self._datafeed_notices = datafeed_notices is True
+        self._datafeed_supplemented = False
+        self._datafeed_snapshot: tuple[int, str] | None = None
+        self._datafeed_built_at: datetime | None = None
+        self._datafeed_retries = notice_sweep.Retries()
+        if self._datafeed_notices:
+            # 有効化の時刻は構築時に置く。ops lane が塞がっていても、その後の記録が下限より前にならない。
+            # 保存に失敗したら構築時刻を持ち続け、保存できるまで同じ値で再試行する
+            self._datafeed_built_at = _aware(wall_clock()).astimezone(timezone.utc)
+            try:
+                if notice_sweep.ensure_enabled(conn, self._datafeed_built_at):
+                    # 有効化の時点で成り立っていた補完の対象 (発生時刻を導入時刻にしてよい分)
+                    self._datafeed_snapshot = notice_sweep.snapshot_target(
+                        conn, self._datafeed_built_at)
+            except Exception:  # noqa: BLE001 -- 置けなければ最初の回収で再試行する
+                _log.warning("datafeed_notice_deferred")
         self._ask_submitter = ask_submitter
         self._improve_supervisor = improve_supervisor
         self._plugins_root = plugins_root
@@ -1761,11 +1781,21 @@ class OpsService:
             if self._data_resume is None:
                 raise OpsError(ErrorCode.INVALID_STATE)
             response = self._data_resume(acknowledge)
-            self._guard_event("data_feed", "resume_requested", None)
+            # 受付は新規に記録したときだけ残す。照会・ack の置換は応答と操作監査だけ
+            if response.get("request_outcome", "new") == "new":
+                self._guard_event("data_feed", "resume_requested",
+                                  self._receipt_generation(response))
             return response
 
         return self._mutate(principal, ENDPOINTS["data_resume"],
                             {"acknowledge": acknowledge}, "data", action, deadline=deadline)
+
+    def _receipt_generation(self, response: dict) -> int | None:
+        """受付 event の generation。通知を作る構成は記録時の epoch (非負整数だけ)、そうでなければ None。"""
+        if not self._datafeed_notices:
+            return None
+        epoch = response.get("epoch")
+        return epoch if type(epoch) is int and epoch >= 0 else None
 
     def reset_kill_switch(self, principal: Caller, expected_generation: int, *,
                           deadline: float | None = None) -> dict:
@@ -2078,10 +2108,34 @@ class OpsService:
             self._finish_notices(notices)
         return emitted
 
-    def emit_pending_notices(self, *, improve_enabled: bool) -> None:
-        """起動時と scheduler の tick ごとに、改善通知と kill switch 通知を 1 回の lane 取得で回す。
+    def _datafeed_notices_in_lane(self) -> None:
+        """データの停止・再開待ちの記録を event にする。最初の 1 回 (起動) は先に補完する。
 
-        2 つは別々の try に入れ、改善側の例外や無効設定で kill switch 側を飛ばさない。"""
+        補完と回収は別の try。失敗しても他の通知・状態更新・保護処理を止めず、記録は次の tick で再試行する。"""
+        now = _aware(self._wall_clock()).astimezone(timezone.utc)
+        if not self._datafeed_supplemented:
+            try:
+                notice_sweep.supplement(
+                    self._conn, now, snapshot=self._datafeed_snapshot,
+                    enabled_hint=self._datafeed_built_at)
+                self._datafeed_supplemented = True
+            except Exception:  # noqa: BLE001
+                _log.warning("datafeed_notice_deferred")
+                with contextlib.suppress(Exception):
+                    self._conn.rollback()
+        try:
+            notice_sweep.sweep(self._conn, self.events, now, retries=self._datafeed_retries,
+                               enabled_hint=self._datafeed_built_at)
+        except Exception:  # noqa: BLE001
+            _log.warning("datafeed_notice_deferred")
+            with contextlib.suppress(Exception):
+                self._conn.rollback()
+
+    def emit_pending_notices(self, *, improve_enabled: bool) -> None:
+        """起動時と scheduler の tick ごとに、改善通知・kill switch 通知・データの停止通知を
+        1 回の lane 取得で回す。
+
+        それぞれ別々の try に入れ、1 つの例外や無効設定で他を飛ばさない。"""
         try:
             with self._ops_lane(self._deadline(None)):
                 if improve_enabled:
@@ -2095,6 +2149,8 @@ class OpsService:
                     self._guard_notices_in_lane()
                 except Exception:  # noqa: BLE001
                     _log.warning("guard_notice_deferred")
+                if self._datafeed_notices:
+                    self._datafeed_notices_in_lane()
         except OpsError:
             _log.warning("guard_notice_deferred")
             return  # lane が空かなかった。次の周期に回す

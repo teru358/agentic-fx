@@ -206,3 +206,31 @@ def test_calendar_worker_and_capacity_words_match_the_daemon():
 def test_bot_health_words_match_the_daemon_contract_golden():
     golden = json.loads((ROOT / "tests/fixtures/bot_health_contract.json").read_text(encoding="utf-8"))
     assert _tables()["BOT_HEALTH"] == set(golden["states"])
+
+
+def test_the_web_phase_table_and_the_guidance_text_copy_match_the_daemon_vocabulary():
+    from agentic_fx.datafeed import guidance_text
+    child = (
+        "import json, sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from afx_ops import guidance_text\n"
+        "from afx_ops.web import marks\n"
+        "print(json.dumps({'table': sorted(marks.DATA_PHASES), 'text': sorted(marks.DATA_PHASE_TEXT),"
+        " 'phases': list(guidance_text.PHASES),"
+        " 'pairs': sorted(map(list, guidance_text.PAIRS))}))\n")
+    done = subprocess.run([sys.executable, "-I", "-c", child, str(AFX_OPS)], capture_output=True,
+                          text=True, check=True, timeout=60)
+    seen = json.loads(done.stdout)
+    assert set(seen["table"]) == set(guidance_text.PHASES)
+    assert set(seen["text"]) == set(guidance_text.PHASES)
+    assert seen["phases"] == list(guidance_text.PHASES)
+    assert seen["pairs"] == sorted(map(list, guidance_text.PAIRS))
+
+
+def test_the_afx_ops_guidance_text_is_a_byte_copy_of_the_canonical_module():
+    canon = ROOT / "src/agentic_fx/datafeed/guidance_text.py"
+    copy = AFX_OPS / "afx_ops/guidance_text.py"
+    assert copy.read_bytes() == canon.read_bytes()
+    assert "agentic_fx" not in "\n".join(
+        line for line in canon.read_text(encoding="utf-8").splitlines()
+        if line.startswith(("import ", "from ")))

@@ -25,6 +25,7 @@ from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.cli_surface import render_shell_help
 from agentic_fx.datafeed.outage import format_unprocessed_positions
+from agentic_fx.datafeed.resume_reply import resume_reply
 from agentic_fx.loops import approval_facts
 from agentic_fx.loops.approval_facts import display_text
 from agentic_fx.store import (approvals, backlog, candidate_archives,
@@ -753,11 +754,10 @@ class Commands:
         info = self.outage.gap_summary(now, conn=self.conn)
         unprocessed = info["unprocessed_positions"]
         detail = format_unprocessed_positions(info.get("unprocessed_by_pair", {}))
-        self.outage.request_resume(now, acknowledge=acknowledge, conn=self.conn)
-        return (f"resume 要求を記録しました。次の tick で判定します。"
-               f"未処理の足がある建玉 {unprocessed} 件"
-               + (f" ({detail})" if detail else "")
-               + (" (--acknowledge 指定あり)" if acknowledge else ""))
+        recorded = self.outage.request_resume(now, acknowledge=acknowledge, conn=self.conn)
+        return (resume_reply(recorded["outcome"], recorded["acknowledge"])
+                + f"未処理の足がある建玉 {unprocessed} 件"
+                + (f" ({detail})" if detail else ""))
 
     @staticmethod
     def _metrics_line(prefix: str, metrics: dict | None) -> str:

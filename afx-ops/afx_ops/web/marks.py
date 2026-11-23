@@ -47,6 +47,13 @@ _UNKNOWN: Verdict = (UNKNOWN, UNKNOWN_WORD)
 
 # data (daemon の datafeed outage の state。定義は agentic_fx.datafeed.outage.DATA_STATES の写し)
 DATA_STATES = {"ready": OK, "degraded": WARN, "restricted": WARN}
+# data の案内の phase (定義は agentic_fx.datafeed.guidance_text.PHASES の写し)。停止・制限・待ちは
+# DATA_STATES と同じく warn、読めないものは不明 (正常には倒さない)
+DATA_PHASES = {"ready": OK, "resume_requested": WARN, "resume_rejected": WARN,
+               "awaiting_resume": WARN, "stopped": WARN, "restricted": WARN, "unknown": UNKNOWN}
+DATA_PHASE_TEXT = {"ready": "停止なし", "resume_requested": "再開要求の判定待ち",
+                   "resume_rejected": "再開要求が拒否", "awaiting_resume": "再開操作待ち",
+                   "stopped": "停止中", "restricted": "制限中", "unknown": UNKNOWN_WORD}
 # bot の gateway health・calendar・worker・容量の語彙は、この表のキーが唯一の定義 (render が写さず導く)
 BOT_HEALTH = {"healthy": OK, "unhealthy": DANGER, "stalled": DANGER, "stale": WARN, "unknown": WARN,
               "not_configured": NEUTRAL, "permanent-failure": DANGER}
@@ -139,3 +146,9 @@ def classify_autopilot(raw: object) -> Verdict:
 
 def classify_data(raw: object) -> Verdict:
     return classify_word(DATA_STATES, raw.get("state") if type(raw) is dict else None)
+
+
+def classify_data_phase(raw: object) -> Verdict:
+    """案内の phase の印。表に無い語・型違いは不明 (ready にしない)。"""
+    return classify_word(DATA_PHASES, raw.get("phase") if type(raw) is dict else None,
+                         DATA_PHASE_TEXT)

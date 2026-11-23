@@ -33,6 +33,8 @@ import httpcore
 import httpx
 
 from agentic_fx.core import improve_repeat as ir
+from agentic_fx.datafeed import guidance_text
+from agentic_fx.datafeed.resume_reply import OUTCOMES, resume_reply
 from agentic_fx.core.kill_switch_words import KILL_SWITCH_RESET_WARNING
 from agentic_fx.core.display_time import (
     PRECISION_MINUTE, PRECISION_SECOND, TIME_FIELDS, convert_activity_line,
@@ -779,6 +781,7 @@ def format_status(data: dict) -> str:
     feed = data.get("data") if isinstance(data.get("data"), dict) else None
     if feed is not None:
         lines.append(f"data: {display_text(feed.get('state'))}")
+        lines.extend(guidance_text.guidance_lines(feed) or ())
     references = _references_line(data.get("references"))
     if references is not None:
         lines.append(references)
@@ -1901,10 +1904,11 @@ class Runner:
         if reply.data is None:
             raise _fail(reply)
         unprocessed = reply.data.get("unprocessed_positions")
-        self.say("resume 要求を記録しました。次の tick で判定します。"
+        outcome = reply.data.get("request_outcome")
+        effective = reply.data.get("acknowledge") is True if outcome else acknowledge
+        self.say(resume_reply(outcome if outcome in OUTCOMES else "new", effective)
                  + (f"未処理の足がある建玉 {_num(unprocessed)} 件" if unprocessed is not None
-                    else "")
-                 + (" (--acknowledge 指定あり)" if acknowledge else ""))
+                    else ""))
         return RC_OK
 
     def _op_job_cancel(self, job_id: str, *, terminal: Terminal) -> int:

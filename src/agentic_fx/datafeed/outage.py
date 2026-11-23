@@ -10,7 +10,9 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+import sqlite3
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from agentic_fx.activity import Category
@@ -18,10 +20,69 @@ from agentic_fx.core import display_time
 from agentic_fx.core.executor import _EXPOSURE
 from agentic_fx.core import market_hours
 from agentic_fx.core.timeutil import as_utc
+from agentic_fx.datafeed import notice_rules
+from agentic_fx.datafeed.guidance_text import UNKNOWN_COUNT
 from agentic_fx.store import ohlcv, orders
 
 # 永続状態機械の取りうる state。web の状態の印の割当表 (afx-ops) はこの語彙を写して持ち、test が突き合わせる
 DATA_STATES = ("ready", "restricted", "degraded")
+
+# 通知の記録の状態語彙。Discord の本文は afx-ops 側が固定語で描く
+NOTICE_STATES = ("stopped", "awaiting_resume", "resume_accepted",
+                 "resume_rejected", "resume_already_ready", "resumed")
+# 要求の終端結果。consume 時に state と同じ transaction で残す
+RESUME_RESULTS = ("accepted", "rejected_unprocessed", "rejected_watermark", "already_ready")
+
+log = logging.getLogger(__name__)
+
+_PENDING_NOTICE_LIMIT = 64
+
+
+def unknown_guidance() -> dict:
+    """案内を読めないときの値 (state は含めない)。件数はゼロにせず unknown。"""
+    return {"phase": "unknown", "next_action": "check_status",
+            "unprocessed_positions": UNKNOWN_COUNT, "resume_last_result": None,
+            "resume_last_result_at": None, "auto_resume_possible": False}
+
+
+def resume_guidance(*, observe_failed: bool, state: str | None, request_pending: bool,
+                    last_result: str | None, awaiting_mark: bool,
+                    unprocessed: int | None) -> tuple[str, str]:
+    """status に出す (phase, next_action)。上の行ほど優先する真理値表で、この 1 関数だけが決める。
+
+    `state` が None は読取り失敗、`unprocessed` が None は件数を読めないこと (ゼロとみなさない)。
+    `last_result` は現在の epoch の直近の終端結果、`awaiting_mark` は同 epoch に再開待ちを
+    知らせた印。件数は ack の要否を決める行でだけ使い、読めなければ不明に倒す。
+    最新の watermark 判定は resume 消費時のもので、ここで健全性の判定はしない。
+    """
+    unknown = ("unknown", "check_status")
+    if observe_failed or state is None:
+        return unknown
+    if request_pending:
+        return ("resume_requested", "wait_tick")
+    if state == "ready":
+        return ("ready", "none")
+    if state not in ("restricted", "degraded"):
+        return unknown
+    if last_result == "rejected_watermark":
+        return ("resume_rejected", "restore_source")
+    if last_result == "rejected_unprocessed":
+        if unprocessed is None:
+            return unknown
+        return ("resume_rejected", "resume_with_ack" if unprocessed else "resume")
+    if state == "degraded":
+        if awaiting_mark:
+            if unprocessed is None:
+                return unknown
+            return ("awaiting_resume", "resume_with_ack" if unprocessed else "resume")
+        return ("stopped", "restore_source")
+    if not awaiting_mark:
+        return ("restricted", "wait_tick")
+    return unknown
+
+
+class _RequestChanged(Exception):
+    """読んだ後に要求が置き換えられた。判定は捨て、次の tick が新しい要求を判定する。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +136,7 @@ class _Outcome:
     attempt_ok: dict
     problem_streak: int
     unconfirmed: frozenset
+    notices: list = field(default_factory=list)
 
 
 def _iso(dt: datetime) -> str:
@@ -149,6 +211,9 @@ class OutageStateMachine:
         # non-ready になるのを避けるため、この印があるときだけ入口で片付け直す
         # (呼び出し元の transaction には印が立たず、従来どおり拒否する)。
         self._own_transaction_left_open = False
+        # 記録に失敗した通知の保留 (epoch, 発生時刻, entries)。次の tick の冒頭で再試行する。
+        # プロセスが落ちれば消える (state commit 後の crash と同じ限界)
+        self._pending_notices: list[tuple[int, datetime, list[tuple[str, str]]]] = []
 
     # ---- public -------------------------------------------------------
 
@@ -208,10 +273,66 @@ class OutageStateMachine:
             "pending_human_confirmation": row.get("pending_human_confirmation", 0),
             "resume_requested_at": row.get("resume_requested_at"),
             "resume_acknowledge": row.get("resume_acknowledge", 0),
+            "resume_last_result": row.get("resume_last_result"),
+            "resume_last_result_at": row.get("resume_last_result_at"),
             "unprocessed_positions": self._unprocessed_position_count(now, epoch, conn=conn),
             "unprocessed_by_pair": self._unprocessed_positions_by_pair(now, epoch, conn=conn),
             "gap_starts": gaps,
         }
+
+    def guidance_snapshot(self, now: datetime, *, conn=None) -> dict:
+        """API の status `data` に足す案内の値。読み取り専用 (行を作らない)。
+
+        state・phase・次の操作は 1 回読んだ同じ行から作る。未処理建玉数は別の表への
+        別の読取りで、行の読取りとの間に tick が遷移すれば 1 回の表示でずれ得る
+        (ack の要否は人が建玉を確認してから決める前提)。state は `state_from` と同じ値
+        (観測の保存に失敗中は degraded)。行が読めないときは state を含めない
+        (呼び出し側が自分の読みに戻す)。件数は ready の行では数えず、読めなければ
+        "unknown" を返し、どちらもゼロとはみなさない。`conn` は `status()` と同じ意味で、
+        API thread は自分の読取り接続を渡す。
+        """
+        now = as_utc(now)
+        try:
+            row = self._load_row(conn=conn)
+        except Exception:  # noqa: BLE001 — 読めないものは不明として返す
+            return unknown_guidance()
+        epoch = row.get("epoch", 0)
+        result = row.get("resume_last_result")
+        state = row.get("state", "ready")
+        unprocessed: int | None = None
+        if state in ("restricted", "degraded") or result in ("rejected_watermark",
+                                                            "rejected_unprocessed"):
+            try:
+                unprocessed = self._unprocessed_position_count(now, epoch, conn=conn)
+            except Exception:  # noqa: BLE001 — 読めない件数をゼロにしない
+                unprocessed = None
+        marked = row.get("recovered_notified_epoch") == epoch
+        phase, action = resume_guidance(
+            observe_failed=self._observe_failed, state=state,
+            request_pending=row.get("resume_requested_at") is not None,
+            last_result=result, awaiting_mark=marked, unprocessed=unprocessed)
+        return {"state": "degraded" if self._observe_failed else row.get("state", "ready"),
+                "phase": phase, "next_action": action,
+                "unprocessed_positions": UNKNOWN_COUNT if unprocessed is None else unprocessed,
+                "resume_last_result": result,
+                "resume_last_result_at": row.get("resume_last_result_at"),
+                "auto_resume_possible": self._may_resume_unattended(row, conn)}
+
+    def _may_resume_unattended(self, row: dict, conn) -> bool:
+        """停止中の epoch が、建玉が無く pending も無く自動復帰が有効で、人の操作なしに
+        戻り得るか。確認できた値だけで真にする: pending は整数 0、設定は厳密な True、
+        建玉の読取りは空の list。欠落・型違い・読取り失敗は False (戻るとは言わない)。"""
+        if row.get("state") != "degraded" or self.auto_resume_when_flat is not True:
+            return False
+        pending = row.get("pending_human_confirmation")
+        if type(pending) is not int or pending != 0:
+            return False
+        try:
+            c = conn if conn is not None else self.conn
+            exposure = orders.list_by_status(c, *_EXPOSURE)
+        except Exception:  # noqa: BLE001 — 読めないものは戻るとは言わない
+            return False
+        return type(exposure) is list and not exposure
 
     def observe(self, now: datetime, report: IngestTickReport) -> str:
         """1 tick 分の観測を反映し、遷移後の `state` を返す。
@@ -233,6 +354,9 @@ class OutageStateMachine:
             self._observe_failed = True
             raise
         self._observe_failed = False
+        # 入口の検査と自分の transaction の commit を通った後。呼び出し元の
+        # transaction には触らず、観測の遷移も遅らせない
+        self._retry_pending_notices()
         if isinstance(outcome, str):
             return outcome
         # commit 済み。プロセス内の記録は commit が成功した後にだけ進める
@@ -240,6 +364,10 @@ class OutageStateMachine:
         self._last_attempt_ok = outcome.attempt_ok
         self._problem_streak = outcome.problem_streak
         state, epoch = outcome.state, outcome.epoch
+        # 通知の記録は activity の書込みより先に。activity の例外で記録を飛ばさない
+        self._record_notices(epoch, now, outcome.notices)
+        if state == "degraded":
+            self._record_timed_stop(epoch, now)
         for event, summary in outcome.activities:
             self._write_activity(event, summary)
         if state == "degraded":
@@ -337,6 +465,16 @@ class OutageStateMachine:
         pending = row.get("pending_human_confirmation", 0)
         recovered_notified_epoch = row.get("recovered_notified_epoch")
         activities: list[tuple[str, str]] = []
+        notices: list[tuple[str, str]] = []
+        request_pending = row.get("resume_requested_at") is not None
+        # この epoch で停止または待ちを知らせる対象になったか (復帰の通知の条件)。
+        # confirmed と待ちの印は tick の最初の値。時間条件の停止の記録は必要なときだけ読む
+        known_stop = bool(confirmed) or recovered_notified_epoch == epoch
+
+        def noticed() -> bool:
+            return (known_stop or self._stop_recorded(epoch)
+                    or any(e == epoch and ("stopped", "") in items
+                           for e, _t, items in self._pending_notices))
         opened = False
 
         def degrade() -> None:
@@ -396,14 +534,17 @@ class OutageStateMachine:
                         restricted_since = None
                         deadline = None
                         activities.append(recovered_activity())
+                        if noticed():
+                            notices.append(("resumed", ""))
                     else:
                         # 復帰はしないが健全に戻っている — 人の resume 待ちとして
                         # 同じ tick で知らせる。
                         degrade()
                         activities.append(degraded_activity())
-                        if recovered_notified_epoch != epoch:
+                        if recovered_notified_epoch != epoch and not request_pending:
                             recovered_notified_epoch = epoch
                             activities.append(("datafeed_recovered_awaiting_resume", f"epoch={epoch}"))
+                            notices.append(("awaiting_resume", ""))
             else:
                 ready_streak = 0
         elif state == "degraded":
@@ -416,22 +557,33 @@ class OutageStateMachine:
                     restricted_since = None
                     deadline = None
                     activities.append(recovered_activity())
+                    if noticed():
+                        notices.append(("resumed", ""))
             else:
                 ready_streak = 0
-                if healthy and (not flat or not self.auto_resume_when_flat) and recovered_notified_epoch != epoch:
+                # 自動 ready の条件 (flat・自動復帰有効・pending なし) が揃わないまま
+                # 健全に戻ったら、人の再開待ちとして一度だけ知らせる。要求中は促さない
+                if (healthy and not request_pending and recovered_notified_epoch != epoch
+                        and (not flat or not self.auto_resume_when_flat or pending)):
                     recovered_notified_epoch = epoch
                     activities.append(("datafeed_recovered_awaiting_resume", f"epoch={epoch}"))
+                    notices.append(("awaiting_resume", ""))
 
         if immediate or stalled:
             problem_streak += 1
             if state == "degraded" and not confirmed and problem_streak >= 2:
                 confirmed = 1
                 activities.append(("data_outage_degraded", f"epoch={epoch} unprocessed_positions={self._unprocessed_position_count(now, epoch)}"))
+                if recovered_notified_epoch != epoch:
+                    notices.append(("stopped", ""))
         else:
             problem_streak = 0
 
         if opened:
             self._open_gaps(epoch, now, watermarks)
+            self.conn.execute(
+                "UPDATE datafeed_outage_state SET resume_last_result=NULL, "
+                "resume_last_result_at=NULL, resume_last_request_at=NULL WHERE id=1")
         self._save_state(state=state, epoch=epoch, confirmed=confirmed,
                          entered_degraded_at=entered,
                          restricted_since=restricted_since,
@@ -441,16 +593,26 @@ class OutageStateMachine:
                          ready_streak=ready_streak, updated_at=_iso(now))
         return _Outcome(state=state, epoch=epoch, activities=activities,
                         attempt_ok=attempt_ok, problem_streak=problem_streak,
-                        unconfirmed=unconfirmed)
+                        unconfirmed=unconfirmed, notices=notices)
 
     def request_resume(self, now: datetime, *, acknowledge: bool = False,
-                       conn=None) -> None:
+                       conn=None) -> dict:
         """手動復旧コマンドから呼ばれる。state は直接書き換えず、要求を
         永続化するだけ — 呼び出し元は core の書込みロックを取らない別スレッド
         (人間向けシェル) を想定する。実際の判定・遷移は次 tick の
         `observe()` (単一のロック区間) の中で行う。これにより、シェル実行と
         scheduler tick の間に競合があっても、判定は常に commit 直後の
         report/watermark を使って行われる。
+
+        未消費の要求の有無を read→判定→更新の 1 つの書込み transaction で決め、
+        結果を返す。``outcome`` は次のいずれか。
+
+        - ``new``: 未消費の要求が無く、新しい要求時刻で記録した。
+        - ``existing``: 未消費の要求があり、同じ ack、または ack ありの要求に対する
+          ack なし。要求時刻と ack は変えない (ack を取り消さない)。
+        - ``replaced``: ack なしの要求を ack ありの新しい要求へ置き換えた。
+
+        ``epoch`` は記録時の epoch、``acknowledge`` は要求が持つ有効な ack。
 
         `conn` を渡すと `self.conn` (scheduler tick 側の接続) の代わりに
         その接続で書く — `Commands` は自身の接続 (`conn_shell`) を渡し、
@@ -460,11 +622,41 @@ class OutageStateMachine:
         now = as_utc(now)
         c = conn if conn is not None else self.conn
         with c:
-            self._ensure_row(now, conn=c)
+            if not c.in_transaction:
+                c.execute("BEGIN IMMEDIATE")
+            self._insert_row_if_missing(c, now)
+            row = dict(c.execute(
+                "SELECT * FROM datafeed_outage_state WHERE id=1").fetchone())
+            current = row.get("resume_requested_at")
+            current_ack = bool(row.get("resume_acknowledge"))
+            epoch = row["epoch"]
+            if current is not None and (current_ack or not acknowledge):
+                return {"outcome": "existing", "epoch": epoch,
+                        "acknowledge": current_ack}
+            stamp = self._unused_request_key(c, now, epoch, row, current)
             c.execute(
                 "UPDATE datafeed_outage_state SET resume_requested_at=?, "
                 "resume_acknowledge=? WHERE id=1",
-                (_iso(now), 1 if acknowledge else 0))
+                (stamp, 1 if acknowledge else 0))
+            return {"outcome": "new" if current is None else "replaced",
+                    "epoch": epoch, "acknowledge": bool(acknowledge)}
+
+    @staticmethod
+    def _unused_request_key(c, now: datetime, epoch: int, row: dict,
+                            current: str | None) -> str:
+        """要求時刻は終端結果の対応キーにもなるので、既に使った値と衝突させない。"""
+        used = {current, row.get("resume_last_request_at")}
+        try:
+            used.update(key for (key,) in c.execute(
+                "SELECT request_key FROM datafeed_outage_notices WHERE request_key<>''"))
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc):
+                raise
+            # 通知の表が無い DB でも要求の記録は止めない
+        stamp = now
+        while _iso(stamp) in used:
+            stamp += timedelta(microseconds=1)
+        return _iso(stamp)
 
     # ---- internal: persistence ----------------------------------------
 
@@ -596,15 +788,23 @@ class OutageStateMachine:
 
     def _consume_resume_request(self, now: datetime, state: str, epoch: int,
                                 unconfirmed_keys: frozenset) -> str:
+        try:
+            return self._consume_read_request(now, state, epoch, unconfirmed_keys)
+        except _RequestChanged:
+            return state
+
+    def _consume_read_request(self, now: datetime, state: str, epoch: int,
+                              unconfirmed_keys: frozenset) -> str:
         row = self._load_row()
         requested_at = row.get("resume_requested_at")
         if requested_at is None:
             return state
         acknowledge = bool(row.get("resume_acknowledge"))
         if state == "ready":
-            # 既に ready — 要求は無意味なので消費して終える。
+            # 既に ready — 要求は無意味なので消費して終える。結果は残す。
             with self.conn:
-                self._clear_resume_request()
+                self._finish_resume_request(now, requested_at, acknowledge, "already_ready")
+            self._record_notices(epoch, now, [("resume_already_ready", requested_at)])
             return state
         watermark_healthy = not unconfirmed_keys
         unprocessed_by_pair = self._unprocessed_positions_by_pair(now, epoch)
@@ -612,8 +812,7 @@ class OutageStateMachine:
         detail = format_unprocessed_positions(unprocessed_by_pair)
         if watermark_healthy and (unprocessed == 0 or acknowledge):
             state = "ready"
-            self._last_unprocessed_by_pair = None
-            # state の更新と要求の消去は 1 つの transaction。途中で落ちたら
+            # state の更新と要求の消去・結果の記録は 1 つの transaction。途中で落ちたら
             # どちらも元のまま残り、次 tick が同じ要求を判定し直す。
             with self.conn:
                 self._save_state(state=state, epoch=epoch, confirmed=0,
@@ -624,7 +823,10 @@ class OutageStateMachine:
                                  recovered_notified_epoch=row.get("recovered_notified_epoch"),
                                  ready_streak=0,
                                  updated_at=_iso(now))
-                self._clear_resume_request()
+                self._finish_resume_request(now, requested_at, acknowledge, "accepted")
+            self._last_unprocessed_by_pair = None
+            self._record_notices(epoch, now, [("resume_accepted", requested_at),
+                                              ("resumed", "")])
             self._write_activity(
                 "data_resume_accepted",
                 f"epoch={epoch} unprocessed_positions={unprocessed}"
@@ -642,17 +844,131 @@ class OutageStateMachine:
                 reason.append(
                     f"unprocessed_positions={unprocessed}"
                     + (f" ({detail})" if detail else ""))
+            # 両方に該当するときは watermark の拒否を優先する
+            result = "rejected_watermark" if not watermark_healthy else "rejected_unprocessed"
             with self.conn:
-                self._clear_resume_request()
+                self._finish_resume_request(now, requested_at, acknowledge, result)
+            self._record_notices(epoch, now, [("resume_rejected", requested_at)])
             self._write_activity(
                 "data_resume_rejected", f"epoch={epoch} reason={','.join(reason)}")
         return state
+
+    def _finish_resume_request(self, now: datetime, requested_at: str,
+                               acknowledge: bool, result: str) -> None:
+        """呼び出し側の `with self.conn:` の中で使う (自前では commit しない)。
+        要求を消費し、その終端結果・判定時刻・対象の要求時刻を残す。
+
+        判定の根拠にした要求が今も同じ値のときだけ消費する。読んだ後に置き換えられて
+        いたら例外で transaction ごと戻し (state の保存も結果の記録も残さない)、
+        次の tick が置換後の要求を判定する。"""
+        cur = self.conn.execute(
+            "UPDATE datafeed_outage_state SET resume_last_result=?, "
+            "resume_last_result_at=?, resume_last_request_at=? "
+            "WHERE id=1 AND resume_requested_at=? AND resume_acknowledge=?",
+            (result, _iso(now), requested_at, requested_at, 1 if acknowledge else 0))
+        if cur.rowcount != 1:
+            raise _RequestChanged()
+        self._clear_resume_request()
 
     def _clear_resume_request(self) -> None:
         """呼び出し側の `with self.conn:` の中で使う (自前では commit しない)。"""
         self.conn.execute(
             "UPDATE datafeed_outage_state SET resume_requested_at=NULL, "
             "resume_acknowledge=0 WHERE id=1")
+
+    # ---- internal: notice records --------------------------------------
+
+    def _record_notices(self, epoch: int, now: datetime,
+                        entries: list[tuple[str, str]]) -> None:
+        """通知の記録を state/gap と要求消費の transaction の外で書く。
+
+        失敗しても状態更新や保護処理を止めない (例外は握って固定語をログに残す)。
+        失敗した分はメモリに保留し、次の tick の冒頭で同じ書込みを再試行する。
+        書くのは固定語・整数・要求時刻だけ。同じ鍵は `ON CONFLICT DO NOTHING` で重複させない。
+        """
+        if entries and not self._write_notices(epoch, now, entries):
+            # 保留に同じ (epoch, 状態, 要求キー) があれば重ねない。書込みが続けて失敗する間に
+            # 同じ記録が積まれて、保留の上限で別の結果の記録を押し出さないため
+            queued = {(e, kind, key) for e, _t, items in self._pending_notices
+                      for kind, key in items}
+            fresh = [(kind, key) for kind, key in entries if (epoch, kind, key) not in queued]
+            if fresh:
+                self._pending_notices.append((epoch, now, fresh))
+                self._trim_pending_notices()
+
+    def _stop_recorded(self, epoch: int) -> bool:
+        """この epoch の停止の記録があるか。読めなければ無いとみなす (観測を止めない)。"""
+        try:
+            return self.conn.execute(
+                "SELECT 1 FROM datafeed_outage_notices WHERE epoch=? AND notice_state='stopped'",
+                (epoch,)).fetchone() is not None
+        except Exception:  # noqa: BLE001 - 通知の記録が読めなくても観測は続ける
+            return False
+
+    def _record_timed_stop(self, epoch: int, now: datetime) -> None:
+        """連続の問題観測 (confirmed) に届かない停止を、開場時間の経過で一度だけ記録する。
+
+        同じ epoch に待ちの印・停止か待ちの記録があれば何もしない。再開の要求が未消費の間は、
+        人が操作中なので知らせない。要求への結果が出ていれば、その判定時刻から開場時間を
+        数え直す (この epoch でまだ停止を知らせていないときだけ。知らせた後は結果の通知で足りる)。開場中の観測 tick の commit 後だけで呼ぶ。停止の判定・遷移は変えず、失敗しても例外を出さない。"""
+        try:
+            row = self._load_row()
+            if row.get("state") != "degraded" or row.get("recovered_notified_epoch") == epoch:
+                return
+            if row.get("resume_requested_at") is not None:
+                return
+            if self.conn.execute(
+                    "SELECT 1 FROM datafeed_outage_notices WHERE epoch=? "
+                    "AND notice_state IN ('stopped', 'awaiting_resume')",
+                    (epoch,)).fetchone() is not None:
+                return
+            start = notice_rules.timer_start(row.get("entered_degraded_at"),
+                                             row.get("resume_last_result_at"))
+            if not notice_rules.stop_after_open_minutes(start, now):
+                return
+        except Exception:  # noqa: BLE001 - 通知の判断が読めなくても観測は続ける
+            log.warning("datafeed_notice_deferred")
+            return
+        self._record_notices(epoch, now, [("stopped", "")])
+
+    def _write_notices(self, epoch: int, now: datetime,
+                       entries: list[tuple[str, str]]) -> bool:
+        try:
+            with self.conn:
+                for notice_state, request_key in entries:
+                    self.conn.execute(
+                        "INSERT INTO datafeed_outage_notices "
+                        "(epoch, notice_state, request_key, occurred_at, event_id) "
+                        "VALUES (?, ?, ?, ?, NULL) "
+                        "ON CONFLICT (epoch, notice_state, request_key) DO NOTHING",
+                        (epoch, notice_state, request_key, _iso(now)))
+            return True
+        except Exception:  # noqa: BLE001 - 通知の記録の失敗で状態更新を止めない
+            log.warning("datafeed_notice_deferred")
+            try:
+                if self.conn.in_transaction:
+                    self.conn.rollback()
+            except Exception:  # noqa: BLE001
+                log.warning("datafeed_notice_deferred")
+            return False
+
+    def _retry_pending_notices(self) -> None:
+        """保留を古い順に書き直す。最初の失敗で止め、残りは保留に残す
+        (lock 待ちを tick あたり保留分の 1 回に抑える)。"""
+        pending, self._pending_notices = self._pending_notices, []
+        for index, item in enumerate(pending):
+            if not self._write_notices(*item):
+                self._pending_notices = pending[index:] + self._pending_notices
+                break
+        self._trim_pending_notices()
+
+    def _trim_pending_notices(self) -> None:
+        """保留は件数の上限つき。超えたら古い順に捨てる。"""
+        total = sum(len(entries) for _e, _t, entries in self._pending_notices)
+        while total > _PENDING_NOTICE_LIMIT and self._pending_notices:
+            total -= len(self._pending_notices[0][2])
+            del self._pending_notices[0]
+            log.warning("datafeed_notice_dropped")
 
     # ---- internal: activity --------------------------------------------
 
