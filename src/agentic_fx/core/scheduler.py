@@ -151,6 +151,8 @@ class Scheduler:
         # scheduler の DB 書込み要求フラグ。tick の間、立て続ける。
         self.writer_admission = writer_admission
         self._daily_report: Callable[[datetime], None] | None = None
+        # 週次の確定の起動。毎 tick 呼ぶだけで、重い処理は呼ばれた側の専用 thread が行う
+        self._weekly_review: Callable[[datetime], None] | None = None
         # 日次 report は scheduler thread で同期実行せず、専用の 1 本の thread に渡す
         self._report_queue: collections.deque = collections.deque()
         self._report_lock = threading.Lock()
@@ -358,6 +360,7 @@ class Scheduler:
                 pending.extend(self._run_hooks(now))
                 with self._writer_scope():
                     pending.extend(self._daily_report_pending(now))
+                self._weekly_review_poll(now)
             finally:
                 with self._writer_scope():
                     self._retry_dirty_cron_cursor(now)
@@ -466,6 +469,20 @@ class Scheduler:
         もう一度呼ぶ。callback の失敗は技術ログと activity に残る。
         """
         self._daily_report = callback
+
+    def register_weekly_review(self, poll: Callable[[datetime], None]) -> None:
+        """週次の確定の起動 hook。毎 tick `poll(now)` を呼ぶ。`poll` は待たずに返ること
+        (日次 report の hook とは独立で、発注の tick を塞がない)。"""
+        self._weekly_review = poll
+
+    def _weekly_review_poll(self, now: datetime) -> None:
+        poll = self._weekly_review
+        if poll is None or self._stopping():
+            return
+        try:
+            poll(now)
+        except Exception as e:  # noqa: BLE001 — 週次の都合で tick を止めない
+            _log.warning("weekly review poll failed: %s", safe_error_text(e))
 
     @staticmethod
     def latest_trading_close(now: datetime) -> datetime | None:

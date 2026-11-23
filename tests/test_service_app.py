@@ -2527,6 +2527,54 @@ def test_run_service_joins_the_daily_report_thread_and_keeps_resources_while_it_
     assert {"conn_core", "conn_signal", "conn_admission"} <= closed["busy"]
 
 
+def test_run_service_keeps_resources_while_the_weekly_review_thread_runs(tmp_path):
+    """週次の確定の thread が join の時間内に終わらなければ、その thread が使う資源を閉じない。"""
+    app = _seam_app(tmp_path, FakeRunner([]))
+    joins: list = []
+    app.weekly_review_tick = SimpleNamespace(
+        join=lambda timeout=None: (joins.append(timeout), False)[1])
+    closed: dict = {}
+    original_close = app.close
+
+    def spy_close(*, busy_resources=frozenset()):
+        closed["busy"] = busy_resources
+        return original_close(busy_resources=busy_resources)
+
+    app.close = spy_close
+    stop_event = threading.Event()
+    stop_event.set()
+    with _no_real_network(), \
+         patch("agentic_fx.service.build_app", return_value=app), \
+         patch("agentic_fx.service.signal.signal"):
+        rc = run_service(tmp_path, daemon=True, _stop_event=stop_event)
+    assert rc == 1
+    act = (tmp_path / "logs" / "activity.log").read_text(encoding="utf-8")
+    assert "shutdown_timeout" in act
+    assert len(joins) == 1 and joins[0] is not None
+    assert {"conn_core", "conn_signal", "conn_admission", "instance_lock"} <= closed["busy"]
+
+
+def test_run_service_closes_normally_when_the_weekly_review_thread_has_stopped(tmp_path):
+    app = _seam_app(tmp_path, FakeRunner([]))
+    app.weekly_review_tick = SimpleNamespace(join=lambda timeout=None: True)
+    closed: dict = {}
+    original_close = app.close
+
+    def spy_close(*, busy_resources=frozenset()):
+        closed["busy"] = busy_resources
+        return original_close(busy_resources=busy_resources)
+
+    app.close = spy_close
+    stop_event = threading.Event()
+    stop_event.set()
+    with _no_real_network(), \
+         patch("agentic_fx.service.build_app", return_value=app), \
+         patch("agentic_fx.service.signal.signal"):
+        rc = run_service(tmp_path, daemon=True, _stop_event=stop_event)
+    assert "conn_core" not in closed["busy"]
+    assert rc == 0
+
+
 def test_run_service_closes_normally_when_the_daily_report_thread_has_stopped(tmp_path):
     app = _seam_app(tmp_path, FakeRunner([]))
     joins: list = []
