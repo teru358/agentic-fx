@@ -74,6 +74,21 @@ def test_rag_rpc_proxy_search_news_round_trip():
     assert sent["args"] == {"query": "usdjpy", "n": 5}
 
 
+def test_rag_rpc_proxy_returns_added_at_unchanged():
+    from agentic_fx.core.mission_protocol import SeqTracker
+
+    hit = {"url": "u", "title": "t", "body": "b", "source_name": "s",
+           "added_at": "2026-08-04T12:00:00+00:00"}
+
+    def read_fn():
+        return {"type": "tool_rpc_result", "seq": 1, "rpc_id": "1", "ok": True,
+                "result": [hit]}
+
+    proxy = mission_worker._RagRpcProxy(lambda frame: None, read_fn,
+                                        SeqTracker(), SeqTracker())
+    assert proxy.search_news("usdjpy") == [hit]
+
+
 def test_rag_rpc_proxy_shares_out_seq_with_other_child_to_parent_frames():
     """CR-3 の直接回帰ピン: `main()` が `ready` (seq=1) を送出済みの状態を
     模して `out_seq` を 1 個進めてから `_RagRpcProxy` に渡すと、

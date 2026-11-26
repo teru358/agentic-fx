@@ -1233,7 +1233,10 @@ def main(*, build_runner: Callable[..., Any] | None = None) -> None:
                     "type": "result",
                     "status": result.status, "output": result.output,
                     "reason": result.reason,
-                    "market_tool_calls": dict(market_tool_calls)})
+                    "market_tool_calls": dict(market_tool_calls),
+                    **({"turn_summary": result.turn_summary}
+                       if getattr(result, "turn_summary", None) is not None
+                       else {})})
             except Exception as exc:  # noqa: BLE001 — 必ず result を送る
                 _send_frame(protocol_out, out_seq, {
                     "type": "result", "status": "failed", "output": None,

@@ -21,6 +21,7 @@ import httpx
 import jsonschema
 
 from agentic_fx._safe_error import safe_error_text, safe_text
+from agentic_fx.runners import turn_budget
 from agentic_fx.runners.base import TOOL_BUDGET_ABORT_PREFIX, AgentRunner, Mission, MissionResult
 from agentic_fx.runners.response_parser import ParseError, parse_json_output
 from agentic_fx.tools.registry import ToolRegistry
@@ -142,11 +143,53 @@ class LocalRunner(AgentRunner):
                 _log.warning("on_message callback raised", exc_info=True)
 
     def run(self, mission: Mission) -> MissionResult:
+        if mission.turn_policy is None:
+            return self._run_loop(mission, None)
+        if mission.max_turns < turn_budget.MIN_TURNS:
+            raise ValueError(
+                f"turn_policy requires max_turns >= {turn_budget.MIN_TURNS}, "
+                f"got {mission.max_turns}")
+        guard = turn_budget.TurnGuard(mission.turn_policy, mission.max_turns)
+        result = self._run_loop(mission, guard)
+        result.turn_summary = guard.summary(result.status, result.reason)
+        return result
+
+    def _execute(self, name, args, allowed, guard):
+        if guard is None:
+            return self._registry.execute(name, args, allowed)
+        return self._registry.execute(name, args, allowed, guard=guard)
+
+    def _run_loop(self, mission: Mission,
+                  guard: "turn_budget.TurnGuard | None") -> MissionResult:
         deadline = self._time() + mission.timeout_sec
         messages: list[dict] = []
-        self._sink(messages, {"role": "user", "content": mission.prompt})
+        prompt = mission.prompt
+        if guard is not None:
+            prompt += turn_budget.turn_notice(guard.policy, mission.max_turns)
+        self._sink(messages, {"role": "user", "content": prompt})
         tools = self._registry.openai_tools(mission.tools)
         parse_retries = schema_retries = 0
+        # policy 有効時は次の要求の直前に 1 つの user メッセージへまとめる
+        # (連続する user 行を作らない)。無効時は従来どおり即時に追加する。
+        pending: list[str] = []
+
+        def queue_user(text: str) -> None:
+            if guard is None:
+                self._sink(messages, {"role": "user", "content": text})
+            else:
+                pending.append(text)
+
+        def no_answer(status: str) -> MissionResult:
+            """有効な回答なしの終端 (修復上限超過・最終回の未回答)。"""
+            if guard is None:
+                return _finish(status)
+            if (guard.policy == turn_budget.POLICY_SIGNAL
+                    and guard.search_unavailable):
+                return _finish("failed",
+                               reason=turn_budget.REASON_SEARCH_UNAVAILABLE)
+            return _finish(status, reason=(
+                turn_budget.REASON_FINAL_ANSWER_MISSING
+                if guard.final_entered else None))
 
         def timed_out() -> bool:
             return self._time() >= deadline
@@ -172,12 +215,24 @@ class LocalRunner(AgentRunner):
             remaining = deadline - self._time()
             if remaining <= 0:
                 return _finish("timeout")
+            final_stage = False
+            if guard is not None:
+                entering_final = not guard.final_entered
+                guard.begin_request(_turn + 1)
+                final_stage = guard.final_stage
+                if final_stage and entering_final:
+                    pending.append(turn_budget.switch_text(mission.output_schema))
+                if pending:
+                    self._sink(messages, {"role": "user",
+                                          "content": "\n\n".join(pending)})
+                    pending.clear()
+            body = {"model": self._model, "messages": messages}
+            if not final_stage:
+                body.update({"tools": tools, "tool_choice": "auto"})
             try:
                 resp = self._client.post(
                     f"{self._base_url}/chat/completions",
-                    json={"model": self._model, "messages": messages,
-                          "tools": tools, "tool_choice": "auto"},
-                    timeout=remaining)
+                    json=body, timeout=remaining)
                 resp.raise_for_status()
             except httpx.TimeoutException:
                 return MissionResult("timeout", None, messages)
@@ -220,6 +275,11 @@ class LocalRunner(AgentRunner):
                                  len(normalized_msg["tool_calls"]),
                                  _MAX_TOOL_CALLS_PER_TURN)
                     return _finish("failed")
+                if final_stage:
+                    if not all(_valid_call_shape(tc)
+                               for tc in normalized_msg["tool_calls"]):
+                        _log.warning("tool_call shape validation failed")
+                        return _finish("failed")
                 for tc in normalized_msg["tool_calls"]:
                     if timed_out():
                         return _finish("timeout")
@@ -244,10 +304,14 @@ class LocalRunner(AgentRunner):
                             args_str = "{}"
                         if not isinstance(args_str, str):
                             raise TypeError("arguments is not a string")
+                        if guard is not None:
+                            guard.note_call(func_name)
                         args = json.loads(args_str)
-                        result = self._registry.execute(func_name, args,
-                                                        mission.tools)
+                        result = self._execute(func_name, args, mission.tools,
+                                               guard)
                     except json.JSONDecodeError as e:
+                        if guard is not None:
+                            guard.note_invalid(func_name)
                         result = json.dumps(
                             {"error": f"tool arguments are not valid JSON: {e}"},
                             ensure_ascii=False)
@@ -270,6 +334,13 @@ class LocalRunner(AgentRunner):
                 if content is not None and not isinstance(content, str):
                     normalized_msg["content"] = json.dumps(
                         content, ensure_ascii=False, default=str)
+                if final_stage:
+                    # 最終段階の呼出しは実行せず、判断 JSON を促す。call 数に
+                    # よらず 1 応答につき parse 修復 1 回。
+                    parse_retries += 1
+                    if parse_retries > _MAX_REPAIR_RETRIES:
+                        return no_answer("failed")
+                    queue_user(turn_budget.FINAL_ONLY_TEXT)
                 continue
 
             # F2: Validate content is a string
@@ -287,39 +358,43 @@ class LocalRunner(AgentRunner):
                     content, ensure_ascii=False, default=str)
                 parse_retries += 1
                 if parse_retries > _MAX_REPAIR_RETRIES:
-                    return _finish("failed")
-                self._sink(messages, {"role": "user",
-                                      "content": f"出力を JSON として解釈できません "
-                                                 f"(content is not a string)"
-                                                 f"。JSON オブジェクトのみを"
-                                                 f"出力してください。"})
+                    return no_answer("failed")
+                queue_user(f"出力を JSON として解釈できません "
+                           f"(content is not a string)"
+                           f"。JSON オブジェクトのみを"
+                           f"出力してください。")
                 continue
 
             # Check deadline before parse_json_output (F4)
             if timed_out():
                 return _finish("timeout")
 
+            if final_stage and turn_budget.is_text_tool_call(content):
+                # 文字列によるツール呼出しは、包みの中の JSON も含めて採用しない
+                parse_retries += 1
+                if parse_retries > _MAX_REPAIR_RETRIES:
+                    return no_answer("failed")
+                queue_user(turn_budget.FINAL_ONLY_TEXT)
+                continue
             try:
                 output = parse_json_output(content)
             except ParseError as e:
                 parse_retries += 1
                 if parse_retries > _MAX_REPAIR_RETRIES:
-                    return _finish("failed")
-                self._sink(messages, {"role": "user",
-                                      "content": f"出力を JSON として解釈できません "
-                                                 f"({e})。JSON オブジェクトのみを"
-                                                 f"出力してください。"})
+                    return no_answer("failed")
+                queue_user(f"出力を JSON として解釈できません "
+                           f"({e})。JSON オブジェクトのみを"
+                           f"出力してください。")
                 continue
             try:
                 jsonschema.validate(output, mission.output_schema)
             except jsonschema.ValidationError as e:
                 schema_retries += 1
                 if schema_retries > _MAX_REPAIR_RETRIES:
-                    return _finish("failed")
-                self._sink(messages, {"role": "user",
-                                      "content": f"出力がスキーマに合いません: "
-                                                 f"{e.message}。修正して JSON のみ"
-                                                 f"再出力してください。"})
+                    return no_answer("failed")
+                queue_user(f"出力がスキーマに合いません: "
+                           f"{e.message}。修正して JSON のみ"
+                           f"再出力してください。")
                 continue
             except Exception as e:  # noqa: BLE001 — W2: SchemaError 等
                 # mission.output_schema 自体が不正 (SchemaError や $ref 解決
@@ -331,6 +406,24 @@ class LocalRunner(AgentRunner):
                 return _finish("failed")
             if timed_out():
                 return _finish("timeout")
+            if guard is not None:
+                guard.note_answer()
+                if (guard.policy == turn_budget.POLICY_SIGNAL
+                        and guard.search_unavailable
+                        and output.get("decision") != "reject"):
+                    return _finish(
+                        "failed", reason=turn_budget.REASON_SEARCH_UNAVAILABLE)
             return MissionResult("completed", output, messages)
 
-        return _finish("max_turns")
+        return no_answer("max_turns")
+
+
+def _valid_call_shape(tc: object) -> bool:
+    """tool_call の形が実行前に確定できるか (形状違反は実行せず failed)。"""
+    if not isinstance(tc, dict) or not isinstance(tc.get("id"), str):
+        return False
+    func = tc.get("function", {})
+    if not isinstance(func, dict) or not isinstance(func.get("name"), str):
+        return False
+    args = func.get("arguments")
+    return args is None or isinstance(args, str)

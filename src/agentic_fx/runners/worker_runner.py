@@ -34,6 +34,7 @@ from agentic_fx.core.mission_protocol import (
 )
 from agentic_fx.plugin.sandbox import _build_env
 from agentic_fx.runners.base import AgentRunner, Mission, MissionResult
+from agentic_fx.runners.turn_budget import MISSING_SUMMARY, parse_turn_summary
 from agentic_fx.store.rag import Rag
 from agentic_fx.tools.improve_rpc_tools import RpcOutcome
 
@@ -169,6 +170,20 @@ class WorkerRunner(AgentRunner):
         永続資源を持たない (LocalRunner との対称性のための空実装)。"""
 
     def run(self, mission: Mission) -> MissionResult:
+        result = self._run_mission(mission)
+        if mission.turn_policy is not None and result.turn_summary is None:
+            # 起動失敗・親側の期限超過など result frame を経ない終端でも、
+            # 0 回ではなく「計測欠損」として残す。
+            result.turn_summary = dict(MISSING_SUMMARY)
+        elif result.turn_summary is not None and not result.turn_summary.get("missing"):
+            # 親が終端を上書きした場合 (budget abort・timeout 等) も、記録する要約を
+            # 最終の status / reason に合わせる。
+            result.turn_summary["terminal"] = result.status
+            result.turn_summary["reason"] = (
+                " ".join(result.reason.split())[:120] if result.reason else None)
+        return result
+
+    def _run_mission(self, mission: Mission) -> MissionResult:
         w = self._settings.worker
         with tempfile.TemporaryDirectory(prefix="afx-mission-") as base:
             workdir = Path(base)
@@ -626,7 +641,10 @@ class WorkerRunner(AgentRunner):
             "mission": {"prompt": mission.prompt, "tools": mission.tools,
                        "output_schema": mission.output_schema,
                        "max_turns": mission.max_turns,
-                       "timeout_sec": mission.timeout_sec},
+                       "timeout_sec": mission.timeout_sec,
+                       # 無効 (None) のときはキーごと送らない (既定の handshake を変えない)
+                       **({"turn_policy": mission.turn_policy}
+                          if mission.turn_policy is not None else {})},
             "worker_profile": self._worker_profile,
             "now": now.isoformat(),
             "credentials": credentials or {},
@@ -764,6 +782,8 @@ class WorkerRunner(AgentRunner):
                         _log.warning("invalid market_tool_calls in result frame")
                     market_tool_calls = None
                 stderr_fatal = payload.get("stderr_fatal")
+                turn_summary = self._restore_turn_summary(
+                    mission, payload.get("turn_summary"))
                 failure_class = payload.get("failure_class")
                 if (not isinstance(failure_class, str)
                         or failure_class not in _FAILURE_CLASSES):
@@ -779,12 +799,14 @@ class WorkerRunner(AgentRunner):
                 tool_calls = None
                 market_tool_calls = None
                 stderr_fatal = None
+                turn_summary = self._restore_turn_summary(mission, None)
                 failure_class = None
             return MissionResult(status, output, transcript, reason=reason,
                                  recovered=recovered, tool_calls=tool_calls,
                                  market_tool_calls=market_tool_calls,
                                  stderr_fatal=stderr_fatal,
-                                 failure_class=failure_class)
+                                 failure_class=failure_class,
+                                 turn_summary=turn_summary)
         finally:
             dispatch_queue.put(None)
             if cleanup is None:
@@ -846,6 +868,19 @@ class WorkerRunner(AgentRunner):
                 return q.get(timeout=min(poll_interval, remaining))
             except queue.Empty:
                 continue
+
+    @staticmethod
+    def _restore_turn_summary(mission, raw):
+        """policy 有効の mission で、要約が届かない・形が合わないときは 0 回ではなく
+        「計測欠損」として残す。policy 無効では常に None。"""
+        if mission.turn_policy is None:
+            return None
+        parsed = parse_turn_summary(raw)
+        if parsed is None:
+            if raw is not None:
+                _log.warning("invalid turn_summary in result frame")
+            return dict(MISSING_SUMMARY)
+        return parsed
 
     def _call_rag(self, name: str, args: dict):
         method = getattr(self._rag, name)
