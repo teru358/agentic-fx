@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 182 件。完了分は closed/。
+未完了: 185 件。完了分は closed/。
 
 ## 実装中 (5)
 
@@ -74,9 +74,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (157)
+## 設計待ち (160)
 
-### 不具合 (85)
+### 不具合 (86)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -152,6 +152,7 @@
 | [paper-starting-balance-cashflow-history](open/paper-starting-balance-cashflow-history.md) | 低 | 2026-11-15 | paper.starting_balance の変更が cashflow 履歴に残らない |
 | [web-approval-detail-budget-review](open/web-approval-detail-budget-review.md) | 低 | 2026-11-18 | 承認詳細で日本語の長い申告があると params の差分と申告が切られる |
 | [backtest-avg-r-currency-mismatch](open/backtest-avg-r-currency-mismatch.md) | 低 | 2026-11-19 | backtest の avg_r が口座通貨の損益を quote 通貨のリスク額で割る |
+| [history-sync-next-advises-import-when-rerun-suffices](open/history-sync-next-advises-import-when-rerun-suffices.md) | 低 | 2026-11-26 | history sync の next 文が、再実行で通る場合にも import を案内する |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backtest-scheduler-log-leak](open/backtest-scheduler-log-leak.md) | 低 |  | backtest 内部 Scheduler の `maintain_reservations failed: no c… |
 | [graceful-stop-waits-mission](open/graceful-stop-waits-mission.md) | 低 |  | graceful stop が走行中 improve mission の timeout (最大 60 分) を待つ … |
@@ -166,11 +167,12 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (41)
+### 機能 (42)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [backtest-history-snapshot-reproducibility](open/backtest-history-snapshot-reproducibility.md) | 高 | 2026-11-14 | 履歴が変わった後も同じ入力で backtest を再現できるようにする |
+| [ctl-guard-recovery-entry](open/ctl-guard-recovery-entry.md) | 高 | 2026-11-26 | 保護の回復を afx ctl の 1 か所から番号で選べるようにする |
 | [backtest-dedup-cache](open/backtest-dedup-cache.md) | 中 | 2026-09-08 | 同一 (候補, config) の backtest 再実行で予算を消費しない (run6: 6 枠中 3 枠がビット… |
 | [indicator-update-dependent-relock-flow](open/indicator-update-dependent-relock-flow.md) | 中 | 2026-10-27 | 指標更新時に依存する戦略の再ロックを手順化する |
 | [plugin-naming-lifecycle-policy](open/plugin-naming-lifecycle-policy.md) | 中 | 2026-10-27 | plugin の命名・引退・保有上限の方針 (同名更新か新名作成か) |
@@ -212,11 +214,12 @@
 | [legacy-e2e-model](open/legacy-e2e-model.md) | 低 |  | backend を切り替えるたびにモデル名の手編集が要る |
 | [legacy-oc-qwen3-8-toolcall](open/legacy-oc-qwen3-8-toolcall.md) | 低 |  | モデルが壊れた引数でツールを連打し予算を焼く |
 
-### 保守 (31)
+### 保守 (32)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [cross-cutting-invariant-review](open/cross-cutting-invariant-review.md) | 高 | 2026-11-14 | 横断の不変条件の再確認 (資金保護・隔離・秘密・状態の整合) |
+| [help-and-settings-example-two-tier](open/help-and-settings-example-two-tier.md) | 中 | 2026-11-26 | help と設定例を「普段使う」と「全部・上級」の 2 段に分ける |
 | [gate-admission-helper](open/gate-admission-helper.md) | 低 | 2026-09-06 | gate 検査が 3 経路で重複し drift する |
 | [fake-run-context-consolidation](open/fake-run-context-consolidation.md) | 低 | 2026-09-17 | テストのフェイク RunContext が散在し追随漏れで壊れやすい |
 | [iw-r3-unverified-residuals](open/iw-r3-unverified-residuals.md) | 低 | 2026-09-19 | iw 3 周目で未検証のまま残った 3 点 |

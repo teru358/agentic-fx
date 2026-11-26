@@ -6,7 +6,7 @@ priority: 中
 kind: 機能
 opened: 2026-11-16
 closed: null
-related: [killswitch-reset-hwm-rebase, killswitch-latched-activity-repeats]
+related: [killswitch-reset-hwm-rebase, killswitch-latched-activity-repeats, ctl-guard-recovery-entry]
 ---
 # [killswitch-reset-implicit-generation-and-dd-preview] kill switch の解除で世代の入力を不要にし、確認画面に現在の DD と再ラッチの予告を出す
 
@@ -25,3 +25,4 @@ related: [killswitch-reset-hwm-rebase, killswitch-latched-activity-repeats]
 ## 経緯
 
 - 2026-11-16: 起票。
+- 2026-11-26: 関連: [killswitch-reset-hwm-rebase, killswitch-latched-activity-repeats, ctl-guard-recovery-entry] — 2026-11-26: 運用の全体整理の裁定 A で ctl-guard-recovery-entry に吸収する (世代入力の撤去と DD の予告はその一部)
