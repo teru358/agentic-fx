@@ -199,6 +199,14 @@ def check_socket_path(path: Path, *, uid: int) -> None:
         raise ServerAuthError("socket_file")
 
 
+# /proc/locks は 1 回の read で 1 page ぶん (環境によっては) しか返さず、lock の取得・解放が
+# 重なる間は読む度に行が抜けることがある (保持者の行も抜ける)。抜けた読みを「保持者なし」と
+# せず、短い間隔を置いて最大 LOCK_READ_ATTEMPTS 回まで読み直す。全回空なら不許可のまま。
+# 限界: 保持者が見えた読みより後の入れ替わりは防げない (daemon は起動中 lock を持ち続ける前提)。
+LOCK_READ_ATTEMPTS = 8
+LOCK_REREAD_INTERVAL = 0.003
+
+
 def lock_holders(lock_path: Path, *, proc_locks: Path = Path("/proc/locks")) -> set[int]:
     """``/proc/locks`` から lock file の FLOCK WRITE 保持者の pid を集める。
 
@@ -208,6 +216,8 @@ def lock_holders(lock_path: Path, *, proc_locks: Path = Path("/proc/locks")) -> 
     inode の一致は必須。装置番号は btrfs・overlayfs・NFS では stat の値 (匿名 dev) と
     ``/proc/locks`` の値 (superblock の dev) が食い違うので、一致すれば速い経路で数え、
     食い違うときはその pid が lock file を fd で開いていることを確かめて数える。
+    欠けた読みは行を落とすだけで足さず、flock は排他で保持者は 1 つ、daemon は lock 後に
+    socket を開くため、別 PID だけの読みは本当の不一致として読み直さない。
     """
     try:
         st = os.stat(lock_path)
@@ -215,11 +225,25 @@ def lock_holders(lock_path: Path, *, proc_locks: Path = Path("/proc/locks")) -> 
     except OSError:
         return set()
     device = (os.major(st.st_dev), os.minor(st.st_dev))
+    for attempt in range(LOCK_READ_ATTEMPTS):
+        if attempt:
+            time.sleep(LOCK_REREAD_INTERVAL)
+        holders = _holders_in_proc_locks(proc_locks, st.st_ino, device, real_path)
+        if holders is None:
+            return set()
+        if holders:
+            return holders
+    return set()
+
+
+def _holders_in_proc_locks(proc_locks: Path, ino: int, device: tuple[int, int],
+                           real_path: str) -> set[int] | None:
+    """/proc/locks を 1 回読んで保持者を返す。読めなければ None。"""
     holders = set()
     try:
         text = proc_locks.read_text(encoding="ascii", errors="replace")
     except OSError:
-        return set()
+        return None
     for line in text.splitlines():
         parts = line.split()
         if len(parts) < 6 or "->" in parts:
@@ -233,7 +257,7 @@ def lock_holders(lock_path: Path, *, proc_locks: Path = Path("/proc/locks")) -> 
             pid = int(pid_text)
         except (IndexError, ValueError):
             continue
-        if ident[2] != st.st_ino:
+        if ident[2] != ino:
             continue
         if ident[:2] == device or _has_open_fd(pid, real_path):
             holders.add(pid)

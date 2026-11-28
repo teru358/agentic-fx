@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 185 件。完了分は closed/。
+未完了: 184 件。完了分は closed/。
 
 ## 実装中 (5)
 
@@ -74,14 +74,13 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (160)
+## 設計待ち (159)
 
-### 不具合 (86)
+### 不具合 (85)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [gate-pytest-dev-writable-and-ldso-exec](open/gate-pytest-dev-writable-and-ldso-exec.md) | 高 | 2026-10-03 | gate の pytest は /dev 全体が書き込み可で ld.so 経由で任意の ELF を起動できる |
-| [ops-bot-exits-not-lock-holder](open/ops-bot-exits-not-lock-holder.md) | 高 | 2026-10-22 | afx-ops bot が稼働中に not_lock_holder で終了し systemd が再起動する |
 | [human-corridor-gate-rows-null-outcome](open/human-corridor-gate-rows-null-outcome.md) | 中 | 2026-09-12 | 人間回廊 (`submit_candidate` / `bless_candidate` → `_run_full_g… |
 | [backtest-worker-cpu-budget-shrinks-with-timeframe](open/backtest-worker-cpu-budget-shrinks-with-timeframe.md) | 中 | 2026-09-20 | strategy の backtest は plugin worker 1 プロセスを再生全体で使い回すので、`plu… |
 | [backtest-rpc-timeout-does-not-stop-parent-work](open/backtest-rpc-timeout-does-not-stop-parent-work.md) | 中 | 2026-09-21 | backtest の待ち時間超過後も親の処理と worker が走り続ける |

@@ -20,6 +20,7 @@ import select
 import socket
 import stat
 import struct
+import time
 from pathlib import Path
 
 # 共有契約の語彙 (本体 client の ServerAuthError.reason と同じ)。
@@ -139,6 +140,36 @@ def _flock_rows(proc_locks: Path) -> list[tuple[int, int, int, int]]:
     return rows
 
 
+# /proc/locks は 1 回の read で 1 page ぶん (環境によっては) しか返さず、lock の取得・解放が
+# 重なる間は読む度に行が抜けることがある (保持者の行も抜ける)。抜けた読みを「保持者なし」と
+# せず、短い間隔を置いて最大 LOCK_READ_ATTEMPTS 回まで読み直す。全回空なら不許可のまま。
+# 限界: 保持者が見えた読みより後の入れ替わりは防げない (daemon は起動中 lock を持ち続ける前提)。
+LOCK_READ_ATTEMPTS = 8
+LOCK_REREAD_INTERVAL = 0.003
+
+
+def _flock_rows_until(proc_locks: Path, accept) -> list[tuple[int, int, int, int]]:
+    """``accept(rows)`` が真になる読みを最大 ``LOCK_READ_ATTEMPTS`` 回まで探し、最後の読みを返す。"""
+    rows = _flock_rows(proc_locks)
+    for _ in range(LOCK_READ_ATTEMPTS - 1):
+        if accept(rows):
+            break
+        time.sleep(LOCK_REREAD_INTERVAL)
+        rows = _flock_rows(proc_locks)
+    return rows
+
+
+def _holders_in(rows, st, real_path: str, dev_fallback: bool) -> set[int]:
+    device = (os.major(st.st_dev), os.minor(st.st_dev))
+    holders = set()
+    for pid, major, minor, inode in rows:
+        if inode != st.st_ino:
+            continue
+        if (major, minor) == device or (dev_fallback and _has_open_fd(pid, real_path)):
+            holders.add(pid)
+    return holders
+
+
 def lock_holders(lock_path: Path, *, proc_locks: Path = PROC_LOCKS,
                  dev_fallback: bool = True) -> set[int]:
     """lock file の FLOCK WRITE 保持者の pid を集める。
@@ -147,24 +178,20 @@ def lock_holders(lock_path: Path, *, proc_locks: Path = PROC_LOCKS,
     ``/proc/locks`` の値が食い違うので、共有契約では食い違うときにその pid が lock file
     を fd で開いていることを確かめて数える。``dev_fallback=False`` ではこの救済をせず
     数えない (固有 admission を通した経路は dev の一致を前提にする)。
+    欠けた読みは行を落とすだけで足さず、flock は排他で保持者は 1 つ、daemon は lock 後に
+    socket を開くため、別 PID だけの読みは本当の不一致として読み直さない。
     """
     try:
         st = os.stat(lock_path)
         real_path = os.path.realpath(lock_path)
     except OSError:
         return set()
-    device = (os.major(st.st_dev), os.minor(st.st_dev))
     try:
-        rows = _flock_rows(proc_locks)
+        rows = _flock_rows_until(
+            proc_locks, lambda rows: bool(_holders_in(rows, st, real_path, dev_fallback)))
     except OSError:
         return set()
-    holders = set()
-    for pid, major, minor, inode in rows:
-        if inode != st.st_ino:
-            continue
-        if (major, minor) == device or (dev_fallback and _has_open_fd(pid, real_path)):
-            holders.add(pid)
-    return holders
+    return _holders_in(rows, st, real_path, dev_fallback)
 
 
 def _has_open_fd(pid: int, real_path: str) -> bool:
@@ -354,16 +381,20 @@ def check_lock_device(lock_path: Path, *, proc_locks: Path = PROC_LOCKS) -> None
     ``/proc/locks`` の dev が食い違う filesystem (btrfs・overlayfs 等) と判断し、readlink で
     救済せず拒否する。同 inode の行が無い場合の判定は後段の共有 verifier に任せる。stat や
     ``/proc/locks`` を読めなければ保持者を確定できないので共有契約と同じ語で止める。
+    期待 dev の行が無いときの拒否は読み直しの間隔を最大 7 回待ってから返る。
     """
     try:
         st = os.stat(lock_path)
     except OSError:
         raise ServerAuthError("not_lock_holder") from None
+    device = (os.major(st.st_dev), os.minor(st.st_dev))
     try:
-        rows = _flock_rows(proc_locks)
+        rows = _flock_rows_until(
+            proc_locks,
+            lambda rows: any(inode == st.st_ino and (major, minor) == device
+                             for _pid, major, minor, inode in rows))
     except OSError as exc:
         raise ServerAuthError("not_lock_holder", _detail_of(exc)) from None
-    device = (os.major(st.st_dev), os.minor(st.st_dev))
     devices = {(major, minor) for _pid, major, minor, inode in rows if inode == st.st_ino}
     if devices and device not in devices:
         raise ServerAuthError("instance_lock_dev_mismatch")
