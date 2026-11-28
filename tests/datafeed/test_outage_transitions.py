@@ -51,7 +51,8 @@ def _report(*, ok=(KEY,), empty=(), failed=()):
 
 
 def _put_state(conn, machine, state, *, deadline=None, pending=0, streak=0, epoch=5):
-    machine._ensure_row(NOW)
+    # 行の作成時刻は最初の tick より前 (同じ now の観測を二重に数えない)
+    machine._ensure_row(NOW - timedelta(minutes=1))
     since = (deadline - timedelta(seconds=1800)).isoformat() if deadline else None
     conn.execute(
         "UPDATE datafeed_outage_state SET state=?, epoch=?, restricted_since=?, "
@@ -62,8 +63,10 @@ def _put_state(conn, machine, state, *, deadline=None, pending=0, streak=0, epoc
 
 
 def _open_position(conn, now=NOW):
-    orders.insert(conn, pair=PAIR, direction="buy", entry_type="market",
-                  horizon="swing", status="open", now=now)
+    # 保護条件が読める建玉 (損切りは足の価格 1.0 より遠い): 停止中に届く足が接触と判定されない
+    orders.insert(conn, pair=PAIR, direction="long", entry_type="market",
+                  horizon="swing", status="open", now=now, filled_at=now.isoformat(),
+                  stop_loss=0.5)
     conn.commit()
 
 
@@ -83,23 +86,25 @@ def _observation(conn, kind):
 
 
 # (現在の state, exposure, 観測) -> (次 state, epoch の増分, pending)
+# 猶予内 (建玉ありは停滞の起点から 600 秒、flat は 1800 秒) の停滞・失敗・空は restricted。
+# restricted は健全な当 tick で ready に戻る (建玉の有無によらない)。degraded は 1 tick の健全では戻らない
 CELLS = [
     ("ready", False, "healthy", "ready", 0, 0),
     ("ready", False, "stalled", "restricted", 1, 0),
-    ("ready", False, "empty", "degraded", 1, 0),
-    ("ready", False, "failed", "degraded", 1, 0),
+    ("ready", False, "empty", "restricted", 1, 0),
+    ("ready", False, "failed", "restricted", 1, 0),
     ("ready", True, "healthy", "ready", 0, 0),
-    ("ready", True, "stalled", "degraded", 1, 1),
-    ("ready", True, "empty", "degraded", 1, 1),
-    ("ready", True, "failed", "degraded", 1, 1),
-    ("restricted", False, "healthy", "restricted", 0, 0),
+    ("ready", True, "stalled", "restricted", 1, 0),
+    ("ready", True, "empty", "restricted", 1, 0),
+    ("ready", True, "failed", "restricted", 1, 0),
+    ("restricted", False, "healthy", "ready", 0, 0),
     ("restricted", False, "stalled", "restricted", 0, 0),
-    ("restricted", False, "empty", "degraded", 0, 0),
-    ("restricted", False, "failed", "degraded", 0, 0),
-    ("restricted", True, "healthy", "degraded", 0, 1),
-    ("restricted", True, "stalled", "degraded", 0, 1),
-    ("restricted", True, "empty", "degraded", 0, 1),
-    ("restricted", True, "failed", "degraded", 0, 1),
+    ("restricted", False, "empty", "restricted", 0, 0),
+    ("restricted", False, "failed", "restricted", 0, 0),
+    ("restricted", True, "healthy", "ready", 0, 0),
+    ("restricted", True, "stalled", "restricted", 0, 0),
+    ("restricted", True, "empty", "restricted", 0, 0),
+    ("restricted", True, "failed", "restricted", 0, 0),
     ("degraded", False, "healthy", "degraded", 0, 0),
     ("degraded", False, "stalled", "degraded", 0, 0),
     ("degraded", False, "empty", "degraded", 0, 0),
@@ -127,11 +132,16 @@ def test_transition_table_cell(tmp_path, state, exposure, kind, want_state,
     assert row["epoch"] == 5 + want_epoch_step
     assert row["pending_human_confirmation"] == want_pending
     if want_state == "restricted":
-        # 期限は後発の観測で動かない (新規なら起点 + 1800 秒)
         if state == "restricted":
+            # 期限は後発の観測で動かない
             assert row["restricted_deadline_at"] == deadline.isoformat()
         else:
-            assert row["restricted_deadline_at"] == "2026-09-30T10:22:30+00:00"
+            # 起点 S は、停滞なら 09:50 の足の次の確認時刻 (09:52:30)、失敗・空なら観測時刻。
+            # 期限 = 起点 + (建玉あり 600 秒 / flat 1800 秒)
+            origin = datetime(2026, 9, 30, 9, 52, 30, tzinfo=UTC) if kind == "stalled" else NOW
+            limit = 600 if exposure else 1800
+            assert row["restricted_deadline_at"] == (
+                origin + timedelta(seconds=limit)).isoformat()
 
 
 def test_new_restricted_episode_records_origin_and_deadline_from_the_stalled_key(tmp_path):
@@ -145,16 +155,16 @@ def test_new_restricted_episode_records_origin_and_deadline_from_the_stalled_key
     assert row["restricted_deadline_at"] == "2026-09-30T10:22:30+00:00"
 
 
-def test_healthy_exactly_at_the_deadline_stays_restricted(tmp_path):
+def test_healthy_at_exactly_thirty_open_minutes_of_restriction_still_recovers(tmp_path):
     conn, machine = _rig(tmp_path)
     deadline = datetime(2026, 9, 30, 10, 0, tzinfo=UTC)
-    _put_state(conn, machine, "restricted", deadline=deadline)
+    _put_state(conn, machine, "restricted", deadline=deadline)   # 起点 = 09:30
     _fresh(conn, NOW)
 
-    assert machine.observe(deadline, _report()) == "restricted"
+    assert machine.observe(deadline, _report()) == "ready"
 
 
-def test_healthy_one_second_after_the_deadline_is_degraded_without_human_confirmation(tmp_path):
+def test_healthy_one_second_after_thirty_open_minutes_stops_with_a_confirmed_stop(tmp_path):
     conn, machine = _rig(tmp_path)
     deadline = datetime(2026, 9, 30, 10, 0, tzinfo=UTC)
     _put_state(conn, machine, "restricted", deadline=deadline, streak=2)
@@ -164,6 +174,7 @@ def test_healthy_one_second_after_the_deadline_is_degraded_without_human_confirm
     assert machine.observe(now, _report()) == "degraded"
     row = machine.status()
     assert row["pending_human_confirmation"] == 0
+    assert row["confirmed"] == 1
     assert row["epoch"] == 5
 
 
@@ -178,18 +189,14 @@ def test_deadline_passed_with_auto_resume_disabled_requires_human_confirmation(t
     assert machine.status()["pending_human_confirmation"] == 1
 
 
-def test_third_healthy_tick_returns_a_restricted_state_to_ready(tmp_path):
+def test_first_healthy_tick_returns_a_restricted_state_to_ready(tmp_path):
     log = ActivityLog(tmp_path / "activity.log")
     conn, machine = _rig(tmp_path, activity=log)
     deadline = NOW + timedelta(minutes=20)
     _put_state(conn, machine, "restricted", deadline=deadline)
-    states = []
-    for minute in (0, 1, 2):
-        now = NOW + timedelta(minutes=minute)
-        _fresh(conn, now)
-        states.append(machine.observe(now, _report()))
+    _fresh(conn, NOW)
 
-    assert states == ["restricted", "restricted", "ready"]
+    assert machine.observe(NOW, _report()) == "ready"
     row = machine.status()
     assert row["restricted_deadline_at"] is None
     assert row["restricted_since"] is None
@@ -197,19 +204,14 @@ def test_third_healthy_tick_returns_a_restricted_state_to_ready(tmp_path):
     assert [line.split("\t")[2] for line in log.tail(10)] == ["datafeed_recovered_auto"]
 
 
-def test_exposure_appearing_on_the_third_healthy_tick_degrades_instead_of_ready(tmp_path):
+def test_an_exposure_does_not_stop_a_restricted_state_from_returning_to_ready(tmp_path):
     conn, machine = _rig(tmp_path)
     _put_state(conn, machine, "restricted", deadline=NOW + timedelta(minutes=20))
-    for minute in (0, 1):
-        now = NOW + timedelta(minutes=minute)
-        _fresh(conn, now)
-        assert machine.observe(now, _report()) == "restricted"
-    now = NOW + timedelta(minutes=2)
-    _fresh(conn, now)
-    _open_position(conn, now)
+    _fresh(conn, NOW)
+    _open_position(conn, NOW)
 
-    assert machine.observe(now, _report()) == "degraded"
-    assert machine.status()["pending_human_confirmation"] == 1
+    assert machine.observe(NOW, _report()) == "ready"
+    assert machine.status()["pending_human_confirmation"] == 0
 
 
 def test_auto_resume_disabled_third_healthy_tick_degrades_with_human_confirmation(tmp_path):
@@ -232,7 +234,7 @@ def test_auto_resume_disabled_third_healthy_tick_degrades_with_human_confirmatio
 ])
 def test_deferred_or_not_attempted_tick_does_not_advance_the_healthy_streak(
         tmp_path, not_healthy):
-    conn, machine = _rig(tmp_path)
+    conn, machine = _rig(tmp_path, auto_resume_when_flat=False)
     _put_state(conn, machine, "restricted", deadline=NOW + timedelta(minutes=30))
     reports = [_report(), _report(), not_healthy, _report(), _report()]
     states = []
@@ -241,15 +243,15 @@ def test_deferred_or_not_attempted_tick_does_not_advance_the_healthy_streak(
         _fresh(conn, now)
         states.append(machine.observe(now, report))
 
-    # 5 tick のうち連続 healthy は 2 本ずつ。3 本そろわないので ready に戻らない。
+    # 5 tick のうち連続 healthy は 2 本ずつ。3 本そろわないので人の待ちへ進まない。
     assert states == ["restricted"] * 5
     now = NOW + timedelta(minutes=5)
     _fresh(conn, now)
-    assert machine.observe(now, _report()) == "ready"
+    assert machine.observe(now, _report()) == "degraded"
 
 
 def test_healthy_streak_restarts_from_zero_after_a_process_restart(tmp_path):
-    conn, machine = _rig(tmp_path)
+    conn, machine = _rig(tmp_path, auto_resume_when_flat=False)
     deadline = NOW + timedelta(minutes=30)
     _put_state(conn, machine, "restricted", deadline=deadline)
     for minute in (0, 1):
@@ -257,15 +259,16 @@ def test_healthy_streak_restarts_from_zero_after_a_process_restart(tmp_path):
         _fresh(conn, now)
         machine.observe(now, _report())
     restarted = OutageStateMachine(conn, hard_keys=frozenset({KEY}), interval_widths=WIDTHS,
-                                   grace=GRACE, storage_source="mt5-live")
+                                   grace=GRACE, storage_source="mt5-live",
+                                   auto_resume_when_flat=False)
     states = []
     for minute in (2, 3, 4):
         now = NOW + timedelta(minutes=minute)
         _fresh(conn, now)
         states.append(restarted.observe(now, _report()))
 
-    # 再起動後は streak を 0 から数え直すが、期限と state は DB の値を引き継ぐ。
-    assert states == ["restricted", "restricted", "ready"]
+    # 再起動後は streak を 0 から数え直すが、restricted の起点と state は DB の値を引き継ぐ。
+    assert states == ["restricted", "restricted", "degraded"]
 
 
 def test_restart_keeps_the_deadline_stored_in_the_database(tmp_path):
@@ -279,9 +282,11 @@ def test_restart_keeps_the_deadline_stored_in_the_database(tmp_path):
     assert restarted.observe(now, _report()) == "degraded"
 
 
-def test_pending_confirmation_keeps_a_restricted_state_from_returning_to_ready(tmp_path):
+def test_a_migration_wait_keeps_a_restricted_state_from_returning_to_ready(tmp_path):
     conn, machine = _rig(tmp_path)
-    _put_state(conn, machine, "restricted", deadline=NOW + timedelta(minutes=20), pending=1)
+    _put_state(conn, machine, "restricted", deadline=NOW + timedelta(minutes=20))
+    conn.execute("UPDATE datafeed_outage_state SET migration_confirmation_pending=1 WHERE id=1")
+    conn.commit()
     states = []
     for minute in (0, 1, 2):
         now = NOW + timedelta(minutes=minute)
@@ -289,11 +294,11 @@ def test_pending_confirmation_keeps_a_restricted_state_from_returning_to_ready(t
         states.append(machine.observe(now, _report()))
 
     assert states == ["restricted", "restricted", "degraded"]
-    assert machine.status()["pending_human_confirmation"] == 1
+    assert machine.status()["migration_confirmation_pending"] == 1
 
 
 def test_promotion_from_restricted_keeps_the_recorded_origin_and_deadline(tmp_path):
-    conn, machine = _rig(tmp_path)
+    conn, machine = _rig(tmp_path, auto_resume_when_flat=False)
     deadline = datetime(2026, 9, 30, 10, 0, tzinfo=UTC)
     _put_state(conn, machine, "restricted", deadline=deadline)
     now = deadline + timedelta(seconds=1)
@@ -340,7 +345,8 @@ def test_second_stalled_tick_with_an_exposure_confirms_the_outage_and_notifies(t
     conn, machine = _rig(tmp_path, activity=log)
     _put_state(conn, machine, "ready")
     _open_position(conn, NOW - timedelta(minutes=30))
-    _seed_bar(conn, NOW - timedelta(minutes=10))
+    # 起点 S=09:42:30 から 17.5 分 (建玉ありの猶予 10 分を超えている)
+    _seed_bar(conn, NOW - timedelta(minutes=20))
 
     assert machine.observe(NOW, _report()) == "degraded"
     assert machine.status()["confirmed"] == 0
@@ -388,19 +394,24 @@ def _both():
     return _report(ok=(KEY, KEY_15M))
 
 
-@pytest.mark.parametrize("start_state", ["restricted", "degraded"])
-def test_a_higher_timeframe_key_probed_once_in_a_while_does_not_block_auto_recovery(
-        tmp_path, start_state):
+def test_a_higher_timeframe_key_probed_once_in_a_while_does_not_block_auto_recovery(tmp_path):
     conn, machine = _rig_with_15m(tmp_path)
-    _put_state(conn, machine, start_state,
-               deadline=NOW + timedelta(minutes=30) if start_state == "restricted" else None)
+    _put_state(conn, machine, "degraded")
     states = []
     for minute, report in enumerate([_both(), _only_1m(), _only_1m()]):
         now = NOW + timedelta(minutes=minute)
         _fresh_both(conn, now)
         states.append(machine.observe(now, report))
 
-    assert states == [start_state, start_state, "ready"]
+    assert states == ["degraded", "degraded", "ready"]
+
+
+def test_a_restricted_state_recovers_when_the_higher_timeframe_key_is_not_probed(tmp_path):
+    conn, machine = _rig_with_15m(tmp_path)
+    _put_state(conn, machine, "restricted", deadline=NOW + timedelta(minutes=30))
+    _fresh_both(conn, NOW)
+
+    assert machine.observe(NOW, _only_1m()) == "ready"
 
 
 def test_a_failed_higher_timeframe_key_degrades_immediately(tmp_path):
@@ -440,7 +451,7 @@ def test_a_higher_timeframe_failure_blocks_recovery_until_that_key_succeeds_agai
 ])
 def test_a_1m_key_that_is_deferred_or_not_attempted_does_not_advance_the_streak(
         tmp_path, skipped):
-    conn, machine = _rig_with_15m(tmp_path)
+    conn, machine = _rig_with_15m(tmp_path, auto_resume_when_flat=False)
     _put_state(conn, machine, "restricted", deadline=NOW + timedelta(minutes=30))
     states = []
     for minute, report in enumerate([_both(), _only_1m(), skipped, _only_1m(), _only_1m()]):
@@ -450,15 +461,15 @@ def test_a_1m_key_that_is_deferred_or_not_attempted_does_not_advance_the_streak(
     assert states == ["restricted"] * 5
     now = NOW + timedelta(minutes=5)
     _fresh_both(conn, now)
-    assert machine.observe(now, _only_1m()) == "ready"
+    assert machine.observe(now, _only_1m()) == "degraded"
 
 
-def test_degrading_from_restricted_discards_the_healthy_streak_collected_so_far(tmp_path):
-    conn, machine = _rig(tmp_path)
-    deadline = NOW + timedelta(minutes=2, seconds=30)
+def test_stopping_a_restricted_state_discards_the_healthy_streak_collected_so_far(tmp_path):
+    conn, machine = _rig(tmp_path, auto_resume_when_flat=False)
+    deadline = NOW + timedelta(minutes=1)     # 起点 = 09:31 (restricted の連続の起点)
     _put_state(conn, machine, "restricted", deadline=deadline)
     states = []
-    # 10:00 / 10:01 は健全 (streak=2)、10:03 は期限 10:02:30 を過ぎて degraded
+    # 10:00 / 10:01 は健全 (streak=2。連続は 29 分と 30 分ちょうど)、10:03 は 32 分で停止
     for minute in (0, 1, 3):
         now = NOW + timedelta(minutes=minute)
         _fresh(conn, now)
@@ -466,12 +477,12 @@ def test_degrading_from_restricted_discards_the_healthy_streak_collected_so_far(
     assert states == ["restricted", "restricted", "degraded"]
     assert machine.status()["ready_streak"] == 0
 
-    # degraded に上がってからは健全 tick が 3 回要る (1 回で戻らない)
+    # degraded に上がった後は、自動復帰が無効なので人の待ちを知らせるだけで戻らない
     for minute in (4, 5, 6):
         now = NOW + timedelta(minutes=minute)
         _fresh(conn, now)
         states.append(machine.observe(now, _report()))
-    assert states[3:] == ["degraded", "degraded", "ready"]
+    assert states[3:] == ["degraded", "degraded", "degraded"]
 
 
 # ---- episode を開く tick の証拠 / 昇格 / 期限切れ後の初観測 -----------------

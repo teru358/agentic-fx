@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 184 件。完了分は closed/。
+未完了: 182 件。完了分は closed/。
 
 ## 実装中 (5)
 
@@ -20,7 +20,7 @@
 | [weekly-improve-rebacktests-deployed-strategies](open/weekly-improve-rebacktests-deployed-strategies.md) | 中 | 2026-10-25 | 週次改善の冒頭で稼働中の戦略を再 backtest し、成績を改善の方向性の材料にする |
 | [weekly-plugin-inventory-notice](open/weekly-plugin-inventory-notice.md) | 中 | 2026-10-29 | 週次の棚卸し: 未使用の指標と成績の悪い戦略を停止の提案として通知する |
 
-## 実装待ち (14)
+## 実装待ち (12)
 
 ### 不具合 (7)
 
@@ -34,12 +34,10 @@
 | [flaky-tool-schemas](open/flaky-tool-schemas.md) | 低 |  | 全ツールのスキーマテストがフル suite でだけ ERROR になる |
 | [improve-add-quotes](open/improve-add-quotes.md) | 低 |  | improve add がクォートを剥がさず表示が崩れる |
 
-### 機能 (3)
+### 機能 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
-| [datafeed-pending-auto-release-when-flat](open/datafeed-pending-auto-release-when-flat.md) | 中 | 2026-11-21 | 建玉が全部決済されデータが健全に戻ったら、人の再開なしで戻すか |
-| [datafeed-rollover-band-expected-gap](open/datafeed-rollover-band-expected-gap.md) | 中 | 2026-11-21 | 日次ロールオーバー帯の 1 分足の無 tick を停止とみなすか |
 | [legacy-oc-tool-not-found](open/legacy-oc-tool-not-found.md) | 低 |  | 存在しない候補名を読むときの誘導が足りない |
 
 ### 保守 (4)

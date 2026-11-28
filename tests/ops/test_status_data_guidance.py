@@ -4,6 +4,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from agentic_fx.ops.contracts import ShellCaller
+from agentic_fx.datafeed.outage import EMPTY_REPORT
 from tests.ops.test_service_api_wiring import _app
 from tests.test_service_app import NOW, _init
 
@@ -26,6 +27,7 @@ def _data(app):
 def test_status_data_keeps_the_state_and_adds_the_guidance_keys(tmp_path):
     _init(tmp_path)
     app = _app(tmp_path)
+    app.outage.observe(NOW, EMPTY_REPORT)   # 起動待ちの観測を済ませる
     try:
         data = _data(app)
         assert data["state"] == "ready"
@@ -37,20 +39,25 @@ def test_status_data_keeps_the_state_and_adds_the_guidance_keys(tmp_path):
         app.close()
 
 
-def test_a_degraded_row_with_the_awaiting_mark_asks_for_a_resume(tmp_path):
+def test_a_degraded_row_asks_for_a_resume_from_the_saved_facts_and_not_from_the_marks(tmp_path):
     _init(tmp_path)
     app = _app(tmp_path)
+    app.outage.observe(NOW, EMPTY_REPORT)   # 起動待ちの観測を済ませる
     try:
         _seed(app, state="degraded", epoch=5, recovered_notified_epoch=5,
               resume_last_result="rejected_watermark", resume_last_result_at=NOW.isoformat())
         data = _data(app)
         assert data["state"] == "degraded"
-        assert (data["phase"], data["next_action"]) == ("resume_rejected", "restore_source")
+        # 保存した健全がまだ無いので停止中。古い拒否は別欄に残るだけで phase は決めない
+        assert (data["phase"], data["next_action"]) == ("stopped", "restore_source")
         assert data["resume_last_result"] == "rejected_watermark"
         assert data["resume_last_result_at"] == NOW.isoformat()
-        _seed(app, resume_last_result=None, resume_last_result_at=None)
+        # 移行確認待ちが残り、手動の健全が保存されていれば、確認 (ack) つきの再開を促す
+        _seed(app, resume_last_result=None, resume_last_result_at=None,
+              migration_confirmation_pending=1, auto_healthy=1, manual_healthy=1)
         data = _data(app)
-        assert (data["phase"], data["next_action"]) == ("awaiting_resume", "resume")
+        assert (data["phase"], data["next_action"]) == ("awaiting_resume", "resume_with_ack")
+        assert data["unprocessed_positions"] == 1
         _seed(app, resume_requested_at=NOW.isoformat())
         assert (_data(app)["phase"], _data(app)["next_action"]) == ("resume_requested", "wait_tick")
     finally:
@@ -60,6 +67,7 @@ def test_a_degraded_row_with_the_awaiting_mark_asks_for_a_resume(tmp_path):
 def test_the_card_state_and_the_guidance_come_from_the_same_read(tmp_path):
     _init(tmp_path)
     app = _app(tmp_path)
+    app.outage.observe(NOW, EMPTY_REPORT)   # 起動待ちの観測を済ませる
     try:
         _seed(app, state="degraded", epoch=5)
         # 別の読み取りが ready を返しても、data の state は案内と同じ行から作る
@@ -110,5 +118,16 @@ def test_the_guidance_does_not_touch_the_scheduler_connection(tmp_path, monkeypa
             scoped.setattr(app.outage, "conn", SimpleNamespace(
                 execute=lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("outage.conn used"))))
             assert _data(app) == expected
+    finally:
+        app.close()
+
+
+def test_a_machine_still_waiting_for_its_first_observation_says_so(tmp_path):
+    _init(tmp_path)
+    app = _app(tmp_path)
+    try:
+        data = _data(app)
+        assert (data["state"], data["phase"], data["next_action"]) == (
+            "degraded", "starting", "wait_tick")
     finally:
         app.close()

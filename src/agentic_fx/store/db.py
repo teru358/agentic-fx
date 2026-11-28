@@ -827,7 +827,12 @@ CREATE TABLE IF NOT EXISTS datafeed_outage_state (
   updated_at TEXT NOT NULL,
   resume_last_result TEXT,
   resume_last_result_at TEXT,
-  resume_last_request_at TEXT
+  resume_last_request_at TEXT,
+  auto_healthy INTEGER,
+  auto_healthy_at TEXT,
+  manual_healthy INTEGER,
+  manual_healthy_at TEXT,
+  migration_confirmation_pending INTEGER NOT NULL DEFAULT 0
 );
 -- 停止・再開待ち・要求の終端結果・復帰の発生記録。event 化の対応は event_id に持つ。
 -- request_key は終端結果の三種類では消費した要求の時刻、それ以外は空文字
@@ -841,13 +846,47 @@ CREATE TABLE IF NOT EXISTS datafeed_outage_notices (
   event_id INTEGER,
   PRIMARY KEY (epoch, notice_state, request_key)
 );
+-- gap_start の NULL は「その key はまだ足を見ていない」。source は記録時の保存先 (旧行は NULL)
 CREATE TABLE IF NOT EXISTS datafeed_outage_gap (
   pair TEXT NOT NULL,
   interval TEXT NOT NULL,
   epoch INTEGER NOT NULL,
-  gap_start TEXT NOT NULL,
+  gap_start TEXT,
   replay_through TEXT,
+  source TEXT,
   PRIMARY KEY (pair, interval, epoch)
+);
+-- key/source ごとの facts。行が無い (保存の開始前) と列が NULL (まだ見ていない・停滞なし) は別
+CREATE TABLE IF NOT EXISTS datafeed_outage_key_facts (
+  pair TEXT NOT NULL,
+  interval TEXT NOT NULL,
+  source TEXT NOT NULL,
+  observed_through TEXT,
+  stall_start TEXT,
+  last_attempt_ok INTEGER CHECK (last_attempt_ok IS NULL OR last_attempt_ok IN (0, 1)),
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (pair, interval, source)
+);
+-- 通常取得で見つけた、取得前水位以前で cache に無かった足。cache と同じ transaction で入り、検査の後に消す
+CREATE TABLE IF NOT EXISTS datafeed_late_bars (
+  pair TEXT NOT NULL,
+  interval TEXT NOT NULL,
+  source TEXT NOT NULL,
+  bar_time TEXT NOT NULL,
+  open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL,
+  close REAL NOT NULL, volume REAL NOT NULL DEFAULT 0,
+  detected_at TEXT NOT NULL,
+  PRIMARY KEY (pair, interval, source, bar_time)
+);
+-- 接触・不明の確認待ちの参照 (注文・足時刻・種別)。価格・金額は持たない
+CREATE TABLE IF NOT EXISTS datafeed_outage_contacts (
+  epoch INTEGER NOT NULL,
+  order_id INTEGER NOT NULL,
+  bar_time TEXT NOT NULL,
+  pair TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('sl', 'tp', 'both', 'limit', 'unknown')),
+  detected_at TEXT NOT NULL,
+  PRIMARY KEY (epoch, order_id, bar_time)
 );
 CREATE TABLE IF NOT EXISTS cron_cursor (
   pair TEXT NOT NULL,
@@ -1027,7 +1066,8 @@ TABLE_NAMES = frozenset({
     "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
     "alert_state", "improve_waves", "improve_wave_slots", "plugin_switch_journal",
     "candidate_archives", "datafeed_outage_state", "datafeed_outage_gap",
-    "datafeed_outage_notices",
+    "datafeed_outage_notices", "datafeed_outage_key_facts", "datafeed_late_bars",
+    "datafeed_outage_contacts",
     "cron_cursor", "mission_decision_bars",
     "ops_requests", "ops_idempotency", "ops_events", "ops_policies",
     "plugin_deploy_ops", "plugin_deploy_op_signals", "plugin_deploy_op_history_forced",
@@ -2505,7 +2545,46 @@ def init_db(conn: sqlite3.Connection, *, root: Path | None = None) -> None:
         "restricted_deadline_at TEXT")
     for column in ("resume_last_result", "resume_last_result_at", "resume_last_request_at"):
         _ensure_column(conn, "datafeed_outage_state", column, f"{column} TEXT")
+    # 新規 DB の DDL と同じ列順で足す (列順まで一致させる test がある)
+    for column, kind in (("auto_healthy", "INTEGER"), ("auto_healthy_at", "TEXT"),
+                         ("manual_healthy", "INTEGER"), ("manual_healthy_at", "TEXT")):
+        _ensure_column(conn, "datafeed_outage_state", column, f"{column} {kind}")
+    _ensure_column(conn, "datafeed_outage_state", "migration_confirmation_pending",
+                   "migration_confirmation_pending INTEGER NOT NULL DEFAULT 0")
+    _rebuild_datafeed_outage_gap(conn)
     conn.commit()
+
+
+def _rebuild_datafeed_outage_gap(conn: sqlite3.Connection) -> None:
+    """旧い `datafeed_outage_gap` (gap_start が NOT NULL・source 列なし) を、gap_start に
+    NULL を書ける形と source 列つきの形へ作り直す。行はそのまま写し、source は NULL。
+
+    列の形で要否を決めるので何度呼んでも 2 回目は何もしない。作り直しは 1 つの
+    transaction で、途中で落ちれば元の表が残り、次回に最初からやり直す。"""
+    cols = {r["name"]: r for r in conn.execute("PRAGMA table_info(datafeed_outage_gap)")}
+    if not cols or ("source" in cols and not cols["gap_start"]["notnull"]):
+        return
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("DROP TABLE IF EXISTS datafeed_outage_gap_new")
+        conn.execute(
+            "CREATE TABLE datafeed_outage_gap_new ("
+            "pair TEXT NOT NULL, interval TEXT NOT NULL, epoch INTEGER NOT NULL, "
+            "gap_start TEXT, replay_through TEXT, source TEXT, "
+            "PRIMARY KEY (pair, interval, epoch))")
+        source = "source" if "source" in cols else "NULL"
+        conn.execute(
+            "INSERT INTO datafeed_outage_gap_new "
+            "(pair, interval, epoch, gap_start, replay_through, source) "
+            f"SELECT pair, interval, epoch, gap_start, replay_through, {source} "
+            "FROM datafeed_outage_gap")
+        conn.execute("DROP TABLE datafeed_outage_gap")
+        conn.execute("ALTER TABLE datafeed_outage_gap_new RENAME TO datafeed_outage_gap")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 def _candidate_archives_shape(conn: sqlite3.Connection) -> list[tuple]:

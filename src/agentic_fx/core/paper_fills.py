@@ -29,18 +29,25 @@ def check_limit_fill(order: dict, bar: Bar, spread: float = 0.0) -> float | None
     return None
 
 
-def check_exit(order: dict, bar: Bar, spread: float, *,
-               entry_same_bar: bool = False) -> tuple[str, float] | None:
+def exit_hits(order: dict, bar: Bar, spread: float) -> tuple[bool, bool]:
+    """この足が SL / TP の価格に届いたか (sl, tp)。決済価格は計算しない。"""
     sl, tp = order["stop_loss"], order["take_profit"]
-    long = order["direction"] == "long"
     half = spread / 2
-
-    if long:
+    if order["direction"] == "long":
         sl_hit = bar.low - half <= sl or bar.open - half <= sl
         tp_hit = tp is not None and bar.high - half >= tp
     else:
         sl_hit = bar.high + half >= sl or bar.open + half >= sl
         tp_hit = tp is not None and bar.low + half <= tp
+    return sl_hit, tp_hit
+
+
+def check_exit(order: dict, bar: Bar, spread: float, *,
+               entry_same_bar: bool = False) -> tuple[str, float] | None:
+    sl, tp = order["stop_loss"], order["take_profit"]
+    long = order["direction"] == "long"
+    half = spread / 2
+    sl_hit, tp_hit = exit_hits(order, bar, spread)
 
     if sl_hit:
         # ギャップ: open が SL を超えていれば open 基準で滑る

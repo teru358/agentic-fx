@@ -115,6 +115,19 @@ def _ticks(day, spec):
     return [_at(day, hh, mm) for hh, mm in spec]
 
 
+# 欠けた足 (fixture の実データ): 9/29 の 21:15 / 21:19-20 / 21:26-27。各欠けは直前の水位の次の足の
+# 確認時刻 (足の開始 + 2 分 30 秒) が起点 S。後続の足が届いた tick (確定 = 足の開始 + 1 分 30 秒) で
+# 復帰する。9/13 の日曜の開場直後は 21:01-18 が 18 分連続で欠け、以後 21:22-23 / 25 / 28-30 / 41-44
+
+ROLLOVER_RESTRICTED = [(21, 17), (21, 21), (21, 22), (21, 28), (21, 29)]
+ROLLOVER_READY_AFTER = [(21, 18), (21, 23), (21, 30)]
+SUNDAY_RESTRICTED = ([(21, m) for m in range(3, 21)]           # 21:01-18 の欠け: S=21:02:30
+                     + [(21, 24), (21, 25), (21, 27)]          # 21:22-23 / 25
+                     + [(21, 30), (21, 31), (21, 32)]          # 21:28-30
+                     + [(21, m) for m in range(43, 47)])       # 21:41-44
+SUNDAY_READY_AFTER = [(21, 21), (21, 26), (21, 28), (21, 33), (21, 47)]
+
+
 def test_rollover_day_makes_three_restricted_episodes_that_each_recover(tmp_path):
     log = ActivityLog(tmp_path / "activity.log")
     conn, ingest, machine = _rig(tmp_path, _load("usdjpy-1m-20260929-rollover.json"),
@@ -123,13 +136,10 @@ def test_rollover_day_makes_three_restricted_episodes_that_each_recover(tmp_path
     states = _states(trace)
 
     restricted_ticks = [t for t, s in states.items() if s == "restricted"]
-    assert restricted_ticks == _ticks(29, [
-        (21, 17), (21, 18), (21, 19),
-        (21, 21), (21, 22), (21, 23), (21, 24),
-        (21, 28), (21, 29), (21, 30), (21, 31)])
+    assert restricted_ticks == _ticks(29, ROLLOVER_RESTRICTED)
     assert "degraded" not in states.values()
-    # 回復 (3 回目の healthy tick) の時刻は 21:20 / 21:25 / 21:32
-    for t in _ticks(29, [(21, 20), (21, 25), (21, 32)]):
+    # 復帰は後続の足が届いた最初の tick で、追加の健全 tick を待たない
+    for t in _ticks(29, ROLLOVER_READY_AFTER):
         assert states[t] == "ready"
     assert states[_at(29, 20, 52)] == "ready"
     assert states[_at(29, 21, 40)] == "ready"
@@ -138,16 +148,16 @@ def test_rollover_day_makes_three_restricted_episodes_that_each_recover(tmp_path
     assert trace[_at(29, 21, 17)][1]["restricted_deadline_at"] == "2026-09-29T21:46:30+00:00"
     assert trace[_at(29, 21, 21)][1]["restricted_deadline_at"] == "2026-09-29T21:50:30+00:00"
     assert trace[_at(29, 21, 28)][1]["restricted_deadline_at"] == "2026-09-29T21:57:30+00:00"
-    assert [trace[_at(29, 21, m)][1]["epoch"] for m in (17, 20, 21, 25, 28, 32)] == [
+    assert [trace[_at(29, 21, m)][1]["epoch"] for m in (17, 18, 21, 23, 28, 30)] == [
         1, 1, 2, 2, 3, 3]
-    assert trace[_at(29, 21, 20)][1]["restricted_deadline_at"] is None
+    assert trace[_at(29, 21, 18)][1]["restricted_deadline_at"] is None
     events = _events(log)
     assert events.count("datafeed_restricted") == 3
     assert events.count("datafeed_recovered_auto") == 3
     assert "datafeed_degraded" not in events
 
 
-def test_rollover_day_with_an_open_position_degrades_on_the_first_stalled_tick(tmp_path):
+def test_rollover_day_with_an_open_position_is_restricted_and_recovers_in_the_same_way(tmp_path):
     log = ActivityLog(tmp_path / "activity.log")
     conn, ingest, machine = _rig(tmp_path, _load("usdjpy-1m-20260929-rollover.json"),
                                  activity=log)
@@ -159,17 +169,19 @@ def test_rollover_day_with_an_open_position_degrades_on_the_first_stalled_tick(t
     states = _states(trace)
 
     assert states[_at(29, 21, 16)] == "ready"
-    assert states[_at(29, 21, 17)] == "degraded"
-    assert trace[_at(29, 21, 17)][1]["pending_human_confirmation"] == 1
+    # 建玉があっても猶予 (10 分) 内の停滞は restricted。人の確認 (pending) は立てない
+    assert states[_at(29, 21, 17)] == "restricted"
+    assert trace[_at(29, 21, 17)][1]["pending_human_confirmation"] == 0
     assert trace[_at(29, 21, 17)][1]["epoch"] == 1
-    # 建玉が残る限り healthy が続いても自動では戻らない
-    assert states[_at(29, 21, 24)] == "degraded"
+    # 後続の足が届いた tick で、建玉ありでも同じ tick で ready に戻る
+    assert states[_at(29, 21, 18)] == "ready"
+    assert states[_at(29, 21, 24)] == "ready"
     events = _events(log)
-    assert "datafeed_restricted" not in events
-    assert events.count("datafeed_degraded") == 1
+    assert events.count("datafeed_restricted") == 2
+    assert "datafeed_degraded" not in events
 
 
-def test_sunday_open_day_makes_three_restricted_episodes_that_each_recover(tmp_path):
+def test_sunday_open_day_makes_restricted_episodes_that_each_recover(tmp_path):
     log = ActivityLog(tmp_path / "activity.log")
     conn, ingest, machine = _rig(tmp_path, _load("usdjpy-1m-20260913-sunday-open.json"),
                                  activity=log)
@@ -177,32 +189,36 @@ def test_sunday_open_day_makes_three_restricted_episodes_that_each_recover(tmp_p
     states = _states(trace)
 
     restricted_ticks = [t for t, s in states.items() if s == "restricted"]
-    expected_restricted = (
-        [(21, m) for m in range(3, 23)]          # 21:03 - 21:22 (21:23 で ready)
-        + [(21, m) for m in range(24, 35)]       # 21:24 - 21:34 (21:35 で ready)
-        + [(21, m) for m in range(43, 49)])      # 21:43 - 21:48 (21:49 で ready)
-    assert restricted_ticks == _ticks(13, expected_restricted)
+    assert restricted_ticks == _ticks(13, SUNDAY_RESTRICTED)
     assert "degraded" not in states.values()
     assert states[_at(13, 21, 2)] == "ready"
-    for t in _ticks(13, [(21, 23), (21, 35), (21, 49), (21, 55)]):
+    for t in _ticks(13, SUNDAY_READY_AFTER + [(21, 55)]):
         assert states[t] == "ready"
     assert trace[_at(13, 21, 3)][1]["restricted_deadline_at"] == "2026-09-13T21:32:30+00:00"
     assert trace[_at(13, 21, 24)][1]["restricted_deadline_at"] == "2026-09-13T21:53:30+00:00"
     assert trace[_at(13, 21, 43)][1]["restricted_deadline_at"] == "2026-09-13T22:12:30+00:00"
     events = _events(log)
-    assert events.count("datafeed_restricted") == 3
-    assert events.count("datafeed_recovered_auto") == 3
+    assert events.count("datafeed_restricted") == 5
+    assert events.count("datafeed_recovered_auto") == 5
 
 
-def test_sunday_open_with_an_open_position_degrades_on_the_first_stalled_tick(tmp_path):
+def test_sunday_open_with_an_open_position_degrades_when_the_stall_passes_ten_open_minutes(
+        tmp_path):
     conn, ingest, machine = _rig(tmp_path, _load("usdjpy-1m-20260913-sunday-open.json"))
     trace = _replay(conn, ingest, machine, _at(13, 21, 2), _at(13, 21, 2))
     orders.insert(conn, pair=PAIR, direction="buy", entry_type="market",
                   horizon="swing", status="open", now=_at(13, 21, 2))
     conn.commit()
-    trace.update(_replay(conn, ingest, machine, _at(13, 21, 3), _at(13, 21, 3)))
+    trace.update(_replay(conn, ingest, machine, _at(13, 21, 3), _at(13, 21, 14)))
+    states = _states(trace)
 
-    assert trace[_at(13, 21, 3)][0] == "degraded"
+    # 起点 S=21:02:30 から 21:12:00 は 570 秒で猶予内、21:13:00 は 630 秒で超過
+    assert states[_at(13, 21, 3)] == "restricted"
+    assert states[_at(13, 21, 12)] == "restricted"
+    assert states[_at(13, 21, 13)] == "degraded"
+    assert trace[_at(13, 21, 13)][1]["pending_human_confirmation"] == 1
+    assert trace[_at(13, 21, 13)][1]["epoch"] == 1
+    assert states[_at(13, 21, 14)] == "degraded"
 
 
 def test_contiguous_day_has_no_state_transition_or_activity(tmp_path):
@@ -222,10 +238,7 @@ def test_real_config_with_a_15m_hard_key_recovers_at_the_same_times_as_1m_alone(
     states = _states(_replay_with_15m(conn, ingest, machine, _at(29, 20, 52), _at(29, 21, 40)))
 
     restricted_ticks = [t for t, s in states.items() if s == "restricted"]
-    assert restricted_ticks == _ticks(29, [
-        (21, 17), (21, 18), (21, 19),
-        (21, 21), (21, 22), (21, 23), (21, 24),
-        (21, 28), (21, 29), (21, 30), (21, 31)])
+    assert restricted_ticks == _ticks(29, ROLLOVER_RESTRICTED)
     assert "degraded" not in states.values()
-    for t in _ticks(29, [(21, 20), (21, 25), (21, 32), (21, 40)]):
+    for t in _ticks(29, ROLLOVER_READY_AFTER + [(21, 40)]):
         assert states[t] == "ready"

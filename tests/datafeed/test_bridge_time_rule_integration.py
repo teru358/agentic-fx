@@ -240,7 +240,7 @@ def test_sunday_open_while_flat_defers_then_restricts_once_and_recovers(
     rig.conn.close()
 
 
-def test_sunday_open_with_a_swing_position_degrades_once_and_waits_for_resume(
+def test_sunday_open_with_a_swing_position_is_restricted_and_recovers_when_the_bars_arrive(
         tmp_path, monkeypatch, caplog):
     caplog.set_level(logging.WARNING, logger=BRIDGE_MODULE)
     rig = _sunday_open_rig(tmp_path, monkeypatch)
@@ -250,17 +250,17 @@ def test_sunday_open_with_a_swing_position_degrades_once_and_waits_for_resume(
 
     states = _run_sunday(rig)
 
-    assert [s for _t, s in states[:2]] == ["ready", "degraded"]
-    assert states[-1] == ("22:10:30", "degraded")                      # resume 待ち
+    # 建玉があっても猶予 (10 分) 内の停滞は restricted で、足が届けば同じ tick で ready に戻る
+    assert [s for _t, s in states[:2]] == ["ready", "restricted"]
+    assert states[-1] == ("22:10:30", "ready")
     assert [code for _t, code in rig.statuses[:3]] == [503, 503, 200]
-    assert rig.events("datafeed_") == ["datafeed_degraded",
-                                       "datafeed_recovered_awaiting_resume"]
-    assert rig.events("datafeed_restricted") == []
+    assert rig.events("datafeed_") == ["datafeed_restricted", "datafeed_recovered_auto"]
+    assert rig.events("datafeed_degraded") == []
     assert _bridge_state_lines(caplog) == ["MT5 time rule state: ok"]
     rig.conn.close()
 
 
-def test_mismatch_degrades_in_one_tick_and_a_flat_account_recovers_by_itself(
+def test_mismatch_restricts_in_one_tick_and_a_flat_account_recovers_by_itself(
         tmp_path, monkeypatch, caplog):
     caplog.set_level(logging.WARNING, logger=BRIDGE_MODULE)
     rig = _Rig(
@@ -272,16 +272,17 @@ def test_mismatch_degrades_in_one_tick_and_a_flat_account_recovers_by_itself(
     assert rig.tick(_at(2026, 11, 4, 12, 0, second=30)) == "ready"   # 初回の食い違いは未確認 (300 秒までは待つ)
     second = rig.tick(_at(2026, 11, 4, 12, 1, second=30))               # tick が動いて確定
 
-    assert second == "degraded"
+    # flat の失敗は猶予内の restricted (新規リスクだけ止める)
+    assert second == "restricted"
     assert rig.ingest.last_errors[KEY] == FIXED_MISMATCH_TEXT
     assert dict(rig.reports[-1].failed)[KEY] == FIXED_MISMATCH_TEXT
-    assert rig.events("datafeed_degraded") == ["datafeed_degraded"]
+    assert rig.events("datafeed_restricted") == ["datafeed_restricted"]
 
     rig.mt5.offset = 7200                                              # broker の時計が規則に戻る
     states = [rig.tick(_at(2026, 11, 4, 12, minute, second=30)) for minute in range(2, 11)]
 
     assert states[-1] == "ready"
-    assert rig.events("datafeed_degraded") == ["datafeed_degraded"]
+    assert rig.events("datafeed_degraded") == []
     assert rig.events("datafeed_recovered_auto") == ["datafeed_recovered_auto"]
     assert _bridge_state_lines(caplog) == ["MT5 time rule state: mismatch",
                                            "MT5 time rule state: ok"]
@@ -418,39 +419,30 @@ def production_rig(tmp_path, monkeypatch):
     rig.close()
 
 
-def test_sunday_open_with_a_position_never_latches_the_kill_switch_and_waits_for_resume(
+def test_sunday_open_with_a_position_never_latches_the_kill_switch_and_recovers_by_itself(
         production_rig):
     rig = production_rig
     rig.open_position()
 
     states = []
-    missions_when_degraded = None
+    calls = {0: rig.env.trade_calls}
     for minute in range(1, 11):
         states.append((minute, rig.tick(_at(2026, 11, 8, 22, minute, second=30))))
-        if minute == 2:
-            missions_when_degraded = rig.env.trade_calls
+        calls[minute] = rig.env.trade_calls
 
-    assert [s for m, s in states if m in (1, 2)] == ["ready", "degraded"]
-    assert states[-1][1] == "degraded"                          # 人の resume 待ち
+    # 建玉があっても猶予 (10 分) 内の停滞は restricted。足が届けば同じ tick で ready に戻る
+    assert [s for m, s in states if m in (1, 2)] == ["ready", "restricted"]
+    assert states[-1][1] == "ready"
     assert set(rig.kill_switch_seen) == {(False, 0)}            # latch も世代の更新も無い
     assert rig.sink.events == [] and rig.sink.drops == []       # 注文の状態遷移の通知は 0 件
     assert rig.notifier.messages == []                          # 運用通知も 0 件
-    assert rig.env.trade_calls == missions_when_degraded        # degraded の間は新規判断を起こさない
+    restricted_minutes = [m for m, s in states if s == "restricted"]
+    assert restricted_minutes and restricted_minutes[0] == 2
     assert orders.list_by_status(rig.env.conn, "open")          # 建玉は触られない
-
-    # 隙間の足を建玉の SL / TP で見ていないので、確認なしの resume は断られて degraded のまま
-    rig.rig.outage.request_resume(_at(2026, 11, 8, 22, 10, second=40))
-    assert rig.tick(_at(2026, 11, 8, 22, 11, second=30)) == "degraded"
-    assert orders.list_by_status(rig.env.conn, "open")
-    rig.rig.outage.request_resume(_at(2026, 11, 8, 22, 11, second=40), acknowledge=True)
-    assert rig.tick(_at(2026, 11, 8, 22, 12, second=30)) == "ready"
-
+    # restricted の間は新規判断を起こさない
+    assert all(calls[m] == calls[m - 1] for m in restricted_minutes)
     assert rig.scheduler_events().count("day_close_deferred") == 0
-    assert rig.rig.events("datafeed_") == ["datafeed_degraded",
-                                           "datafeed_recovered_awaiting_resume"]
-    rig_events = [line.split("\t")[2] for line in rig.rig.activity.tail(200)]
-    assert rig_events.count("data_resume_rejected") == 1
-    assert rig_events.count("data_resume_accepted") == 1
+    assert rig.rig.events("datafeed_") == ["datafeed_restricted", "datafeed_recovered_auto"]
     assert set(rig.kill_switch_seen) == {(False, 0)}
     assert rig.sink.events == [] and rig.notifier.messages == []
 

@@ -64,7 +64,7 @@ def test_a_restart_does_not_restart_the_open_time(tmp_path):
 
 
 def test_no_stop_is_recorded_after_the_wait_was(tmp_path):
-    conn, machine = _rig(tmp_path)
+    conn, machine = _rig(tmp_path, auto_resume_when_flat=False)
     _set(conn, machine, state="degraded", epoch=3, entered_degraded_at=WED.isoformat(),
          pending_human_confirmation=1)
     _tick(conn, machine, WED + timedelta(minutes=1))                 # 健全: 待ちを記録

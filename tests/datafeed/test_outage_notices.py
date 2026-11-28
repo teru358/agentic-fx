@@ -52,8 +52,9 @@ def _tick(conn, machine, now, *, failed=False, empty=False, fresh=True):
 
 
 def _open_position(conn, at):
-    orders.insert(conn, pair=PAIR, direction="buy", entry_type="market", horizon="swing",
-                  status="open", now=at, filled_at=at.isoformat())
+    # 保護条件が読める建玉 (損切りは足の価格 1.0 より遠い): 停止中に届く足が接触と判定されない
+    orders.insert(conn, pair=PAIR, direction="long", entry_type="market", horizon="swing",
+                  status="open", now=at, filled_at=at.isoformat(), stop_loss=0.5)
     conn.commit()
 
 
@@ -68,7 +69,8 @@ def _states(conn):
 
 
 def _set(conn, machine, **cols):
-    machine._ensure_row(WED)
+    # 行の作成時刻は最初の tick より前 (同じ now の観測を二重に数えない)
+    machine._ensure_row(WED - timedelta(minutes=1))
     sets = ", ".join(f"{k}=?" for k in cols)
     conn.execute(f"UPDATE datafeed_outage_state SET {sets} WHERE id=1", tuple(cols.values()))
     conn.commit()
@@ -137,9 +139,19 @@ def test_a_request_works_without_the_notice_table(tmp_path):
 # ---- 終端結果 ----------------------------------------------------------
 
 def _degrade(conn, machine, now, *, with_position=False):
+    """停止中の epoch 5 を直接用意する (停止に至る観測の経路は遷移表の test が確かめる)。"""
     if with_position:
         _open_position(conn, now - timedelta(minutes=30))
-    assert _tick(conn, machine, now, failed=True) == "degraded"
+    _bar(conn, now - timedelta(minutes=2))
+    conn.execute(
+        "UPDATE datafeed_outage_state SET state='degraded', epoch=5, confirmed=0, "
+        "entered_degraded_at=?, pending_human_confirmation=?, recovered_notified_epoch=NULL, "
+        "updated_at=? WHERE id=1", (now.isoformat(), 1 if with_position else 0, now.isoformat()))
+    conn.execute(
+        "INSERT INTO datafeed_outage_gap (pair, interval, epoch, gap_start, replay_through, "
+        "source) VALUES (?, '1m', 5, ?, NULL, 'mt5-live')",
+        (PAIR, (now - timedelta(minutes=2)).isoformat()))
+    conn.commit()
 
 
 def test_an_accepted_request_persists_its_result_and_notifies_acceptance_then_resumption(tmp_path):
@@ -187,7 +199,8 @@ def test_a_watermark_rejection_wins_over_unprocessed_positions_even_with_acknowl
     machine.request_resume(WED + timedelta(minutes=3), acknowledge=True)
     assert _tick(conn, machine, WED + timedelta(minutes=4), failed=True) == "degraded"
     assert machine.status()["resume_last_result"] == "rejected_watermark"
-    assert _states(conn) == ["stopped", "resume_rejected", "resume_rejected"]
+    # 停止の確定 (問題観測の 2 連続) は最初の拒否より後
+    assert _states(conn) == ["resume_rejected", "stopped", "resume_rejected"]
 
 
 def test_a_request_on_a_ready_state_is_consumed_as_already_ready(tmp_path):
@@ -220,7 +233,8 @@ def test_a_new_epoch_clears_the_previous_result(tmp_path):
     machine.request_resume(WED, acknowledge=False)
     _tick(conn, machine, WED + timedelta(minutes=1))
     assert machine.status()["resume_last_result"] == "already_ready"
-    assert _tick(conn, machine, WED + timedelta(minutes=3), failed=True) == "degraded"
+    # 開場中の失敗は、flat なら猶予内の restricted (停止ではない) で新しい epoch を開く
+    assert _tick(conn, machine, WED + timedelta(minutes=3), failed=True) == "restricted"
     row = machine.status()
     assert row["epoch"] == 5
     assert (row["resume_last_result"], row["resume_last_result_at"],
@@ -232,7 +246,7 @@ def test_a_request_recorded_before_a_new_stop_is_judged_against_the_new_epoch(tm
     _set(conn, machine, state="ready", epoch=4)
     machine.request_resume(WED, acknowledge=True)
     key = machine.status()["resume_requested_at"]
-    assert _tick(conn, machine, WED + timedelta(minutes=1), failed=True) == "degraded"
+    assert _tick(conn, machine, WED + timedelta(minutes=1), failed=True) == "restricted"
     assert machine.status()["resume_last_result"] == "rejected_watermark"
     assert _notices(conn)[-1] == (5, "resume_rejected", key)
 
@@ -240,15 +254,16 @@ def test_a_request_recorded_before_a_new_stop_is_judged_against_the_new_epoch(tm
 # ---- 停止・待ち・復帰の記録 --------------------------------------------
 
 def test_two_consecutive_problem_ticks_record_one_stop_per_episode(tmp_path):
-    conn, machine = _rig(tmp_path)
+    conn, machine = _rig(tmp_path, flat_stall_max_sec=0)
     _set(conn, machine, state="ready", epoch=4)
     for minute in range(4):
         _tick(conn, machine, WED + timedelta(minutes=minute), failed=True)
     assert _notices(conn) == [(5, "stopped", "")]
 
 
-def test_a_healthy_recovery_with_a_retained_pending_flag_records_the_wait_once(tmp_path):
-    conn, machine = _rig(tmp_path, activity=ActivityLog(tmp_path / "activity.log"))
+def test_a_healthy_recovery_that_needs_a_human_records_the_wait_once(tmp_path):
+    conn, machine = _rig(tmp_path, activity=ActivityLog(tmp_path / "activity.log"),
+                         auto_resume_when_flat=False)
     _set(conn, machine, state="degraded", epoch=9, pending_human_confirmation=1)
     for minute in range(4):
         assert _tick(conn, machine, WED + timedelta(minutes=minute)) == "degraded"
@@ -271,9 +286,9 @@ def test_no_wait_is_recorded_while_a_request_is_pending(tmp_path):
     assert machine.status()["recovered_notified_epoch"] is None
 
 
-def test_a_flat_healthy_recovery_without_pending_is_not_a_wait(tmp_path):
+def test_a_flat_healthy_recovery_is_not_a_wait_even_with_a_pending_flag(tmp_path):
     conn, machine = _rig(tmp_path)
-    _set(conn, machine, state="degraded", epoch=9)
+    _set(conn, machine, state="degraded", epoch=9, pending_human_confirmation=1)
     for minute in range(3):
         _tick(conn, machine, WED + timedelta(minutes=minute))
     assert machine.state == "ready"
@@ -284,8 +299,9 @@ def test_no_stop_is_recorded_after_the_wait_of_the_same_epoch(tmp_path):
     conn, machine = _rig(tmp_path)
     _open_position(conn, WED - timedelta(minutes=30))
     _set(conn, machine, state="ready", epoch=4)
-    _bar(conn, WED - timedelta(minutes=10))
-    assert machine.observe(WED, _report()) == "degraded"       # 建玉あり + 停滞 -> 即 degraded
+    _bar(conn, WED - timedelta(minutes=20))
+    # 建玉あり + 停滞の起点から 10 分超 (S=09:42:30 から 17.5 分) -> degraded
+    assert machine.observe(WED, _report()) == "degraded"
     _tick(conn, machine, WED + timedelta(minutes=1))              # 健全 -> 待ち
     _tick(conn, machine, WED + timedelta(minutes=2), failed=True)
     _tick(conn, machine, WED + timedelta(minutes=3), failed=True)  # confirmed
@@ -294,7 +310,7 @@ def test_no_stop_is_recorded_after_the_wait_of_the_same_epoch(tmp_path):
 
 
 def test_an_automatic_recovery_after_a_stop_record_adds_the_resumption(tmp_path):
-    conn, machine = _rig(tmp_path)
+    conn, machine = _rig(tmp_path, flat_stall_max_sec=0)
     _set(conn, machine, state="ready", epoch=4)
     _tick(conn, machine, WED, failed=True)
     _tick(conn, machine, WED + timedelta(minutes=1), failed=True)
@@ -318,7 +334,7 @@ def test_a_restricted_only_recovery_records_nothing(tmp_path):
 # ---- 記録の失敗の隔離 --------------------------------------------------
 
 def test_a_notice_write_failure_neither_fails_the_observation_nor_stops_the_state(tmp_path, caplog):
-    conn, machine = _rig(tmp_path)
+    conn, machine = _rig(tmp_path, flat_stall_max_sec=0)
     _set(conn, machine, state="ready", epoch=4)
     conn.execute("DROP TABLE datafeed_outage_notices")
     conn.commit()
@@ -361,16 +377,14 @@ def _epoch66(tmp_path):
     conn, machine = _rig(tmp_path)
     _set(conn, machine, state="ready", epoch=65)
     _open_position(conn, THU - timedelta(hours=3))
-    _bar(conn, THU - timedelta(minutes=10))
-    assert machine.observe(THU, _report()) == "degraded"                     # 11-19 22:40 建玉あり 1m 停滞
+    _bar(conn, THU - timedelta(minutes=20))
+    assert machine.observe(THU, _report()) == "degraded"                     # 11-19 22:40 建玉あり 1m 停滞 (10 分超)
     row = machine.status()
     assert (row["epoch"], row["pending_human_confirmation"]) == (66, 1)
     assert _tick(conn, machine, THU + timedelta(minutes=1)) == "degraded"    # 22:41 健全 -> 待ち
     assert _states(conn) == ["awaiting_resume"]
-    conn.execute("UPDATE orders SET status='closed' WHERE status='open'")    # 00:56 建玉を決済
-    conn.commit()
     for at in (datetime(2026, 11, 20, 0, 56, tzinfo=UTC), datetime(2026, 11, 20, 0, 57, tzinfo=UTC)):
-        assert _tick(conn, machine, at) == "degraded"                        # pending が自動復帰を妨げる
+        assert _tick(conn, machine, at) == "degraded"                        # 建玉が残る間は自動復帰しない
     # 04:19 再起動 (プロセス内の連続カウンタが消える) の後、二連続の問題観測
     machine = OutageStateMachine(conn, hard_keys=frozenset({KEY}), interval_widths=WIDTHS,
                                  grace=timedelta(seconds=30), storage_source="mt5-live")
@@ -479,7 +493,7 @@ class _BrokenActivity:
 
 
 def test_a_failing_activity_write_does_not_skip_the_notice_record(tmp_path):
-    conn, machine = _rig(tmp_path, activity=_BrokenActivity())
+    conn, machine = _rig(tmp_path, activity=_BrokenActivity(), flat_stall_max_sec=0)
     _set(conn, machine, state="ready", epoch=4)
     for minute in range(2):
         with pytest.raises(OSError):
@@ -501,7 +515,7 @@ def test_a_failing_activity_write_does_not_skip_the_result_record_of_a_request(t
 
 
 def test_a_failed_notice_write_is_retried_on_the_next_tick(tmp_path):
-    conn, machine = _rig(tmp_path)
+    conn, machine = _rig(tmp_path, flat_stall_max_sec=0)
     _set(conn, machine, state="ready", epoch=4)
     _tick(conn, machine, WED, failed=True)
     conn.execute("DROP TABLE datafeed_outage_notices")

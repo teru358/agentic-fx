@@ -182,6 +182,8 @@ class Mt5Settings(SourceToggle):
 
 
 class OutageSettings(_Strict):
+    """価格源の停滞・不通の猶予と自動復帰。建玉があるときの猶予 (600 秒) は設定を持たない。"""
+
     flat_stall_max_sec: int = Field(default=1800, ge=0)
     ready_confirm_ticks: int = Field(default=3, ge=1)
     auto_resume_when_flat: bool = True

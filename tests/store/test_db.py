@@ -25,6 +25,7 @@ EXPECTED = {
     "ohlcv_slice_generations", "econ_reaction_keys", "econ_reaction_values",
     "kill_switch_hwm_rebases",
     "review_weeks", "strategy_review_weekly", "plugin_inventory_weekly",
+    "datafeed_outage_key_facts", "datafeed_late_bars", "datafeed_outage_contacts",
 }
 
 

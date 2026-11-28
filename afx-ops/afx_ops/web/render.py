@@ -272,7 +272,7 @@ _DATA_OPERATION_NOTE = "操作は SSH の端末から行ってください。こ
 _COMMAND_ACTIONS = ("resume", "resume_with_ack")
 
 
-def _data_guidance(data: Mapping[str, object]) -> str:
+def _data_guidance(data: Mapping[str, object], tz: str | None = None) -> str:
     """data の行を含む群の直後に置く固定案内 (停止理由と次の操作)。常時出す。
 
     SSH の端末から操作する旨の注記は、次の操作が実行するコマンドのときだけ添える。
@@ -285,6 +285,9 @@ def _data_guidance(data: Mapping[str, object]) -> str:
     phase, action = guidance_text.checked_pair(feed)
     verdict = marks.classify_data_phase({"phase": phase})
     note = "<p>" + _DATA_OPERATION_NOTE + "</p>" if action in _COMMAND_ACTIONS else ""
+    convert = (lambda value: value) if tz is None else (
+        lambda value: display_time.convert_or_raw(value, tz, display_time.PRECISION_SECOND))
+    lines = [*lines, *guidance_text.contact_lines(feed, convert)]
     return ("<section><h2>データの案内</h2>"
             + "<p>" + marks.render_verdict(verdict) + "</p>"
             + "".join("<p>" + html.escape(line, quote=True) + "</p>" for line in lines)
@@ -300,7 +303,7 @@ def _status_overview(data: Mapping[str, object], tz: str) -> str:
         if rows:
             parts.append(f"<section><h2>{title}</h2>{rows}</section>")
         if "data" in keys:
-            parts.append(_data_guidance(data))
+            parts.append(_data_guidance(data, tz))
     return "".join(parts)
 
 

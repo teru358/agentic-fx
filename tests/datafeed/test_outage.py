@@ -19,7 +19,7 @@ from agentic_fx.datafeed.outage import (
     format_unprocessed_positions,
     unprocessed_positions_by_pair,
 )
-from agentic_fx.store import orders
+from agentic_fx.store import orders, outage_facts
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.ohlcv import upsert_cache_bars
 
@@ -30,6 +30,9 @@ GRACE = timedelta(seconds=30)
 
 
 def _machine(conn, *, activity=None, **kw):
+    # 既定は停滞・失敗の猶予なし (最初の問題 tick で degraded)。猶予内の restricted を見る test は
+    # flat_stall_max_sec を明示する
+    kw.setdefault("flat_stall_max_sec", 0)
     return OutageStateMachine(conn, hard_keys=HARD_KEYS, interval_widths=WIDTHS,
                               grace=GRACE, storage_source="mt5-live",
                               activity=activity, **kw)
@@ -90,7 +93,7 @@ def test_stall_formula_single_grace_no_double_counting_1m_and_1h(tmp_path):
     conn = _db(tmp_path)
     _seed_bar(conn, PAIR, "1m", datetime(2026, 9, 24, 9, 59, tzinfo=timezone.utc))
     _seed_bar(conn, PAIR, "1h", datetime(2026, 9, 24, 9, 0, tzinfo=timezone.utc))
-    m = _machine(conn)
+    m = _machine(conn, flat_stall_max_sec=1800)
     # 10:01:00 はまだ ready (10:01:30 を過ぎていない)
     assert m.observe(datetime(2026, 9, 24, 10, 1, 0, tzinfo=timezone.utc),
                      _report(succeeded=[(PAIR, "1m"), (PAIR, "1h")])) == "ready"
@@ -103,7 +106,7 @@ def test_restricted_deadline_is_absolute_and_strictly_exclusive(tmp_path):
     conn = _db(tmp_path)
     _seed_bar(conn, PAIR, "1m", datetime(2026, 9, 24, 9, 59, tzinfo=timezone.utc))
     _seed_bar(conn, PAIR, "1h", datetime(2026, 9, 24, 9, 0, tzinfo=timezone.utc))
-    m = _machine(conn)
+    m = _machine(conn, flat_stall_max_sec=1800)
     report = _report(succeeded=HARD_KEYS)
     assert m.observe(datetime(2026, 9, 24, 10, 2, tzinfo=timezone.utc), report) == "restricted"
     row = m.status()
@@ -129,7 +132,7 @@ def test_stall_formula_1h_boundary(tmp_path):
     _seed_bar(conn, PAIR, "1m", datetime(2026, 9, 24, 10, 58, tzinfo=timezone.utc))
     _seed_bar(conn, PAIR, "1m", datetime(2026, 9, 24, 10, 59, tzinfo=timezone.utc))
     _seed_bar(conn, PAIR, "1h", datetime(2026, 9, 24, 9, 0, tzinfo=timezone.utc))
-    m = _machine(conn)
+    m = _machine(conn, flat_stall_max_sec=1800)
     assert m.observe(datetime(2026, 9, 24, 11, 0, 0, tzinfo=timezone.utc),
                      _report(succeeded=[(PAIR, "1m"), (PAIR, "1h")])) == "ready"
     assert m.observe(datetime(2026, 9, 24, 11, 1, 0, tzinfo=timezone.utc),
@@ -270,7 +273,7 @@ def test_watermark_reads_are_scoped_by_storage_source(tmp_path):
              source="yfinance")
     _seed_bar(conn, PAIR, "1h", datetime(2026, 9, 24, 9, 0, tzinfo=timezone.utc),
              source="mt5-live")
-    m = _machine(conn)
+    m = _machine(conn, flat_stall_max_sec=1800)
     now = datetime(2026, 9, 24, 10, 2, tzinfo=timezone.utc)
     # 1m の ingest 自体は succeeded だったことにしても (例えば「別 source から
     # 取ってしまった」誤設定を模す)、mt5-live 側の watermark 停滞は検出される
@@ -326,13 +329,13 @@ def test_migration_is_idempotent_for_outage_tables(tmp_path):
 
 
 def _insert_open(conn, pair, filled_at):
-    return orders.insert(conn, pair=pair, direction="buy", entry_type="market",
+    return orders.insert(conn, pair=pair, direction="long", stop_loss=0.5, entry_type="market",
                          horizon="swing", status="open", now=filled_at,
                          filled_at=filled_at.isoformat())
 
 
 def _insert_pending(conn, pair, created_at):
-    return orders.insert(conn, pair=pair, direction="buy", entry_type="limit",
+    return orders.insert(conn, pair=pair, direction="long", requested_price=0.5, entry_type="limit",
                          horizon="swing", status="pending_fill", now=created_at)
 
 
@@ -433,7 +436,7 @@ def test_resume_request_is_rejected_when_unprocessed_positions_remain(tmp_path):
     _seed_bar(conn, PAIR, "1h", datetime(2026, 9, 24, 10, 0, tzinfo=timezone.utc))
     _seed_bar(conn, PAIR, "1m", datetime(2026, 9, 24, 10, 5, tzinfo=timezone.utc))
     filled_at = datetime(2026, 9, 24, 9, 30, tzinfo=timezone.utc)
-    orders.insert(conn, pair=PAIR, direction="buy", entry_type="market",
+    orders.insert(conn, pair=PAIR, direction="long", stop_loss=0.5, entry_type="market",
                   horizon="swing", status="open", now=filled_at,
                   filled_at=filled_at.isoformat())
 
@@ -466,7 +469,7 @@ def test_resume_request_is_accepted_with_acknowledge_despite_unprocessed_positio
     _seed_bar(conn, PAIR, "1h", datetime(2026, 9, 24, 10, 0, tzinfo=timezone.utc))
     _seed_bar(conn, PAIR, "1m", datetime(2026, 9, 24, 10, 5, tzinfo=timezone.utc))
     filled_at = datetime(2026, 9, 24, 9, 30, tzinfo=timezone.utc)
-    orders.insert(conn, pair=PAIR, direction="buy", entry_type="market",
+    orders.insert(conn, pair=PAIR, direction="long", stop_loss=0.5, entry_type="market",
                   horizon="swing", status="open", now=filled_at,
                   filled_at=filled_at.isoformat())
 
@@ -824,13 +827,14 @@ def test_unprocessed_bars_notification_resets_after_resume_acceptance(tmp_path):
         return [l for l in log.tail(50) if "data_outage_unprocessed_bars" in l]
 
     orders.insert(
-        conn, pair=PAIR, direction="buy", entry_type="market", horizon="swing",
+        conn, pair=PAIR, direction="long", stop_loss=0.5, entry_type="market", horizon="swing",
         status="open", now=datetime(2026, 9, 24, 9, 30, tzinfo=timezone.utc),
         filled_at=datetime(2026, 9, 24, 9, 30, tzinfo=timezone.utc).isoformat())
 
     # episode 1: 1m 失敗 → degraded、gap_start(1m)=09:59。
     t1 = datetime(2026, 9, 24, 10, 1, 0, tzinfo=timezone.utc)
-    failed = _report(failed=[((PAIR, "1m"), "ConnectError")], succeeded=[(PAIR, "1h")])
+    # 建玉があるので 1m の失敗は猶予内の restricted になる。上位足 (1h) の失敗は建玉ありなら即 degraded
+    failed = _report(failed=[((PAIR, "1h"), "ConnectError")], succeeded=[(PAIR, "1m")])
     assert m.observe(t1, failed) == "degraded"
     assert _lines() == []
 
@@ -849,8 +853,8 @@ def test_unprocessed_bars_notification_resets_after_resume_acceptance(tmp_path):
     assert m._last_unprocessed_by_pair is None
 
     # episode 2: 再び 1m 失敗 → 新 epoch。
-    t4 = datetime(2026, 9, 24, 10, 3, 0, tzinfo=timezone.utc)
-    failed2 = _report(failed=[((PAIR, "1m"), "ConnectError")], succeeded=[(PAIR, "1h")])
+    t4 = datetime(2026, 9, 24, 10, 2, 25, tzinfo=timezone.utc)
+    failed2 = _report(failed=[((PAIR, "1h"), "ConnectError")], succeeded=[(PAIR, "1m")])
     assert m.observe(t4, failed2) == "degraded"
     assert len(_lines()) == 1  # 確定足がまだ gap に追いついていない
 
@@ -882,31 +886,28 @@ def test_recovered_awaiting_resume_notification_survives_process_restart(tmp_pat
     t1 = datetime(2026, 9, 24, 10, 1, tzinfo=timezone.utc)
     assert m1.observe(t1, failed) == "degraded"
 
+    # 各 tick は 2 分以内の間隔 (観測の途切れにしない)。tick ごとに 1m の足が 1 本進む
     _seed_bar(conn, PAIR, "1h", datetime(2026, 9, 24, 10, 0, tzinfo=timezone.utc))
-    _seed_bar(conn, PAIR, "1m", datetime(2026, 9, 24, 10, 5, tzinfo=timezone.utc))
-    t2 = datetime(2026, 9, 24, 10, 7, tzinfo=timezone.utc)
-    assert m1.observe(t2, healthy) == "degraded"
+    t2 = datetime(2026, 9, 24, 10, 3, tzinfo=timezone.utc)
+    assert _beat(conn, m1, t2, healthy) == "degraded"
     assert len(_lines()) == 1
 
     # プロセス再起動を模して新インスタンスを同じ conn 上に作る。
     m2 = _machine(conn, activity=log, auto_resume_when_flat=False)
-    _seed_bar(conn, PAIR, "1m", datetime(2026, 9, 24, 10, 6, tzinfo=timezone.utc))
-    t3 = datetime(2026, 9, 24, 10, 8, tzinfo=timezone.utc)
-    assert m2.observe(t3, healthy) == "degraded"
+    t3 = datetime(2026, 9, 24, 10, 4, tzinfo=timezone.utc)
+    assert _beat(conn, m2, t3, healthy) == "degraded"
     assert len(_lines()) == 1  # 同じ epoch・健全 report では再送しない
 
     # OPEN/PENDING_FILL は無いので resume はそのまま受理される。
-    m2.request_resume(datetime(2026, 9, 24, 10, 9, tzinfo=timezone.utc), acknowledge=False)
-    _seed_bar(conn, PAIR, "1m", datetime(2026, 9, 24, 10, 10, tzinfo=timezone.utc))
-    t4 = datetime(2026, 9, 24, 10, 12, tzinfo=timezone.utc)
-    assert m2.observe(t4, healthy) == "ready"
+    m2.request_resume(datetime(2026, 9, 24, 10, 5, tzinfo=timezone.utc), acknowledge=False)
+    t4 = datetime(2026, 9, 24, 10, 6, tzinfo=timezone.utc)
+    assert _beat(conn, m2, t4, healthy) == "ready"
 
     # 新しい epoch: 再度 failed → succeeded で改めて 1 回出る。
-    t5 = datetime(2026, 9, 24, 10, 13, tzinfo=timezone.utc)
+    t5 = datetime(2026, 9, 24, 10, 7, tzinfo=timezone.utc)
     assert m2.observe(t5, failed) == "degraded"
-    _seed_bar(conn, PAIR, "1m", datetime(2026, 9, 24, 10, 17, tzinfo=timezone.utc))
-    t6 = datetime(2026, 9, 24, 10, 19, tzinfo=timezone.utc)
-    assert m2.observe(t6, healthy) == "degraded"
+    t6 = datetime(2026, 9, 24, 10, 9, tzinfo=timezone.utc)
+    assert _beat(conn, m2, t6, healthy) == "degraded"
     assert len(_lines()) == 2
 
 
@@ -926,9 +927,16 @@ def test_confirmed_outage_activity_event_is_data_outage_degraded(tmp_path):
 
 
 def _auto_machine(conn, *, activity=None, **kwargs):
+    kwargs.setdefault("flat_stall_max_sec", 0)
     return OutageStateMachine(
         conn, hard_keys=HARD_KEYS, interval_widths=WIDTHS, grace=GRACE,
         storage_source="mt5-live", activity=activity, **kwargs)
+
+
+def _beat(conn, machine, now, report):
+    """足が 1 本進んだ tick の観測 (健全な tick は水位が進む)。"""
+    _seed_bar(conn, PAIR, "1m", now - timedelta(minutes=2))
+    return machine.observe(now, report)
 
 
 def _degrade(machine, now):
@@ -943,8 +951,8 @@ def test_flat_episode_auto_resumes_after_three_healthy_ticks(tmp_path):
     _degrade(machine, datetime(2026, 9, 24, 10, 1, tzinfo=timezone.utc))
     healthy = _report(succeeded=HARD_KEYS)
     for minute in (2, 3):
-        assert machine.observe(datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy) == "degraded"
-    assert machine.observe(datetime(2026, 9, 24, 10, 4, tzinfo=timezone.utc), healthy) == "ready"
+        assert _beat(conn, machine, datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy) == "degraded"
+    assert _beat(conn, machine, datetime(2026, 9, 24, 10, 4, tzinfo=timezone.utc), healthy) == "ready"
     lines = log.tail(50)
     auto_lines = [line for line in lines if "datafeed_recovered_auto" in line]
     assert len(auto_lines) == 1
@@ -965,8 +973,8 @@ def test_auto_resume_clears_confirmed_after_two_problem_ticks(tmp_path):
 
     healthy = _report(succeeded=HARD_KEYS)
     for minute in (3, 4):
-        assert machine.observe(datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy) == "degraded"
-    assert machine.observe(datetime(2026, 9, 24, 10, 5, tzinfo=timezone.utc), healthy) == "ready"
+        assert _beat(conn, machine, datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy) == "degraded"
+    assert _beat(conn, machine, datetime(2026, 9, 24, 10, 5, tzinfo=timezone.utc), healthy) == "ready"
     assert machine.status()["confirmed"] == 0
 
 
@@ -976,12 +984,12 @@ def test_auto_resume_streak_resets_on_empty_tick(tmp_path):
     _degrade(machine, datetime(2026, 9, 24, 10, 1, tzinfo=timezone.utc))
     healthy = _report(succeeded=HARD_KEYS)
     for minute in (2, 3):
-        machine.observe(datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy)
+        _beat(conn, machine, datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy)
     empty = _report(succeeded=HARD_KEYS, empty=[(PAIR, "1m")])
-    assert machine.observe(datetime(2026, 9, 24, 10, 4, tzinfo=timezone.utc), empty) == "degraded"
+    assert _beat(conn, machine, datetime(2026, 9, 24, 10, 4, tzinfo=timezone.utc), empty) == "degraded"
     for minute in (5, 6):
-        assert machine.observe(datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy) == "degraded"
-    assert machine.observe(datetime(2026, 9, 24, 10, 7, tzinfo=timezone.utc), healthy) == "ready"
+        assert _beat(conn, machine, datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy) == "degraded"
+    assert _beat(conn, machine, datetime(2026, 9, 24, 10, 7, tzinfo=timezone.utc), healthy) == "ready"
 
 
 @pytest.mark.parametrize("status", [
@@ -992,12 +1000,12 @@ def test_exposure_order_prevents_auto_resume(status, tmp_path):
     log = ActivityLog(tmp_path / status / "activity.log")
     machine = _auto_machine(conn, activity=log)
     _degrade(machine, datetime(2026, 9, 24, 10, 1, tzinfo=timezone.utc))
-    orders.insert(conn, pair=PAIR, direction="buy", entry_type="market",
+    orders.insert(conn, pair=PAIR, direction="long", stop_loss=0.5, entry_type="market",
                   horizon="swing", status=status,
                   now=datetime(2026, 9, 24, 10, 1, tzinfo=timezone.utc))
     healthy = _report(succeeded=HARD_KEYS)
     for minute in (2, 3, 4):
-        assert machine.observe(datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy) == "degraded"
+        assert _beat(conn, machine, datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy) == "degraded"
     assert len([line for line in log.tail(50) if "datafeed_recovered_awaiting_resume" in line]) == 1
 
 
@@ -1006,14 +1014,14 @@ def test_auto_resume_uses_last_success_for_not_attempted_key(tmp_path):
     keys = frozenset({(PAIR, "1m"), (PAIR, "15m")})
     machine = OutageStateMachine(conn, hard_keys=keys,
         interval_widths={"1m": timedelta(minutes=1), "15m": timedelta(minutes=15)},
-        grace=GRACE, storage_source="mt5-live")
+        grace=GRACE, storage_source="mt5-live", flat_stall_max_sec=0)
     assert machine.observe(datetime(2026, 9, 24, 10, 1, tzinfo=timezone.utc),
         _report(failed=[((PAIR, "1m"), "ConnectError")], succeeded=[(PAIR, "15m")])) == "degraded"
-    assert machine.observe(datetime(2026, 9, 24, 10, 2, tzinfo=timezone.utc),
-        _report(succeeded=keys)) == "degraded"
+    assert _beat(conn, machine, datetime(2026, 9, 24, 10, 2, tzinfo=timezone.utc),
+                 _report(succeeded=keys)) == "degraded"
     one_minute = _report(succeeded=[(PAIR, "1m")])
-    assert machine.observe(datetime(2026, 9, 24, 10, 3, tzinfo=timezone.utc), one_minute) == "degraded"
-    assert machine.observe(datetime(2026, 9, 24, 10, 4, tzinfo=timezone.utc), one_minute) == "ready"
+    assert _beat(conn, machine, datetime(2026, 9, 24, 10, 3, tzinfo=timezone.utc), one_minute) == "degraded"
+    assert _beat(conn, machine, datetime(2026, 9, 24, 10, 4, tzinfo=timezone.utc), one_minute) == "ready"
 
 
 def test_auto_resume_streak_resets_after_process_restart(tmp_path):
@@ -1022,11 +1030,11 @@ def test_auto_resume_streak_resets_after_process_restart(tmp_path):
     _degrade(machine, datetime(2026, 9, 24, 10, 1, tzinfo=timezone.utc))
     healthy = _report(succeeded=HARD_KEYS)
     for minute in (2, 3):
-        machine.observe(datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy)
+        _beat(conn, machine, datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy)
     restarted = _auto_machine(conn)
     for minute in (4, 5):
-        assert restarted.observe(datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy) == "degraded"
-    assert restarted.observe(datetime(2026, 9, 24, 10, 6, tzinfo=timezone.utc), healthy) == "ready"
+        assert _beat(conn, restarted, datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy) == "degraded"
+    assert _beat(conn, restarted, datetime(2026, 9, 24, 10, 6, tzinfo=timezone.utc), healthy) == "ready"
 
 
 def test_resume_request_on_auto_resume_tick_is_consumed_without_second_ready(tmp_path):
@@ -1036,9 +1044,9 @@ def test_resume_request_on_auto_resume_tick_is_consumed_without_second_ready(tmp
     _degrade(machine, datetime(2026, 9, 24, 10, 1, tzinfo=timezone.utc))
     healthy = _report(succeeded=HARD_KEYS)
     for minute in (2, 3):
-        machine.observe(datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy)
+        _beat(conn, machine, datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy)
     machine.request_resume(datetime(2026, 9, 24, 10, 4, tzinfo=timezone.utc))
-    assert machine.observe(datetime(2026, 9, 24, 10, 4, tzinfo=timezone.utc), healthy) == "ready"
+    assert _beat(conn, machine, datetime(2026, 9, 24, 10, 4, tzinfo=timezone.utc), healthy) == "ready"
     lines = log.tail(50)
     assert len([line for line in lines if "datafeed_recovered_auto" in line]) == 1
     assert not any("data_resume_accepted" in line for line in lines)
@@ -1051,7 +1059,7 @@ def test_auto_resume_flap_opens_next_epoch(tmp_path):
     _degrade(machine, datetime(2026, 9, 24, 10, 1, tzinfo=timezone.utc))
     healthy = _report(succeeded=HARD_KEYS)
     for minute in (2, 3, 4):
-        machine.observe(datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy)
+        _beat(conn, machine, datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy)
     assert machine.observe(datetime(2026, 9, 24, 10, 5, tzinfo=timezone.utc),
         _report(failed=[((PAIR, "1m"), "ConnectError")], succeeded=[(PAIR, "1h")])) == "degraded"
     assert machine.status()["epoch"] == 2
@@ -1059,18 +1067,22 @@ def test_auto_resume_flap_opens_next_epoch(tmp_path):
     assert conn.execute("SELECT count(*) FROM datafeed_outage_gap WHERE epoch=2").fetchone()[0] == 2
 
 
-def test_auto_resume_can_be_disabled_or_blocked_by_human_confirmation(tmp_path):
+def test_auto_resume_can_be_disabled_or_blocked_by_a_contact_wait(tmp_path):
     for kwargs in ({"auto_resume_when_flat": False}, {}):
         conn = _db(tmp_path / str(kwargs))
         log = ActivityLog(tmp_path / str(kwargs) / "activity.log")
         machine = _auto_machine(conn, activity=log, **kwargs)
         _degrade(machine, datetime(2026, 9, 24, 10, 1, tzinfo=timezone.utc))
         if not kwargs:
-            conn.execute("UPDATE datafeed_outage_state SET pending_human_confirmation=1 WHERE id=1")
+            # 接触待ちの参照がある epoch は、flat で健全でも自動では戻らない
+            outage_facts.add_contact(
+                conn, epoch=1, order_id=1, pair=PAIR, kind="sl",
+                bar_time=datetime(2026, 9, 24, 10, 0, tzinfo=timezone.utc),
+                detected_at=datetime(2026, 9, 24, 10, 1, tzinfo=timezone.utc))
             conn.commit()
         healthy = _report(succeeded=HARD_KEYS)
         for minute in (2, 3, 4):
-            assert machine.observe(datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy) == "degraded"
+            assert _beat(conn, machine, datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy) == "degraded"
         awaiting = [line for line in log.tail(50) if "datafeed_recovered_awaiting_resume" in line]
         assert len(awaiting) == 1
 
@@ -1081,7 +1093,7 @@ def test_disabled_auto_resume_keeps_ready_streak_zero(tmp_path):
     _degrade(machine, datetime(2026, 9, 24, 10, 1, tzinfo=timezone.utc))
     healthy = _report(succeeded=HARD_KEYS)
     for minute in (2, 3, 4):
-        assert machine.observe(datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy) == "degraded"
+        assert _beat(conn, machine, datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy) == "degraded"
         assert conn.execute(
             "SELECT ready_streak FROM datafeed_outage_state WHERE id=1"
         ).fetchone()["ready_streak"] == 0

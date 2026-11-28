@@ -806,6 +806,8 @@ def format_status(data: dict) -> str:
     if feed is not None:
         lines.append(f"data: {display_text(feed.get('state'))}")
         lines.extend(guidance_text.guidance_lines(feed) or ())
+        lines.extend(display_text(line) for line in guidance_text.contact_lines(
+            feed, lambda value: convert_or_raw(value, tz)))
     references = _references_line(data.get("references"))
     if references is not None:
         lines.append(references)

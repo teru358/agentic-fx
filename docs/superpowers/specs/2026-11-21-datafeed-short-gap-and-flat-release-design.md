@@ -301,6 +301,7 @@ fixture は全期間 SQL の時刻と合成価格を使う。fake bridge・仮�
 | scheduler がcacheを温める | `src/agentic_fx/service.py:1602-1606` の注記は実体と不一致。本番は `:1829-1832`, `:1878` のDB読取り、保存は `ingest.py:319` |
 | example/docstring はflatの短停滞だけ | `config/settings.yaml.example:63-65`, `outage.py:3-7` を10分・穴受容・検査優先へ同期。健全3 tick は H と auto=false の手動待ち、Eは同tick。autoは建玉ありEも制御 |
 | 長時間停止も回復足の確定時刻で期限内復帰できる | 現行 `outage.py:370-373` の壁時計判定を開場秒数・exposure別期限へ変更し、updated_at の観測中断を区別 |
+| 回復 tick の N は `IngestTickReport.new_times` から数える | `new_times` は載せない。N は保存した observe 済み水位から数える |
 
 ## 変更履歴
 
@@ -317,3 +318,4 @@ fixture は全期間 SQL の時刻と合成価格を使う。fake bridge・仮�
 | 2026-11-21 | C0.8 | 停滞 600 秒、epoch 全体の接触検査、通常取得による取り直しと保存・状態・通知・受入を整理 | 独立チェックの指摘と利用者裁定 (停滞 10 分・自動解除前の検査) を反映し、取り直しを通常取得に寄せて単純化 | 952b3f31 |
 | 2026-11-21 | C0.9 | 回復 tick の接触検査を遷移先に応じて分け、observe 済み水位による起動時差分回収と既存 epoch の手動確認を定義。穴の発見を前提とした記述と受入を整理 | 独立チェックの閉鎖確認の指摘を反映 | bac23aac |
 | 2026-11-21 | C1 | 利用者が承認 | 利用者承認 | |
+| 2026-11-28 | C1.1 | 付録に `IngestTickReport.new_times` を載せない旨を追記 | 実装 (gapfix) の数え方に文書を合わせる | |

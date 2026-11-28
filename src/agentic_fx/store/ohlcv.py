@@ -127,7 +127,7 @@ def _require_aware_utc(dt: datetime, label: str) -> datetime:
 
 
 def upsert_cache_bars(conn: sqlite3.Connection, bars: list[Bar], *,
-                      source: str) -> int:
+                      source: str, commit: bool = True) -> int:
     """live キャッシュ用。形成中バーの更新があるため常に上書きする。
 
     `source` は `LIVE_SOURCES` のいずれかでなければならない — 一括インポート
@@ -149,7 +149,8 @@ def upsert_cache_bars(conn: sqlite3.Connection, bars: list[Bar], *,
         "close=excluded.close, volume=excluded.volume",
         [(b.symbol, b.interval, _iso_utc(b.ts), b.open, b.high, b.low,
           b.close, b.volume, source) for b in bars])
-    conn.commit()
+    if commit:
+        conn.commit()
     return len(bars)
 
 

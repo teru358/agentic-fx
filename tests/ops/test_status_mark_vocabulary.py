@@ -125,22 +125,29 @@ def _outage_source() -> str:
     return (ROOT / "src/agentic_fx/datafeed/outage.py").read_text(encoding="utf-8")
 
 
+def _transition_source() -> str:
+    return (ROOT / "src/agentic_fx/datafeed/outage_transition.py").read_text(encoding="utf-8")
+
+
 def _bot_source() -> str:
     return (ROOT / "src/agentic_fx/ops/bot_health.py").read_text(encoding="utf-8")
 
 
 def test_every_state_the_outage_machine_produces_is_in_the_vocabulary():
-    words = _state_words(_outage_source())
-    assert words and words <= set(outage.DATA_STATES), words
+    # 状態の語は、読み口 (outage.py) と遷移の規則 (outage_transition.py) の両方が作る
+    for source in (_outage_source(), _transition_source()):
+        words = _state_words(source)
+        assert words and words <= set(outage.DATA_STATES), words
 
 
 def test_a_new_outage_state_on_any_producing_path_is_caught():
-    source = _outage_source()
-    for needle, mutated in (
-            ('return self._load_row().get("state", "ready")',
+    for source, needle, mutated in (
+            (_outage_source(), 'return self._load_row().get("state", "ready")',
              'return "new_state"\n        return self._load_row().get("state", "ready")'),
-            ('state = "restricted"', 'state = "paused"'),
-            ('"state": row.get("state", "ready")', '"state": row.get("state", "idle")')):
+            (_transition_source(), 'state = "restricted"', 'state = "paused"'),
+            (_transition_source(), 'state = "ready"', 'state = "idle"'),
+            (_outage_source(), '"state": row.get("state", "ready")',
+             '"state": row.get("state", "idle")')):
         assert needle in source, needle
         assert not _state_words(source.replace(needle, mutated, 1)) <= set(outage.DATA_STATES), needle
 

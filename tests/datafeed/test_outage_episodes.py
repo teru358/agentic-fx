@@ -51,7 +51,7 @@ def _row(conn):
     return dict(conn.execute("SELECT * FROM datafeed_outage_state WHERE id=1").fetchone())
 
 
-def test_friday_restricted_expires_over_the_weekend_then_recovers_after_three_healthy_ticks(
+def test_friday_restricted_survives_the_weekend_and_recovers_on_the_first_healthy_tick(
         tmp_path):
     log = ActivityLog(tmp_path / "activity.log")
     conn, machine = _rig(tmp_path, activity=log)
@@ -77,25 +77,30 @@ def test_friday_restricted_expires_over_the_weekend_then_recovers_after_three_he
         assert (after["state"], after["epoch"], after["ready_streak"]) == ("restricted", 1, 0)
         assert after["restricted_deadline_at"] == "2026-09-25T21:22:30+00:00"
 
-    # 日曜の最初の tick は healthy でも、期限超過が先に効いて degraded。人手確認は立てない。
+    # restricted の連続は開場時間で数える: 金曜 20:52:30 から閉場 (21:00) までの 7.5 分と、
+    # 日曜 21:00 から 2 分の 9.5 分。壁時計の 2 日ではないので、日曜の最初の healthy tick で復帰する
     _bar(conn, datetime(2026, 9, 27, 21, 0, tzinfo=UTC))
     sunday = datetime(2026, 9, 27, 21, 2, tzinfo=UTC)
-    assert machine.observe(sunday, _ok()) == "degraded"
-    degraded = _row(conn)
-    assert degraded["pending_human_confirmation"] == 0
-    assert degraded["epoch"] == 1
-    assert degraded["entered_degraded_at"] == "2026-09-27T21:02:00+00:00"
+    assert machine.observe(sunday, _ok()) == "ready"
+    recovered = _row(conn)
+    assert recovered["pending_human_confirmation"] == 0
+    assert recovered["epoch"] == 1
+    assert recovered["restricted_since"] is None and recovered["ready_streak"] == 0
+    assert _events(log) == ["datafeed_restricted", "datafeed_recovered_auto"]
+    assert recovered["updated_at"] == "2026-09-27T21:02:00+00:00"
 
-    # 続く healthy 3 tick で自動復帰する (21:03, 21:04 はまだ degraded)。
-    states = []
-    for minute, bar_minute in ((3, 1), (4, 2), (5, 3)):
-        _bar(conn, datetime(2026, 9, 27, 21, bar_minute, tzinfo=UTC))
-        states.append(machine.observe(datetime(2026, 9, 27, 21, minute, tzinfo=UTC), _ok()))
-    assert states == ["degraded", "degraded", "ready"]
-    assert _events(log) == ["datafeed_restricted", "datafeed_degraded",
-                            "datafeed_recovered_auto"]
-    # 停止時間は DB の時刻から測れる: 金曜 20:52:30 起点 → 日曜 21:05 の復帰
-    assert _row(conn)["updated_at"] == "2026-09-27T21:05:00+00:00"
+
+def test_friday_restricted_stops_after_thirty_open_minutes_counted_across_the_weekend(tmp_path):
+    log = ActivityLog(tmp_path / "activity.log")
+    conn, machine = _rig(tmp_path, activity=log, auto_resume_when_flat=False)
+    _bar(conn, datetime(2026, 9, 25, 20, 50, tzinfo=UTC))
+    assert machine.observe(datetime(2026, 9, 25, 20, 58, tzinfo=UTC), _ok()) == "restricted"
+    # 開場分: 金曜 7.5 分 + 日曜 21:00 から。21:22 までで 29.5 分、21:23 で 30.5 分
+    _bar(conn, datetime(2026, 9, 27, 21, 0, tzinfo=UTC))
+    assert machine.observe(datetime(2026, 9, 27, 21, 22, tzinfo=UTC), _ok()) == "restricted"
+    assert machine.observe(datetime(2026, 9, 27, 21, 23, tzinfo=UTC), _ok()) == "degraded"
+    row = _row(conn)
+    assert row["confirmed"] == 1 and row["epoch"] == 1
 
 
 def test_winter_sunday_2100_to_2200_is_closed_for_outage_failures(tmp_path):
@@ -111,7 +116,8 @@ def test_winter_sunday_2100_to_2200_is_closed_for_outage_failures(tmp_path):
         assert machine.observe(now, failed) == "ready"
         assert _row(conn)["epoch"] == 0
 
-    assert machine.observe(datetime(2026, 11, 8, 22, 1, tzinfo=UTC), failed) == "degraded"
+    # 開場後の失敗は、flat なら猶予内の restricted (停止はしない)
+    assert machine.observe(datetime(2026, 11, 8, 22, 1, tzinfo=UTC), failed) == "restricted"
     assert _row(conn)["epoch"] == 1
 
 
@@ -155,11 +161,11 @@ def test_failure_while_writing_gap_rows_leaves_the_state_row_untouched(
     _bar(conn, WED - timedelta(minutes=10))
     _bar(conn, WED - timedelta(minutes=10), OTHER)
     machine._ensure_row(WED)  # row の作成は observe の transaction の中なので、先に確定させておく
-    def half_written(epoch, now, watermarks):
+    def half_written(epoch, origins):
         # 1 key 分の gap を書いた後で落とす
         machine.conn.execute(
             "INSERT INTO datafeed_outage_gap (pair, interval, epoch, gap_start, "
-            "replay_through) VALUES (?, '1m', ?, ?, NULL)", (PAIR, epoch, now.isoformat()))
+            "replay_through) VALUES (?, '1m', ?, ?, NULL)", (PAIR, epoch, WED.isoformat()))
         raise sqlite3.OperationalError("injected crash")
 
     monkeypatch.setattr(machine, "_open_gaps", half_written)

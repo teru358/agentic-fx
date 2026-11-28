@@ -156,6 +156,11 @@ def test_phase1_full_cycle(tmp_path):
                     149.00, 149.05, 148.95, 149.00, 100),
             ]
             app.clock = FixedClock(WED + timedelta(hours=1, minutes=1))
+            # この 1 時間の跳びは fixture の省略で、観測は途切れていない体にする
+            # (途切れた観測は旧停滞の期限を評価して停止するので、前回の観測時刻を進めておく)
+            app.conn_core.execute("UPDATE datafeed_outage_state SET updated_at=?",
+                                  ((WED + timedelta(hours=1)).isoformat(),))
+            app.conn_core.commit()
             _scheduler_tick_once(app)
             time.sleep(0.5)
             refl = app.conn_core.execute("SELECT * FROM reflections").fetchall()

@@ -60,9 +60,9 @@ datafeed:
   freshness_max_min: 20       # これより古い quote/bar は不健全扱い
   closed_bar_grace_sec: 30    # source 時刻の遅延・境界丸めを吸収する暫定猶予秒
   outage:
-    flat_stall_max_sec: 1800     # 建玉も未約定指値も無いときの 1m 停滞を restricted (新規リスク停止) に留める最大秒。0 で無効 (即 degraded)
-    ready_confirm_ticks: 3       # restricted / degraded から ready に戻るのに必要な連続健全 tick 数 (1 以上)
-    auto_resume_when_flat: true  # flat の episode は連続健全 tick で自動 ready。false だと人の `data resume` が要る
+    flat_stall_max_sec: 1800     # 全 exposure ゼロのときの 1m の停滞・取得失敗・空を restricted (新規リスク停止) に留める最大の開場秒。超えると停止 (degraded)。0 で猶予なし。建玉があるときの猶予は 600 秒 (固定)。後続の足が届いている穴は猶予に数えず、足が届けば同じ tick で ready に戻る。restricted が連続 30 分 (開場秒) を超えたら足が届いていても停止する
+    ready_confirm_ticks: 3       # flat の degraded の自動解除、および自動復帰が無効なときの restricted から人の待ちへ進むのに必要な、水位が進む連続健全 tick 数 (1 以上)
+    auto_resume_when_flat: true  # true: flat の degraded を健全 tick の連続で自動解除し、restricted は健全な tick で復帰する。false: flat の自動解除と建玉ありの restricted の復帰を止め、取得と検査は続けて健全 3 tick 後に人の待ちにする (`data resume`)。停止中に届いた足が保護価格・指値に触れた場合は、この設定によらず人の確認 (`data resume --acknowledge`) が要る
   conversion_skew_max_min: 5  # 換算レート (口座通貨換算) のクロス脚間・判断内スナップショットの時刻差許容。freshness_max_min より必ず小さいこと (同じ/大きいと skew 検証が発火しなくなる)
   intervals: [1m, 5m, 15m, 1h, 4h]   # 取得・保持する足 (1m は必須: ペーパー約定判定が依存)
   decision_timeframes: [1h]          # [init] 判断足は現在ちょうど1本。15分なら [15m] に変更する

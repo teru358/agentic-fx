@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 PHASES = ("unknown", "resume_requested", "ready", "resume_rejected", "awaiting_resume",
-          "stopped", "restricted")
+          "stopped", "restricted", "recovering", "starting")
 # daemon が返す (phase, next_action) の組。これ以外は不明として扱う
 PAIRS = frozenset({
     ("unknown", "check_status"),
@@ -21,6 +21,8 @@ PAIRS = frozenset({
     ("awaiting_resume", "resume"),
     ("stopped", "restore_source"),
     ("restricted", "wait_tick"),
+    ("recovering", "wait_tick"),
+    ("starting", "wait_tick"),
 })
 UNKNOWN_COUNT = "unknown"
 
@@ -34,6 +36,8 @@ _REASON = {
     "awaiting_resume": "取得の回復を確認済みで、人の再開操作を待っています",
     "stopped": "データの欠落を検知して停止しています",
     "restricted": "データの欠落を検知し、制限状態で自動復帰を判定しています",
+    "recovering": "健全な足の確認を続けています。条件が揃えば自動解除します",
+    "starting": "起動直後で、最初の開場中の観測を待っています。新規リスクは止まっています",
 }
 _REJECTED_REASON = {
     "rejected_watermark": "前回の要求は、取得状態が確認できず拒否されました",
@@ -57,6 +61,38 @@ _ACTION = {
 }
 _RESUME_NO_ACK_NEEDED = ("未処理の足がある建玉は現在ありません。--acknowledge なしで再要求できます ("
                          + RESUME + ")。判定は次の開場中の tick です")
+
+
+# 接触・不明の種別の表示語 (core.protection_contact の KINDS と同じ集合)
+_CONTACT_KIND_TEXT = {
+    "sl": "損切り価格に接触",
+    "tp": "利確価格に接触",
+    "both": "損切り・利確の両方に接触",
+    "limit": "指値に到達",
+    "unknown": "接触の有無を判定できません",
+}
+_CONTACT_LINES_MAX = 5
+
+
+def contact_lines(feed: object, convert=lambda value: value) -> list[str]:
+    """接触・不明の参照 (注文 ID・足時刻・種別) の表示行。形が合わない要素は出さない。
+
+    `convert` は足時刻の文字列を表示用に換算する関数。最大 5 件で、残りは件数だけにする。"""
+    refs = feed.get("contacts") if type(feed) is dict else None
+    if type(refs) is not list:
+        return []
+    lines = []
+    for item in refs[:_CONTACT_LINES_MAX]:
+        if type(item) is not dict:
+            continue
+        order_id, bar_time, kind = item.get("order_id"), item.get("bar_time"), item.get("kind")
+        if type(order_id) is not int or type(bar_time) is not str or kind not in _CONTACT_KIND_TEXT:
+            continue
+        lines.append(f"接触・不明: 注文 #{order_id} / 足 {convert(bar_time)} / "
+                     f"{_CONTACT_KIND_TEXT[kind]}")
+    if len(refs) > _CONTACT_LINES_MAX:
+        lines.append(f"接触・不明: ほか {len(refs) - _CONTACT_LINES_MAX} 件")
+    return lines
 
 
 def checked_pair(feed: dict) -> tuple[str, str]:

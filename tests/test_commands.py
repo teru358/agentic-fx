@@ -61,6 +61,8 @@ def _commands_with_outage(tmp_path):
 
 
 def _degrade(outage, now):
+    # 猶予なし (最初の失敗 tick で停止) にして、停止中の表示を確かめる
+    outage.flat_stall_max_sec = 0
     report = IngestTickReport(
         attempted=frozenset({("USDJPY", "1m")}), succeeded=frozenset(),
         failed=frozenset({(("USDJPY", "1m"), "ConnectError")}),
